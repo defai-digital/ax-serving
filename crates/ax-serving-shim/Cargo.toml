@@ -1,0 +1,20 @@
+[package]
+name = "ax-serving-shim"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ax-serving-engine = { path = "../ax-serving-engine" }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = "0.2"
+
+[build-dependencies]
+# cbindgen generates llama.h from this crate's extern "C" symbols
+# Run: cbindgen --config cbindgen.toml --crate ax-serving-shim --output llama.h

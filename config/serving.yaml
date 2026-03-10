@@ -1,0 +1,77 @@
+# ax-serving serving configuration
+#
+# All values shown are the built-in defaults.
+# Override with AXS_* environment variables or CLI flags.
+# See config/serving.example.yaml for the full reference.
+
+rest_addr: "127.0.0.1:18080"
+grpc_socket: "/tmp/ax-serving.sock"
+grpc_host: "127.0.0.1"
+
+sched_max_inflight: 16
+sched_max_queue: 128
+sched_max_wait_ms: 120000
+sched_overload_policy: "queue"
+sched_per_model_max_inflight: 4
+sched_max_batch_size: 8
+sched_batch_window_ms: 5
+
+idle_timeout_secs: 0
+thermal_poll_secs: 5
+
+cache:
+  enabled: false
+  url: "redis://127.0.0.1:6379"
+  key_prefix: "axs:chat:v1"
+  default_ttl: "1h"
+  max_ttl: "30d"
+
+registry:
+  max_loaded_models: 16
+  idle_check_interval_secs: 60
+
+dispatcher:
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  retry_after_secs: 5
+  cache_inflight_max_retries: 3
+
+llamacpp:
+  bin: ""
+  host: "127.0.0.1"
+  port: 18181
+  token_batch_size: 4
+  token_batch_max: 32
+  circuit_breaker_trip_threshold: 3
+  circuit_breaker_recovery_ms: 10000
+  http_request_timeout_secs: 300
+  server_startup_timeout_secs: 120
+  server_restart_timeout_secs: 60
+  wait_ready_poll_interval_ms: 500
+  wait_ready_check_timeout_secs: 1
+  health_poller_interval_secs: 5
+  health_poller_check_timeout_secs: 2
+  health_poller_restart_threshold: 3
+  health_poller_max_restarts: 3
+  cache_prompt: true
+  # n_batch: 4096              # env: AXS_LLAMACPP_N_BATCH  (logical batch size)
+  # n_ubatch: 4096             # env: AXS_LLAMACPP_N_UBATCH  (physical/micro batch size)
+                               # IMPORTANT: set n_ubatch >= n_batch for embedding models.
+                               # llama-server defaults n_ubatch to 512; any single input
+                               # exceeding 512 tokens fails with HTTP 500. For embedding
+                               # workloads with real document chunks, set both to 4096.
+
+orchestrator:
+  host: "127.0.0.1"
+  port: 18080
+  internal_port: 19090
+  worker_heartbeat_ms: 5000
+  worker_ttl_ms: 15000
+  dispatch_policy: "least_inflight"
+  retry_after_secs: 5
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  global_queue_max: 128
+  global_queue_depth: 256
+  global_queue_wait_ms: 10000
+  global_queue_policy: "queue"

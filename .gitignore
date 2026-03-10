@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Models
+models
+models/
+*.gguf
+
+# AI agent instruction/config files
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+opencode.json
+
+# Logs and artifacts
+*.log
+automatosx/
+.automatosx/
+.ax-grok/
+.gemini/
+Archived/
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+__pycache__/
+*.pyc

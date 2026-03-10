@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ax-serving dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --green: #22c55e;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --grey: #64748b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  .mode-badge { background: var(--card); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: 12px; color: var(--muted); }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
+  .banner { background: #2d2000; border: 1px solid var(--yellow); border-radius: 6px; padding: 12px 16px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+  .banner-icon { color: var(--yellow); font-size: 16px; flex-shrink: 0; }
+  .banner p { color: #fcd34d; line-height: 1.5; font-size: 13px; }
+  .banner a { color: #fbbf24; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .badge-oss { background: #1e2433; color: var(--grey); border: 1px solid var(--border); }
+  .badge-business { background: #052e16; color: var(--green); border: 1px solid #166534; }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .label { color: var(--muted); min-width: 100px; }
+  input[type=text] { background: #0f1117; border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 7px 12px; font-size: 13px; width: 280px; outline: none; }
+  input[type=text]:focus { border-color: var(--blue); }
+  button { background: var(--blue); border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 13px; padding: 7px 16px; }
+  button:hover { background: #2563eb; }
+  button.danger { background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; padding: 3px 10px; font-size: 12px; }
+  button.danger:hover { background: #450a0a; border-color: var(--red); }
+  .buy-link { font-size: 13px; margin-top: 8px; }
+  .buy-link a { color: var(--blue); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 12px 10px 0; border-bottom: 1px solid #1e2433; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-green { background: var(--green); }
+  .dot-red { background: var(--red); }
+  .dot-yellow { background: var(--yellow); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+  .stat { background: #0f1117; border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; }
+  .stat-label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .stat-value { font-size: 22px; font-weight: 700; }
+  .stat-value.warn { color: var(--yellow); }
+  .stat-value.ok { color: var(--green); }
+  .stat-value.err { color: var(--red); }
+  .status-ok { color: var(--green); }
+  .status-degraded { color: var(--red); }
+  #error-bar { display: none; background: #2d0000; border: 1px solid var(--red); border-radius: 6px; padding: 10px 16px; color: #fca5a5; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ax-serving</h1>
+  <span id="mode-badge" class="mode-badge">loading…</span>
+  <span id="status-text" style="margin-left:auto;font-size:13px;color:var(--muted)">●</span>
+</header>
+<main>
+  <div id="error-bar"></div>
+
+  <!-- License panel -->
+  <div class="card" id="license-card">
+    <h2>License</h2>
+    <div id="license-reminder" class="banner" style="display:none">
+      <span class="banner-icon">⚠</span>
+      <p>Remote workers detected — this is a <strong>Business Edition</strong> feature.
+      For teams with annual revenue &gt; USD 2M, a license is required.<br>
+      <a id="banner-buy-link" href="#" target="_blank" rel="noopener">Purchase a license →</a></p>
+    </div>
+    <div class="row">
+      <span class="label">Edition</span>
+      <span id="edition-badge" class="badge badge-oss">OSS</span>
+    </div>
+    <div class="row">
+      <span class="label">License key</span>
+      <input type="text" id="license-key-input" placeholder="Enter license key…">
+      <button onclick="activateLicense()">Activate</button>
+    </div>
+    <div class="buy-link">
+      Don't have a key? <a id="footer-buy-link" href="#" target="_blank" rel="noopener">Buy Business Edition</a>
+    </div>
+    <div id="license-msg" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+  </div>
+
+  <!-- Workers panel (orchestrator mode) -->
+  <div class="card" id="workers-card" style="display:none">
+    <h2>Workers</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Machine</th>
+          <th>Chip</th>
+          <th>Health</th>
+          <th>Inflight</th>
+          <th>Thermal</th>
+          <th>Models</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="workers-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- Queue panel (orchestrator mode) -->
+  <div class="card" id="queue-card" style="display:none">
+    <h2>Queue</h2>
+    <div class="stats" id="queue-stats"></div>
+  </div>
+
+  <!-- System panel (single-worker mode) -->
+  <div class="card" id="system-card" style="display:none">
+    <h2>System</h2>
+    <div class="stats" id="system-stats"></div>
+  </div>
+</main>
+
+<script>
+  let isOrchestrator = null;
+  let pollMs = 2000;
+
+  function fmt(n) { return n == null ? '—' : n.toLocaleString(); }
+  function fmtBytes(b) {
+    if (b == null) return '—';
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+    if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+    return (b/1073741824).toFixed(2) + ' GB';
+  }
+
+  function statCard(label, value, cls='') {
+    return `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${value}</div></div>`;
+  }
+
+  function dotColor(w) {
+    if (w.drain) return 'dot-yellow';
+    if (w.health === 'healthy') return 'dot-green';
+    return 'dot-red';
+  }
+
+  async function fetchJSON(path) {
+    const r = await fetch(path);
+    if (!r.ok) throw new Error(`${path} → ${r.status}`);
+    return r.json();
+  }
+
+  async function refreshLicense() {
+    try {
+      const d = await fetchJSON('/v1/license');
+      const badge = document.getElementById('edition-badge');
+      if (d.edition === 'business') {
+        badge.textContent = 'Business ✓';
+        badge.className = 'badge badge-business';
+      } else {
+        badge.textContent = 'OSS';
+        badge.className = 'badge badge-oss';
+      }
+      document.getElementById('license-reminder').style.display =
+        d.needs_reminder ? 'flex' : 'none';
+      // Update buy links and poll interval from server config.
+      if (d.buy_link) {
+        document.getElementById('banner-buy-link').href = d.buy_link;
+        document.getElementById('footer-buy-link').href = d.buy_link;
+      }
+      if (d.dashboard_poll_ms && d.dashboard_poll_ms > 0) {
+        pollMs = d.dashboard_poll_ms;
+      }
+    } catch (_) {}
+  }
+
+  async function refreshMetrics() {
+    let health, metrics;
+    try { health = await fetchJSON('/health'); } catch(e) {
+      showError('Cannot reach /health: ' + e.message); return;
+    }
+    try { metrics = await fetchJSON('/v1/metrics'); } catch(e) {
+      showError('Cannot reach /v1/metrics: ' + e.message); return;
+    }
+    clearError();
+
+    // Determine mode on every tick so the UI adapts if the server restarts
+    // in a different mode (e.g. worker → orchestrator).
+    isOrchestrator = metrics.worker_detail !== undefined;
+
+    // Status
+    const statusEl = document.getElementById('status-text');
+    const st = health.status || 'unknown';
+    statusEl.textContent = '● ' + st;
+    statusEl.className = st === 'ok' ? 'status-ok' : 'status-degraded';
+
+    document.getElementById('mode-badge').textContent =
+      isOrchestrator ? 'orchestrator' : 'worker';
+
+    if (isOrchestrator) {
+      renderOrchestrator(health, metrics);
+    } else {
+      renderSingleWorker(health, metrics);
+    }
+  }
+
+  function renderOrchestrator(health, metrics) {
+    document.getElementById('workers-card').style.display = 'block';
+    document.getElementById('queue-card').style.display = 'block';
+    document.getElementById('system-card').style.display = 'none';
+
+    // Workers table
+    const workers = metrics.worker_detail || [];
+    const tbody = document.getElementById('workers-tbody');
+    tbody.innerHTML = workers.map(w => {
+      const healthColor = dotColor(w);
+      const name = w.friendly_name || w.addr || w.id || '—';
+      const chip = w.chip_model || '—';
+      const models = (w.capabilities || []).join(', ') || '—';
+      const thermal = w.thermal_state || '—';
+      const inflight = w.inflight != null ? `${w.inflight}/${w.max_inflight||'?'}` : '—';
+      const healthLabel = w.drain ? 'draining' : (w.health || 'unknown');
+      return `<tr>
+        <td>${esc(name)}</td>
+        <td style="color:var(--muted)">${esc(chip)}</td>
+        <td><span class="dot ${healthColor}"></span>${esc(healthLabel)}</td>
+        <td>${esc(inflight)}</td>
+        <td style="color:var(--muted)">${esc(thermal)}</td>
+        <td style="color:var(--muted);font-size:12px">${esc(models)}</td>
+        <td><button class="danger" data-worker-id="${esc(w.id)}" onclick="removeWorker(this.dataset.workerId)">Remove</button></td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="7" style="color:var(--muted);padding:16px 0">No workers registered</td></tr>';
+
+    // Queue stats
+    const q = health.queue || metrics.queue || {};
+    const hw = health.workers || {};
+    document.getElementById('queue-stats').innerHTML = [
+      statCard('Active', fmt(q.active)),
+      statCard('Queued', fmt(q.queued), q.queued > 0 ? 'warn' : ''),
+      statCard('Eligible Workers', fmt(hw.eligible ?? hw.healthy), (hw.eligible ?? hw.healthy) > 0 ? 'ok' : 'err'),
+      statCard('Rejected', fmt(q.rejected_total), q.rejected_total > 0 ? 'warn' : ''),
+      statCard('Shed', fmt(q.shed_total), q.shed_total > 0 ? 'warn' : ''),
+      statCard('Timed Out', fmt(q.timeout_total), q.timeout_total > 0 ? 'warn' : ''),
+    ].join('');
+  }
+
+  function renderSingleWorker(health, metrics) {
+    document.getElementById('workers-card').style.display = 'none';
+    document.getElementById('queue-card').style.display = 'none';
+    document.getElementById('system-card').style.display = 'block';
+
+    const loadedRaw = metrics.loaded_models ?? health.loaded_models;
+    const loaded = Array.isArray(loadedRaw) ? loadedRaw.length : loadedRaw;
+    const rss = fmtBytes(metrics.rss_bytes);
+    const sched = metrics.scheduler || {};
+    const inflight = sched.inflight_count ?? '—';
+    const queued = sched.queue_depth ?? '—';
+
+    document.getElementById('system-stats').innerHTML = [
+      statCard('Loaded Models', fmt(loaded)),
+      statCard('Inflight', fmt(inflight)),
+      statCard('Queued', fmt(queued), queued > 0 ? 'warn' : ''),
+      statCard('RSS', rss),
+    ].join('');
+  }
+
+  async function removeWorker(id) {
+    if (!confirm('Remove worker ' + id + '?\n\nThis immediately stops routing to it. Use only for accidental registrations or stuck workers.')) return;
+    try {
+      const r = await fetch('/v1/workers/' + encodeURIComponent(id), {method: 'DELETE'});
+      if (r.ok || r.status === 204) {
+        await refreshMetrics();
+      } else {
+        alert('Remove failed: HTTP ' + r.status);
+      }
+    } catch(e) { alert('Remove failed: ' + e.message); }
+  }
+
+  async function activateLicense() {
+    const key = document.getElementById('license-key-input').value.trim();
+    if (!key) { setLicenseMsg('Enter a key first.'); return; }
+    try {
+      const r = await fetch('/v1/license', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key}),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        setLicenseMsg('License activated.');
+        document.getElementById('license-key-input').value = '';
+        await refreshLicense();
+      } else {
+        setLicenseMsg('Error: ' + (d.error || r.status));
+      }
+    } catch(e) { setLicenseMsg('Request failed: ' + e.message); }
+  }
+
+  function setLicenseMsg(msg) {
+    document.getElementById('license-msg').textContent = msg;
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('error-bar');
+    el.textContent = '⚠ ' + msg;
+    el.style.display = 'block';
+  }
+
+  function clearError() {
+    document.getElementById('error-bar').style.display = 'none';
+  }
+
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+  }
+
+  async function tick() {
+    await Promise.all([refreshLicense(), refreshMetrics()]);
+    setTimeout(tick, pollMs);
+  }
+
+  tick();
+</script>
+</body>
+</html>

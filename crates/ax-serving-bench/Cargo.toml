@@ -1,0 +1,29 @@
+[package]
+name = "ax-serving-bench"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ax-serving-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "raw-mistralrs-bench"
+path = "src/raw_mistralrs_bench.rs"
+
+[dependencies]
+ax-serving-engine = { path = "../ax-serving-engine" }
+ax-serving-api = { path = "../ax-serving-api" }
+mistralrs = { workspace = true }
+either = "1"
+indexmap = "2"
+
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }

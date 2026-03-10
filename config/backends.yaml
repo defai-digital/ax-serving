@@ -1,0 +1,48 @@
+# AX Serving backend routing configuration
+#
+# CURRENT POLICY: mistralrs (native) is the primary backend for supported families.
+# llama.cpp is the fallback for unsupported architectures and explicit llama_cpp families.
+# See ADR-013 for the re-enablement decision and validation gate.
+#
+# Backends:
+#   native    — mistralrs (primary; requires Xcode Metal toolchain)
+#   llama_cpp — llama-server subprocess (requires llama-server on PATH via brew install llama.cpp)
+#   lib_llama — direct libllama C API, no subprocess (requires `libllama` feature; Phase 2)
+#   auto      — try native first; fall back to llama_cpp on unsupported arch
+#
+# Family detection:
+#   Primary:  reads `general.architecture` from the GGUF header (authoritative).
+#   Fallback: lowercase filename substring match (used if GGUF is unreadable).
+#
+# Lookup order:
+#   1. Exact match on `general.architecture` value (e.g. "qwen3")
+#   2. Prefix match (e.g. key "qwen" matches "qwen2", "qwen3", "qwen2_moe")
+#   3. default_backend
+#
+# Loading order for this config file:
+#   1. $AXS_ROUTING_CONFIG env var path
+#   2. ./backends.yaml in CWD
+#   3. Built-in defaults (default_backend: auto)
+
+# Unknown families: try native first, fall back to llama.cpp on unsupported arch.
+default_backend: auto
+
+families:
+  # ── mistralrs native (primary) ─────────────────────────────────────────────
+  llama:     native   # LLaMA 3.x
+  qwen:      native   # Qwen 2/3 (dense + MoE fixed in mistralrs v0.7.0)
+  gemma:     native   # Gemma 2/3
+  mistral:   native   # Mistral / Mistral 3
+  phi:       native   # Phi-2, Phi-3, Phi-4
+  starcoder: native   # Starcoder2
+
+  # ── auto (native where supported, llama.cpp fallback) ─────────────────────
+  deepseek:  auto     # Dense distills (≤14B) → native; 671B full → OOM propagates.
+                      # For DeepSeek-V3/R1 671B use: POST /v1/models {backend: "llama_cpp"}
+  glm:       auto     # GLM-4 → native; GLM-5 unknown arch → llama.cpp fallback
+
+  # ── llama.cpp only (no mistralrs support) ─────────────────────────────────
+  gptj:     llama_cpp  # GPT-J
+  gpt_neox: llama_cpp  # GPT-NeoX / Pythia / RedPajama
+  falcon:   llama_cpp  # Falcon 7B/40B/180B
+  minimax:  llama_cpp  # MiniMax

@@ -1,0 +1,131 @@
+# ax-serving configuration reference
+#
+# Load order (highest priority first):
+#   CLI flags  >  AXS_* env vars  >  this file  >  built-in defaults
+#
+# Auto-loaded from (first match):
+#   $AXS_CONFIG  >  config/serving.yaml  >  serving.yaml  >  ~/.config/ax-serving/serving.yaml
+#
+# All values below show the built-in defaults.
+
+# ── REST / gRPC bind addresses ────────────────────────────────────────────────
+rest_addr: "127.0.0.1:18080"   # env: AXS_REST_HOST + AXS_REST_PORT
+grpc_socket: "/tmp/ax-serving.sock"
+grpc_host: "127.0.0.1"         # env: AXS_GRPC_HOST  (bind host for TCP gRPC)
+grpc_port: null                # env: AXS_GRPC_PORT  (set to enable TCP gRPC alongside the Unix socket)
+
+# ── Admission scheduler ───────────────────────────────────────────────────────
+sched_max_inflight: 16         # env: AXS_SCHED_MAX_INFLIGHT
+sched_max_queue: 128           # env: AXS_SCHED_MAX_QUEUE
+sched_max_wait_ms: 120000      # env: AXS_SCHED_MAX_WAIT_MS
+                               # (2 minutes — embedding requests can take 2-15s on local models)
+sched_overload_policy: "queue" # env: AXS_OVERLOAD_POLICY  ("queue" | "reject" | "shed_oldest")
+                               # "queue" is required for batch embedding workloads;
+                               # "reject" causes HTTP 500 when concurrent requests exceed the limit
+sched_per_model_max_inflight: 4  # env: AXS_PER_MODEL_MAX_INFLIGHT
+                               # (max concurrent requests per distinct model ID)
+sched_max_batch_size: 8        # env: AXS_MAX_BATCH_SIZE
+                               # (advisory; reserved for future continuous-batching)
+sched_batch_window_ms: 5       # env: AXS_BATCH_WINDOW_MS
+                               # (advisory; reserved for future continuous-batching)
+
+# ── Idle eviction & thermal ───────────────────────────────────────────────────
+idle_timeout_secs: 0           # env: AXS_IDLE_TIMEOUT_SECS
+                               # (0 = disabled; unload models idle longer than this)
+thermal_poll_secs: 5           # env: AXS_THERMAL_POLL_SECS
+                               # (how often the macOS thermal state is sampled; min 1)
+
+# ── Response cache (Valkey / Redis) ───────────────────────────────────────────
+cache:
+  enabled: false               # env: AXS_CACHE_ENABLED
+  url: "redis://127.0.0.1:6379"   # env: AXS_CACHE_URL
+  key_prefix: "axs:chat:v1"   # env: AXS_CACHE_KEY_PREFIX
+  default_ttl: "1h"            # env: AXS_CACHE_DEFAULT_TTL  (s/m/h/d/w/mo/month)
+  max_ttl: "30d"               # env: AXS_CACHE_MAX_TTL
+
+# ── Model registry ────────────────────────────────────────────────────────────
+registry:
+  max_loaded_models: 16        # env: AXS_MAX_LOADED_MODELS
+  idle_check_interval_secs: 60 # env: AXS_IDLE_CHECK_INTERVAL_SECS
+                               # (how often the idle-eviction background task runs)
+
+# ── Dispatcher / request routing ─────────────────────────────────────────────
+dispatcher:
+  pool_max_idle_per_host: 8    # env: AXS_DISPATCHER_POOL_MAX_IDLE
+                               # (reqwest connection-pool cap per worker)
+  request_timeout_secs: 300    # env: AXS_DISPATCHER_TIMEOUT_SECS
+                               # (timeout for orchestrator -> worker proxy requests)
+  retry_after_secs: 5          # env: AXS_RETRY_AFTER_SECS
+                               # (Retry-After header value on 429 Rejected responses)
+  cache_inflight_max_retries: 3  # env: AXS_CACHE_INFLIGHT_MAX_RETRIES
+                               # (max follow-up attempts on cache-inflight collision)
+
+# ── llama.cpp subprocess backend ─────────────────────────────────────────────
+# Used by RouterBackend when routing to llama-server.
+llamacpp:
+  bin: ""                      # env: AXS_LLAMA_CPP_BIN
+                               # (path to llama-server binary; required for llama.cpp routing)
+  host: "127.0.0.1"            # env: AXS_LLAMACPP_HOST
+  port: 18181                   # env: AXS_LLAMACPP_PORT
+  token_batch_size: 4          # env: AXS_LLAMACPP_TOKEN_BATCH  (SSE token buffer, 1–32)
+  token_batch_max: 32
+  circuit_breaker_trip_threshold: 3    # env: AXS_CB_TRIP_THRESHOLD
+                               # (consecutive failures before opening the circuit breaker)
+  circuit_breaker_recovery_ms: 10000   # env: AXS_CB_RECOVERY_MS
+                               # (ms before a tripped circuit breaker tries recovery)
+  http_request_timeout_secs: 300
+  server_startup_timeout_secs: 120
+  server_restart_timeout_secs: 60
+  wait_ready_poll_interval_ms: 500
+  wait_ready_check_timeout_secs: 1
+  health_poller_interval_secs: 5
+  health_poller_check_timeout_secs: 2
+  health_poller_restart_threshold: 3
+  health_poller_max_restarts: 3
+  cache_prompt: true           # env: AXS_LLAMACPP_CACHE_PROMPT
+                               # (pass cache_prompt=true in llama-server requests)
+  # n_batch: 4096              # env: AXS_LLAMACPP_N_BATCH  (logical batch size)
+  # n_ubatch: 4096             # env: AXS_LLAMACPP_N_UBATCH  (physical/micro batch size)
+                               # IMPORTANT: set n_ubatch >= n_batch for embedding models.
+                               # llama-server defaults n_ubatch to 512; inputs exceeding
+                               # this limit fail with HTTP 500. For embedding workloads
+                               # with document chunks (500-2000 tokens), set both to 4096.
+
+# ── Multi-worker orchestrator ─────────────────────────────────────────────────
+# Used by `ax-llama orchestrate` (public proxy + internal worker API).
+orchestrator:
+  host: 127.0.0.1               # env: AXS_ORCHESTRATOR_HOST  (public inference proxy host)
+  port: 18080                   # env: AXS_ORCHESTRATOR_PORT  (public inference proxy)
+  internal_port: 19090          # env: AXS_INTERNAL_PORT  (worker registration/heartbeat API)
+  worker_heartbeat_ms: 5000    # env: AXS_WORKER_HEARTBEAT_MS
+                               # (expected heartbeat interval from workers, ms)
+  worker_ttl_ms: 15000         # env: AXS_WORKER_TTL_MS
+                               # (age at which a silent worker is evicted, ms)
+  dispatch_policy: "least_inflight"  # env: AXS_DISPATCH_POLICY
+                               # ("least_inflight" | "weighted_round_robin" | "model_affinity")
+  retry_after_secs: 5          # env: AXS_RETRY_AFTER_SECS  (Retry-After on 429)
+  pool_max_idle_per_host: 8    # env: AXS_DISPATCHER_POOL_MAX_IDLE
+  request_timeout_secs: 300    # env: AXS_DISPATCHER_TIMEOUT_SECS
+                               # (timeout for orchestrator -> worker proxy requests)
+
+  # Global admission queue (controls what the orchestrator proxy accepts)
+  global_queue_max: 128        # env: AXS_GLOBAL_QUEUE_MAX
+                               # (max active forwarded requests before queuing)
+  global_queue_depth: 256      # env: AXS_GLOBAL_QUEUE_DEPTH
+                               # (max queued requests before overload policy triggers)
+  global_queue_wait_ms: 10000  # env: AXS_GLOBAL_QUEUE_WAIT_MS
+                               # (max ms a queued request waits before timing out)
+  global_queue_policy: "queue"  # env: AXS_GLOBAL_QUEUE_POLICY
+                               # ("queue"/"reject" → HTTP 429 | "shed_oldest" → HTTP 503)
+
+# ── License reminder & dashboard ─────────────────────────────────────────────
+# Trust-based; no enforcement or feature gating.
+license:
+  buy_link: "https://license.automatosx.com"  # env: AXS_LICENSE_BUY_LINK
+                               # (URL shown in dashboard "Buy Business Edition" link)
+  config_dir: "ax-serving"    # env: AXS_LICENSE_CONFIG_DIR
+                               # (directory under ~/.config/ for the license key file)
+  key_file: "license.key"     # env: AXS_LICENSE_KEY_FILE
+                               # (key filename within config_dir)
+  dashboard_poll_ms: 2000     # env: AXS_DASHBOARD_POLL_MS
+                               # (dashboard polling interval in ms; min 500)

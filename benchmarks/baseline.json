@@ -1,0 +1,122 @@
+{
+  "_meta": {
+    "description": "Phase 1 inference baselines for mistralrs (native) backend models. BMS-AX-SERVING-v1.0 §4.",
+    "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
+    "os": "macOS 14.x (Sonoma)",
+    "build": "cargo build --workspace --release",
+    "date": null,
+    "note": "Results are null — fill in on reference hardware after running: cargo run -p ax-serving-bench --release -- bench -m <model_path>"
+  },
+  "models": [
+    {
+      "model_id": "llama3-8b",
+      "gguf_filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "quant": "Q4_K_M",
+      "backend": "native",
+      "targets": {
+        "decode_tok_per_sec": 100.0,
+        "prefill_tok_per_sec": 1200.0,
+        "ttft_ms": 500.0
+      },
+      "results": {
+        "decode_tok_per_sec": null,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": null,
+        "gates": {
+          "decode_gate_pass": null,
+          "prefill_gate_pass": null,
+          "ttft_gate_pass": null
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-8b",
+      "gguf_filename": "Qwen3-8B-Q4_K_M.gguf",
+      "quant": "Q4_K_M",
+      "backend": "native",
+      "targets": {
+        "decode_tok_per_sec": 35.0,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": 500.0
+      },
+      "results": {
+        "decode_tok_per_sec": null,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": null,
+        "gates": {
+          "decode_gate_pass": null,
+          "prefill_gate_pass": null,
+          "ttft_gate_pass": null
+        }
+      }
+    },
+    {
+      "model_id": "gemma3-4b",
+      "gguf_filename": "gemma-3-4b-it-Q4_K_M.gguf",
+      "quant": "Q4_K_M",
+      "backend": "native",
+      "targets": {
+        "decode_tok_per_sec": 90.0,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": 500.0
+      },
+      "results": {
+        "decode_tok_per_sec": null,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": null,
+        "gates": {
+          "decode_gate_pass": null,
+          "prefill_gate_pass": null,
+          "ttft_gate_pass": null
+        }
+      }
+    },
+    {
+      "model_id": "glm4-9b",
+      "gguf_filename": "glm-4-9b-chat-Q4_K_M.gguf",
+      "quant": "Q4_K_M",
+      "backend": "native",
+      "targets": {
+        "decode_tok_per_sec": 30.0,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": 500.0
+      },
+      "results": {
+        "decode_tok_per_sec": null,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": null,
+        "gates": {
+          "decode_gate_pass": null,
+          "prefill_gate_pass": null,
+          "ttft_gate_pass": null
+        }
+      }
+    },
+    {
+      "model_id": "deepseek-r1-7b",
+      "gguf_filename": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
+      "quant": "Q4_K_M",
+      "backend": "native",
+      "targets": {
+        "decode_tok_per_sec": 80.0,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": 500.0
+      },
+      "results": {
+        "decode_tok_per_sec": null,
+        "prefill_tok_per_sec": null,
+        "ttft_ms": null,
+        "gates": {
+          "decode_gate_pass": null,
+          "prefill_gate_pass": null,
+          "ttft_gate_pass": null
+        }
+      }
+    }
+  ],
+  "soak_thresholds": {
+    "rss_drift_pct": 5.0,
+    "p95_latency_drift_pct": 5.0,
+    "duration_h": 8
+  }
+}

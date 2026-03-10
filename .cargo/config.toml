@@ -1,0 +1,5 @@
+[env]
+# In this environment, mistralrs Metal build scripts can fail to resolve the
+# downloaded Metal toolchain via xcodebuild/xcrun. Disabling precompile keeps
+# builds working reliably without changing runtime Metal execution behavior.
+MISTRALRS_METAL_PRECOMPILE = "0"

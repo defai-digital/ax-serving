@@ -1,0 +1,25 @@
+[package]
+name = "ax-serving-cli"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ax-serving"
+path = "src/main.rs"
+
+[[bin]]
+name = "ax-serving-api"
+path = "src/api_main.rs"
+
+[dependencies]
+ax-serving-engine = { path = "../ax-serving-engine" }
+ax-serving-api = { path = "../ax-serving-api" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }

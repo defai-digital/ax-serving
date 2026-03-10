@@ -1,0 +1,137 @@
+{
+  "_meta": {
+    "description": "Multi-worker orchestration baselines (ADR-012, TASK-MW-019).",
+    "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
+    "os": "macOS 14.x (Sonoma)",
+    "build": "cargo build --workspace --release",
+    "date": "2026-03-01",
+    "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "model_id": "llama3-8b",
+    "decode_tokens": 128,
+    "note": "Baselines measured at 16 concurrent clients, 30-minute runs. Fill in on reference hardware."
+  },
+  "configs": [
+    {
+      "id": "direct-least_inflight-4w",
+      "mode": "direct",
+      "policy": "least_inflight",
+      "workers": 4,
+      "concurrency": 16,
+      "duration_secs": 1800,
+      "results": {
+        "requests_total": null,
+        "success": null,
+        "errors": null,
+        "error_rate_pct": null,
+        "requests_per_sec": null,
+        "latency_ms": {
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null
+        },
+        "gates": {
+          "throughput_vs_single_worker_ratio": null,
+          "throughput_gate_pass": null,
+          "p95_vs_single_worker_ratio": null,
+          "p95_gate_pass": null,
+          "error_rate_lt_1pct": null,
+          "dispatch_overhead_p50_lt_5ms": null
+        }
+      }
+    },
+    {
+      "id": "direct-weighted_round_robin-4w",
+      "mode": "direct",
+      "policy": "weighted_round_robin",
+      "workers": 4,
+      "concurrency": 16,
+      "duration_secs": 1800,
+      "results": {
+        "requests_total": null,
+        "success": null,
+        "errors": null,
+        "error_rate_pct": null,
+        "requests_per_sec": null,
+        "latency_ms": {
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null
+        },
+        "gates": {
+          "throughput_vs_single_worker_ratio": null,
+          "throughput_gate_pass": null,
+          "p95_vs_single_worker_ratio": null,
+          "p95_gate_pass": null,
+          "error_rate_lt_1pct": null,
+          "dispatch_overhead_p50_lt_5ms": null
+        }
+      }
+    },
+    {
+      "id": "direct-model_affinity-2x2w",
+      "mode": "direct",
+      "policy": "model_affinity",
+      "workers": 4,
+      "concurrency": 16,
+      "duration_secs": 1800,
+      "note": "2 workers per 2 models (model_affinity scenario)",
+      "results": {
+        "requests_total": null,
+        "success": null,
+        "errors": null,
+        "error_rate_pct": null,
+        "requests_per_sec": null,
+        "latency_ms": {
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null
+        },
+        "gates": {
+          "throughput_vs_single_worker_ratio": null,
+          "throughput_gate_pass": null,
+          "p95_vs_single_worker_ratio": null,
+          "p95_gate_pass": null,
+          "error_rate_lt_1pct": null,
+          "dispatch_overhead_p50_lt_5ms": null
+        }
+      }
+    },
+    {
+      "id": "nats-least_inflight-4w",
+      "mode": "nats",
+      "policy": "least_inflight",
+      "workers": 4,
+      "concurrency": 16,
+      "duration_secs": 1800,
+      "results": {
+        "requests_total": null,
+        "success": null,
+        "errors": null,
+        "error_rate_pct": null,
+        "requests_per_sec": null,
+        "latency_ms": {
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null
+        },
+        "gates": {
+          "throughput_vs_single_worker_ratio": null,
+          "throughput_gate_pass": null,
+          "p95_vs_single_worker_ratio": null,
+          "p95_gate_pass": null,
+          "error_rate_lt_1pct": null,
+          "dispatch_overhead_p50_lt_5ms": null
+        }
+      }
+    }
+  ],
+  "single_worker_baseline": {
+    "model_id": "llama3-8b",
+    "decode_tok_per_sec": null,
+    "note": "Copy from benchmarks/baseline.json llama3-8b entry after measuring on reference hardware."
+  }
+}

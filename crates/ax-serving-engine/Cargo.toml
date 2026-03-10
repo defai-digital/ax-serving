@@ -1,0 +1,48 @@
+[package]
+name = "ax-serving-engine"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["metal"]
+metal = []
+# Direct libllama C API backend (Phase 2). Requires system libllama.dylib.
+# brew install llama.cpp  →  cargo build --features ax-serving-engine/libllama
+libllama = []
+
+[dependencies]
+# mistralrs high-level SDK for GgufModelBuilder + Model
+mistralrs = { workspace = true }
+# mistralrs-core for TokenizationRequest/DetokenizationRequest not re-exported by mistralrs
+mistralrs-core = { workspace = true }
+# Async runtime
+tokio = { workspace = true }
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# Logging
+tracing = { workspace = true }
+# Hashing
+rustc-hash = { workspace = true }
+# Serialization
+serde = { workspace = true }
+# either crate for mistralrs tokenize API
+either = "1"
+libc = "0.2"
+# IndexMap for building mistralrs Chat messages
+indexmap = "2"
+# Serialization
+serde_json = { workspace = true }
+# YAML config for backends.yaml
+serde_yaml = { workspace = true }
+# HTTP client for llama.cpp subprocess proxy
+reqwest = { workspace = true }
+
+[build-dependencies]
+# Used by build.rs to generate libllama FFI bindings when the `libllama`
+# feature is enabled. The build script is a no-op without the feature.
+bindgen = "0.70"
+
+[dev-dependencies]
+rstest = { workspace = true }

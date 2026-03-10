@@ -1,0 +1,164 @@
+name: Release
+
+# Triggered by pushing a version tag: git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # upload release assets
+
+jobs:
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-15   # ARM64 runner — satisfies aarch64-apple-darwin gate
+    outputs:
+      tarball: ${{ steps.package.outputs.tarball }}
+      sha256:  ${{ steps.package.outputs.sha256 }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # ── Build release binaries ────────────────────────────────────────────
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      # ── Determine version from tag ────────────────────────────────────────
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"   # strip leading 'v'
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ── Create tarball ────────────────────────────────────────────────────
+      - name: Package tarball
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          TARBALL="ax-serving-v${VERSION}-aarch64-apple-darwin.tar.gz"
+          STAGEDIR="ax-serving-v${VERSION}"
+
+          mkdir -p "$STAGEDIR/bin" "$STAGEDIR/config"
+          cp target/release/ax-serving     "$STAGEDIR/bin/"
+          cp target/release/ax-serving-api "$STAGEDIR/bin/"
+          cp config/backends.yaml          "$STAGEDIR/config/"
+          cp config/serving.yaml           "$STAGEDIR/config/"
+          cp README.md                     "$STAGEDIR/"
+
+          tar -czf "$TARBALL" "$STAGEDIR"
+          SHA256=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
+
+          echo "tarball=$TARBALL"     >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256"       >> "$GITHUB_OUTPUT"
+
+      # ── Build .pkg installer ──────────────────────────────────────────────
+      - name: Build .pkg installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PAYLOAD="packaging/payload/usr/local/bin"
+          mkdir -p "$PAYLOAD"
+          cp target/release/ax-serving     "$PAYLOAD/"
+          cp target/release/ax-serving-api "$PAYLOAD/"
+
+          pkgbuild \
+            --root packaging/payload \
+            --identifier com.automatosx.ax-serving \
+            --version "$VERSION" \
+            --install-location / \
+            "ax-serving-v${VERSION}.pkg"
+
+      # ── Upload release assets ─────────────────────────────────────────────
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.tarball }}
+            ax-serving-v${{ steps.version.outputs.version }}.pkg
+          generate_release_notes: true
+
+      # ── Persist tarball + sha256 for the tap-update job ──────────────────
+      - name: Save artifact metadata
+        run: |
+          echo "${{ steps.package.outputs.sha256 }}" > sha256.txt
+          echo "${{ steps.package.outputs.tarball }}" > tarball.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: |
+            sha256.txt
+            tarball.txt
+
+  # ── Update Homebrew tap formula ───────────────────────────────────────────
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: build-macos
+
+    steps:
+      - name: Download release metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: release-meta
+
+      - name: Update formula in homebrew-ax-serving tap
+        env:
+          # Set this secret in your repo: Settings → Secrets → TAP_GITHUB_TOKEN
+          # The token needs push access to the homebrew-ax-serving tap repo.
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION:  ${{ needs.build-macos.outputs.version }}
+        run: |
+          SHA256=$(cat sha256.txt)
+          TARBALL=$(cat tarball.txt)
+
+          # Clone the tap repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/automatosx/homebrew-ax-serving.git" tap
+          cd tap
+
+          # Rewrite the version, url, and sha256 in the formula
+          sed -i "s|version \".*\"|version \"${VERSION}\"|" Formula/ax-serving.rb
+          sed -i "s|url \".*aarch64-apple-darwin.*\"|url \"https://github.com/automatosx/ax-serving/releases/download/v${VERSION}/${TARBALL}\"|" Formula/ax-serving.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA256}\"|" Formula/ax-serving.rb
+
+          git config user.email "ci@automatosx.com"
+          git config user.name  "CI Bot"
+          git add Formula/ax-serving.rb
+          git diff --cached --quiet || \
+            git commit -m "ax-serving ${VERSION}" && git push
+
+  publish-js-sdk:
+    name: Publish JS SDK to npm
+    runs-on: ubuntu-latest
+    needs: build-macos
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+          cache-dependency-path: sdk/javascript/package-lock.json
+
+      - name: Install JS SDK dependencies
+        working-directory: sdk/javascript
+        run: npm ci
+
+      - name: Build JS SDK
+        working-directory: sdk/javascript
+        run: npm run build
+
+      - name: Publish package
+        working-directory: sdk/javascript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

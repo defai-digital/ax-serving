@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!--
+  distribution.xml — productbuild distribution descriptor for ax-serving.
+  Customise welcome/readme/license text by editing the pkg-ref blocks.
+-->
+<installer-gui-script minSpecVersion="2">
+
+  <title>ax-serving</title>
+  <welcome    file="welcome.rtf"    mime-type="text/rtf"    language="en"/>
+  <license    file="LICENSE"         mime-type="text/plain"  language="en"/>
+
+  <!-- macOS 14 (Sonoma) + Apple Silicon required -->
+  <os-version min="14.0"/>
+  <arch-list>
+    <arch>arm64</arch>
+  </arch-list>
+
+  <options customize="never" rootVolumeOnly="true" require-scripts="false"/>
+
+  <domains enable_currentUserHome="false" enable_localSystem="true"/>
+
+  <choices-outline>
+    <line choice="default"/>
+  </choices-outline>
+
+  <choice id="default" visible="false" title="ax-serving">
+    <pkg-ref id="com.automatosx.ax-serving"/>
+  </choice>
+
+  <pkg-ref id="com.automatosx.ax-serving"
+           version="0"
+           onConclusion="none">component.pkg</pkg-ref>
+
+</installer-gui-script>

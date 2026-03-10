@@ -1,0 +1,230 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']           # trigger release-validation on version tags
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      results:
+        description: 'Path to mixed bench results JSON (for regression-check job)'
+        required: false
+      model_path:
+        description: 'Path to model GGUF for smoke soak test'
+        required: false
+
+jobs:
+  check:
+    name: Check + Lint
+    runs-on: macos-15  # Apple Silicon (ARM64, macOS 15) — satisfies aarch64-apple-darwin gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --tests -- -D warnings
+
+      - name: cargo test (lib only)
+        run: cargo test --workspace --lib
+
+  js-sdk:
+    name: JS SDK Build + Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: sdk/javascript/package-lock.json
+
+      - name: Install JS SDK dependencies
+        working-directory: sdk/javascript
+        run: npm ci
+
+      - name: Build JS SDK
+        working-directory: sdk/javascript
+        run: npm run build
+
+      - name: Typecheck JS SDK
+        working-directory: sdk/javascript
+        run: npm run typecheck
+
+  # ── Integration tests (no model required) ────────────────────────────────────
+  # These run on every push and PR to catch regressions in:
+  #   - orchestration (queue, dispatch, reroute, health, overload, chaos)
+  #   - model management (load/unload/reload, auth, input validation)
+  #   - graceful shutdown (in-flight drain, final-request completion)
+  # All three test suites use in-process mock servers and NullBackend —
+  # no GGUF model file or Metal GPU is required.
+  integration-tests:
+    name: Integration Tests
+    runs-on: macos-15
+    needs: [check, js-sdk]
+    env:
+      AXS_ALLOW_NO_AUTH: "true"   # integration tests build apps without API keys
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Integration tests — orchestration
+        run: cargo test -p ax-serving-api --test orchestration
+
+      - name: Integration tests — model_management
+        run: cargo test -p ax-serving-api --test model_management
+
+      - name: Integration tests — graceful_shutdown
+        run: cargo test -p ax-serving-api --test graceful_shutdown
+
+  # ── Release readiness validation (runs on v* tags) ───────────────────────────
+  # Enforces that baseline files have been populated before a version is tagged.
+  # Bench regression and smoke soak must have passed manually on release hardware
+  # using workflow_dispatch before the tag is pushed:
+  #
+  #   1. Run on a machine with a GGUF model:
+  #        cargo run -p ax-serving-bench --bin ax-serving-bench -- mixed \
+  #          --url http://127.0.0.1:8080 --model default \
+  #          --concurrency-levels 1,2,4,8 --requests 120 \
+  #          --json benchmarks/baseline-mixed.json
+  #
+  #   2. Trigger workflow_dispatch with inputs.results=benchmarks/baseline-mixed.json
+  #      and verify bench-regression passes.
+  #
+  #   3. Trigger workflow_dispatch with inputs.model_path=./models/llama3.gguf
+  #      and verify smoke-soak passes.
+  #
+  #   4. Only then push the v* tag.
+  release-validation:
+    name: Release Readiness Validation
+    runs-on: macos-15
+    needs: [check, integration-tests]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate baseline files are populated
+        run: |
+          python3 - <<'EOF'
+          import json, sys, pathlib
+
+          errors = []
+
+          for fname in ["benchmarks/baseline-mixed.json"]:
+              p = pathlib.Path(fname)
+              if not p.exists():
+                  errors.append(f"MISSING: {fname}")
+                  continue
+              try:
+                  data = json.loads(p.read_text())
+              except json.JSONDecodeError as e:
+                  errors.append(f"INVALID JSON in {fname}: {e}")
+                  continue
+              # Check that at least one metric is non-null
+              non_null = [k for k, v in data.items() if v is not None]
+              if not non_null:
+                  errors.append(
+                      f"BASELINE NOT ESTABLISHED: all values in {fname} are null. "
+                      "Run the mixed bench on release hardware and commit the results "
+                      "before tagging a release."
+                  )
+              else:
+                  print(f"  OK {fname}: {len(non_null)} metric(s) populated: {non_null}")
+
+          if errors:
+              print("\nRelease blocked:", file=sys.stderr)
+              for e in errors:
+                  print(f"  ✗ {e}", file=sys.stderr)
+              print(
+                  "\nRun the bench suite on release hardware and re-commit "
+                  "benchmarks/baseline-mixed.json before tagging.",
+                  file=sys.stderr
+              )
+              sys.exit(1)
+
+          print("All release baselines populated — release gate passed.")
+          EOF
+
+      - name: Remind: manual bench + soak required
+        run: |
+          echo "Release tag detected: ${{ github.ref_name }}"
+          echo ""
+          echo "Static baseline check passed. Confirm the following were run"
+          echo "via workflow_dispatch before this tag was pushed:"
+          echo "  1. bench-regression job (inputs.results set, all metrics PASS)"
+          echo "  2. smoke-soak job      (inputs.model_path set, 15-min soak PASS)"
+          echo ""
+          echo "If not yet verified, delete this tag and re-run the manual gates first."
+
+  # ── Performance regression gate (manual — requires live server + model) ───────
+  bench-regression:
+    name: Bench Regression Gate
+    runs-on: macos-15
+    if: github.event_name == 'workflow_dispatch' && inputs.results != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check regression
+        run: |
+          cargo run -p ax-serving-bench --bin ax-serving-bench -- regression-check \
+            --results "${{ inputs.results }}" \
+            --baseline benchmarks/baseline-mixed.json
+
+  # ── Smoke soak (manual — requires live server + GGUF model) ──────────────────
+  smoke-soak:
+    name: 15-min Smoke Soak
+    runs-on: macos-15
+    if: github.event_name == 'workflow_dispatch' && inputs.model_path != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bench
+        run: cargo build -p ax-serving-bench --release
+
+      - name: Smoke soak (15 min)
+        run: |
+          ./target/release/ax-serving-bench soak \
+            -m "${{ inputs.model_path }}" \
+            --duration-min 15 \
+            --json automatosx/tmp/smoke-soak-result.json
+
+      - name: Assert soak passed
+        run: |
+          python3 -c "
+          import json, sys
+          r = json.load(open('automatosx/tmp/smoke-soak-result.json'))
+          sys.exit(0 if r.get('passed') else 1)
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-soak-result
+          path: automatosx/tmp/smoke-soak-result.json

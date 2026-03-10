@@ -1,0 +1,54 @@
+[package]
+name = "ax-serving-api"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[features]
+## Enable the NATS JetStream dispatcher and worker sidecar.
+##
+## Adds `async-nats` as a dependency.  The feature is opt-in so that the
+## default `cargo build` does not require a NATS installation.
+##
+## Env vars (when mode=nats):
+##   AXS_NATS_URL=nats://127.0.0.1:4222
+##   AXS_NATS_STREAM=ax-serving
+##   AXS_NATS_MAX_DELIVER=3
+nats-dispatch = ["dep:async-nats"]
+
+[dependencies]
+## Optional: NATS JetStream client (only compiled with the `nats-dispatch` feature).
+async-nats = { version = "0.37", optional = true }
+ax-serving-engine = { path = "../ax-serving-engine" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rustc-hash = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+tower-http = { workspace = true }
+hdrhistogram = { workspace = true }
+dashmap = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

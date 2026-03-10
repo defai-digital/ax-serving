@@ -1,0 +1,50 @@
+{
+  "name": "@defai-digital/ax-serving",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for AX Serving (OpenAI-compatible REST client)",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/defai-digital/ax-serving.git",
+    "directory": "sdk/javascript"
+  },
+  "bugs": {
+    "url": "https://github.com/defai-digital/ax-serving/issues"
+  },
+  "homepage": "https://github.com/defai-digital/ax-serving/tree/main/sdk/javascript",
+  "keywords": [
+    "ax-serving",
+    "llm",
+    "openai-compatible",
+    "typescript",
+    "zod"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
