@@ -381,7 +381,6 @@ Other benchmark modes:
 ## Documentation
 
 - [QUICKSTART.md](QUICKSTART.md)
-- [ROADMAP.md](ROADMAP.md)
 - `docs/contracts/ax-fabric-runtime-contract.md`
 - `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
 - `sdk/python/` (Python SDK)
