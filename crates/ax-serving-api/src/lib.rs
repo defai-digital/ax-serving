@@ -53,7 +53,7 @@ use crate::scheduler::{PerModelScheduler, Scheduler};
 /// Shared serving state — held by both the gRPC and REST servers.
 pub struct ServingLayer {
     pub registry: ModelRegistry,
-    pub metrics: MetricsStore,
+    pub metrics: Arc<MetricsStore>,
     pub backend: Arc<dyn InferenceBackend>,
     /// Global admission queue + concurrency control (PRD M1).
     pub scheduler: Scheduler,
@@ -97,7 +97,7 @@ impl ServingLayer {
         let cache_inflight_max_retries = config.dispatcher.cache_inflight_max_retries;
         Self {
             registry: ModelRegistry::new(config.registry.max_loaded_models),
-            metrics: MetricsStore::new(),
+            metrics: Arc::new(MetricsStore::new()),
             scheduler: Scheduler::from_serve_config(
                 config.sched_max_inflight,
                 config.sched_max_queue,

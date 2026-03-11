@@ -307,10 +307,10 @@ async fn test_queue_reject_when_full() {
         overload_policy: OverloadPolicy::Reject,
     });
 
-    let permit = q.acquire().await;
+    let permit = q.acquire("test-client-a".into()).await;
     assert!(matches!(permit, AcquireResult::Permit(_)));
 
-    let r = q.acquire().await;
+    let r = q.acquire("test-client-a".into()).await;
     assert!(matches!(r, AcquireResult::Rejected));
 }
 
@@ -324,18 +324,18 @@ async fn test_queue_shed_oldest() {
         overload_policy: OverloadPolicy::ShedOldest,
     }));
 
-    let permit = q.acquire().await;
+    let permit = q.acquire("test-client-a".into()).await;
     assert!(matches!(permit, AcquireResult::Permit(_)));
 
     // First waiter fills the single queue depth slot.
     let q2 = Arc::clone(&q);
-    let waiter1 = tokio::spawn(async move { q2.acquire().await });
+    let waiter1 = tokio::spawn(async move { q2.acquire("test-client-a".into()).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(q.queued(), 1);
 
     // Second request: queue full → shed waiter1, enqueue waiter2.
     let q3 = Arc::clone(&q);
-    let waiter2 = tokio::spawn(async move { q3.acquire().await });
+    let waiter2 = tokio::spawn(async move { q3.acquire("test-client-b".into()).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let r1 = waiter1.await.unwrap();
@@ -1165,7 +1165,7 @@ async fn test_overload_queue_full_429() {
         .register(reg_req(worker_addr, &["overload-model"]), 5000);
 
     // Hold the only concurrency slot.
-    let AcquireResult::Permit(_permit) = layer.queue.acquire().await else {
+    let AcquireResult::Permit(_permit) = layer.queue.acquire("test-client-a".into()).await else {
         panic!("expected permit");
     };
 
@@ -1208,7 +1208,7 @@ async fn test_overload_shed_oldest_503() {
         .register(reg_req(worker_addr, &["shed-model"]), 5000);
 
     // Hold the concurrency slot.
-    let AcquireResult::Permit(permit) = layer.queue.acquire().await else {
+    let AcquireResult::Permit(permit) = layer.queue.acquire("test-client-a".into()).await else {
         panic!("expected permit");
     };
 
@@ -1281,7 +1281,7 @@ async fn test_overload_queue_timeout_503() {
         .register(reg_req(worker_addr, &["timeout-model"]), 5000);
 
     // Hold the only slot so every incoming request queues.
-    let AcquireResult::Permit(_permit) = layer.queue.acquire().await else {
+    let AcquireResult::Permit(_permit) = layer.queue.acquire("test-client-a".into()).await else {
         panic!("expected permit");
     };
 

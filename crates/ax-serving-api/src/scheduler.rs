@@ -65,6 +65,8 @@ use hdrhistogram::Histogram;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+const HISTOGRAM_SHARDS: usize = 8;
+
 // ── Config ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,12 +152,12 @@ pub struct SchedulerMetrics {
     /// Sequences currently in the decode phase (WS2 split scheduler).
     pub decode_sequences_active: AtomicI64,
 
-    // HDR latency histograms (accumulate all samples; O(1) record, O(1) percentile).
-    // try_lock is used to avoid blocking the hot path if a reader holds the lock.
-    queue_wait_histogram: std::sync::Mutex<LatencyWindow>,
-    e2e_histogram: std::sync::Mutex<LatencyWindow>,
+    // Sharded HDR histograms reduce writer contention on the hot path while
+    // keeping percentile reads cheap enough for metrics scrapes.
+    queue_wait_histogram: HistogramShards,
+    e2e_histogram: HistogramShards,
     /// Time-to-first-token histogram (streaming requests only).
-    ttft_histogram: std::sync::Mutex<LatencyWindow>,
+    ttft_histogram: HistogramShards,
 }
 
 impl Default for SchedulerMetrics {
@@ -170,9 +172,9 @@ impl Default for SchedulerMetrics {
             cache_follower_waiting: AtomicI64::new(0),
             prefill_tokens_active: AtomicI64::new(0),
             decode_sequences_active: AtomicI64::new(0),
-            queue_wait_histogram: std::sync::Mutex::new(LatencyWindow::new()),
-            e2e_histogram: std::sync::Mutex::new(LatencyWindow::new()),
-            ttft_histogram: std::sync::Mutex::new(LatencyWindow::new()),
+            queue_wait_histogram: HistogramShards::new(),
+            e2e_histogram: HistogramShards::new(),
+            ttft_histogram: HistogramShards::new(),
         }
     }
 }
@@ -193,99 +195,110 @@ impl SchedulerMetrics {
     // is acceptable; the next scrape will observe the current value.
 
     pub fn queue_wait_p50_us(&self) -> u64 {
-        self.queue_wait_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p50().as_micros() as u64)
-            .unwrap_or(0)
+        self.queue_wait_histogram.p50_us()
     }
 
     pub fn queue_wait_p95_us(&self) -> u64 {
-        self.queue_wait_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p95().as_micros() as u64)
-            .unwrap_or(0)
+        self.queue_wait_histogram.p95_us()
     }
 
     pub fn queue_wait_p99_us(&self) -> u64 {
-        self.queue_wait_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p99().as_micros() as u64)
-            .unwrap_or(0)
+        self.queue_wait_histogram.p99_us()
     }
 
     // ── End-to-end percentiles (all admitted requests) ─────────────────────
 
     pub fn e2e_p50_us(&self) -> u64 {
-        self.e2e_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p50().as_micros() as u64)
-            .unwrap_or(0)
+        self.e2e_histogram.p50_us()
     }
 
     pub fn e2e_p95_us(&self) -> u64 {
-        self.e2e_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p95().as_micros() as u64)
-            .unwrap_or(0)
+        self.e2e_histogram.p95_us()
     }
 
     pub fn e2e_p99_us(&self) -> u64 {
-        self.e2e_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p99().as_micros() as u64)
-            .unwrap_or(0)
+        self.e2e_histogram.p99_us()
     }
 
     // ── TTFT percentiles (streaming requests only) ─────────────────────────
 
     pub fn ttft_p50_us(&self) -> u64 {
-        self.ttft_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p50().as_micros() as u64)
-            .unwrap_or(0)
+        self.ttft_histogram.p50_us()
     }
 
     pub fn ttft_p95_us(&self) -> u64 {
-        self.ttft_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p95().as_micros() as u64)
-            .unwrap_or(0)
+        self.ttft_histogram.p95_us()
     }
 
     pub fn ttft_p99_us(&self) -> u64 {
-        self.ttft_histogram
-            .try_lock()
-            .ok()
-            .map(|h| h.p99().as_micros() as u64)
-            .unwrap_or(0)
+        self.ttft_histogram.p99_us()
     }
 
     // ── Internal recording helpers ─────────────────────────────────────────
 
     fn record_queue_wait(&self, us: u64) {
-        if let Ok(mut h) = self.queue_wait_histogram.lock() {
-            h.record_us(us);
-        }
+        self.queue_wait_histogram.record_us(us);
     }
 
     fn record_e2e(&self, us: u64) {
-        if let Ok(mut h) = self.e2e_histogram.lock() {
-            h.record_us(us);
-        }
+        self.e2e_histogram.record_us(us);
     }
 
     pub fn record_ttft(&self, us: u64) {
-        if let Ok(mut h) = self.ttft_histogram.lock() {
-            h.record_us(us);
+        self.ttft_histogram.record_us(us);
+    }
+}
+
+struct HistogramShards {
+    next_shard: AtomicUsize,
+    shards: [std::sync::Mutex<LatencyWindow>; HISTOGRAM_SHARDS],
+}
+
+impl HistogramShards {
+    fn new() -> Self {
+        Self {
+            next_shard: AtomicUsize::new(0),
+            shards: std::array::from_fn(|_| std::sync::Mutex::new(LatencyWindow::new())),
         }
+    }
+
+    fn record_us(&self, us: u64) {
+        let idx = self.next_shard.fetch_add(1, Ordering::Relaxed) % HISTOGRAM_SHARDS;
+        if let Ok(mut shard) = self.shards[idx].lock() {
+            shard.record_us(us);
+        }
+    }
+
+    fn snapshot(&self) -> Option<LatencyWindow> {
+        let mut merged = LatencyWindow::new();
+        let mut saw_data = false;
+        for shard in &self.shards {
+            if let Ok(guard) = shard.try_lock()
+                && !guard.hist.is_empty()
+            {
+                let _ = merged.hist.add(&guard.hist);
+                saw_data = true;
+            }
+        }
+        if saw_data { Some(merged) } else { None }
+    }
+
+    fn p50_us(&self) -> u64 {
+        self.snapshot()
+            .map(|h| h.p50().as_micros() as u64)
+            .unwrap_or(0)
+    }
+
+    fn p95_us(&self) -> u64 {
+        self.snapshot()
+            .map(|h| h.p95().as_micros() as u64)
+            .unwrap_or(0)
+    }
+
+    fn p99_us(&self) -> u64 {
+        self.snapshot()
+            .map(|h| h.p99().as_micros() as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -886,11 +899,8 @@ mod tests {
         // Simulate metrics with p99 = 500ms (above 100ms target).
         let metrics = SchedulerMetrics::default();
         // Feed 100 samples of 500ms into e2e histogram to get p99 = 500ms.
-        {
-            let mut h = metrics.e2e_histogram.lock().unwrap();
-            for _ in 0..100 {
-                h.record_us(500_000);
-            }
+        for _ in 0..100 {
+            metrics.e2e_histogram.record_us(500_000);
         }
         ctrl.maybe_adapt(&metrics);
         // Effective limit should have decreased from 8.
@@ -904,11 +914,8 @@ mod tests {
         ctrl.effective_limit.store(4, Ordering::Relaxed);
         let metrics = SchedulerMetrics::default();
         // Feed 100 samples of 20ms into e2e histogram (well below 80ms = 0.8×100ms).
-        {
-            let mut h = metrics.e2e_histogram.lock().unwrap();
-            for _ in 0..100 {
-                h.record_us(20_000);
-            }
+        for _ in 0..100 {
+            metrics.e2e_histogram.record_us(20_000);
         }
         ctrl.maybe_adapt(&metrics);
         // Effective limit should have increased from 4.
@@ -922,11 +929,8 @@ mod tests {
         ctrl.effective_limit.store(6, Ordering::Relaxed);
         let metrics = SchedulerMetrics::default();
         // 90ms is above 80ms (hold threshold) and below 100ms (decrease threshold).
-        {
-            let mut h = metrics.e2e_histogram.lock().unwrap();
-            for _ in 0..100 {
-                h.record_us(90_000);
-            }
+        for _ in 0..100 {
+            metrics.e2e_histogram.record_us(90_000);
         }
         ctrl.maybe_adapt(&metrics);
         assert_eq!(
@@ -942,11 +946,8 @@ mod tests {
         let ctrl = AdaptiveController::new(8, 100 /* ms */, 5);
         ctrl.effective_limit.store(8, Ordering::Relaxed);
         let metrics = SchedulerMetrics::default();
-        {
-            let mut h = metrics.e2e_histogram.lock().unwrap();
-            for _ in 0..100 {
-                h.record_us(500_000); // high p99 → would decrease
-            }
+        for _ in 0..100 {
+            metrics.e2e_histogram.record_us(500_000); // high p99 → would decrease
         }
         // Completions 1-4 should be no-ops.
         for _ in 0..4 {

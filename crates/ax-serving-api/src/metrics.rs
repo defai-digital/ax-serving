@@ -4,7 +4,10 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ax_serving_engine::GenerationStats;
 
 /// Per-request inference metrics.
 #[derive(Debug, Default, Clone)]
@@ -137,6 +140,10 @@ pub struct MetricsStore {
     pub burn_1h: Mutex<BurnRateWindow>,
     /// 6-hour sliding error-rate window for slow burn-rate alerting (> 6.0×).
     pub burn_6h: Mutex<BurnRateWindow>,
+    /// Most recent decode throughput reported by a completed request.
+    recent_decode_tok_per_sec_bits: AtomicU64,
+    /// Most recent prefill throughput reported by a completed request.
+    recent_prefill_tok_per_sec_bits: AtomicU64,
 }
 
 impl MetricsStore {
@@ -145,11 +152,32 @@ impl MetricsStore {
             uptime_start: Instant::now(),
             burn_1h: Mutex::new(BurnRateWindow::new(3_600_000)),
             burn_6h: Mutex::new(BurnRateWindow::new(21_600_000)),
+            recent_decode_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
+            recent_prefill_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
         }
     }
 
     pub fn uptime_secs(&self) -> u64 {
         self.uptime_start.elapsed().as_secs()
+    }
+
+    pub fn record_generation_stats(&self, stats: &GenerationStats) {
+        self.recent_decode_tok_per_sec_bits.store(
+            stats.decode_tok_per_sec.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.recent_prefill_tok_per_sec_bits.store(
+            stats.prefill_tok_per_sec.to_bits(),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn recent_decode_tok_per_sec(&self) -> f64 {
+        f64::from_bits(self.recent_decode_tok_per_sec_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn recent_prefill_tok_per_sec(&self) -> f64 {
+        f64::from_bits(self.recent_prefill_tok_per_sec_bits.load(Ordering::Relaxed))
     }
 }
 

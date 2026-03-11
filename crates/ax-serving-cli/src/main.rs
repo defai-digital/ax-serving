@@ -432,6 +432,7 @@ async fn heartbeat_loop(
         // WS4: richer telemetry for TokenCostPolicy scoring
         let active_sequences = inflight; // active_sequences == inflight for single-stream model
         let ttft_p95_ms = layer.scheduler.metrics.ttft_p95_us() / 1000;
+        let decode_tok_per_sec = layer.metrics.recent_decode_tok_per_sec();
 
         let url = format!(
             "{}/internal/workers/{}/heartbeat",
@@ -443,7 +444,7 @@ async fn heartbeat_loop(
             "model_ids": model_ids,
             "rss_bytes": rss_bytes,
             "active_sequences": active_sequences,
-            "decode_tok_per_sec": 0.0_f64,
+            "decode_tok_per_sec": decode_tok_per_sec,
             "ttft_p95_ms": ttft_p95_ms,
         });
 

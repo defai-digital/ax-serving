@@ -85,7 +85,8 @@ pub struct QueuePermit {
     /// Shared active-request counter — decremented if no waiter claims the slot.
     active: Arc<AtomicUsize>,
     /// Waiter queue — locked only when transferring a slot to a queued request.
-    waiters: Arc<Mutex<VecDeque<oneshot::Sender<bool>>>>,
+    waiters: Arc<Mutex<VecDeque<WaiterEntry>>>,
+    last_served_client: Arc<Mutex<Option<String>>>,
 }
 
 impl Drop for QueuePermit {
@@ -97,12 +98,19 @@ impl Drop for QueuePermit {
             self.active.fetch_sub(1, Ordering::Release);
             return;
         };
+        let mut last_served = self.last_served_client.lock().ok();
         // Hand the slot to the next live waiter; skip dead ones
-        // (rx was dropped because the request timed out).
+        // (rx was dropped because the request timed out). When multiple clients
+        // are queued, prefer a different client than the one most recently
+        // served to prevent a single hot client from monopolizing the queue.
         loop {
-            match waiters.pop_front() {
-                Some(tx) => {
-                    if tx.send(true).is_ok() {
+            let next = select_next_waiter(&mut waiters, last_served.as_deref().and_then(|v| v.as_ref()));
+            match next {
+                Some(entry) => {
+                    if entry.tx.send(true).is_ok() {
+                        if let Some(ref mut client) = last_served {
+                            **client = Some(entry.client_key);
+                        }
                         // Slot transferred — active count is unchanged (permit
                         // passes from this request to the woken waiter).
                         return;
@@ -150,7 +158,10 @@ pub struct GlobalQueue {
     /// Number of currently active (permitted) requests.
     active: Arc<AtomicUsize>,
     /// Requests waiting for a slot; locked only on the slow path.
-    waiters: Arc<Mutex<VecDeque<oneshot::Sender<bool>>>>,
+    waiters: Arc<Mutex<VecDeque<WaiterEntry>>>,
+    /// Last client that received a handed-off slot. Used to spread queued
+    /// wakeups across clients rather than purely serving FIFO by enqueue order.
+    last_served_client: Arc<Mutex<Option<String>>>,
     config: Arc<GlobalQueueConfig>,
     pub metrics: Arc<GlobalQueueMetrics>,
 }
@@ -160,6 +171,7 @@ impl GlobalQueue {
         Self {
             active: Arc::new(AtomicUsize::new(0)),
             waiters: Arc::new(Mutex::new(VecDeque::new())),
+            last_served_client: Arc::new(Mutex::new(None)),
             config: Arc::new(config),
             metrics: Arc::new(GlobalQueueMetrics::default()),
         }
@@ -171,6 +183,7 @@ impl GlobalQueue {
         QueuePermit {
             active: Arc::clone(&self.active),
             waiters: Arc::clone(&self.waiters),
+            last_served_client: Arc::clone(&self.last_served_client),
         }
     }
 
@@ -182,7 +195,7 @@ impl GlobalQueue {
     /// **Slow path** (mutex): if at capacity, queues the caller (up to
     /// `max_queue_depth`) and waits up to `wait_ms`.  Applies the overload
     /// policy when the queue is also full.
-    pub async fn acquire(&self) -> AcquireResult {
+    pub async fn acquire(&self, client_key: String) -> AcquireResult {
         // ── Fast path: lock-free CAS loop ────────────────────────────────────
         let max = self.config.max_concurrent;
         let mut current = self.active.load(Ordering::Acquire);
@@ -195,6 +208,9 @@ impl GlobalQueue {
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
+                    if let Ok(mut last_served) = self.last_served_client.lock() {
+                        *last_served = Some(client_key.clone());
+                    }
                     self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
                     return AcquireResult::Permit(self.make_permit());
                 }
@@ -221,6 +237,9 @@ impl GlobalQueue {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
+                        if let Ok(mut last_served) = self.last_served_client.lock() {
+                            *last_served = Some(client_key.clone());
+                        }
                         self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
                         return AcquireResult::Permit(self.make_permit());
                     }
@@ -232,7 +251,7 @@ impl GlobalQueue {
             // checking depth.  Without this, timed-out entries remain in the
             // deque and inflate the apparent queue depth, causing new requests
             // to be incorrectly rejected or shed as "queue full".
-            waiters.retain(|tx| !tx.is_closed());
+            waiters.retain(|entry| !entry.tx.is_closed());
 
             if waiters.len() >= self.config.max_queue_depth {
                 match self.config.overload_policy {
@@ -243,7 +262,7 @@ impl GlobalQueue {
                     OverloadPolicy::ShedOldest => {
                         // Evict oldest waiter to make room; active stays the same.
                         if let Some(oldest) = waiters.pop_front() {
-                            let _ = oldest.send(false); // false = "you are shed"
+                            let _ = oldest.tx.send(false); // false = "you are shed"
                             self.metrics.shed_total.fetch_add(1, Ordering::Relaxed);
                             // Fall through: enqueue current request.
                         } else {
@@ -257,7 +276,7 @@ impl GlobalQueue {
             }
 
             let (tx, rx) = oneshot::channel::<bool>();
-            waiters.push_back(tx);
+            waiters.push_back(WaiterEntry { client_key, tx });
             rx
         }; // ← waiters mutex released here
 
@@ -294,11 +313,43 @@ impl GlobalQueue {
     }
 }
 
+#[derive(Debug)]
+struct WaiterEntry {
+    client_key: String,
+    tx: oneshot::Sender<bool>,
+}
+
+fn select_next_waiter(
+    waiters: &mut VecDeque<WaiterEntry>,
+    last_served_client: Option<&String>,
+) -> Option<WaiterEntry> {
+    let preferred_idx = last_served_client.and_then(|last| {
+        waiters
+            .iter()
+            .position(|entry| !entry.tx.is_closed() && &entry.client_key != last)
+    });
+
+    if let Some(idx) = preferred_idx {
+        waiters.remove(idx)
+    } else {
+        while let Some(entry) = waiters.pop_front() {
+            if !entry.tx.is_closed() {
+                return Some(entry);
+            }
+        }
+        None
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(name: &str) -> String {
+        name.to_string()
+    }
 
     fn cfg(max: usize, depth: usize, wait_ms: u64, policy: OverloadPolicy) -> GlobalQueueConfig {
         GlobalQueueConfig {
@@ -312,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn permit_immediate_when_under_limit() {
         let q = GlobalQueue::new(cfg(2, 4, 1000, OverloadPolicy::Reject));
-        let r = q.acquire().await;
+        let r = q.acquire(key("a")).await;
         assert!(matches!(r, AcquireResult::Permit(_)));
         assert_eq!(q.active(), 1);
     }
@@ -321,7 +372,7 @@ mod tests {
     async fn permit_released_on_drop() {
         let q = GlobalQueue::new(cfg(1, 0, 100, OverloadPolicy::Reject));
         {
-            let r = q.acquire().await;
+            let r = q.acquire(key("a")).await;
             assert!(matches!(r, AcquireResult::Permit(_)));
             assert_eq!(q.active(), 1);
         }
@@ -331,8 +382,8 @@ mod tests {
     #[tokio::test]
     async fn reject_when_queue_full() {
         let q = GlobalQueue::new(cfg(1, 0, 100, OverloadPolicy::Reject));
-        let _permit = q.acquire().await; // occupies the sole slot
-        let r = q.acquire().await;
+        let _permit = q.acquire(key("a")).await; // occupies the sole slot
+        let r = q.acquire(key("a")).await;
         assert!(matches!(r, AcquireResult::Rejected));
         assert_eq!(q.metrics.rejected_total.load(Ordering::Relaxed), 1);
     }
@@ -340,11 +391,11 @@ mod tests {
     #[tokio::test]
     async fn queued_request_gets_permit_on_release() {
         let q = Arc::new(GlobalQueue::new(cfg(1, 4, 1000, OverloadPolicy::Reject)));
-        let permit = q.acquire().await;
+        let permit = q.acquire(key("a")).await;
         assert!(matches!(permit, AcquireResult::Permit(_)));
 
         let q2 = Arc::clone(&q);
-        let handle = tokio::spawn(async move { q2.acquire().await });
+        let handle = tokio::spawn(async move { q2.acquire(key("b")).await });
 
         // Give the waiter time to enqueue.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -360,10 +411,10 @@ mod tests {
     #[tokio::test]
     async fn timeout_when_no_release() {
         let q = Arc::new(GlobalQueue::new(cfg(1, 4, 50, OverloadPolicy::Reject)));
-        let _permit = q.acquire().await;
+        let _permit = q.acquire(key("a")).await;
 
         let q2 = Arc::clone(&q);
-        let handle = tokio::spawn(async move { q2.acquire().await });
+        let handle = tokio::spawn(async move { q2.acquire(key("b")).await });
 
         let result = handle.await.unwrap();
         assert!(matches!(result, AcquireResult::Timeout));
@@ -384,12 +435,12 @@ mod tests {
         //                      with the fix, dead tx_B is pruned → C queues.
         let q = Arc::new(GlobalQueue::new(cfg(1, 1, 50, OverloadPolicy::Reject)));
 
-        let permit = q.acquire().await;
+        let permit = q.acquire(key("a")).await;
         assert!(matches!(permit, AcquireResult::Permit(_)));
 
         // Waiter B queues with a very short timeout.
         let q2 = Arc::clone(&q);
-        let waiter_b = tokio::spawn(async move { q2.acquire().await });
+        let waiter_b = tokio::spawn(async move { q2.acquire(key("b")).await });
 
         // Let B time out.
         let r_b = waiter_b.await.unwrap();
@@ -398,7 +449,7 @@ mod tests {
         // After B times out, C must be allowed to enqueue (not rejected).
         // Release A's permit so C can eventually receive it.
         drop(permit);
-        let r_c = q.acquire().await;
+        let r_c = q.acquire(key("c")).await;
         assert!(
             matches!(r_c, AcquireResult::Permit(_)),
             "expected Permit for C after timed-out B was pruned, got Rejected"
@@ -415,18 +466,18 @@ mod tests {
             OverloadPolicy::ShedOldest,
         )));
 
-        let permit = q.acquire().await;
+        let permit = q.acquire(key("a")).await;
         assert!(matches!(permit, AcquireResult::Permit(_)));
 
         // First waiter fills the queue depth slot.
         let q2 = Arc::clone(&q);
-        let waiter1 = tokio::spawn(async move { q2.acquire().await });
+        let waiter1 = tokio::spawn(async move { q2.acquire(key("b")).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(q.queued(), 1);
 
         // Second request arrives: queue full → shed waiter1, enqueue waiter2.
         let q3 = Arc::clone(&q);
-        let waiter2 = tokio::spawn(async move { q3.acquire().await });
+        let waiter2 = tokio::spawn(async move { q3.acquire(key("c")).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // waiter1 should have been shed.
@@ -439,5 +490,33 @@ mod tests {
         assert!(matches!(r2, AcquireResult::Permit(_)));
         assert_eq!(q.metrics.shed_total.load(Ordering::Relaxed), 1);
         assert_eq!(q.metrics.permit_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_handoff_prefers_different_client_when_possible() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 1000, OverloadPolicy::Reject)));
+
+        let permit = match q.acquire(key("client-a")).await {
+            AcquireResult::Permit(p) => p,
+            other => panic!("expected initial permit, got {:?}", core::mem::discriminant(&other)),
+        };
+
+        let q2 = Arc::clone(&q);
+        let waiter_a2 = tokio::spawn(async move { q2.acquire(key("client-a")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let q3 = Arc::clone(&q);
+        let waiter_b = tokio::spawn(async move { q3.acquire(key("client-b")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(permit);
+
+        let permit_b = waiter_b.await.unwrap();
+        assert!(matches!(permit_b, AcquireResult::Permit(_)));
+        let AcquireResult::Permit(permit_b) = permit_b else { unreachable!() };
+        drop(permit_b);
+
+        let permit_a2 = waiter_a2.await.unwrap();
+        assert!(matches!(permit_a2, AcquireResult::Permit(_)));
     }
 }

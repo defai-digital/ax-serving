@@ -629,7 +629,15 @@ pub async fn chat_completions(
     // Extract queue_wait_us before permit is moved.
     let queue_wait_us = permit.queue_wait_us();
     if req.stream {
-        stream_response(rx, model_name, req_logprobs, permit, pm_permit).into_response()
+        stream_response(
+            rx,
+            model_name,
+            req_logprobs,
+            Arc::clone(&layer.metrics),
+            permit,
+            pm_permit,
+        )
+        .into_response()
     } else {
         blocking_response(
             rx,
@@ -638,6 +646,7 @@ pub async fn chat_completions(
             cache_key,
             cache_ttl,
             layer.cache_metrics.as_ref(),
+            layer.metrics.as_ref(),
             cache_leader_guard,
             permit,
             pm_permit,
@@ -658,6 +667,7 @@ fn stream_response(
     rx: mpsc::Receiver<GenerateEvent>,
     model: String,
     logprobs: bool,
+    metrics: Arc<crate::metrics::MetricsStore>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -684,8 +694,9 @@ fn stream_response(
             Some(pm_permit),
             logprobs,
             None::<GenerateEvent>,
+            metrics,
         ),
-        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending)| async move {
+        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending, metrics)| async move {
             match phase {
                 2 => None,
                 1 => {
@@ -693,7 +704,7 @@ fn stream_response(
                     let ev = Event::default().data("[DONE]");
                     Some((
                         Ok(ev),
-                        (rx, id, model, created, 2, false, None, None, logprobs, None),
+                        (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
                     ))
                 }
                 _ => {
@@ -786,6 +797,7 @@ fn stream_response(
                                     pm,
                                     logprobs,
                                     next_pending,
+                                    metrics,
                                 ),
                             ))
                         }
@@ -822,10 +834,23 @@ fn stream_response(
                             let ev = sse_json_event(&chunk);
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 1, false, None, None, logprobs, None),
+                                (
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
+                                    metrics,
+                                ),
                             ))
                         }
                         GenerateEvent::Done(stats) => {
+                            record_generation_stats(metrics.as_ref(), &stats);
                             let chunk = StreamChatChunk {
                                 id: &id,
                                 object: "chat.completion.chunk",
@@ -855,7 +880,7 @@ fn stream_response(
                             // Drop both permits; next phase emits [DONE] then ends.
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 1, false, None, None, logprobs, None),
+                                (rx, id, model, created, 1, false, None, None, logprobs, None, metrics),
                             ))
                         }
                         GenerateEvent::Error(e) => {
@@ -867,7 +892,7 @@ fn stream_response(
                             );
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 2, false, None, None, logprobs, None),
+                                (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
                             ))
                         }
                         // TokenLogprob is handled above; this arm is unreachable.
@@ -894,6 +919,13 @@ fn with_timing(mut resp: Response, queue_wait_us: u64) -> Response {
     resp
 }
 
+fn record_generation_stats(
+    metrics: &crate::metrics::MetricsStore,
+    stats: &ax_serving_engine::GenerationStats,
+) {
+    metrics.record_generation_stats(stats);
+}
+
 /// Collect all tokens and return a complete (non-streaming) response.
 ///
 /// Adds `X-Ax-Stage-Timing: queue_wait_us=<N>` on every response (success and
@@ -906,6 +938,7 @@ async fn blocking_response(
     cache_key: Option<String>,
     cache_ttl: Option<std::time::Duration>,
     cache_metrics: &crate::cache::CacheMetrics,
+    metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
@@ -953,6 +986,7 @@ async fn blocking_response(
                 finish_reason = FinishReason::ToolCalls;
             }
             GenerateEvent::Done(stats) => {
+                record_generation_stats(metrics, &stats);
                 usage = Usage {
                     prompt_tokens: stats.prompt_tokens as u32,
                     completion_tokens: stats.completion_tokens as u32,
@@ -1418,7 +1452,15 @@ pub async fn text_completions(
 
     let queue_wait_us = permit.queue_wait_us();
     if req.stream {
-        text_stream_response(rx, model_name, req_logprobs, permit, pm_permit).into_response()
+        text_stream_response(
+            rx,
+            model_name,
+            req_logprobs,
+            Arc::clone(&layer.metrics),
+            permit,
+            pm_permit,
+        )
+        .into_response()
     } else {
         text_blocking_response(
             rx,
@@ -1428,6 +1470,7 @@ pub async fn text_completions(
             cache_key,
             cache_ttl,
             layer.cache_metrics.as_ref(),
+            layer.metrics.as_ref(),
             cache_leader_guard,
             permit,
             pm_permit,
@@ -1443,6 +1486,7 @@ fn text_stream_response(
     rx: mpsc::Receiver<GenerateEvent>,
     model: String,
     logprobs: bool,
+    metrics: Arc<crate::metrics::MetricsStore>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1461,15 +1505,16 @@ fn text_stream_response(
             Some(pm_permit),
             logprobs,
             None::<GenerateEvent>,
+            metrics,
         ),
-        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending)| async move {
+        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending, metrics)| async move {
             match phase {
                 2 => None,
                 1 => {
                     let ev = Event::default().data("[DONE]");
                     Some((
                         Ok(ev),
-                        (rx, id, model, created, 2, false, None, None, logprobs, None),
+                        (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
                     ))
                 }
                 _ => {
@@ -1556,10 +1601,12 @@ fn text_stream_response(
                                     pm,
                                     logprobs,
                                     next_pending,
+                                    metrics,
                                 ),
                             ))
                         }
                         GenerateEvent::Done(stats) => {
+                            record_generation_stats(metrics.as_ref(), &stats);
                             let chunk = StreamTextChunk {
                                 id: &id,
                                 object: "text_completion",
@@ -1584,7 +1631,7 @@ fn text_stream_response(
                             let ev = sse_json_event(&chunk);
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 1, false, None, None, logprobs, None),
+                                (rx, id, model, created, 1, false, None, None, logprobs, None, metrics),
                             ))
                         }
                         GenerateEvent::Error(e) => {
@@ -1596,7 +1643,7 @@ fn text_stream_response(
                             );
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 2, false, None, None, logprobs, None),
+                                (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
                             ))
                         }
                         // Tool calls are not part of the text completions protocol.
@@ -1613,6 +1660,7 @@ fn text_stream_response(
                                 pm,
                                 logprobs,
                                 None,
+                                metrics,
                             ),
                         )),
                         // TokenLogprob was resolved above; this arm is unreachable.
@@ -1636,6 +1684,7 @@ async fn text_blocking_response(
     cache_key: Option<String>,
     cache_ttl: Option<std::time::Duration>,
     cache_metrics: &crate::cache::CacheMetrics,
+    metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
@@ -1666,6 +1715,7 @@ async fn text_blocking_response(
             }
             GenerateEvent::ToolCall { .. } => {}
             GenerateEvent::Done(stats) => {
+                record_generation_stats(metrics, &stats);
                 usage = Usage {
                     prompt_tokens: stats.prompt_tokens as u32,
                     completion_tokens: stats.completion_tokens as u32,

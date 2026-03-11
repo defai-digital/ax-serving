@@ -167,6 +167,7 @@ async fn proxy_inference(
     }
 
     let auth_header = req_headers.get(header::AUTHORIZATION);
+    let client_key = fairness_client_key(&req_headers);
 
     let (model_id, stream) = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
         Ok(v) => (v.model.unwrap_or_else(|| "default".to_string()), v.stream),
@@ -176,7 +177,7 @@ async fn proxy_inference(
     };
 
     // Admission control: acquire a queue slot before dispatching.
-    let permit = match layer.queue.acquire().await {
+    let permit = match layer.queue.acquire(client_key).await {
         AcquireResult::Permit(p) => p,
 
         AcquireResult::Rejected => {
@@ -270,6 +271,35 @@ async fn proxy_inference(
         drop(permit);
         resp
     }
+}
+
+fn fairness_client_key(headers: &HeaderMap) -> String {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return format!("auth:{auth}");
+    }
+    if let Some(forwarded_for) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return format!("ip:{forwarded_for}");
+    }
+    if let Some(real_ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return format!("ip:{real_ip}");
+    }
+    "anonymous".to_string()
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
