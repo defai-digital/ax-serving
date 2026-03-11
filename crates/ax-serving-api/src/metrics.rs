@@ -144,6 +144,14 @@ pub struct MetricsStore {
     recent_decode_tok_per_sec_bits: AtomicU64,
     /// Most recent prefill throughput reported by a completed request.
     recent_prefill_tok_per_sec_bits: AtomicU64,
+    /// Non-streaming requests that executed inference because no cache result was available.
+    cold_requests_total: AtomicU64,
+    /// Requests served immediately from an exact response-cache hit.
+    exact_cache_hits_total: AtomicU64,
+    /// Requests served from a follower wait after another leader populated cache.
+    cache_follower_hits_total: AtomicU64,
+    /// Successful response-cache writes after a completed inference.
+    cache_fills_total: AtomicU64,
 }
 
 impl MetricsStore {
@@ -154,6 +162,10 @@ impl MetricsStore {
             burn_6h: Mutex::new(BurnRateWindow::new(21_600_000)),
             recent_decode_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
             recent_prefill_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
+            cold_requests_total: AtomicU64::new(0),
+            exact_cache_hits_total: AtomicU64::new(0),
+            cache_follower_hits_total: AtomicU64::new(0),
+            cache_fills_total: AtomicU64::new(0),
         }
     }
 
@@ -162,14 +174,17 @@ impl MetricsStore {
     }
 
     pub fn record_generation_stats(&self, stats: &GenerationStats) {
-        self.recent_decode_tok_per_sec_bits.store(
-            stats.decode_tok_per_sec.to_bits(),
-            Ordering::Relaxed,
-        );
-        self.recent_prefill_tok_per_sec_bits.store(
-            stats.prefill_tok_per_sec.to_bits(),
-            Ordering::Relaxed,
-        );
+        // Guard against NaN / infinity before storing.  Non-finite values arise
+        // when mistralrs reports throughput for a request that completes in near-
+        // zero time (decode_time ≈ 0 → tokens/time = +∞ or NaN).  Storing them
+        // as-is is safe here, but `recent_decode_tok_per_sec()` is serialized by
+        // the heartbeat loop via `serde_json::json!`, which panics on non-finite
+        // f64 (serde_json rejects NaN/±∞ as invalid JSON).  Clamp to 0.0 so the
+        // heartbeat never panics and the metric is simply stale rather than fatal.
+        let decode = if stats.decode_tok_per_sec.is_finite() { stats.decode_tok_per_sec } else { 0.0 };
+        let prefill = if stats.prefill_tok_per_sec.is_finite() { stats.prefill_tok_per_sec } else { 0.0 };
+        self.recent_decode_tok_per_sec_bits.store(decode.to_bits(), Ordering::Relaxed);
+        self.recent_prefill_tok_per_sec_bits.store(prefill.to_bits(), Ordering::Relaxed);
     }
 
     pub fn recent_decode_tok_per_sec(&self) -> f64 {
@@ -178,6 +193,39 @@ impl MetricsStore {
 
     pub fn recent_prefill_tok_per_sec(&self) -> f64 {
         f64::from_bits(self.recent_prefill_tok_per_sec_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn record_cold_request(&self) {
+        self.cold_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_exact_cache_hit(&self) {
+        self.exact_cache_hits_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cache_follower_hit(&self) {
+        self.cache_follower_hits_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cache_fill(&self) {
+        self.cache_fills_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cold_requests_total(&self) -> u64 {
+        self.cold_requests_total.load(Ordering::Relaxed)
+    }
+
+    pub fn exact_cache_hits_total(&self) -> u64 {
+        self.exact_cache_hits_total.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_follower_hits_total(&self) -> u64 {
+        self.cache_follower_hits_total.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_fills_total(&self) -> u64 {
+        self.cache_fills_total.load(Ordering::Relaxed)
     }
 }
 
@@ -360,6 +408,47 @@ mod tests {
         // Both should construct without panic and have burn windows.
         let _s1 = MetricsStore::new();
         let _s2 = MetricsStore::default();
+    }
+
+    #[test]
+    fn record_generation_stats_clamps_non_finite_to_zero() {
+        // Non-finite throughput values (NaN, ±∞) must never reach the heartbeat
+        // JSON serialization path where serde_json::json! would panic.
+        let store = MetricsStore::new();
+        let nan_stats = ax_serving_engine::GenerationStats {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prefill_tok_per_sec: f64::NAN,
+            decode_tok_per_sec: f64::INFINITY,
+            stop_reason: String::new(),
+        };
+        store.record_generation_stats(&nan_stats);
+        assert_eq!(store.recent_decode_tok_per_sec(), 0.0, "infinity must be clamped to 0.0");
+        assert_eq!(store.recent_prefill_tok_per_sec(), 0.0, "NaN must be clamped to 0.0");
+        // Verify that finite values pass through unchanged.
+        let finite_stats = ax_serving_engine::GenerationStats {
+            prompt_tokens: 512,
+            completion_tokens: 100,
+            prefill_tok_per_sec: 1200.0,
+            decode_tok_per_sec: 85.5,
+            stop_reason: "stop".to_string(),
+        };
+        store.record_generation_stats(&finite_stats);
+        assert!((store.recent_decode_tok_per_sec() - 85.5).abs() < 0.001);
+        assert!((store.recent_prefill_tok_per_sec() - 1200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn request_class_counters_increment() {
+        let store = MetricsStore::new();
+        store.record_cold_request();
+        store.record_exact_cache_hit();
+        store.record_cache_follower_hit();
+        store.record_cache_fill();
+        assert_eq!(store.cold_requests_total(), 1);
+        assert_eq!(store.exact_cache_hits_total(), 1);
+        assert_eq!(store.cache_follower_hits_total(), 1);
+        assert_eq!(store.cache_fills_total(), 1);
     }
 
     #[test]
