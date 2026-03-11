@@ -38,6 +38,14 @@ use crate::{
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+fn mistralrs_max_num_seqs_from_env() -> usize {
+    std::env::var("AXS_MISTRALRS_MAX_SEQS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(32)
+}
+
 fn next_handle() -> ModelHandle {
     ModelHandle(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed))
 }
@@ -189,11 +197,7 @@ impl InferenceBackend for MistralrsBackend {
         }
 
         // WS1: expose AXS_MISTRALRS_MAX_SEQS to control continuous-batching depth.
-        let max_num_seqs = std::env::var("AXS_MISTRALRS_MAX_SEQS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(32);
+        let max_num_seqs = mistralrs_max_num_seqs_from_env();
         builder = builder.with_max_num_seqs(max_num_seqs);
 
         // Build the model on the caller thread. Metal device initialization has
@@ -671,4 +675,40 @@ pub fn current_rss_bytes() -> u64 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mistralrs_max_num_seqs_from_env;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn mistralrs_max_num_seqs_defaults_to_32() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("AXS_MISTRALRS_MAX_SEQS") };
+        assert_eq!(mistralrs_max_num_seqs_from_env(), 32);
+    }
+
+    #[test]
+    fn mistralrs_max_num_seqs_parses_positive_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AXS_MISTRALRS_MAX_SEQS", "48") };
+        assert_eq!(mistralrs_max_num_seqs_from_env(), 48);
+        unsafe { std::env::remove_var("AXS_MISTRALRS_MAX_SEQS") };
+    }
+
+    #[test]
+    fn mistralrs_max_num_seqs_rejects_zero_and_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe { std::env::set_var("AXS_MISTRALRS_MAX_SEQS", "0") };
+        assert_eq!(mistralrs_max_num_seqs_from_env(), 32);
+
+        unsafe { std::env::set_var("AXS_MISTRALRS_MAX_SEQS", "not-a-number") };
+        assert_eq!(mistralrs_max_num_seqs_from_env(), 32);
+
+        unsafe { std::env::remove_var("AXS_MISTRALRS_MAX_SEQS") };
+    }
 }

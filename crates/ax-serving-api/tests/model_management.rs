@@ -5,6 +5,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use ax_serving_api::{ServingLayer, config::ServeConfig, rest};
 use ax_serving_engine::{
@@ -13,6 +15,7 @@ use ax_serving_engine::{
 };
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use tokio::sync::Notify;
 use tower::ServiceExt; // for `oneshot`
 
 /// Read the full response body as a UTF-8 string.
@@ -352,6 +355,108 @@ fn make_embedding_layer() -> Arc<ServingLayer> {
 
 fn make_embedding_failure_layer() -> Arc<ServingLayer> {
     make_layer_with_backend(Arc::new(EmbeddingFailureBackend))
+}
+
+struct BlockingEchoBackend {
+    started: Arc<AtomicUsize>,
+    released: Arc<AtomicBool>,
+    release: Arc<Notify>,
+}
+
+impl InferenceBackend for BlockingEchoBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(5),
+            ModelMetadata {
+                architecture: "blocking-echo".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        let started = Arc::clone(&self.started);
+        let released = Arc::clone(&self.released);
+        let release = Arc::clone(&self.release);
+        tokio::spawn(async move {
+            started.fetch_add(1, Ordering::Relaxed);
+            while !released.load(Ordering::Relaxed) {
+                release.notified().await;
+            }
+            let _ = tx.send(GenerateEvent::Token("hello".to_string())).await;
+            let _ = tx
+                .send(GenerateEvent::Done(GenerationStats {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    prefill_tok_per_sec: 0.0,
+                    decode_tok_per_sec: 0.0,
+                    stop_reason: "stop".to_string(),
+                }))
+                .await;
+        });
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
+    }
+}
+
+fn make_blocking_cache_layer(
+    started: Arc<AtomicUsize>,
+    released: Arc<AtomicBool>,
+    release: Arc<Notify>,
+) -> Arc<ServingLayer> {
+    let backend: Arc<dyn InferenceBackend> = Arc::new(BlockingEchoBackend {
+        started,
+        released,
+        release,
+    });
+    let mut config = ServeConfig::default();
+    config.cache.enabled = true;
+    Arc::new(ServingLayer::new(backend, config))
 }
 
 /// Build the Axum router with a single required API key.
@@ -839,6 +944,22 @@ async fn slo_gauges_no_data_are_zero() {
     assert!(
         text.contains("axs_scheduler_decode_sequences_active "),
         "prometheus metrics should expose decode_sequences_active; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_cache_follower_waiting "),
+        "prometheus metrics should expose cache_follower_waiting; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_ttft_p50_us "),
+        "prometheus metrics should expose ttft_p50_us; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_ttft_p95_us "),
+        "prometheus metrics should expose ttft_p95_us; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_ttft_p99_us "),
+        "prometheus metrics should expose ttft_p99_us; got:\n{text}"
     );
 }
 
@@ -1843,9 +1964,13 @@ async fn v1_metrics_returns_scheduler_key() {
         "v1/metrics must include 'scheduler' key"
     );
     assert!(json["scheduler"]["max_inflight"].is_number());
+    assert!(json["scheduler"]["cache_follower_waiting"].is_number());
     assert!(json["scheduler"]["prefill_tokens_active"].is_number());
     assert!(json["scheduler"]["decode_sequences_active"].is_number());
     assert!(json["scheduler"]["split_scheduler_enabled"].is_boolean());
+    assert!(json["scheduler"]["ttft_p50_us"].is_number());
+    assert!(json["scheduler"]["ttft_p95_us"].is_number());
+    assert!(json["scheduler"]["ttft_p99_us"].is_number());
     assert!(
         json["cache"].is_object(),
         "v1/metrics must include 'cache' key"
@@ -2065,6 +2190,109 @@ async fn text_completions_inference_200() {
     assert!(!choices.is_empty());
     assert_eq!(choices[0]["text"], "hello");
     assert!(json["usage"].is_object());
+}
+
+#[tokio::test]
+async fn cache_follower_wait_does_not_consume_extra_scheduler_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache-follow.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+    let layer = make_blocking_cache_layer(
+        Arc::clone(&started),
+        Arc::clone(&released),
+        Arc::clone(&release),
+    );
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "cache-follow", "path": path.to_string_lossy()}).to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "cache-follow",
+        "messages": [{"role": "user", "content": "same request"}],
+        "cache": "enable",
+        "stream": false,
+        "max_tokens": 8
+    })
+    .to_string();
+
+    let app = rest::router(Arc::clone(&layer), Arc::clone(&keys));
+    let req1 = {
+        let app = app.clone();
+        let body = request_body.clone();
+        tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+    };
+
+    while started.load(Ordering::Relaxed) < 1 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let req2 = {
+        let app = app.clone();
+        let body = request_body.clone();
+        tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        layer.scheduler.metrics.inflight_count.load(Ordering::Relaxed),
+        1,
+        "follower wait must not consume a second scheduler permit"
+    );
+    assert_eq!(
+        layer
+            .scheduler
+            .metrics
+            .cache_follower_waiting
+            .load(Ordering::Relaxed),
+        1,
+        "follower should be accounted as waiting pre-permit"
+    );
+
+    released.store(true, Ordering::Relaxed);
+    release.notify_waiters();
+    let resp1 = req1.await.unwrap();
+    let resp2 = req2.await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp2.status(), StatusCode::OK);
 }
 
 #[tokio::test]

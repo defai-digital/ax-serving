@@ -9,12 +9,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ax_serving_api::orchestration::{
     direct::DirectDispatcher,
+    internal_routes::{InternalState, router as internal_router},
     policy::{DispatchContext, DispatchPolicy, policy_from_str},
     queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy},
     registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry, WorkerStatus},
+    LicenseConfig, OrchestratorConfig, OrchestratorLayer,
 };
 use axum::{Router, routing::post};
 use reqwest::Client;
+use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -708,6 +711,165 @@ async fn test_wrr_dispatch_proportional() {
             "WRR dispatch must always succeed"
         );
     }
+}
+
+#[tokio::test]
+async fn test_token_cost_dispatch_prefers_lower_cost_worker() {
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "token_cost".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let slow = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"slow"}}]}"#).await
+    );
+    let fast = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"fast"}}]}"#).await
+    );
+
+    let slow_reg = layer.registry.register(reg_req(slow, &["tc-model"]), 5000);
+    let fast_reg = layer.registry.register(reg_req(fast, &["tc-model"]), 5000);
+
+    let slow_id = WorkerId::parse(&slow_reg.worker_id).unwrap();
+    let fast_id = WorkerId::parse(&fast_reg.worker_id).unwrap();
+
+    assert!(layer.registry.heartbeat(
+        slow_id,
+        HeartbeatRequest {
+            inflight: 3,
+            thermal_state: "nominal".into(),
+            model_ids: vec!["tc-model".into()],
+            rss_bytes: 0,
+            active_sequences: 3,
+            decode_tok_per_sec: 20.0,
+            ttft_p95_ms: 400,
+        }
+    ));
+    assert!(layer.registry.heartbeat(
+        fast_id,
+        HeartbeatRequest {
+            inflight: 1,
+            thermal_state: "nominal".into(),
+            model_ids: vec!["tc-model".into()],
+            rss_bytes: 0,
+            active_sequences: 1,
+            decode_tok_per_sec: 80.0,
+            ttft_p95_ms: 100,
+        }
+    ));
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"tc-model","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "fast");
+}
+
+#[tokio::test]
+async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let state = InternalState {
+        registry: layer.registry.clone(),
+        config: Arc::clone(&layer.config),
+        license: Arc::clone(&layer.license),
+    };
+    let app = internal_router(state);
+
+    let register_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/internal/workers/register")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "addr": "127.0.0.1:18081",
+                        "capabilities": ["hb-model"],
+                        "backend": "native",
+                        "max_inflight": 8
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), 200);
+    let register_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(register_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let worker_id = register_json["worker_id"].as_str().unwrap().to_string();
+
+    let heartbeat_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(format!("/internal/workers/{worker_id}/heartbeat"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "inflight": 2,
+                        "thermal_state": "serious",
+                        "model_ids": ["hb-model"],
+                        "rss_bytes": 123456,
+                        "active_sequences": 5,
+                        "decode_tok_per_sec": 42.5,
+                        "ttft_p95_ms": 150
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(heartbeat_resp.status(), 200);
+
+    let get_resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/internal/workers/{worker_id}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), 200);
+    let worker_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(worker_json["inflight"], 2);
+    assert_eq!(worker_json["thermal_state"], "serious");
+    assert_eq!(worker_json["rss_bytes"], 123456);
+    assert_eq!(worker_json["active_sequences"], 5);
+    assert_eq!(worker_json["decode_tok_per_sec"], 42.5);
+    assert_eq!(worker_json["ttft_p95_ms"], 150);
+    assert_eq!(worker_json["capabilities"][0], "hb-model");
 }
 
 // ── Overload scenario helpers ─────────────────────────────────────────────────
