@@ -5,7 +5,7 @@ The Execution And Serving Control Plane For AX Fabric
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/defai-digital/ax-serving)
 [![rust-1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
-[![cargo test · 295 passing](https://img.shields.io/badge/cargo%20test-295%20passing-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
+[![Tests: CI](https://img.shields.io/badge/tests-CI%20verified-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![license-AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 AX Serving is the execution and model-serving control plane for [AX Fabric](https://github.com/defai-digital/ax-fabric). It turns local model runtime into an operational layer for agent workloads with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, scheduling, and benchmarking.
@@ -266,6 +266,9 @@ just a request proxy.
   - enables prefill/decode activity tracking in scheduler metrics
 - `AXS_MISTRALRS_MAX_SEQS=<n>`
   - controls `mistralrs` continuous-batching sequence depth
+- `AXS_MAX_BATCH_SIZE` / `AXS_BATCH_WINDOW_MS`
+  - currently advisory scheduler hints only
+  - they are exposed for future scheduler work and do not drive a batching loop today
 
 Relevant scheduler metrics:
 - `prefill_tokens_active`
@@ -329,15 +332,16 @@ cargo build --workspace --release
 
 All tests run automatically in CI on every push and pull request against `main`. No model file or GPU is required — tests use in-process backends (`NullBackend`, `EchoBackend`, `FailingUnloadBackend`) that exercise the full request path without hardware.
 
-| Suite | Count | What It Covers |
-|---|---|---|
-| **Unit — serving API** | 163 | Scheduler (permits, AIMD, TTFT histogram, split prefill/decode), model registry (lifecycle, idle eviction, capacity), orchestration (queue, dispatch policies, worker registry, DashMap), REST helpers (cache key normalisation, cache hit ratio), config (env layering, validation), gRPC status mapping, auth, metrics |
-| **Unit — engine** | 31 | Backend routing, GGUF metadata parsing, thermal state, memory budget |
-| **Unit — C shim** | 22 | Null-safe llama.h ABI compatibility (21 exported functions) |
-| **Integration — model\_management** | 54 | Auth (Bearer, whitespace tolerance, 401+WWW-Authenticate), model load/unload/reload (201/200/409/404/503), health semantics (ok/degraded/critical-thermal/no-models), input validation (400/422 on every field), full inference path (chat + completions via EchoBackend), embeddings (400/404/501), security response headers (nosniff, X-Frame-Options, X-Request-ID), metrics JSON keys, dashboard HTML, license GET/SET |
-| **Integration — orchestration** | 23 | Worker register/heartbeat/eviction, dispatch (least-inflight, weighted round-robin, model-affinity, token-cost), queue admission and backpressure, reroute on 5xx, chaos (all workers fail → 503), overload (queue full → 429) |
-| **Integration — graceful\_shutdown** | 2 | In-flight request drains to completion before server exits |
-| **Total** | **295** | |
+Exact test counts change over time. Use the linked CI badge and workflow runs as the source of truth.
+
+| Suite | What It Covers |
+|---|---|
+| **Unit — serving API** | Scheduler (permits, AIMD, TTFT histogram, split prefill/decode), model registry (lifecycle, idle eviction, capacity), orchestration (queue, dispatch policies, worker registry, DashMap), REST helpers (cache key normalisation, cache hit ratio), config (env layering, validation), gRPC status mapping, auth, metrics |
+| **Unit — engine** | Backend routing, GGUF metadata parsing, thermal state, memory budget |
+| **Unit — C shim** | Null-safe llama.h ABI compatibility |
+| **Integration — model\_management** | Auth (Bearer, whitespace tolerance, 401+WWW-Authenticate), model load/unload/reload (201/200/409/404/503), health semantics (ok/degraded/critical-thermal/no-models), input validation (400/422 on every field), full inference path (chat + completions via EchoBackend), embeddings, security response headers, metrics JSON keys, dashboard HTML, license GET/SET |
+| **Integration — orchestration** | Worker register/heartbeat/eviction, dispatch (least-inflight, weighted round-robin, model-affinity, token-cost), queue admission and backpressure, reroute on 5xx, chaos (all workers fail → 503), overload (queue full → 429) |
+| **Integration — graceful\_shutdown** | In-flight request drains to completion before server exits |
 
 Every CI run posts a test summary to the GitHub Actions job summary page — see the [Actions tab](https://github.com/defai-digital/ax-serving/actions) for per-run results.
 

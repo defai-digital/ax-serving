@@ -32,10 +32,14 @@ pub struct ServeConfig {
     /// Per-model concurrency cap (each model ID gets its own semaphore).
     /// env: `AXS_PER_MODEL_MAX_INFLIGHT`
     pub sched_per_model_max_inflight: usize,
-    /// Advisory max batch size for future continuous-batching support.
+    /// Advisory max batch size for future scheduler-managed batching support.
+    /// Stored in config and metrics surfaces only; does not currently change
+    /// request execution behavior on its own.
     /// env: `AXS_MAX_BATCH_SIZE`
     pub sched_max_batch_size: usize,
-    /// Advisory batch-fill window (ms) for future continuous-batching support.
+    /// Advisory batch-fill window (ms) for future scheduler-managed batching.
+    /// Stored in config and metrics surfaces only; does not currently change
+    /// request execution behavior on its own.
     /// env: `AXS_BATCH_WINDOW_MS`
     pub sched_batch_window_ms: u64,
     /// Default `max_tokens` applied when the client omits the field.

@@ -73,6 +73,9 @@ AX Fabric integration should follow the runtime contract in
   - enables prefill/decode activity tracking in scheduler metrics
 - `AXS_MISTRALRS_MAX_SEQS=<n>`
   - sets `mistralrs` continuous-batching sequence depth
+- `AXS_MAX_BATCH_SIZE` / `AXS_BATCH_WINDOW_MS`
+  - currently advisory only
+  - they do not enable a scheduler-managed batching loop today
 
 ---
 
@@ -504,12 +507,19 @@ cargo run -p ax-serving-bench --release -- mixed \
   --url http://127.0.0.1:18080 --model default
 ```
 
-Cache effectiveness (cold vs. warm latency):
+Release baselines for `mixed` are checked during release validation, but the
+benchmark run itself is still a manual hardware step. Populate
+`benchmarks/baseline-mixed.json` on the reference machine before tagging.
+
+Exact-response cache effectiveness (cold vs. warm latency):
 
 ```bash
 cargo run -p ax-serving-bench --release -- cache-bench \
   --url http://127.0.0.1:18080 --model default
 ```
+
+This measures response-cache reuse for repeated identical requests. It does not
+measure KV prefix-cache reuse across partially overlapping prompts.
 
 24-hour soak test:
 

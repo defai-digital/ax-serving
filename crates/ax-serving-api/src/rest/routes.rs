@@ -523,8 +523,13 @@ pub async fn chat_completions(
         }
     };
 
+    // Split-scheduler prompt estimation is only needed when the feature is enabled.
+    let estimated_prompt_tokens = if layer.scheduler.split_enabled {
+        estimate_chat_prompt_tokens(&req.messages)
+    } else {
+        0
+    };
     // Acquire global admission slot — returns 429 on queue-full, 503 on timeout/throttle.
-    let estimated_prompt_tokens = estimate_chat_prompt_tokens(&req.messages);
     let permit = match layer
         .scheduler
         .acquire_with_tokens(estimated_prompt_tokens)
@@ -1330,7 +1335,11 @@ pub async fn text_completions(
         }
     };
 
-    let estimated_prompt_tokens = estimate_text_prompt_tokens(&req.prompt);
+    let estimated_prompt_tokens = if layer.scheduler.split_enabled {
+        estimate_text_prompt_tokens(&req.prompt)
+    } else {
+        0
+    };
     let permit = match layer
         .scheduler
         .acquire_with_tokens(estimated_prompt_tokens)

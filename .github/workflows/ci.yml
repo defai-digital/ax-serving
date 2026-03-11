@@ -209,7 +209,7 @@ jobs:
           echo ""
           echo "If not yet verified, delete this tag and re-run the manual gates first."
 
-  # ── Performance regression gate (manual — requires live server + model) ───────
+  # ── Performance regression gate (manual benchmark run + checked baseline) ──────
   bench-regression:
     name: Bench Regression Gate
     runs-on: macos-15
