@@ -3,10 +3,11 @@
 //! Each test spins up real in-process axum servers bound to ephemeral ports
 //! so that `DirectDispatcher` exercises actual HTTP round-trips.
 
-use std::net::SocketAddr;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use ax_serving_api::orchestration::{
     direct::DirectDispatcher,
@@ -21,6 +22,51 @@ use reqwest::Client;
 use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct TestConfigHome {
+    _guard: MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+    previous_xdg: Option<std::ffi::OsString>,
+    previous_home: Option<std::ffi::OsString>,
+}
+
+impl TestConfigHome {
+    fn new() -> Self {
+        let guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("HOME", dir.path());
+        }
+        Self {
+            _guard: guard,
+            _dir: dir,
+            previous_xdg,
+            previous_home,
+        }
+    }
+}
+
+impl Drop for TestConfigHome {
+    fn drop(&mut self) {
+        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
+        unsafe {
+            match &self.previous_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
 
 /// Spawn a minimal axum mock worker on an ephemeral port.
 ///
@@ -1003,6 +1049,117 @@ async fn test_admin_status_reports_auth_required_from_runtime_state() {
     )
     .unwrap();
     assert_eq!(json["auth_required"], true);
+}
+
+#[tokio::test]
+async fn test_admin_startup_report_and_diagnostics_include_audit() {
+    let _config_home = TestConfigHome::new();
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let startup = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/startup-report")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(startup.status(), axum::http::StatusCode::OK);
+    let startup_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(startup.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(startup_json["service"], "orchestrator");
+    assert_eq!(startup_json["auth_required"], true);
+
+    let license_set = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/license")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", "req-orch-license")
+                .body(axum::body::Body::from(r#"{"key":"biz-key"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let license_status = license_set.status();
+    let license_body = axum::body::to_bytes(license_set.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        license_status,
+        axum::http::StatusCode::OK,
+        "license body: {}",
+        String::from_utf8_lossy(&license_body)
+    );
+
+    let diag = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-request-id", "req-orch-diag")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let diag_status = diag.status();
+    let diag_body = axum::body::to_bytes(diag.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        diag_status,
+        axum::http::StatusCode::OK,
+        "diagnostics body: {}",
+        String::from_utf8_lossy(&diag_body)
+    );
+    let diag_json: serde_json::Value = serde_json::from_slice(&diag_body).unwrap();
+    assert_eq!(diag_json["request_id"], "req-orch-diag");
+    assert!(diag_json["audit_tail"].as_array().unwrap().iter().any(
+        |e| e["action"] == "license_set" && e["actor"] == "request:req-orch-license"
+    ));
+
+    let audit = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/audit?limit=10")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), axum::http::StatusCode::OK);
+    let audit_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(audit_json["events"].as_array().unwrap().iter().any(
+        |e| e["action"] == "startup" && e["target_type"] == "orchestrator_layer"
+    ));
 }
 
 #[tokio::test]

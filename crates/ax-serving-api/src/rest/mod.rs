@@ -62,6 +62,9 @@ pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
         .route("/v1/models/{id}/reload", post(routes::rest_reload_model))
         .route("/health", get(routes::health))
         .route("/v1/metrics", get(routes::metrics))
+        .route("/v1/admin/startup-report", get(routes::admin_startup_report))
+        .route("/v1/admin/diagnostics", get(routes::admin_diagnostics))
+        .route("/v1/admin/audit", get(routes::admin_audit))
         .route("/metrics", get(routes::prometheus_metrics))
         .route("/dashboard", get(routes::dashboard))
         .route(

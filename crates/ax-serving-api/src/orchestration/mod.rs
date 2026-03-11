@@ -39,7 +39,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::{Body, BodyDataStream, Bytes},
-    extract::{Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse},
@@ -55,6 +55,8 @@ use self::internal_routes::{InternalState, internal_auth_middleware, router as i
 use self::policy::DispatchPolicy;
 use self::queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy};
 use self::registry::WorkerRegistry;
+use crate::audit::AuditLog;
+use crate::auth::RequestId;
 use crate::license::LicenseState;
 
 pub use crate::config::{LicenseConfig, OrchestratorConfig};
@@ -74,6 +76,8 @@ pub struct OrchestratorLayer {
     pub license: Arc<LicenseState>,
     /// Whether the public proxy requires bearer authentication.
     pub public_auth_required: AtomicBool,
+    /// In-process audit log for admin and worker lifecycle actions.
+    pub audit: Arc<AuditLog>,
 }
 
 impl OrchestratorLayer {
@@ -93,7 +97,7 @@ impl OrchestratorLayer {
             wait_ms: config.global_queue_wait_ms,
             overload_policy: queue_policy,
         };
-        Ok(Self {
+        let layer = Self {
             registry: WorkerRegistry::new(),
             policy: Arc::from(policy),
             dispatcher: DirectDispatcher::new(pool_max_idle, timeout_secs),
@@ -102,7 +106,21 @@ impl OrchestratorLayer {
             retry_after_secs,
             license: LicenseState::new(&license_config),
             public_auth_required: AtomicBool::new(false),
-        })
+            audit: AuditLog::default_shared(),
+        };
+        layer.audit.record(
+            "system",
+            "startup",
+            "orchestrator_layer",
+            None,
+            "ok",
+            Some(serde_json::json!({
+                "dispatch_policy": layer.config.dispatch_policy,
+                "public_port": layer.config.port,
+                "internal_port": layer.config.internal_port,
+            })),
+        );
+        Ok(layer)
     }
 
     pub fn set_public_auth_required(&self, required: bool) {
@@ -120,6 +138,9 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/health", get(proxy_health))
         .route("/v1/metrics", get(proxy_metrics))
         .route("/v1/admin/status", get(proxy_admin_status))
+        .route("/v1/admin/startup-report", get(proxy_admin_startup_report))
+        .route("/v1/admin/diagnostics", get(proxy_admin_diagnostics))
+        .route("/v1/admin/audit", get(proxy_admin_audit))
         .route("/dashboard", get(proxy_dashboard))
         .route(
             "/v1/license",
@@ -301,6 +322,43 @@ fn fairness_client_key(headers: &HeaderMap) -> String {
     "anonymous".to_string()
 }
 
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    50
+}
+
+fn audit_actor(req_id: Option<Extension<RequestId>>) -> String {
+    req_id
+        .map(|id| format!("request:{}", id.0.0))
+        .unwrap_or_else(|| "request:unknown".to_string())
+}
+
+fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_json::Value {
+    serde_json::json!({
+        "service": "orchestrator",
+        "status": "ok",
+        "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
+        "license": layer.license.to_json(),
+        "runtime": {
+            "host": layer.config.host,
+            "port": layer.config.port,
+            "internal_port": layer.config.internal_port,
+            "dispatch_policy": layer.config.dispatch_policy,
+            "worker_heartbeat_ms": layer.config.worker_heartbeat_ms,
+            "worker_ttl_ms": layer.config.worker_ttl_ms,
+            "request_timeout_secs": layer.config.request_timeout_secs,
+            "global_queue_max": layer.config.global_queue_max,
+            "global_queue_depth": layer.config.global_queue_depth,
+            "global_queue_wait_ms": layer.config.global_queue_wait_ms,
+        }
+    })
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 /// `POST /v1/chat/completions` — admission control, extract model, dispatch.
@@ -455,6 +513,80 @@ async fn proxy_admin_status(
     }))
 }
 
+/// `GET /v1/admin/startup-report` — authenticated orchestrator startup summary.
+async fn proxy_admin_startup_report(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    Json(orchestrator_startup_report_value(&layer))
+}
+
+/// `GET /v1/admin/diagnostics` — authenticated orchestrator diagnostics bundle.
+async fn proxy_admin_diagnostics(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<Extension<RequestId>>,
+) -> impl IntoResponse {
+    let (healthy, unhealthy, draining) = layer.registry.counts();
+    let workers = layer.registry.list_all();
+    let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
+    let total_active_sequences: usize = workers.iter().map(|w| w.active_sequences).sum();
+    let eligible = layer.registry.eligible_healthy_count();
+    let qm = &layer.queue.metrics;
+    Json(serde_json::json!({
+        "request_id": req_id.map(|v| v.0.0).unwrap_or_default(),
+        "startup_report": orchestrator_startup_report_value(&layer),
+        "health": {
+            "status": if eligible > 0 { "ok" } else { "degraded" },
+            "workers": {
+                "total": healthy + unhealthy,
+                "healthy": healthy,
+                "unhealthy": unhealthy,
+                "draining": draining,
+                "eligible": eligible,
+            },
+            "queue": {
+                "active": layer.queue.active(),
+                "queued": layer.queue.queued(),
+                "rejected_total": qm.rejected_total.load(Ordering::Relaxed),
+                "shed_total": qm.shed_total.load(Ordering::Relaxed),
+                "timeout_total": qm.timeout_total.load(Ordering::Relaxed),
+            }
+        },
+        "metrics": {
+            "mode": "direct",
+            "policy": layer.config.dispatch_policy,
+            "workers": {
+                "healthy": healthy,
+                "unhealthy": unhealthy,
+                "draining": draining,
+                "eligible": eligible,
+                "total_inflight": total_inflight,
+                "total_active_sequences": total_active_sequences,
+            },
+            "reroute_total": layer.dispatcher.reroutes(),
+            "queue": {
+                "active": layer.queue.active(),
+                "queued": layer.queue.queued(),
+                "permit_total": qm.permit_total.load(Ordering::Relaxed),
+                "rejected_total": qm.rejected_total.load(Ordering::Relaxed),
+                "shed_total": qm.shed_total.load(Ordering::Relaxed),
+                "timeout_total": qm.timeout_total.load(Ordering::Relaxed),
+            }
+        },
+        "workers": workers,
+        "audit_tail": layer.audit.tail(50),
+    }))
+}
+
+/// `GET /v1/admin/audit` — authenticated recent audit events.
+async fn proxy_admin_audit(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    Query(query): Query<AuditQuery>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "events": layer.audit.tail(query.limit.clamp(1, 200)),
+    }))
+}
+
 /// `GET /v1/workers` — authenticated worker inventory for the public admin API.
 async fn proxy_list_workers(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
     Json(serde_json::json!({
@@ -480,6 +612,7 @@ async fn proxy_get_worker(
 /// `POST /v1/workers/{id}/drain` — authenticated graceful drain start.
 async fn proxy_drain_worker(
     State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
@@ -489,6 +622,14 @@ async fn proxy_drain_worker(
     if !layer.registry.mark_drain(id) {
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
+    layer.audit.record(
+        audit_actor(req_id),
+        "worker_drain",
+        "worker",
+        Some(id.to_string()),
+        "ok",
+        None,
+    );
     tracing::info!(%id, "worker marked for drain via public API");
     StatusCode::OK.into_response()
 }
@@ -496,6 +637,7 @@ async fn proxy_drain_worker(
 /// `POST /v1/workers/{id}/drain-complete` — authenticated graceful worker removal.
 async fn proxy_drain_complete_worker(
     State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
@@ -506,6 +648,14 @@ async fn proxy_drain_complete_worker(
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
     layer.registry.evict(id);
+    layer.audit.record(
+        audit_actor(req_id),
+        "worker_drain_complete",
+        "worker",
+        Some(id.to_string()),
+        "ok",
+        None,
+    );
     tracing::info!(%id, "worker drain complete via public API");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -518,6 +668,7 @@ async fn proxy_drain_complete_worker(
 /// and not reachable from a browser dashboard).
 async fn proxy_delete_worker(
     State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
@@ -529,6 +680,14 @@ async fn proxy_delete_worker(
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
     layer.registry.evict(id);
+    layer.audit.record(
+        audit_actor(req_id),
+        "worker_delete",
+        "worker",
+        Some(id.to_string()),
+        "ok",
+        None,
+    );
     tracing::info!(%id, "worker force-removed via public API");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -548,6 +707,7 @@ async fn proxy_get_license(State(layer): State<Arc<OrchestratorLayer>>) -> impl 
 /// Body: `{"key": "<license-key>"}`
 async fn proxy_set_license(
     State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(key) = body.get("key").and_then(|v| v.as_str()) else {
@@ -566,7 +726,17 @@ async fn proxy_set_license(
             .into_response();
     }
     match layer.license.set_key(key) {
-        Ok(()) => Json(layer.license.to_json()).into_response(),
+        Ok(()) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "license_set",
+                "license",
+                None,
+                "ok",
+                None,
+            );
+            Json(layer.license.to_json()).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

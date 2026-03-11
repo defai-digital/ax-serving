@@ -10,7 +10,7 @@ use ax_serving_engine::{
     current_rss_bytes,
 };
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::schema::*;
 use crate::ServingLayer;
+use crate::auth::RequestId;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
 use crate::registry::RegistryError;
 use crate::scheduler::SchedulerPermit;
@@ -1859,6 +1860,11 @@ pub async fn health(State(layer): State<Arc<ServingLayer>>) -> Json<HealthRespon
     })
 }
 
+/// `GET /v1/admin/startup-report` — authenticated runtime and config summary.
+pub async fn admin_startup_report(State(layer): State<Arc<ServingLayer>>) -> impl IntoResponse {
+    Json(serving_startup_report_value(&layer))
+}
+
 /// GET /v1/metrics — scheduler and serving metrics (JSON).
 pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json::Value> {
     let m = &layer.scheduler.metrics;
@@ -1924,6 +1930,35 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
             "writes": layer.cache_metrics.writes.load(Ordering::Relaxed),
             "errors": layer.cache_metrics.errors.load(Ordering::Relaxed),
         }
+    }))
+}
+
+/// `GET /v1/admin/diagnostics` — authenticated diagnostics bundle.
+pub async fn admin_diagnostics(
+    State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
+) -> impl IntoResponse {
+    let health = health(State(Arc::clone(&layer))).await;
+    let metrics = metrics(State(Arc::clone(&layer))).await;
+    let models = list_models(State(Arc::clone(&layer))).await;
+    Json(serde_json::json!({
+        "request_id": req_id.map(|v| v.0.0).unwrap_or_default(),
+        "generated_at": unix_now(),
+        "startup_report": serving_startup_report_value(&layer),
+        "health": health.0,
+        "metrics": metrics.0,
+        "models": models.0,
+        "audit_tail": layer.audit.tail(50),
+    }))
+}
+
+/// `GET /v1/admin/audit` — authenticated recent audit events.
+pub async fn admin_audit(
+    State(layer): State<Arc<ServingLayer>>,
+    Query(query): Query<AuditQuery>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "events": layer.audit.tail(query.limit.clamp(1, 200)),
     }))
 }
 
@@ -2246,6 +2281,7 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
 /// POST /v1/models — load a model from a GGUF file.
 pub async fn rest_load_model(
     State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
     let pooling_type = match req.pooling_type.as_deref() {
@@ -2286,6 +2322,17 @@ pub async fn rest_load_model(
 
     match result {
         Ok(Ok(entry)) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_load",
+                "model",
+                Some(entry.id.clone()),
+                "ok",
+                Some(serde_json::json!({
+                    "path": entry.path.display().to_string(),
+                    "architecture": entry.metadata.architecture,
+                })),
+            );
             let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
             (
                 StatusCode::CREATED,
@@ -2303,6 +2350,17 @@ pub async fn rest_load_model(
                 .into_response()
         }
         Ok(Err(e)) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_load",
+                "model",
+                Some(req.model_id.clone()),
+                "error",
+                Some(serde_json::json!({
+                    "path": req.path,
+                    "error": e.to_string(),
+                })),
+            );
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::AlreadyLoaded(_)) => StatusCode::CONFLICT,
                 Some(
@@ -2353,6 +2411,7 @@ fn lifecycle_snapshot(layer: &Arc<ServingLayer>) -> (bool, bool, usize) {
 /// DELETE /v1/models/:id — unload a loaded model.
 pub async fn rest_unload_model(
     State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Path(model_id): Path<String>,
 ) -> Response {
     let id_for_response = model_id.clone();
@@ -2366,6 +2425,14 @@ pub async fn rest_unload_model(
 
     match result {
         Ok(Ok(())) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_unload",
+                "model",
+                Some(id_for_response.clone()),
+                "ok",
+                None,
+            );
             let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
             (
                 StatusCode::OK,
@@ -2380,6 +2447,14 @@ pub async fn rest_unload_model(
                 .into_response()
         }
         Ok(Err(e)) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_unload",
+                "model",
+                Some(id_for_response.clone()),
+                "error",
+                Some(serde_json::json!({ "error": e.to_string() })),
+            );
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2397,18 +2472,31 @@ pub async fn rest_unload_model(
 /// POST /v1/models/:id/reload — atomically reload from the same path and config.
 pub async fn rest_reload_model(
     State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Path(model_id): Path<String>,
 ) -> Response {
     let layer_for_reload = Arc::clone(&layer);
+    let reload_id = model_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         layer_for_reload
             .registry
-            .reload(&model_id, layer_for_reload.backend.as_ref())
+            .reload(&reload_id, layer_for_reload.backend.as_ref())
     })
     .await;
 
     match result {
         Ok(Ok(entry)) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_reload",
+                "model",
+                Some(entry.id.clone()),
+                "ok",
+                Some(serde_json::json!({
+                    "path": entry.path.display().to_string(),
+                    "architecture": entry.metadata.architecture,
+                })),
+            );
             let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
             (
                 StatusCode::OK,
@@ -2425,6 +2513,14 @@ pub async fn rest_reload_model(
                 .into_response()
         }
         Ok(Err(e)) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "model_reload",
+                "model",
+                Some(model_id.clone()),
+                "error",
+                Some(serde_json::json!({ "error": e.to_string() })),
+            );
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2551,6 +2647,61 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[derive(serde::Deserialize)]
+pub struct AuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    50
+}
+
+fn audit_actor(req_id: Option<Extension<RequestId>>) -> String {
+    req_id
+        .map(|id| format!("request:{}", id.0.0))
+        .unwrap_or_else(|| "request:unknown".to_string())
+}
+
+fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value {
+    let config_validation = layer.config.validate().err().map(|e| e.to_string());
+    let allowed_model_dirs = std::env::var("AXS_MODEL_ALLOWED_DIRS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "service": "serving",
+        "status": if config_validation.is_none() { "ok" } else { "degraded" },
+        "config_valid": config_validation.is_none(),
+        "config_error": config_validation,
+        "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
+        "license": layer.license.to_json(),
+        "runtime": {
+            "rest_addr": layer.config.rest_addr,
+            "grpc_socket": layer.config.grpc_socket,
+            "grpc_host": layer.config.grpc_host,
+            "grpc_port": layer.config.grpc_port,
+            "cache_enabled": layer.config.cache.enabled,
+            "split_scheduler": layer.config.split_scheduler,
+            "default_max_tokens": layer.config.default_max_tokens,
+            "idle_timeout_secs": layer.config.idle_timeout_secs,
+            "thermal_poll_secs": layer.config.thermal_poll_secs,
+            "sched_max_inflight": layer.config.sched_max_inflight,
+            "sched_max_queue": layer.config.sched_max_queue,
+        },
+        "trust": {
+            "allowed_model_dirs": allowed_model_dirs,
+        }
+    })
 }
 
 // ── Dashboard + License handlers ──────────────────────────────────────────────
@@ -2694,6 +2845,7 @@ pub async fn get_license(State(layer): State<Arc<ServingLayer>>) -> impl IntoRes
 /// Body: `{"key": "<license-key>"}`
 pub async fn set_license(
     State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(key) = body.get("key").and_then(|v| v.as_str()) else {
@@ -2712,7 +2864,17 @@ pub async fn set_license(
             .into_response();
     }
     match layer.license.set_key(key) {
-        Ok(()) => Json(layer.license.to_json()).into_response(),
+        Ok(()) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "license_set",
+                "license",
+                None,
+                "ok",
+                None,
+            );
+            Json(layer.license.to_json()).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

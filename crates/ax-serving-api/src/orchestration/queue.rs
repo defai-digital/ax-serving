@@ -121,8 +121,10 @@ impl Drop for QueuePermit {
         let hint: Option<&str> = last_served
             .as_deref()
             .and_then(|v| v.as_deref())
-            .or_else(|| {
-                if self.client_key.is_empty() { None } else { Some(self.client_key.as_str()) }
+            .or(if self.client_key.is_empty() {
+                None
+            } else {
+                Some(self.client_key.as_str())
             });
         loop {
             let next = select_next_waiter(&mut waiters, hint);

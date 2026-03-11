@@ -27,6 +27,7 @@
 compile_error!("ax-serving-api only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
 pub mod auth;
+pub mod audit;
 pub mod cache;
 pub mod config;
 pub mod grpc;
@@ -38,6 +39,7 @@ pub mod rest;
 pub mod scheduler;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use ax_serving_engine::{InferenceBackend, ThermalMonitor};
@@ -49,12 +51,14 @@ use crate::license::LicenseState;
 use crate::metrics::MetricsStore;
 use crate::registry::ModelRegistry;
 use crate::scheduler::{PerModelScheduler, Scheduler};
+use crate::audit::AuditLog;
 
 /// Shared serving state — held by both the gRPC and REST servers.
 pub struct ServingLayer {
     pub registry: ModelRegistry,
     pub metrics: Arc<MetricsStore>,
     pub backend: Arc<dyn InferenceBackend>,
+    pub config: Arc<ServeConfig>,
     /// Global admission queue + concurrency control (PRD M1).
     pub scheduler: Scheduler,
     /// Per-model concurrency limiter for multi-model concurrent serving (Phase 3).
@@ -73,6 +77,10 @@ pub struct ServingLayer {
     pub default_max_tokens: u32,
     /// Soft license reminder state.
     pub license: Arc<LicenseState>,
+    /// Whether the public REST surface requires bearer authentication.
+    pub public_auth_required: AtomicBool,
+    /// In-process audit log for admin and model lifecycle actions.
+    pub audit: Arc<AuditLog>,
 }
 
 impl ServingLayer {
@@ -95,9 +103,10 @@ impl ServingLayer {
         // ThermalMonitor poll interval from config (or env fallback via new()).
         let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
         let cache_inflight_max_retries = config.dispatcher.cache_inflight_max_retries;
-        Self {
+        let layer = Self {
             registry: ModelRegistry::new(config.registry.max_loaded_models),
             metrics: Arc::new(MetricsStore::new()),
+            config: Arc::new(config.clone()),
             scheduler: Scheduler::from_serve_config(
                 config.sched_max_inflight,
                 config.sched_max_queue,
@@ -115,7 +124,26 @@ impl ServingLayer {
             cache_inflight_max_retries,
             default_max_tokens: config.default_max_tokens,
             license: LicenseState::new(&config.license),
-        }
+            public_auth_required: AtomicBool::new(false),
+            audit: AuditLog::default_shared(),
+        };
+        layer.audit.record(
+            "system",
+            "startup",
+            "serving_layer",
+            None,
+            "ok",
+            Some(serde_json::json!({
+                "rest_addr": layer.config.rest_addr,
+                "split_scheduler": layer.config.split_scheduler,
+                "cache_enabled": layer.config.cache.enabled,
+            })),
+        );
+        layer
+    }
+
+    pub fn set_public_auth_required(&self, required: bool) {
+        self.public_auth_required.store(required, Ordering::Relaxed);
     }
 }
 
@@ -179,6 +207,7 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
     } else {
         info!("API key authentication enabled ({} key(s))", api_keys.len());
     }
+    layer.set_public_auth_required(!api_keys.is_empty());
 
     tokio::try_join!(
         rest::serve(layer.clone(), config.rest_addr.clone(), api_keys.clone()),
