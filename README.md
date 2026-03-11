@@ -2,7 +2,7 @@
 
 The Execution And Serving Control Plane For AX Fabric
 
-[![Latest Release](https://img.shields.io/github/v/release/defai-digital/ax-serving)](https://github.com/defai-digital/ax-serving/releases)
+
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
 [![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://github.com/defai-digital/ax-serving)
