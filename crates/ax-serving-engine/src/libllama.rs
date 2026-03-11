@@ -69,6 +69,19 @@ pub(crate) mod ffi {
     include!(concat!(env!("OUT_DIR"), "/libllama_bindings.rs"));
 }
 
+// ── Backend defaults (overridable via AXS_LIBLLAMA_* env vars) ───────────────
+
+/// CPU threads per context; 0 lets llama.cpp auto-detect from available cores.
+const DEFAULT_N_THREADS: i32 = 0;
+/// Enable flash attention by default for significant prefill speedup on Metal.
+const DEFAULT_FLASH_ATTN: bool = true;
+/// Logical batch size for prompt processing.
+const DEFAULT_N_BATCH: u32 = 512;
+/// Max concurrent inference requests per loaded model (context pool size).
+const DEFAULT_POOL_SIZE: usize = 4;
+/// GPU offload layers; 99 is effectively "all layers" for any model ≤ ~200 layers.
+const DEFAULT_N_GPU_LAYERS: i32 = 99;
+
 // ── Handle counter ────────────────────────────────────────────────────────────
 
 static NEXT_LIBLLAMA_HANDLE: AtomicU64 = AtomicU64::new(4_000_000);
@@ -207,21 +220,21 @@ impl LibLlamaBackend {
         let n_threads = std::env::var("AXS_LIBLLAMA_THREADS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0); // 0 = llama.cpp auto-detects
+            .unwrap_or(DEFAULT_N_THREADS);
 
         let flash_attn = std::env::var("AXS_LIBLLAMA_FLASH_ATTN")
             .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+            .unwrap_or(DEFAULT_FLASH_ATTN);
 
         let n_batch = std::env::var("AXS_LIBLLAMA_N_BATCH")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(512);
+            .unwrap_or(DEFAULT_N_BATCH);
 
         let pool_size = std::env::var("AXS_LIBLLAMA_POOL_SIZE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(DEFAULT_POOL_SIZE)
             .max(1);
 
         info!(
@@ -268,7 +281,7 @@ impl InferenceBackend for LibLlamaBackend {
                     std::env::var("AXS_LIBLLAMA_N_GPU_LAYERS")
                         .ok()
                         .and_then(|v| v.parse::<i32>().ok())
-                        .unwrap_or(99)
+                        .unwrap_or(DEFAULT_N_GPU_LAYERS)
                 }),
             };
 

@@ -3,6 +3,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Capacity of the in-process mpsc channels used for streaming inference events.
+///
+/// Sized to buffer ~512 tokens ahead without backpressure on the generator
+/// while keeping memory overhead negligible (~16 KB per active stream).
+const INFER_CHANNEL_CAPACITY: usize = 512;
+
 use ax_serving_engine::{
     BackendType, ChatMessage, GenerateEvent, GenerateInput, GenerationParams, LoadConfig,
     ThermalState,
@@ -242,14 +248,14 @@ impl AxServingServiceTrait for AxServingService {
             ..Default::default()
         };
 
-        let (engine_tx, mut engine_rx) = mpsc::channel::<GenerateEvent>(512);
+        let (engine_tx, mut engine_rx) = mpsc::channel::<GenerateEvent>(INFER_CHANNEL_CAPACITY);
 
         self.layer
             .backend
             .generate(handle, input, params, engine_tx)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let (out_tx, out_rx) = mpsc::channel::<Result<proto::InferResponse, Status>>(512);
+        let (out_tx, out_rx) = mpsc::channel::<Result<proto::InferResponse, Status>>(INFER_CHANNEL_CAPACITY);
 
         // Start timing before spawning so total_time_ms covers the full
         // generation window, not just task-scheduled-to-done.
