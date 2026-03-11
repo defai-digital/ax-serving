@@ -195,7 +195,7 @@ enum Command {
     /// and reports throughput and latency percentiles.
     ///
     /// Use `--requests` for a fixed count or `--duration-secs` for a time-bounded run.
-    /// A markdown report is automatically written to `automatosx/tmp/`.
+    /// A markdown report is automatically written to `target/bench-reports/`.
     MultiWorker {
         /// Orchestrator base URL (e.g. `http://127.0.0.1:18080`).
         #[arg(long, default_value = "http://127.0.0.1:18080")]
@@ -224,7 +224,7 @@ enum Command {
         /// Write results to a JSON file.
         #[arg(long)]
         json: Option<PathBuf>,
-        /// Skip writing the markdown report to automatosx/tmp/.
+        /// Skip writing the markdown report to `target/bench-reports/`.
         #[arg(long)]
         no_report: bool,
     },

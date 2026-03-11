@@ -211,20 +211,21 @@ jobs:
 
       - name: Smoke soak (15 min)
         run: |
+          mkdir -p target/ci
           ./target/release/ax-serving-bench soak \
             -m "${{ inputs.model_path }}" \
             --duration-min 15 \
-            --json automatosx/tmp/smoke-soak-result.json
+            --json target/ci/smoke-soak-result.json
 
       - name: Assert soak passed
         run: |
           python3 -c "
           import json, sys
-          r = json.load(open('automatosx/tmp/smoke-soak-result.json'))
+          r = json.load(open('target/ci/smoke-soak-result.json'))
           sys.exit(0 if r.get('passed') else 1)
           "
 
       - uses: actions/upload-artifact@v4
         with:
           name: smoke-soak-result
-          path: automatosx/tmp/smoke-soak-result.json
+          path: target/ci/smoke-soak-result.json

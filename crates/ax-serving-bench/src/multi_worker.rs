@@ -46,7 +46,7 @@ pub struct MultiWorkerConfig {
     pub mode: String,
     /// Optional path to write a JSON results file.
     pub json: Option<PathBuf>,
-    /// If true, auto-write a markdown report to automatosx/tmp/.
+    /// If true, auto-write a markdown report to `target/bench-reports/`.
     pub write_report: bool,
 }
 
@@ -281,7 +281,7 @@ fn print_report(cfg: &MultiWorkerConfig, r: &MultiWorkerResults) {
 
 fn write_markdown_report(cfg: &MultiWorkerConfig, r: &MultiWorkerResults) -> Result<()> {
     let date = chrono_date_str();
-    let dir = "automatosx/tmp";
+    let dir = "target/bench-reports";
     std::fs::create_dir_all(dir)?;
     let path = format!("{dir}/bench-multi-worker-{date}.md");
     let gate_str = if r.overhead_gate_pass {
