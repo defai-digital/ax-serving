@@ -220,4 +220,165 @@ mod tests {
         assert!(keys.contains("key1"));
         assert!(keys.contains("key2"));
     }
+
+    // ── auth_middleware tests via minimal router ───────────────────────────────
+
+    fn make_keys(raw: &[&str]) -> Arc<HashSet<String>> {
+        Arc::new(raw.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Build a minimal one-route app layered with auth_middleware.
+    fn auth_app(keys: Arc<HashSet<String>>) -> axum::Router {
+        axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "ok" }))
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(keys, auth_middleware))
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_empty_key_set_allows_all() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&[]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_valid_key_returns_200() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&["correct-key"]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("Authorization", "Bearer correct-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_missing_header_returns_401() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&["secret"]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // RFC 7235 §4.1 requires WWW-Authenticate on every 401.
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .expect("WWW-Authenticate header must be present"),
+            "Bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_wrong_key_returns_401_with_www_authenticate() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&["correct-key"]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("Authorization", "Bearer wrong-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_exempt_health_bypasses_key_check() {
+        use tower::ServiceExt;
+        // Even with a required key, /health is always accessible.
+        let app = auth_app(make_keys(&["secret"]));
+        let req = axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── request_id_and_headers_middleware tests ────────────────────────────────
+
+    fn headers_app() -> axum::Router {
+        axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(
+                request_id_and_headers_middleware,
+            ))
+    }
+
+    #[tokio::test]
+    async fn security_headers_always_added_to_response() {
+        use tower::ServiceExt;
+        let app = headers_app();
+        let req = axum::http::Request::builder()
+            .uri("/test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert!(
+            resp.headers().contains_key("x-request-id"),
+            "x-request-id header must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_forwarded_when_client_provides_header() {
+        use tower::ServiceExt;
+        let app = headers_app();
+        let req = axum::http::Request::builder()
+            .uri("/test")
+            .header("X-Request-ID", "my-correlation-id-42")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("my-correlation-id-42"),
+            "client-provided X-Request-ID must be echoed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_generated_as_uuid_when_absent() {
+        use tower::ServiceExt;
+        let app = headers_app();
+        let req = axum::http::Request::builder()
+            .uri("/test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let id = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id must be set");
+        assert!(
+            Uuid::parse_str(id).is_ok(),
+            "generated X-Request-ID must be a valid UUID: {id}"
+        );
+    }
 }

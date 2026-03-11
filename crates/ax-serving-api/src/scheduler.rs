@@ -1120,4 +1120,114 @@ mod tests {
         let ttft_p50 = metrics.ttft_p50_us();
         assert!(ttft_p50 > 0, "ttft histogram should have one sample");
     }
+
+    // ── slow-path queue wait recording ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn slow_path_permit_records_nonzero_queue_wait() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 4,
+                max_wait_ms: 1000,
+                overload_policy: OverloadPolicy::Reject,
+                max_batch_size: 8,
+                batch_window_ms: 5,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        // Occupy the only inflight slot.
+        let p1 = s.acquire().await.unwrap();
+
+        // Spawn a waiter that will enter the slow-path queue.
+        let s2 = Arc::clone(&s);
+        let waiter = tokio::spawn(async move { s2.acquire().await });
+
+        // Give the waiter time to block on the semaphore.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Release the slot so the waiter can proceed.
+        drop(p1);
+
+        let p2 = waiter
+            .await
+            .expect("waiter task panicked")
+            .expect("second acquire failed");
+        assert!(
+            p2.queue_wait_us() > 0,
+            "slow-path permit must record non-zero queue_wait_us"
+        );
+    }
+
+    // ── timeout in admission queue ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn acquire_times_out_when_inflight_slot_never_freed() {
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 4,
+                max_wait_ms: 5, // extremely short timeout
+                overload_policy: OverloadPolicy::Reject,
+                max_batch_size: 8,
+                batch_window_ms: 5,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+
+        // Hold the only slot for the duration of the test.
+        let _p1 = s.acquire().await.unwrap();
+
+        let result = s.acquire().await;
+        assert!(result.is_err(), "should return Err on queue timeout");
+        let msg = match result {
+            Ok(_) => panic!("should return Err on queue timeout"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("timed out"),
+            "error message should mention timeout: {msg}"
+        );
+        assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
+    }
+
+    // ── split-scheduler drop-without-ttft clears prefill ──────────────────────
+
+    #[test]
+    fn split_scheduler_drop_without_ttft_clears_prefill_budget() {
+        // Verify that dropping a permit that was charged prefill tokens but never
+        // called record_ttft_now() correctly releases the prefill budget rather
+        // than leaking it.
+        let metrics = Arc::new(SchedulerMetrics::default());
+        let sem = Arc::new(Semaphore::new(1));
+        let raw = sem.try_acquire_owned().expect("semaphore");
+
+        let permit = SchedulerPermit {
+            _permit: raw,
+            metrics: Arc::clone(&metrics),
+            adaptive: None,
+            arrived_at: Instant::now(),
+            queue_wait_us: 0,
+            estimated_prompt_tokens: 48,
+            ttft_fired: AtomicBool::new(false),
+        };
+
+        // Simulate what acquire_with_tokens does: charge prefill at acquisition.
+        metrics.prefill_tokens_active.store(48, Ordering::Relaxed);
+
+        // Drop without calling record_ttft_now() (error / non-streaming path).
+        drop(permit);
+
+        assert_eq!(
+            metrics.prefill_tokens_active.load(Ordering::Relaxed),
+            0,
+            "prefill budget must be released on drop even if ttft never fired"
+        );
+        assert_eq!(
+            metrics.decode_sequences_active.load(Ordering::Relaxed),
+            0,
+            "decode_sequences must not be incremented when ttft never fired"
+        );
+    }
 }

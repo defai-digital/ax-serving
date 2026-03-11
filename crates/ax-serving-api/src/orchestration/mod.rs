@@ -142,6 +142,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/completions", post(proxy_completions))
+        .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/models", get(proxy_models))
         .route("/health", get(proxy_health))
         .route("/v1/metrics", get(proxy_metrics))
@@ -289,16 +290,18 @@ async fn proxy_inference(
         .await;
 
     // Add X-Reason header for dispatcher-level errors (PRD §FR-3.3).
-    let reason: Option<&'static str> = match resp.status() {
-        StatusCode::SERVICE_UNAVAILABLE => Some("no_eligible_worker"),
-        StatusCode::BAD_GATEWAY => Some("worker_crash"),
-        _ => None,
-    };
-    if let Some(r) = reason {
-        resp.headers_mut().insert(
-            HeaderName::from_static("x-reason"),
-            HeaderValue::from_static(r),
-        );
+    if !resp.headers().contains_key("x-reason") {
+        let reason: Option<&'static str> = match resp.status() {
+            StatusCode::SERVICE_UNAVAILABLE => Some("no_eligible_worker"),
+            StatusCode::BAD_GATEWAY => Some("worker_crash"),
+            _ => None,
+        };
+        if let Some(r) = reason {
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-reason"),
+                HeaderValue::from_static(r),
+            );
+        }
     }
 
     // For streaming responses the body is delivered lazily after this handler
@@ -418,6 +421,16 @@ async fn proxy_completions(
     body: Bytes,
 ) -> axum::response::Response {
     proxy_inference(layer, headers, body, "/v1/completions").await
+}
+
+/// `POST /v1/embeddings` — same admission control, forward to worker's
+/// `/v1/embeddings` endpoint.
+async fn proxy_embeddings(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    proxy_inference(layer, headers, body, "/v1/embeddings").await
 }
 
 /// `GET /v1/models` — aggregate model list across all healthy workers.

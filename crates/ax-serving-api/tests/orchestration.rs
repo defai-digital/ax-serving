@@ -77,16 +77,17 @@ impl Drop for TestConfigHome {
 /// Every POST to `/v1/chat/completions` returns the given `status` and `body`.
 /// The server runs until the test process exits.
 async fn spawn_mock_worker(status: u16, body: &'static str) -> Option<SocketAddr> {
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move || async move {
-            axum::response::Response::builder()
-                .status(status)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap()
-        }),
-    );
+    let response = move || async move {
+        axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(response))
+        .route("/v1/completions", post(response))
+        .route("/v1/embeddings", post(response));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;
@@ -1494,6 +1495,69 @@ async fn test_project_policy_enforces_worker_pool() {
     assert!(
         text.contains("green"),
         "expected policy-enforced green pool response, got {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_embeddings_route_and_project_policy() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig {
+                enabled: true,
+                default_project: None,
+                rules: vec![ax_serving_api::config::ProjectRuleConfig {
+                    project: "fabric".into(),
+                    allowed_models: vec!["embed-*".into()],
+                    max_tokens_limit: None,
+                    worker_pool: Some("green".into()),
+                }],
+            },
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1],"index":0}],"model":"embed-main"}"#)
+            .await
+    );
+    let green = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"data":[{"embedding":[0.9],"index":0}],"model":"embed-main"}"#)
+            .await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["embed-main"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["embed-main"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/embeddings")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-project", "fabric")
+                .body(axum::body::Body::from(
+                    r#"{"model":"embed-main","input":"hello"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("0.9"),
+        "expected policy-enforced green pool embedding response, got {text}"
     );
 }
 

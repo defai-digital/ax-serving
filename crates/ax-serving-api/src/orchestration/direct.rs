@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 use reqwest::Client;
@@ -159,14 +159,10 @@ impl DirectDispatcher {
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
 
             let Some(retry_body) = retry_body else {
-                // Only one eligible worker and it failed — upstream error, not a
-                // capacity/availability issue.  Return 502 so proxy_inference
-                // attaches X-Reason: worker_crash rather than no_eligible_worker.
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("no alternative worker for '{}' after reroute", ctx.model_id),
-                )
-                    .into_response();
+                return worker_failure_response(format!(
+                    "no alternative worker for '{}' after reroute",
+                    ctx.model_id
+                ));
             };
 
             return self
@@ -247,14 +243,7 @@ impl DirectDispatcher {
                 }
             }
             registry.mark_unhealthy(selected2_id);
-            // Both workers returned errors — this is an upstream failure, not a
-            // capacity issue.  Return 502 so proxy_inference attaches
-            // X-Reason: worker_crash rather than no_eligible_worker.
-            return (
-                StatusCode::BAD_GATEWAY,
-                "all workers failed for this request",
-            )
-                .into_response();
+            return worker_failure_response("all workers failed for this request");
         }
 
         // Record affinity only on 2xx — not on 4xx, to avoid biasing future
@@ -280,7 +269,7 @@ impl DirectDispatcher {
         match result {
             Err(e) => {
                 warn!(%url, err = %e, "dispatch request failed");
-                (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                worker_failure_response(e.to_string())
             }
             Ok(resp) => {
                 let status = StatusCode::from_u16(resp.status().as_u16())
@@ -325,7 +314,7 @@ impl DirectDispatcher {
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                         Err(e) => {
                             error!(%url, err = %e, "reading worker response body failed");
-                            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                            worker_failure_response(e.to_string())
                         }
                     }
                 }
@@ -369,6 +358,15 @@ fn preferred_pool_workers(
     } else {
         preferred
     }
+}
+
+fn worker_failure_response(message: impl Into<String>) -> Response {
+    let mut resp = (StatusCode::SERVICE_UNAVAILABLE, message.into()).into_response();
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-reason"),
+        HeaderValue::from_static("worker_crash"),
+    );
+    resp
 }
 
 #[cfg(test)]

@@ -719,4 +719,59 @@ mod tests {
             "should select lower-load worker when TTFT is unknown"
         );
     }
+
+    #[test]
+    fn token_cost_legacy_worker_uses_inflight_as_seqs() {
+        // Legacy worker: active_sequences == 0 && inflight != 0.
+        // The policy must use `inflight` as the sequence count in that case.
+        let legacy_busy = WorkerStatus {
+            id: WorkerId(Uuid::new_v4()),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+            inflight: 3,
+            max_inflight: 4,
+            inflight_counter: Arc::new(AtomicUsize::new(3)),
+            active_sequences: 0, // legacy worker — not yet sending the new field
+            decode_tok_per_sec: 0.0,
+            ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
+        };
+        let modern_idle = WorkerStatus {
+            id: WorkerId(Uuid::new_v4()),
+            addr: "127.0.0.1:8082".parse().unwrap(),
+            inflight: 1,
+            max_inflight: 4,
+            inflight_counter: Arc::new(AtomicUsize::new(1)),
+            active_sequences: 1,
+            decode_tok_per_sec: 0.0,
+            ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
+        };
+        let workers = vec![legacy_busy.clone(), modern_idle.clone()];
+        let sel = TokenCostPolicy::new().select(&workers, &ctx()).unwrap();
+        // modern_idle has lower effective seqs (1) vs legacy (inflight=3) → should win.
+        assert_eq!(sel.id, modern_idle.id);
+    }
+
+    #[test]
+    fn token_cost_legacy_worker_at_capacity_excluded() {
+        // Legacy worker where inflight == max_inflight must be treated as full.
+        let legacy_full = WorkerStatus {
+            id: WorkerId(Uuid::new_v4()),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+            inflight: 4,
+            max_inflight: 4,
+            inflight_counter: Arc::new(AtomicUsize::new(4)),
+            active_sequences: 0,
+            decode_tok_per_sec: 0.0,
+            ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
+        };
+        assert!(
+            TokenCostPolicy::new().select(&[legacy_full], &ctx()).is_none(),
+            "legacy worker at inflight==max_inflight must be excluded"
+        );
+    }
 }

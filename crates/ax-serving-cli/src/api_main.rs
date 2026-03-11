@@ -14,7 +14,7 @@
 //!   AXS_ORCHESTRATOR_PORT   — public proxy port (default: 18080)
 //!   AXS_INTERNAL_PORT       — loopback-only internal API port (default: 19090)
 //!   AXS_DISPATCH_POLICY     — worker selection policy (default: least_inflight)
-//!                             choices: least_inflight | weighted_round_robin | model_affinity
+//!                             choices: least_inflight | weighted_round_robin | model_affinity | token_cost
 //!   AXS_WORKER_HEARTBEAT_MS — heartbeat interval hint sent to workers (default: 5000)
 //!   AXS_WORKER_TTL_MS       — eviction TTL for silent workers (default: 15000)
 //!   AXS_GLOBAL_QUEUE_MAX    — max concurrent requests before overload policy triggers (default: 128)
@@ -58,7 +58,7 @@ struct Cli {
     internal_port: Option<u16>,
 
     /// Worker selection policy.
-    /// Choices: least_inflight (default), weighted_round_robin, model_affinity.
+    /// Choices: least_inflight (default), weighted_round_robin, model_affinity, token_cost.
     /// Overrides AXS_DISPATCH_POLICY.
     #[arg(long)]
     policy: Option<String>,
@@ -78,22 +78,24 @@ fn main() -> Result<()> {
     use ax_serving_api::orchestration::start_orchestrator;
 
     // Load config from YAML (with env-var overrides).
-    let serve_config = ServeConfig::load_default();
-    let mut config = serve_config.orchestrator;
-    let license_config = serve_config.license;
-    let project_policy = serve_config.project_policy;
+    let mut serve_config = ServeConfig::load_default();
     if let Some(h) = cli.host {
-        config.host = h;
+        serve_config.orchestrator.host = h;
     }
     if let Some(p) = cli.port {
-        config.port = p;
+        serve_config.orchestrator.port = p;
     }
     if let Some(p) = cli.internal_port {
-        config.internal_port = p;
+        serve_config.orchestrator.internal_port = p;
     }
     if let Some(pol) = cli.policy {
-        config.dispatch_policy = pol;
+        serve_config.orchestrator.dispatch_policy = pol;
     }
+    serve_config.validate()?;
+
+    let config = serve_config.orchestrator;
+    let license_config = serve_config.license;
+    let project_policy = serve_config.project_policy;
 
     eprintln!(
         "[ax-serving-api] starting: mode=direct public={}:{} internal=127.0.0.1:{} policy={}",

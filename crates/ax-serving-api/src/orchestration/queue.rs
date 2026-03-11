@@ -516,6 +516,55 @@ mod tests {
         assert_eq!(q.metrics.permit_total.load(Ordering::Relaxed), 2);
     }
 
+    // ── shed_oldest with zero queue depth (nothing to shed) ──────────────────
+
+    #[tokio::test]
+    async fn shed_oldest_with_zero_queue_depth_rejects_immediately() {
+        // max_queue_depth=0 means no waiter slots exist.  ShedOldest with an
+        // empty queue can't shed anyone, so it must fall back to Rejected.
+        let q = GlobalQueue::new(cfg(1, 0, 1000, OverloadPolicy::ShedOldest));
+        let _permit = q.acquire(key("a")).await; // occupies sole slot
+        let r = q.acquire(key("b")).await;
+        assert!(
+            matches!(r, AcquireResult::Rejected),
+            "ShedOldest with empty queue must return Rejected"
+        );
+        assert_eq!(q.metrics.rejected_total.load(Ordering::Relaxed), 1);
+        // shed_total must NOT be incremented — nothing was shed.
+        assert_eq!(q.metrics.shed_total.load(Ordering::Relaxed), 0);
+    }
+
+    // ── metrics: all outcome counters ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_track_permit_and_rejected_outcomes() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 0, 100, OverloadPolicy::Reject)));
+
+        // First acquire → Permit.
+        let permit = q.acquire(key("a")).await;
+        assert!(matches!(permit, AcquireResult::Permit(_)));
+        assert_eq!(q.metrics.permit_total.load(Ordering::Relaxed), 1);
+
+        // Second acquire → Rejected (queue depth = 0, no wait room).
+        let r = q.acquire(key("b")).await;
+        assert!(matches!(r, AcquireResult::Rejected));
+        assert_eq!(q.metrics.rejected_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_timeout_outcome() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 20, OverloadPolicy::Reject)));
+        let _permit = q.acquire(key("a")).await; // holds the only slot
+
+        let q2 = Arc::clone(&q);
+        let handle = tokio::spawn(async move { q2.acquire(key("b")).await });
+        let r = handle.await.unwrap();
+        assert!(matches!(r, AcquireResult::Timeout));
+        assert_eq!(q.metrics.timeout_total.load(Ordering::Relaxed), 1);
+        // permit_total is only 1 (the first acquire) — timed-out request must not count.
+        assert_eq!(q.metrics.permit_total.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn queued_handoff_prefers_different_client_when_possible() {
         let q = Arc::new(GlobalQueue::new(cfg(1, 4, 1000, OverloadPolicy::Reject)));

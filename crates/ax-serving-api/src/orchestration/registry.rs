@@ -892,6 +892,144 @@ mod tests {
         assert!(WorkerId::parse("not-a-uuid").is_none());
     }
 
+    // ── register: invalid address falls back gracefully ───────────────────────
+
+    #[test]
+    fn register_invalid_addr_falls_back_to_loopback_sentinel() {
+        let r = WorkerRegistry::new();
+        // A bad address must not poison the registry — the worker is registered
+        // with the "127.0.0.1:1" sentinel so it never receives real traffic.
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "not-a-valid:addr:at:all".into(),
+                capabilities: vec!["m1".to_string()],
+                backend: "auto".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snap = r.get_snapshot(id).unwrap();
+        // The sentinel address is "127.0.0.1:1".
+        assert_eq!(snap.addr, "127.0.0.1:1");
+        // Other fields should still be set correctly.
+        assert_eq!(snap.max_inflight, 4);
+        // The registry should still contain this entry (not poisoned/absent).
+        assert_eq!(r.list_all().len(), 1);
+    }
+
+    // ── tick: full health state-machine transition matrix ─────────────────────
+
+    #[test]
+    fn tick_health_state_transitions_all_four_stages() {
+        let r = WorkerRegistry::new();
+        // ttl = 9000 ms → boundaries at ttl/3 = 3000 ms, 2*ttl/3 = 6000 ms.
+        let ttl_ms = 9_000u64;
+
+        // Helper: register a worker then backdates its last_heartbeat.
+        let make_aged = |age_ms: u64| -> WorkerId {
+            let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+            let id = WorkerId::parse(&resp.worker_id).unwrap();
+            let past = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(age_ms))
+                .expect("test machine must have been running for at least 10 s");
+            r.inner.get_mut(&id).unwrap().last_heartbeat = past;
+            id
+        };
+
+        let id_healthy = make_aged(1_000); // 1 s → Healthy   (≤ 3 s)
+        let id_miss1 = make_aged(4_000); // 4 s → Unhealthy{1} (3 s < age ≤ 6 s)
+        let id_miss2 = make_aged(7_000); // 7 s → Unhealthy{2} (6 s < age ≤ 9 s)
+        let id_dead = make_aged(10_000); // 10 s → Dead         (> 9 s)
+
+        let evicted = r.tick(ttl_ms);
+
+        assert_eq!(evicted.len(), 1, "only the dead worker should be evicted");
+        assert!(evicted.contains(&id_dead));
+        assert!(r.inner.get(&id_dead).is_none(), "dead worker must be removed");
+
+        assert_eq!(r.inner.get(&id_healthy).unwrap().health, WorkerHealth::Healthy);
+        assert_eq!(
+            r.inner.get(&id_miss1).unwrap().health,
+            WorkerHealth::Unhealthy { missed: 1 }
+        );
+        assert_eq!(
+            r.inner.get(&id_miss2).unwrap().health,
+            WorkerHealth::Unhealthy { missed: 2 }
+        );
+    }
+
+    // ── tick: draining workers ─────────────────────────────────────────────────
+
+    #[test]
+    fn tick_draining_worker_evicted_only_after_ttl() {
+        let r = WorkerRegistry::new();
+        let ttl_ms = 9_000u64;
+
+        // Register two draining workers: one fresh, one stale.
+        let resp_fresh = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id_fresh = WorkerId::parse(&resp_fresh.worker_id).unwrap();
+        r.mark_drain(id_fresh);
+
+        let resp_stale = r.register(reg_req("127.0.0.1:8082", &["m1"], 4), 5000);
+        let id_stale = WorkerId::parse(&resp_stale.worker_id).unwrap();
+        r.mark_drain(id_stale);
+        // Backdate the stale worker past the TTL.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(ttl_ms + 1_000))
+            .unwrap();
+        r.inner.get_mut(&id_stale).unwrap().last_heartbeat = past;
+
+        let evicted = r.tick(ttl_ms);
+
+        assert!(evicted.contains(&id_stale), "stale draining worker must be evicted");
+        assert!(!evicted.contains(&id_fresh), "fresh draining worker must not be evicted yet");
+        assert!(r.inner.get(&id_fresh).is_some());
+    }
+
+    // ── mark_unhealthy: idempotent — already-unhealthy stays at missed:1 ───────
+
+    #[test]
+    fn mark_unhealthy_is_idempotent_does_not_escalate() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.mark_unhealthy(id);
+        // Second call on an already-unhealthy worker must not escalate missed count.
+        r.mark_unhealthy(id);
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Unhealthy { missed: 1 },
+            "mark_unhealthy must not escalate beyond missed:1"
+        );
+    }
+
+    // ── eligible_workers: exact model match (no substring) ───────────────────
+
+    #[test]
+    fn eligible_workers_requires_exact_model_id_match() {
+        let r = WorkerRegistry::new();
+        // Worker has "llama3-8b" — must NOT be returned for "llama3" or "llama3-8b-v2".
+        r.register(reg_req("127.0.0.1:8081", &["llama3-8b"], 4), 5000);
+
+        assert_eq!(r.eligible_workers("llama3-8b").len(), 1, "exact match must work");
+        assert!(
+            r.eligible_workers("llama3").is_empty(),
+            "substring 'llama3' must not match 'llama3-8b'"
+        );
+        assert!(
+            r.eligible_workers("llama3-8b-v2").is_empty(),
+            "extended name must not match shorter capability"
+        );
+    }
+
     #[test]
     fn heartbeat_resets_health() {
         let r = WorkerRegistry::new();
