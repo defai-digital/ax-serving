@@ -1919,6 +1919,46 @@ pub async fn admin_startup_report(State(layer): State<Arc<ServingLayer>>) -> imp
     Json(serving_startup_report_value(&layer))
 }
 
+/// `GET /v1/admin/status` — authenticated operational summary for the serving runtime.
+pub async fn admin_status(
+    State(layer): State<Arc<ServingLayer>>,
+    req_id: Option<Extension<RequestId>>,
+) -> impl IntoResponse {
+    let thermal = layer.backend.thermal_state();
+    let loaded_models = layer.registry.list_ids();
+    let scheduler = &layer.scheduler.metrics;
+    let metrics = &layer.metrics;
+
+    Json(serde_json::json!({
+        "request_id": req_id.map(|v| v.0.0).unwrap_or_default(),
+        "service": "serving",
+        "status": if thermal.as_str() == "Critical" { "degraded" } else { "ok" },
+        "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
+        "license": layer.license.to_json(),
+        "runtime": {
+            "rest_addr": layer.config.rest_addr,
+            "grpc_socket": layer.config.grpc_socket,
+            "cache_enabled": layer.cache.is_some(),
+            "split_scheduler": layer.config.split_scheduler,
+        },
+        "models": {
+            "loaded_model_count": loaded_models.len(),
+            "loaded_models": loaded_models,
+        },
+        "scheduler": {
+            "queue_depth": scheduler.queue_depth.load(Ordering::Relaxed),
+            "inflight_count": scheduler.inflight_count.load(Ordering::Relaxed),
+            "rejected_requests": scheduler.rejected_requests.load(Ordering::Relaxed),
+            "effective_inflight_limit": layer.scheduler.effective_inflight_limit(),
+        },
+        "system": {
+            "thermal": thermal.as_str(),
+            "rss_bytes": current_rss_bytes(),
+            "uptime_secs": metrics.uptime_secs(),
+        }
+    }))
+}
+
 /// GET /v1/metrics — scheduler and serving metrics (JSON).
 pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json::Value> {
     let m = &layer.scheduler.metrics;

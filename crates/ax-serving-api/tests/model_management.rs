@@ -2299,6 +2299,50 @@ async fn admin_startup_report_requires_auth_and_returns_runtime_summary() {
 }
 
 #[tokio::test]
+async fn admin_status_requires_auth_and_returns_operational_summary() {
+    let (_layer, app) = make_app_with_key_and_layer("secret");
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/status")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-request-id", "req-admin-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["request_id"], "req-admin-status");
+    assert_eq!(json["service"], "serving");
+    assert_eq!(json["auth_required"], true);
+    assert!(json["models"]["loaded_model_count"].is_u64());
+    assert!(json["scheduler"]["queue_depth"].is_i64());
+    assert!(json["system"]["uptime_secs"].is_u64());
+}
+
+#[tokio::test]
 async fn admin_diagnostics_and_audit_capture_license_change() {
     let (_layer, app) = make_app_with_key_and_layer("secret");
 
