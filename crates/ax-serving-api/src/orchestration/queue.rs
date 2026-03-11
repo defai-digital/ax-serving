@@ -98,6 +98,12 @@ impl Drop for QueuePermit {
             self.active.fetch_sub(1, Ordering::Release);
             return;
         };
+        // Fast exit when no one is queued — avoids locking last_served_client
+        // in the common (no-queue) case.
+        if waiters.is_empty() {
+            self.active.fetch_sub(1, Ordering::Release);
+            return;
+        }
         let mut last_served = self.last_served_client.lock().ok();
         // Hand the slot to the next live waiter; skip dead ones
         // (rx was dropped because the request timed out). When multiple clients
@@ -208,9 +214,8 @@ impl GlobalQueue {
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    if let Ok(mut last_served) = self.last_served_client.lock() {
-                        *last_served = Some(client_key.clone());
-                    }
+                    // Fast path: no waiters to wake, so fairness tracking is
+                    // not needed — skip last_served_client to stay lock-free.
                     self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
                     return AcquireResult::Permit(self.make_permit());
                 }
@@ -237,9 +242,8 @@ impl GlobalQueue {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        if let Ok(mut last_served) = self.last_served_client.lock() {
-                            *last_served = Some(client_key.clone());
-                        }
+                        // Slow-path re-check: fairness not needed here either
+                        // (we're about to return without waking a waiter).
                         self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
                         return AcquireResult::Permit(self.make_permit());
                     }
