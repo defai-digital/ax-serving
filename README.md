@@ -3,6 +3,10 @@
 The Execution And Serving Control Plane For AX Fabric
 
 [![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/defai-digital/ax-serving)](https://github.com/defai-digital/ax-serving/releases)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
+[![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://github.com/defai-digital/ax-serving)
 
 AX Serving is the execution and model-serving control plane for [AX Fabric](https://github.com/defai-digital/ax-fabric). It turns local model runtime into an operational layer for agent workloads with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, scheduling, and benchmarking.
 
