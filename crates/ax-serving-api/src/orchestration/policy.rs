@@ -134,10 +134,12 @@ impl DispatchPolicy for WeightedRoundRobinPolicy {
     ) -> Option<&'a WorkerStatus> {
         // First pass: sum available capacity across all non-full workers.
         // No Vec allocation — two linear scans over the (typically small) slice.
+        // Use saturating addition to guard against overflow in debug builds where
+        // .sum() (checked add) would panic if the total ever exceeded usize::MAX.
         let total_weight: usize = workers
             .iter()
             .map(|w| w.max_inflight.saturating_sub(w.inflight))
-            .sum();
+            .fold(0usize, |acc, cap| acc.saturating_add(cap));
 
         if total_weight == 0 {
             return None;

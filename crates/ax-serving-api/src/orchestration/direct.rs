@@ -159,8 +159,11 @@ impl DirectDispatcher {
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
 
             let Some(retry_body) = retry_body else {
+                // Only one eligible worker and it failed — upstream error, not a
+                // capacity/availability issue.  Return 502 so proxy_inference
+                // attaches X-Reason: worker_crash rather than no_eligible_worker.
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::BAD_GATEWAY,
                     format!("no alternative worker for '{}' after reroute", ctx.model_id),
                 )
                     .into_response();
@@ -244,8 +247,11 @@ impl DirectDispatcher {
                 }
             }
             registry.mark_unhealthy(selected2_id);
+            // Both workers returned errors — this is an upstream failure, not a
+            // capacity issue.  Return 502 so proxy_inference attaches
+            // X-Reason: worker_crash rather than no_eligible_worker.
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::BAD_GATEWAY,
                 "all workers failed for this request",
             )
                 .into_response();
