@@ -5,8 +5,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ax_serving_api::{ServingLayer, config::ServeConfig, rest};
 use ax_serving_engine::{
@@ -969,6 +969,22 @@ async fn slo_gauges_no_data_are_zero() {
     assert!(
         text.contains("axs_ttft_p99_us "),
         "prometheus metrics should expose ttft_p99_us; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_request_class_cold_requests_total "),
+        "prometheus metrics should expose cold request classification; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_request_class_exact_cache_hits_total "),
+        "prometheus metrics should expose exact cache-hit classification; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_request_class_cache_follower_hits_total "),
+        "prometheus metrics should expose follower cache-hit classification; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_request_class_cache_fills_total "),
+        "prometheus metrics should expose cache fill classification; got:\n{text}"
     );
 }
 
@@ -1984,6 +2000,14 @@ async fn v1_metrics_returns_scheduler_key() {
         json["cache"].is_object(),
         "v1/metrics must include 'cache' key"
     );
+    assert!(
+        json["request_classes"].is_object(),
+        "v1/metrics must include 'request_classes' key"
+    );
+    assert!(json["request_classes"]["cold_requests_total"].is_number());
+    assert!(json["request_classes"]["exact_cache_hits_total"].is_number());
+    assert!(json["request_classes"]["cache_follower_hits_total"].is_number());
+    assert!(json["request_classes"]["cache_fills_total"].is_number());
     assert!(json["uptime_secs"].is_number());
 }
 
@@ -2060,7 +2084,9 @@ async fn admin_startup_report_requires_auth_and_returns_runtime_summary() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(json["service"], "serving");
@@ -2111,9 +2137,13 @@ async fn admin_diagnostics_and_audit_capture_license_change() {
     .unwrap();
     assert_eq!(diag_json["request_id"], "req-diag-1");
     assert_eq!(diag_json["startup_report"]["service"], "serving");
-    assert!(diag_json["audit_tail"].as_array().unwrap().iter().any(
-        |e| e["action"] == "license_set" && e["outcome"] == "ok"
-    ));
+    assert!(
+        diag_json["audit_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "license_set" && e["outcome"] == "ok")
+    );
 
     let audit_resp = app
         .oneshot(
@@ -2133,9 +2163,13 @@ async fn admin_diagnostics_and_audit_capture_license_change() {
             .unwrap(),
     )
     .unwrap();
-    assert!(audit_json["events"].as_array().unwrap().iter().any(
-        |e| e["action"] == "license_set" && e["actor"] == "request:req-license-audit"
-    ));
+    assert!(
+        audit_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "license_set" && e["actor"] == "request:req-license-audit")
+    );
 }
 
 #[tokio::test]
@@ -2436,7 +2470,11 @@ async fn cache_follower_wait_does_not_consume_extra_scheduler_permit() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert_eq!(
-        layer.scheduler.metrics.inflight_count.load(Ordering::Relaxed),
+        layer
+            .scheduler
+            .metrics
+            .inflight_count
+            .load(Ordering::Relaxed),
         1,
         "follower wait must not consume a second scheduler permit"
     );
@@ -2456,6 +2494,77 @@ async fn cache_follower_wait_does_not_consume_extra_scheduler_permit() {
     let resp2 = req2.await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
     assert_eq!(resp2.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cold_request_updates_request_class_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cold-request.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_echo_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body = serde_json::json!({
+        "model_id": "cold-request",
+        "path": path.to_string_lossy()
+    })
+    .to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "cold-request",
+        "messages": [{"role": "user", "content": "repeat me"}],
+        "cache": "enable",
+        "stream": false,
+        "max_tokens": 8
+    })
+    .to_string();
+
+    let app = rest::router(Arc::clone(&layer), Arc::clone(&keys));
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let metrics_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_resp.status(), StatusCode::OK);
+    let metrics_text = body_text(metrics_resp).await;
+    let metrics_json: serde_json::Value = serde_json::from_str(&metrics_text).unwrap();
+    assert_eq!(metrics_json["request_classes"]["cold_requests_total"], 1);
+    assert_eq!(metrics_json["request_classes"]["exact_cache_hits_total"], 0);
+    assert_eq!(
+        metrics_json["request_classes"]["cache_follower_hits_total"],
+        0
+    );
 }
 
 #[tokio::test]

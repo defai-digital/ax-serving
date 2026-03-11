@@ -3,8 +3,8 @@
 //! Ported from ax-engine's metrics module. No external dependencies.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ax_serving_engine::GenerationStats;
@@ -181,10 +181,20 @@ impl MetricsStore {
         // the heartbeat loop via `serde_json::json!`, which panics on non-finite
         // f64 (serde_json rejects NaN/±∞ as invalid JSON).  Clamp to 0.0 so the
         // heartbeat never panics and the metric is simply stale rather than fatal.
-        let decode = if stats.decode_tok_per_sec.is_finite() { stats.decode_tok_per_sec } else { 0.0 };
-        let prefill = if stats.prefill_tok_per_sec.is_finite() { stats.prefill_tok_per_sec } else { 0.0 };
-        self.recent_decode_tok_per_sec_bits.store(decode.to_bits(), Ordering::Relaxed);
-        self.recent_prefill_tok_per_sec_bits.store(prefill.to_bits(), Ordering::Relaxed);
+        let decode = if stats.decode_tok_per_sec.is_finite() {
+            stats.decode_tok_per_sec
+        } else {
+            0.0
+        };
+        let prefill = if stats.prefill_tok_per_sec.is_finite() {
+            stats.prefill_tok_per_sec
+        } else {
+            0.0
+        };
+        self.recent_decode_tok_per_sec_bits
+            .store(decode.to_bits(), Ordering::Relaxed);
+        self.recent_prefill_tok_per_sec_bits
+            .store(prefill.to_bits(), Ordering::Relaxed);
     }
 
     pub fn recent_decode_tok_per_sec(&self) -> f64 {
@@ -302,7 +312,10 @@ mod tests {
         assert_eq!(h.p95(), Duration::ZERO);
         assert_eq!(h.p99(), Duration::ZERO);
         let (p50, p95, p99) = h.percentiles();
-        assert_eq!((p50, p95, p99), (Duration::ZERO, Duration::ZERO, Duration::ZERO));
+        assert_eq!(
+            (p50, p95, p99),
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO)
+        );
     }
 
     #[test]
@@ -400,7 +413,10 @@ mod tests {
     fn metrics_store_uptime_near_zero_on_construction() {
         let store = MetricsStore::new();
         let uptime = store.uptime_secs();
-        assert!(uptime < 5, "uptime should be near 0 at construction, got {uptime}");
+        assert!(
+            uptime < 5,
+            "uptime should be near 0 at construction, got {uptime}"
+        );
     }
 
     #[test]
@@ -423,8 +439,16 @@ mod tests {
             stop_reason: String::new(),
         };
         store.record_generation_stats(&nan_stats);
-        assert_eq!(store.recent_decode_tok_per_sec(), 0.0, "infinity must be clamped to 0.0");
-        assert_eq!(store.recent_prefill_tok_per_sec(), 0.0, "NaN must be clamped to 0.0");
+        assert_eq!(
+            store.recent_decode_tok_per_sec(),
+            0.0,
+            "infinity must be clamped to 0.0"
+        );
+        assert_eq!(
+            store.recent_prefill_tok_per_sec(),
+            0.0,
+            "NaN must be clamped to 0.0"
+        );
         // Verify that finite values pass through unchanged.
         let finite_stats = ax_serving_engine::GenerationStats {
             prompt_tokens: 512,
@@ -465,6 +489,9 @@ mod tests {
         // The function delegates to the engine's macOS task_info call.
         // Any live process must have at least some resident memory.
         let rss = current_rss_bytes();
-        assert!(rss > 0, "expected non-zero RSS for the current process, got {rss}");
+        assert!(
+            rss > 0,
+            "expected non-zero RSS for the current process, got {rss}"
+        );
     }
 }

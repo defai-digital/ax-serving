@@ -369,6 +369,7 @@ pub async fn chat_completions(
                             Ok(Some(hit_json)) => {
                                 if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                                     // Immediate cache hit — bypass admission entirely.
+                                    layer.metrics.record_exact_cache_hit();
                                     return (
                                         StatusCode::OK,
                                         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -441,6 +442,7 @@ pub async fn chat_completions(
                 Ok(Some(hit_json)) => {
                     if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                         // Cache hit — no permits ever needed.
+                        layer.metrics.record_cache_follower_hit();
                         layer
                             .scheduler
                             .metrics
@@ -624,6 +626,7 @@ pub async fn chat_completions(
         )
             .into_response();
     }
+    layer.metrics.record_cold_request();
 
     // Both permits are carried into the stream/blocking response and dropped
     // only when the full response is sent — keeping inflight slots occupied.
@@ -697,7 +700,19 @@ fn stream_response(
             None::<GenerateEvent>,
             metrics,
         ),
-        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending, metrics)| async move {
+        |(
+            mut rx,
+            id,
+            model,
+            created,
+            phase,
+            first_token,
+            permit,
+            pm,
+            logprobs,
+            pending,
+            metrics,
+        )| async move {
             match phase {
                 2 => None,
                 1 => {
@@ -705,7 +720,9 @@ fn stream_response(
                     let ev = Event::default().data("[DONE]");
                     Some((
                         Ok(ev),
-                        (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
+                        (
+                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                        ),
                     ))
                 }
                 _ => {
@@ -836,16 +853,7 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx,
-                                    id,
-                                    model,
-                                    created,
-                                    1,
-                                    false,
-                                    None,
-                                    None,
-                                    logprobs,
-                                    None,
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
                                     metrics,
                                 ),
                             ))
@@ -881,7 +889,10 @@ fn stream_response(
                             // Drop both permits; next phase emits [DONE] then ends.
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 1, false, None, None, logprobs, None, metrics),
+                                (
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
                             ))
                         }
                         GenerateEvent::Error(e) => {
@@ -893,7 +904,10 @@ fn stream_response(
                             );
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
+                                (
+                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
                             ))
                         }
                         // TokenLogprob is handled above; this arm is unreachable.
@@ -1119,11 +1133,13 @@ async fn blocking_response(
     drop(pm_permit);
     drop(permit);
 
-    if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl)
-        && let Err(e) = cache.set(&key, &response, ttl).await
-    {
-        cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("cache write error: {e}");
+    if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl) {
+        if let Err(e) = cache.set(&key, &response, ttl).await {
+            cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("cache write error: {e}");
+        } else {
+            metrics.record_cache_fill();
+        }
     }
 
     with_timing(
@@ -1229,6 +1245,7 @@ pub async fn text_completions(
                         match cache.get(&key).await {
                             Ok(Some(hit_json)) => {
                                 if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
+                                    layer.metrics.record_exact_cache_hit();
                                     return (
                                         StatusCode::OK,
                                         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1291,6 +1308,7 @@ pub async fn text_completions(
             match cache.get(&key).await {
                 Ok(Some(hit_json)) => {
                     if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
+                        layer.metrics.record_cache_follower_hit();
                         layer
                             .scheduler
                             .metrics
@@ -1450,6 +1468,7 @@ pub async fn text_completions(
         )
             .into_response();
     }
+    layer.metrics.record_cold_request();
 
     let queue_wait_us = permit.queue_wait_us();
     if req.stream {
@@ -1508,14 +1527,28 @@ fn text_stream_response(
             None::<GenerateEvent>,
             metrics,
         ),
-        |(mut rx, id, model, created, phase, first_token, permit, pm, logprobs, pending, metrics)| async move {
+        |(
+            mut rx,
+            id,
+            model,
+            created,
+            phase,
+            first_token,
+            permit,
+            pm,
+            logprobs,
+            pending,
+            metrics,
+        )| async move {
             match phase {
                 2 => None,
                 1 => {
                     let ev = Event::default().data("[DONE]");
                     Some((
                         Ok(ev),
-                        (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
+                        (
+                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                        ),
                     ))
                 }
                 _ => {
@@ -1632,7 +1665,10 @@ fn text_stream_response(
                             let ev = sse_json_event(&chunk);
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 1, false, None, None, logprobs, None, metrics),
+                                (
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
                             ))
                         }
                         GenerateEvent::Error(e) => {
@@ -1644,7 +1680,10 @@ fn text_stream_response(
                             );
                             Some((
                                 Ok(ev),
-                                (rx, id, model, created, 2, false, None, None, logprobs, None, metrics),
+                                (
+                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
                             ))
                         }
                         // Tool calls are not part of the text completions protocol.
@@ -1797,11 +1836,13 @@ async fn text_blocking_response(
     drop(pm_permit);
     drop(permit);
 
-    if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl)
-        && let Err(e) = cache.set(&key, &response, ttl).await
-    {
-        cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("cache write error: {e}");
+    if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl) {
+        if let Err(e) = cache.set(&key, &response, ttl).await {
+            cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("cache write error: {e}");
+        } else {
+            metrics.record_cache_fill();
+        }
     }
 
     with_timing(
@@ -1929,6 +1970,12 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
             "misses": layer.cache_metrics.misses.load(Ordering::Relaxed),
             "writes": layer.cache_metrics.writes.load(Ordering::Relaxed),
             "errors": layer.cache_metrics.errors.load(Ordering::Relaxed),
+        },
+        "request_classes": {
+            "cold_requests_total": layer.metrics.cold_requests_total(),
+            "exact_cache_hits_total": layer.metrics.exact_cache_hits_total(),
+            "cache_follower_hits_total": layer.metrics.cache_follower_hits_total(),
+            "cache_fills_total": layer.metrics.cache_fills_total(),
         }
     }))
 }
@@ -2124,6 +2171,42 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
     buf.push_str(&format!(
         "axs_adaptive_target_p99_ms {}\n",
         layer.scheduler.adaptive_target_p99_ms().unwrap_or(0)
+    ));
+
+    buf.push_str(
+        "# HELP axs_request_class_cold_requests_total Requests that executed inference without a cache result\n",
+    );
+    buf.push_str("# TYPE axs_request_class_cold_requests_total counter\n");
+    buf.push_str(&format!(
+        "axs_request_class_cold_requests_total {}\n",
+        layer.metrics.cold_requests_total()
+    ));
+
+    buf.push_str(
+        "# HELP axs_request_class_exact_cache_hits_total Requests served immediately from exact response-cache hits\n",
+    );
+    buf.push_str("# TYPE axs_request_class_exact_cache_hits_total counter\n");
+    buf.push_str(&format!(
+        "axs_request_class_exact_cache_hits_total {}\n",
+        layer.metrics.exact_cache_hits_total()
+    ));
+
+    buf.push_str(
+        "# HELP axs_request_class_cache_follower_hits_total Requests served from follower waits after a leader cache fill\n",
+    );
+    buf.push_str("# TYPE axs_request_class_cache_follower_hits_total counter\n");
+    buf.push_str(&format!(
+        "axs_request_class_cache_follower_hits_total {}\n",
+        layer.metrics.cache_follower_hits_total()
+    ));
+
+    buf.push_str(
+        "# HELP axs_request_class_cache_fills_total Successful exact response-cache writes after inference\n",
+    );
+    buf.push_str("# TYPE axs_request_class_cache_fills_total counter\n");
+    buf.push_str(&format!(
+        "axs_request_class_cache_fills_total {}\n",
+        layer.metrics.cache_fills_total()
     ));
 
     // ── Thermal ────────────────────────────────────────────────────────────
