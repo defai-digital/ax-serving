@@ -1,6 +1,6 @@
 # AX Serving
 
-The Execution And Serving Control Plane For AX Fabric
+The Offline Serving And Orchestration Plane For AX Fabric
 
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/defai-digital/ax-serving)
@@ -8,86 +8,79 @@ The Execution And Serving Control Plane For AX Fabric
 [![Tests: CI](https://img.shields.io/badge/tests-CI%20verified-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![license-AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-AX Serving is the execution and model-serving control plane for [AX Fabric](https://github.com/defai-digital/ax-fabric). It turns local model runtime into an operational layer for agent workloads with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, scheduling, and benchmarking.
+AX Serving is the offline serving and orchestration layer behind [AX Fabric](https://github.com/defai-digital/ax-fabric). It provides OpenAI-compatible APIs, runtime model lifecycle control, scheduling, metrics, and multi-worker routing on Apple Silicon.
 
-AX Fabric is the product-facing knowledge and retrieval layer. AX Serving exists to power that stack by providing model access, execution control, request routing, and service operations.
+AX Fabric is the product-facing layer for retrieval, knowledge, and grounded agent workflows. AX Serving is the infrastructure layer that makes that stack deployable and operable.
 
-Status: Production Ready | Rust Workspace | Apple Silicon (`aarch64-apple-darwin`) | OpenAI-Compatible REST + gRPC
+Status: production-ready Rust workspace for Apple Silicon (`aarch64-apple-darwin`) with OpenAI-compatible REST, gRPC, runtime model management, and optional multi-worker orchestration.
 
-> What AX Serving is: the execution/control-plane subsystem behind AX Fabric.
+What AX Serving is:
+- the serving/control-plane subsystem behind AX Fabric
+- not the end-user product surface
+- not the low-level inference engine itself
 
-> What AX Serving does: provides model serving, execution orchestration, routing, queueing, runtime load/unload, and operator visibility for AX Fabric deployments.
-
-> Product positioning: AX Fabric is the primary product; AX Serving is the infrastructure layer that makes AX Fabric deployable, scalable, and operable.
+What AX Serving is for:
+- single-node offline serving
+- multi-worker model routing and health-aware dispatch
+- operator-facing runtime control, diagnostics, metrics, and audit surfaces
+- OSS and Business deployments of the public repo
 
 * * *
 
 ## Editions
 
-Jump to: [OSS](#oss) | [Business](#business) | [Enterprise](#enterprise)
+Jump to: [OSS](#oss) | [Business](#business)
 
-| Capability | OSS | Business | Enterprise |
-| --- | --- | --- | --- |
-| OpenAI-compatible REST + gRPC serving | Yes | Yes | Yes |
-| Runtime model load/unload/reload APIs | Yes | Yes | Yes |
-| Scheduler controls, metrics, and dashboard | Yes | Yes | Yes |
-| Benchmark/soak tooling (`ax-serving-bench`) | Yes | Yes | Yes |
-| Local/self-hosted deployment | Yes | Yes | Yes |
-| Single-node runtime | Yes | Yes | Yes |
-| Multi-node Mac Grid | No | Yes | Yes |
-| Multi-node NVIDIA CUDA Grid | No | No | Yes |
-| Commercial licensing terms | No | Included | Included |
-| Contracted support/SLA | No | By agreement | By agreement |
-| Enterprise procurement/compliance terms | No | Optional | Included by agreement |
+| Capability | OSS | Business |
+| --- | --- | --- |
+| OpenAI-compatible REST + gRPC serving | Yes | Yes |
+| Runtime model load/unload/reload APIs | Yes | Yes |
+| Scheduler controls, metrics, dashboard, and admin APIs | Yes | Yes |
+| Benchmark/soak tooling (`ax-serving-bench`) | Yes | Yes |
+| Single-node offline runtime | Yes | Yes |
+| Multi-worker Mac Grid orchestration | No | Yes |
+| Commercial licensing terms | No | Included |
+| Optional support arrangements | No | By agreement |
 
 <details>
 <summary><strong id="oss">OSS</strong></summary>
 
-- License: AGPL-3.0-only, with separate commercial licensing available.
-- Includes AX Serving runtime for single-node deployments.
-- Best for individual builders, prototyping, and teams operating under OSS terms.
-- Multi-node/grid deployment is not part of OSS edition.
+- License: AGPL-3.0-only
+- Best for local builders, evaluation, and teams operating under OSS terms
+- Single-node serving surface in the public repo
 
 </details>
 
 <details>
 <summary><strong id="business">Business</strong></summary>
 
-- Includes everything in OSS.
-- Available under commercial terms (`LICENSE-COMMERCIAL.md`) as an alternative to AGPL obligations, with license key activation via `AXS_LICENSE_KEY` or `POST /v1/license`.
-- Supports multi-node deployment on Mac Grid.
-- Companies with annual revenue under USD 2M can use Business features at no cost.
-- Optional paid support licenses are available.
+- Includes everything in OSS
+- Available under [commercial terms](LICENSE-COMMERCIAL.md) as an alternative to AGPL obligations
+- Adds multi-worker Mac Grid deployment in the public repo
+- License key activation via `AXS_LICENSE_KEY` or `POST /v1/license`
 
 </details>
 
-<details>
-<summary><strong id="enterprise">Enterprise</strong></summary>
-
-- Includes everything in Business.
-- Supports multi-node deployment across Mac Grid and NVIDIA CUDA Grid.
-- Includes NVIDIA Jetson Thor optimizations for higher performance.
-- Designed for enterprise-grade security and enterprise procurement/compliance needs.
-
-</details>
+Private enterprise work is handled in a separate private project. This public repository covers OSS and Business.
 
 * * *
 
-## Quick Start (60 Seconds)
+## Quick Start
 
-### 1. Prerequisites
-
-- macOS on Apple Silicon
+Prerequisites:
+- Apple Silicon macOS
 - Rust toolchain
 - `llama-server` on `PATH`
-- GGUF model file (example: `./models/<model>.gguf`)
+- a GGUF model file
+
+Validate your environment:
 
 ```bash
 cargo check --workspace
 which llama-server
 ```
 
-### 2. Start a Worker
+Start the simplest local runtime:
 
 ```bash
 AXS_ALLOW_NO_AUTH=true \
@@ -98,7 +91,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
   --port 18080
 ```
 
-### 3. Send a Request
+Send a request:
 
 ```bash
 curl -sS http://127.0.0.1:18080/v1/chat/completions \
@@ -111,7 +104,12 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-For full setup paths (single worker + gateway/worker), see [QUICKSTART.md](QUICKSTART.md).
+For fuller setup paths, see [QUICKSTART.md](QUICKSTART.md):
+- single runtime
+- authenticated offline deployment
+- gateway + workers
+- model management
+- embeddings
 
 TypeScript SDK (Zod-validated):
 
@@ -125,22 +123,19 @@ npm run build
 
 ## Why AX Serving
 
-Most local runtimes optimize single-process inference. AX Serving focuses on the execution and serving layer required to run AX Fabric reliably, with model inference exposed as a managed runtime behind the product.
+Most local runtimes focus on single-process inference. AX Serving focuses on the operational layer above inference:
 
-### Positioning
+- OpenAI-compatible REST and gRPC serving
+- runtime model load/unload/reload
+- admission queueing and concurrency control
+- metrics, dashboard, diagnostics, and audit surfaces
+- multi-worker orchestration for Business deployments
+- benchmark and soak tooling in the same repo
 
-AX Serving should be understood as infrastructure, not as the top-level product.
-
-- AX Fabric: the product users adopt for local retrieval, memory, ingestion, and grounded agent workflows
-- AX Serving: the runtime/control plane that powers model execution, APIs, routing, scheduling, and deployment for AX Fabric
-- Together: a complete local stack for grounded AI agents, with AX Fabric as the product surface and AX Serving as the execution substrate
-
-- OpenAI-compatible REST endpoints
-- gRPC serving/control plane
-- Runtime model load/unload/reload
-- Admission queue + concurrency controls
-- Multi-worker orchestrator with health-aware dispatch
-- Built-in benchmark and soak tooling in the same repo
+Positioning:
+- AX Fabric is the product layer
+- AX Serving is the serving and orchestration layer underneath it
+- inference runtimes such as `llama.cpp` or `mistralrs` remain lower-level execution backends
 
 ### Best With AX Fabric
 
@@ -160,7 +155,7 @@ AX Serving is designed to work with AX Fabric as part of one complete system.
 | Streaming SSE + non-streaming responses | ✅ |
 | Runtime model management (`/v1/models`) | ✅ |
 | Multi-worker orchestration (`ax-serving-api`) | ✅ |
-| Dispatch policies (`least_inflight`, `weighted_round_robin`, `model_affinity`) | ✅ |
+| Dispatch policies (`least_inflight`, `weighted_round_robin`, `model_affinity`, `token_cost`) | ✅ |
 | Scheduler queue/inflight controls | ✅ |
 | Prometheus + JSON metrics | ✅ |
 | Embedded dashboard (`/dashboard`) | ✅ |
@@ -170,7 +165,7 @@ AX Serving is designed to work with AX Fabric as part of one complete system.
 
 ## Run Modes
 
-### Single Inference (No Server)
+### 1. Single Inference CLI
 
 ```bash
 cargo run -p ax-serving-cli --bin ax-serving -- \
@@ -179,7 +174,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- \
   -n 128
 ```
 
-### Single Worker (REST + gRPC)
+### 2. Single Runtime (`ax-serving serve`)
 
 ```bash
 AXS_ALLOW_NO_AUTH=true \
@@ -189,7 +184,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
   --port 18080
 ```
 
-### Multi-Worker (Gateway + Workers, Business/Enterprise)
+### 3. Gateway + Workers (`ax-serving-api` + workers, Business)
 
 Gateway:
 
@@ -216,7 +211,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
 
 ## API Surface
 
-Primary REST endpoints:
+### Serving runtime (`ax-serving serve`)
 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
@@ -229,8 +224,30 @@ Primary REST endpoints:
 - `GET /v1/metrics`
 - `GET /metrics`
 - `GET /dashboard`
-- `GET/POST /v1/license`
+- `GET /v1/license`
+- `POST /v1/license`
 - `GET /v1/admin/status`
+- `GET /v1/admin/startup-report`
+- `GET /v1/admin/diagnostics`
+- `GET /v1/admin/audit`
+- `GET /v1/admin/policy`
+
+### Orchestrator (`ax-serving-api`, Business)
+
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/embeddings`
+- `GET /v1/models`
+- `GET /health`
+- `GET /v1/metrics`
+- `GET /v1/license`
+- `POST /v1/license`
+- `GET /v1/admin/status`
+- `GET /v1/admin/startup-report`
+- `GET /v1/admin/diagnostics`
+- `GET /v1/admin/audit`
+- `GET /v1/admin/policy`
+- `GET /v1/admin/fleet`
 - `GET /v1/workers`
 - `GET /v1/workers/{id}`
 - `POST /v1/workers/{id}/drain`
@@ -245,20 +262,11 @@ Runtime health contract:
 AX Fabric integration contract:
 - documented in [docs/contracts/ax-fabric-runtime-contract.md](docs/contracts/ax-fabric-runtime-contract.md)
 
-### v1.5 Control-Plane Surface
-
-`v1.5` makes the orchestrator usable as a production-facing admin surface, not
-just a request proxy.
-
-- `GET /v1/admin/status` gives an authenticated operational summary for queue,
-  dispatch policy, license state, worker counts, and reroute totals
-- `GET /v1/workers` and `GET /v1/workers/{id}` expose authenticated worker
-  inventory and per-worker telemetry
-- `POST /v1/workers/{id}/drain` and `POST /v1/workers/{id}/drain-complete`
-  support the public graceful-drain lifecycle for browser dashboards and ops
-  tooling
-- all authenticated admin responses preserve `X-Request-ID` so operators can
-  correlate API calls with logs and incident notes
+Admin/control-plane notes:
+- all authenticated admin responses preserve `X-Request-ID`
+- `GET /v1/admin/status` gives an operational summary
+- `GET /v1/admin/startup-report` and `GET /v1/admin/diagnostics` are for runtime inspection
+- worker inventory and drain APIs are orchestrator-only
 
 ### v1.4 Runtime Controls
 

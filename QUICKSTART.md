@@ -1,8 +1,15 @@
 # AX Serving Quickstart
 
-This guide gets you from checkout to a working AX Serving runtime.
+This guide gets you from checkout to a working AX Serving deployment.
 
-AX Serving works best with [AX Fabric](https://github.com/defai-digital/ax-fabric): AX Serving handles agent orchestration and model runtime, while AX Fabric handles local retrieval, vector search, and document ingestion.
+AX Serving works best with [AX Fabric](https://github.com/defai-digital/ax-fabric):
+- AX Fabric is the product-facing retrieval and knowledge layer
+- AX Serving is the serving and orchestration layer underneath it
+
+Use this guide for:
+- a single local serving runtime
+- an authenticated offline deployment
+- a gateway plus multiple workers
 
 ## Prerequisites
 
@@ -20,11 +27,22 @@ which llama-server
 
 ---
 
-## Path A: Single Worker (simplest)
+## Choose A Deployment Path
 
-One process handles everything — model loading, serving, and admission control.
+### Path A: Single Runtime (`ax-serving serve`)
 
-Recommended for offline enterprise pilots:
+One process handles:
+- model loading
+- OpenAI-compatible serving
+- scheduler/admission control
+- metrics, dashboard, and admin endpoints
+
+Best for:
+- OSS usage
+- local evaluation
+- single-node offline deployments
+
+Authenticated startup:
 
 ```bash
 AXS_CONFIG=config/serving.offline-enterprise.yaml \
@@ -37,7 +55,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
   --port 18080
 ```
 
-For ad hoc local development, you can still use the simpler no-auth startup below:
+Ad hoc local startup without auth:
 
 ```bash
 AXS_ALLOW_NO_AUTH=true \
@@ -55,7 +73,7 @@ curl -sS http://127.0.0.1:18080/health
 curl -sS http://127.0.0.1:18080/v1/models
 ```
 
-`/health` is the runtime health contract for integration:
+Runtime health contract:
 - `status`: `ok` or `degraded`
 - `ready`: whether the runtime is able to serve
 - `model_available`: whether at least one model is loaded
@@ -79,9 +97,14 @@ AX Fabric integration should follow the runtime contract in
 
 ---
 
-## Path B: Gateway + Multiple Workers
+### Path B: Gateway + Multiple Workers
 
-The gateway is a stateless API proxy; workers do the inference. Workers register themselves automatically.
+The gateway (`ax-serving-api`) is the public API and orchestration layer. Workers (`ax-serving serve --orchestrator ...`) do the inference and register themselves automatically.
+
+Best for:
+- Business deployments
+- multi-worker Mac Grid
+- fleet-aware routing and admin control
 
 Start the gateway:
 
@@ -115,7 +138,9 @@ curl -sS http://127.0.0.1:18080/v1/models
 
 Dispatch policies:
 - `least_inflight` — routes to the worker with the fewest in-flight requests (default).
-- `weighted_round_robin` — rotates across workers proportionally to their weights.
+- `weighted_round_robin` — rotates across workers proportionally to capacity.
+- `model_affinity` — prefers a worker that has already served the model.
+- `token_cost` — prefers workers with lower effective sequence and TTFT cost.
 
 ---
 
@@ -290,7 +315,7 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
 
 ## Embeddings
 
-Load a dedicated embedding model, or start a chat model with `--embeddings` passed to llama-server.
+Load a dedicated embedding model, or start a chat-capable model with embeddings enabled in the backend.
 
 Basic embedding:
 
@@ -336,7 +361,7 @@ curl -sS http://127.0.0.1:18080/v1/embeddings \
 | `truncate` | bool | `true` | Truncate inputs exceeding context length |
 | `encoding_format` | string | `"float"` | `"float"` or `"base64"` (little-endian f32 bytes) |
 
-### Critical: batch size for embedding workloads
+### Important: batch size for embedding workloads
 
 llama-server's default `n_ubatch=512` causes HTTP 500 errors for any input exceeding 512 tokens. Set both values to 4096 or higher:
 
@@ -457,8 +482,10 @@ AX Serving is available under AGPL-3.0-only by default, with separate commercial
 # One-time env var (both gateway and workers read this)
 export AXS_LICENSE_KEY="your-key-here"
 
-# Or persist via the API (survives restarts without the env var)
+# Or persist via the API (survives restarts without the env var).
+# If API auth is enabled, POST requires Authorization: Bearer <token>.
 curl -sS -X POST http://127.0.0.1:18080/v1/license \
+  -H 'Authorization: Bearer token1' \
   -H 'Content-Type: application/json' \
   -d '{"key":"your-key-here"}'
 ```
@@ -547,7 +574,7 @@ Additional modes: `compare`, `regression-check`, `multi-worker`.
 | `AXS_INTERNAL_API_TOKEN` | Optional shared token for orchestrator internal APIs (`X-Internal-Token`) |
 | `AXS_WORKER_HEARTBEAT_MS` | Worker heartbeat interval (default `5000`) |
 | `AXS_WORKER_TTL_MS` | Worker TTL without heartbeat (default `15000`) |
-| `AXS_DISPATCH_POLICY` | `least_inflight` or `weighted_round_robin` |
+| `AXS_DISPATCH_POLICY` | `least_inflight`, `weighted_round_robin`, `model_affinity`, or `token_cost` |
 | `AXS_MODEL_ALLOWED_DIRS` | Optional comma-separated allowlist of model root directories for `POST /v1/models` |
 | `AXS_LICENSE_KEY` | Commercial license key |
 | `AXS_DASHBOARD_POLL_MS` | Dashboard refresh interval (default `2000`) |
@@ -557,7 +584,7 @@ Additional modes: `compare`, `regression-check`, `multi-worker`.
 | `AXS_LOG_FORMAT` | `pretty` (default) or `json` |
 
 Recommended profiles:
-- `config/serving.offline-enterprise.yaml` — secure starter profile for offline enterprise pilots
+- `config/serving.offline-enterprise.yaml` — secure starter profile for offline Business deployments
 - `config/serving.example.yaml` — full configuration reference
 
 ---
