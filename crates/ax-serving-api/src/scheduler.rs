@@ -54,7 +54,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -145,6 +145,10 @@ pub struct SchedulerMetrics {
     pub queue_wait_us_total: AtomicU64,
     /// Cache followers currently waiting pre-permit (WS3/WS5).
     pub cache_follower_waiting: AtomicI64,
+    /// Prompt tokens currently in the prefill phase (WS2 split scheduler).
+    pub prefill_tokens_active: AtomicI64,
+    /// Sequences currently in the decode phase (WS2 split scheduler).
+    pub decode_sequences_active: AtomicI64,
 
     // HDR latency histograms (accumulate all samples; O(1) record, O(1) percentile).
     // try_lock is used to avoid blocking the hot path if a reader holds the lock.
@@ -164,6 +168,8 @@ impl Default for SchedulerMetrics {
             queued_requests: AtomicU64::new(0),
             queue_wait_us_total: AtomicU64::new(0),
             cache_follower_waiting: AtomicI64::new(0),
+            prefill_tokens_active: AtomicI64::new(0),
+            decode_sequences_active: AtomicI64::new(0),
             queue_wait_histogram: std::sync::Mutex::new(LatencyWindow::new()),
             e2e_histogram: std::sync::Mutex::new(LatencyWindow::new()),
             ttft_histogram: std::sync::Mutex::new(LatencyWindow::new()),
@@ -368,6 +374,8 @@ pub struct Scheduler {
     thermal: Arc<ThermalMonitor>,
     /// Optional AIMD adaptive controller (enabled by `AXS_TARGET_P99_MS > 0`).
     adaptive: Option<Arc<AdaptiveController>>,
+    /// WS2: split prefill/decode tracking enabled (AXS_SPLIT_SCHEDULER).
+    pub split_enabled: bool,
 }
 
 impl Scheduler {
@@ -406,6 +414,9 @@ impl Scheduler {
                  AXS_GLOBAL_QUEUE_OVERLOAD_POLICY for shed_oldest behavior."
             );
         }
+        let split_enabled = std::env::var("AXS_SPLIT_SCHEDULER")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
         let semaphore = Arc::new(Semaphore::new(config.max_inflight));
         Self {
             config,
@@ -413,6 +424,7 @@ impl Scheduler {
             metrics: Arc::new(SchedulerMetrics::default()),
             thermal,
             adaptive,
+            split_enabled,
         }
     }
 
@@ -483,6 +495,8 @@ impl Scheduler {
                 adaptive: self.adaptive.clone(),
                 arrived_at,
                 queue_wait_us: 0,
+                estimated_prompt_tokens: 0,
+                ttft_fired: AtomicBool::new(false),
             });
         }
 
@@ -579,7 +593,28 @@ impl Scheduler {
             adaptive: self.adaptive.clone(),
             arrived_at,
             queue_wait_us,
+            estimated_prompt_tokens: 0,
+            ttft_fired: AtomicBool::new(false),
         })
+    }
+
+    /// Acquire a permit and set the estimated prompt token count for split-scheduler tracking.
+    ///
+    /// When `AXS_SPLIT_SCHEDULER=true`, this enables prefill/decode phase tracking in metrics:
+    /// - `prefill_tokens_active` increments by `tokens` immediately.
+    /// - On first token (`record_ttft_now()`), transitions to `decode_sequences_active`.
+    /// - On drop, releases whichever phase is still held.
+    ///
+    /// If `tokens == 0` or split scheduler is disabled, behaves identically to `acquire()`.
+    pub async fn acquire_with_tokens(&self, tokens: u64) -> Result<SchedulerPermit> {
+        let mut permit = self.acquire().await?;
+        if tokens > 0 && self.split_enabled {
+            permit.estimated_prompt_tokens = tokens;
+            self.metrics
+                .prefill_tokens_active
+                .fetch_add(tokens as i64, Ordering::Relaxed);
+        }
+        Ok(permit)
     }
 
     pub fn config(&self) -> &SchedulerConfig {
@@ -601,6 +636,10 @@ pub struct SchedulerPermit {
     arrived_at: Instant,
     /// Queue wait in µs (0 for fast-path requests that skipped the queue).
     queue_wait_us: u64,
+    /// Estimated prompt token count for split-scheduler tracking (0 = disabled).
+    estimated_prompt_tokens: u64,
+    /// True after record_ttft_now() fires the prefill→decode transition.
+    ttft_fired: AtomicBool,
 }
 
 impl SchedulerPermit {
@@ -614,8 +653,21 @@ impl SchedulerPermit {
     /// Call exactly once, when the first `Token` event is ready to send to the client.
     /// No-op if the histogram lock is contended (stale read on next scrape is acceptable).
     pub fn record_ttft_now(&self) {
+        if self.ttft_fired.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
         self.metrics
             .record_ttft(self.arrived_at.elapsed().as_micros() as u64);
+        // WS2: on first token, transition from prefill to decode phase.
+        if self.estimated_prompt_tokens > 0 {
+            self.metrics
+                .prefill_tokens_active
+                .fetch_sub(self.estimated_prompt_tokens as i64, Ordering::Relaxed);
+            self.metrics
+                .decode_sequences_active
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -626,6 +678,20 @@ impl Drop for SchedulerPermit {
             .record_e2e(self.arrived_at.elapsed().as_micros() as u64);
         if let Some(ref adaptive) = self.adaptive {
             adaptive.maybe_adapt(&self.metrics);
+        }
+        // WS2: release whichever phase budget is still held.
+        if self.estimated_prompt_tokens > 0 {
+            if self.ttft_fired.load(Ordering::Relaxed) {
+                // Streaming: was in decode phase at completion.
+                self.metrics
+                    .decode_sequences_active
+                    .fetch_sub(1, Ordering::Relaxed);
+            } else {
+                // Non-streaming or error: never transitioned, still in prefill.
+                self.metrics
+                    .prefill_tokens_active
+                    .fetch_sub(self.estimated_prompt_tokens as i64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -863,7 +929,11 @@ mod tests {
             }
         }
         ctrl.maybe_adapt(&metrics);
-        assert_eq!(ctrl.effective_limit(), 6, "limit must not change in hold-steady band");
+        assert_eq!(
+            ctrl.effective_limit(),
+            6,
+            "limit must not change in hold-steady band"
+        );
     }
 
     #[test]
@@ -882,10 +952,17 @@ mod tests {
         for _ in 0..4 {
             ctrl.maybe_adapt(&metrics);
         }
-        assert_eq!(ctrl.effective_limit(), 8, "should not change before probe interval");
+        assert_eq!(
+            ctrl.effective_limit(),
+            8,
+            "should not change before probe interval"
+        );
         // Completion 5 should trigger a decrease.
         ctrl.maybe_adapt(&metrics);
-        assert!(ctrl.effective_limit() < 8, "should decrease at probe interval");
+        assert!(
+            ctrl.effective_limit() < 8,
+            "should decrease at probe interval"
+        );
     }
 
     #[test]
@@ -950,5 +1027,64 @@ mod tests {
         // After drop the slot should be free again.
         let p2 = sched.acquire("model-a", 100).await;
         assert!(p2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn acquire_with_tokens_tracks_prefill_then_decode() {
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 100,
+                overload_policy: OverloadPolicy::Reject,
+                max_batch_size: 8,
+                batch_window_ms: 5,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+
+        let permit = s.acquire_with_tokens(16).await.unwrap();
+        let prefill = s.metrics.prefill_tokens_active.load(Ordering::Relaxed);
+        if s.split_enabled {
+            assert_eq!(prefill, 16, "split tracking should charge prompt tokens");
+            permit.record_ttft_now();
+            assert_eq!(s.metrics.prefill_tokens_active.load(Ordering::Relaxed), 0);
+            assert_eq!(s.metrics.decode_sequences_active.load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(
+                prefill, 0,
+                "without split scheduling, token-aware acquire should behave like acquire()"
+            );
+        }
+
+        drop(permit);
+        assert_eq!(s.metrics.decode_sequences_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_ttft_only_counts_once_and_transitions_once() {
+        let metrics = Arc::new(SchedulerMetrics::default());
+        let permit_raw = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("semaphore permit");
+        let permit = SchedulerPermit {
+            _permit: permit_raw,
+            metrics: Arc::clone(&metrics),
+            adaptive: None,
+            arrived_at: Instant::now(),
+            queue_wait_us: 0,
+            estimated_prompt_tokens: 32,
+            ttft_fired: AtomicBool::new(false),
+        };
+
+        metrics.prefill_tokens_active.store(32, Ordering::Relaxed);
+        permit.record_ttft_now();
+        permit.record_ttft_now();
+
+        assert_eq!(metrics.prefill_tokens_active.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.decode_sequences_active.load(Ordering::Relaxed), 1);
+
+        let ttft_p50 = metrics.ttft_p50_us();
+        assert!(ttft_p50 > 0, "ttft histogram should have one sample");
     }
 }

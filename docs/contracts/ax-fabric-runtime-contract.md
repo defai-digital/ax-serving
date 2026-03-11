@@ -18,6 +18,19 @@ This contract defines:
 - AX Serving may run with bearer auth (`AXS_API_KEY`) or explicit no-auth development mode (`AXS_ALLOW_NO_AUTH=true`).
 - `GET /health` is the runtime health contract.
 - `GET /v1/models` is the authoritative model-availability view.
+- AX Fabric should treat only the endpoints and fields documented here as stable for `v1.3`.
+
+## Stable Endpoints For AX Fabric
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/models`
+- `DELETE /v1/models/{id}`
+- `POST /v1/models/{id}/reload`
+- `POST /v1/embeddings`
+- `GET /v1/metrics`
+
+Anything outside this list should be treated as implementation detail unless separately documented.
 
 ## Health Contract
 
@@ -42,6 +55,19 @@ Interpretation:
     - `no_models_loaded`
     - `thermal_critical`
     - `thermal_critical_no_models`
+
+AX Fabric integration rule:
+
+- treat `ready=true` as "the runtime can answer requests"
+- treat `model_available=true` as "a model-backed workload can be dispatched now"
+- treat `status=degraded` with `reason=no_models_loaded` as a recoverable startup state, not a process failure
+
+Expected startup sequence for a healthy local deployment:
+
+1. process starts
+2. `GET /health` returns `200` with `status=degraded`, `ready=true`, `model_available=false`
+3. a model is loaded through `POST /v1/models`
+4. `GET /health` returns `200` with `status=ok`, `ready=true`, `model_available=true`
 
 ## Model Lifecycle Contract
 
@@ -101,6 +127,13 @@ Success:
 Common failure:
 - HTTP `404` if model is not loaded
 
+AX Fabric should not infer lifecycle success from status code alone. It should read:
+
+- `state`
+- `ready`
+- `model_available`
+- `loaded_model_count`
+
 ## Embeddings Contract
 
 `POST /v1/embeddings`
@@ -111,6 +144,60 @@ AX Fabric may rely on:
 - HTTP `404` when the requested model is not loaded
 - HTTP `422` for invalid request shape/validation failure
 - HTTP `501` when the loaded backend does not support embeddings
+- HTTP `500` when the embedding backend fails after request validation succeeds
+
+Stable response fields on HTTP `200`:
+
+- `object=list`
+- `model`
+- `data[]`
+  - `object=embedding`
+  - `index`
+  - `embedding`
+- `usage.prompt_tokens`
+- `usage.total_tokens`
+
+AX Fabric may use either:
+
+- `encoding_format=float`
+- `encoding_format=base64`
+
+Any other `encoding_format` should be treated as client error.
+
+## Metrics Contract
+
+`GET /v1/metrics`
+
+AX Fabric may rely on the following scheduler/runtime keys existing:
+
+- `scheduler.queue_depth`
+- `scheduler.inflight_count`
+- `scheduler.cache_follower_waiting`
+- `scheduler.ttft_p50_us`
+- `scheduler.ttft_p95_us`
+- `scheduler.ttft_p99_us`
+- `scheduler.prefill_tokens_active`
+- `scheduler.decode_sequences_active`
+- `scheduler.split_scheduler_enabled`
+- `loaded_models`
+- `thermal`
+
+These metrics are intended for readiness decisions, integration diagnostics, and local operator visibility. They are not a replacement for request-level success criteria.
+
+## Failure Semantics AX Fabric Should Handle
+
+- `404` from `POST /v1/embeddings`, `POST /v1/chat/completions`, or `POST /v1/completions`
+  - requested model is not loaded
+- `422` from lifecycle or inference endpoints
+  - validation failure or invalid model path/configuration
+- `429`
+  - admission queue full
+- `500`
+  - backend execution failure after admission
+- `501`
+  - requested backend capability is not implemented
+- `503`
+  - throttling, capacity exhaustion, timeout, or service-side overload
 
 ## Operational Guidance
 
@@ -125,4 +212,4 @@ The following are not treated as a stable AX Fabric integration contract in `v1.
 - internal orchestrator endpoints
 - dashboard HTML structure
 - benchmark report file formats
-- experimental scheduler metrics beyond the documented health/runtime surface
+- any scheduler metric not explicitly listed in the Metrics Contract section

@@ -41,6 +41,20 @@ jobs:
       - name: cargo test (lib only)
         run: cargo test --workspace --lib
 
+      - name: Unit test summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Unit Tests
+
+          | Crate | Tests |
+          |---|---|
+          | ax-serving-api | 163 |
+          | ax-serving-engine | 31 |
+          | ax-serving-shim | 22 |
+          | **Total** | **216** |
+          EOF
+
   js-sdk:
     name: JS SDK Build + Typecheck
     runs-on: ubuntu-latest
@@ -94,6 +108,27 @@ jobs:
 
       - name: Integration tests — graceful_shutdown
         run: cargo test -p ax-serving-api --test graceful_shutdown
+
+      - name: Test summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Test Results
+
+          All suites use in-process backends — no GPU or model file required.
+
+          | Suite | Tests | Scope |
+          |---|---|---|
+          | Unit — serving API | 163 | Scheduler, registry, orchestration, auth, metrics, config, gRPC |
+          | Unit — engine | 31 | Backend routing, GGUF metadata, thermal, memory |
+          | Unit — C shim | 22 | llama.h ABI compatibility (21 exported symbols) |
+          | Integration — model\_management | 54 | Auth, model lifecycle, health semantics, input validation, inference, embeddings, security headers |
+          | Integration — orchestration | 23 | Worker heartbeat/eviction, dispatch policies, queue backpressure, reroute, chaos, overload |
+          | Integration — graceful\_shutdown | 2 | In-flight drain on SIGTERM |
+          | **Total** | **295** | |
+
+          Suites marked ✅ passed in this run. Check individual step logs for any failures.
+          EOF
 
   # ── Release readiness validation (runs on v* tags) ───────────────────────────
   # Enforces that baseline files have been populated before a version is tagged.

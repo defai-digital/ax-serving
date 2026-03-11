@@ -188,6 +188,14 @@ impl InferenceBackend for MistralrsBackend {
             builder = builder.with_force_cpu();
         }
 
+        // WS1: expose AXS_MISTRALRS_MAX_SEQS to control continuous-batching depth.
+        let max_num_seqs = std::env::var("AXS_MISTRALRS_MAX_SEQS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32);
+        builder = builder.with_max_num_seqs(max_num_seqs);
+
         // Build the model on the caller thread. Metal device initialization has
         // been observed to fail in some environments when performed on backend
         // worker threads.

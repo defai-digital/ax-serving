@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use ax_serving_api::{ServingLayer, config::ServeConfig, rest};
 use ax_serving_engine::{
-    GenerateEvent, GenerateInput, GenerationParams, GenerationStats, InferenceBackend, LoadConfig,
-    ModelHandle, ModelMetadata, ThermalState,
+    EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
+    GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
 };
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -156,6 +156,168 @@ impl InferenceBackend for CriticalBackend {
     }
 }
 
+struct EmbeddingBackend;
+
+impl InferenceBackend for EmbeddingBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(3),
+            ModelMetadata {
+                architecture: "embed".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 3,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
+    }
+
+    fn embed(
+        &self,
+        _handle: ModelHandle,
+        inputs: &EmbedInput<'_>,
+        _config: &EmbedConfig,
+    ) -> anyhow::Result<EmbedResult> {
+        let (count, prompt_tokens) = match inputs {
+            EmbedInput::Strings(texts) => (
+                texts.len(),
+                texts.iter().map(|s| s.len() as u32).sum::<u32>().max(1),
+            ),
+            EmbedInput::Tokens(seqs) => (
+                seqs.len(),
+                seqs.iter().map(|s| s.len() as u32).sum::<u32>().max(1),
+            ),
+        };
+
+        Ok(EmbedResult {
+            embeddings: (0..count)
+                .map(|i| vec![i as f32, i as f32 + 0.5, i as f32 + 1.0])
+                .collect(),
+            prompt_tokens,
+        })
+    }
+}
+
+struct EmbeddingFailureBackend;
+
+impl InferenceBackend for EmbeddingFailureBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(4),
+            ModelMetadata {
+                architecture: "embed-fail".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 3,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
+    }
+
+    fn embed(
+        &self,
+        _handle: ModelHandle,
+        _inputs: &EmbedInput<'_>,
+        _config: &EmbedConfig,
+    ) -> anyhow::Result<EmbedResult> {
+        Err(anyhow::anyhow!("embedding backend failure"))
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn make_layer() -> Arc<ServingLayer> {
@@ -182,6 +344,14 @@ fn make_app_with_backend_no_auth(backend: Arc<dyn InferenceBackend>) -> axum::Ro
     let layer = make_layer_with_backend(backend);
     let keys = Arc::new(std::collections::HashSet::<String>::new());
     rest::router(layer, keys)
+}
+
+fn make_embedding_layer() -> Arc<ServingLayer> {
+    make_layer_with_backend(Arc::new(EmbeddingBackend))
+}
+
+fn make_embedding_failure_layer() -> Arc<ServingLayer> {
+    make_layer_with_backend(Arc::new(EmbeddingFailureBackend))
 }
 
 /// Build the Axum router with a single required API key.
@@ -662,6 +832,14 @@ async fn slo_gauges_no_data_are_zero() {
         text.contains("axs_slo_error_rate_pass 0"),
         "error_rate_pass should be 0 with no data; got:\n{text}"
     );
+    assert!(
+        text.contains("axs_scheduler_prefill_tokens_active "),
+        "prometheus metrics should expose prefill_tokens_active; got:\n{text}"
+    );
+    assert!(
+        text.contains("axs_scheduler_decode_sequences_active "),
+        "prometheus metrics should expose decode_sequences_active; got:\n{text}"
+    );
 }
 
 // ── EchoBackend ───────────────────────────────────────────────────────────────
@@ -1026,8 +1204,7 @@ async fn text_completions_prompt_too_large_400() {
 #[tokio::test]
 async fn text_completions_max_tokens_exceeded_400() {
     let app = make_app_no_auth();
-    let body =
-        serde_json::json!({"model": "any", "prompt": "hi", "max_tokens": 32769}).to_string();
+    let body = serde_json::json!({"model": "any", "prompt": "hi", "max_tokens": 32769}).to_string();
     let resp = app
         .oneshot(
             Request::builder()
@@ -1112,8 +1289,7 @@ async fn text_completions_model_not_found_404() {
 async fn embeddings_model_id_too_long_400() {
     let app = make_app_no_auth();
     let long_id = "a".repeat(257);
-    let body =
-        serde_json::json!({"model": long_id, "input": "hello"}).to_string();
+    let body = serde_json::json!({"model": long_id, "input": "hello"}).to_string();
     let resp = app
         .oneshot(
             Request::builder()
@@ -1169,8 +1345,7 @@ async fn embeddings_not_implemented_501() {
         .await
         .unwrap();
 
-    let embed_body =
-        serde_json::json!({"model": "embed-test", "input": "hello world"}).to_string();
+    let embed_body = serde_json::json!({"model": "embed-test", "input": "hello world"}).to_string();
     let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
         .oneshot(
             Request::builder()
@@ -1183,6 +1358,109 @@ async fn embeddings_not_implemented_501() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn embeddings_success_200() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embed-model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_embedding_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body =
+        serde_json::json!({"model_id": "embed-ok", "path": path.to_string_lossy()}).to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let embed_body = serde_json::json!({
+        "model": "embed-ok",
+        "input": ["hello", "world"],
+        "encoding_format": "float"
+    })
+    .to_string();
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(embed_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["object"], "list");
+    assert_eq!(json["model"], "embed-ok");
+    let data = json["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["object"], "embedding");
+    assert!(data[0]["embedding"].is_array());
+    assert_eq!(json["usage"]["prompt_tokens"], 10);
+    assert_eq!(json["usage"]["total_tokens"], 10);
+}
+
+#[tokio::test]
+async fn embeddings_backend_failure_500() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embed-fail.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_embedding_failure_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body = serde_json::json!({
+        "model_id": "embed-fail",
+        "path": path.to_string_lossy()
+    })
+    .to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let embed_body = serde_json::json!({"model": "embed-fail", "input": "hello world"}).to_string();
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(embed_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("embedding backend failure"),
+        "backend failure should surface in the error envelope; got: {json}"
+    );
 }
 
 // ── Basic endpoint format tests ───────────────────────────────────────────────
@@ -1203,13 +1481,34 @@ async fn health_without_models_is_degraded_but_ready() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["status"], "degraded", "health status must be 'degraded' with no models; got: {json}");
-    assert_eq!(json["ready"], true, "runtime should still be ready without models");
-    assert_eq!(json["model_available"], false, "health must report no models available");
-    assert_eq!(json["reason"], "no_models_loaded", "health should explain degraded no-model state");
-    assert!(json["thermal"].is_string(), "health must have thermal field");
-    assert!(json["loaded_models"].is_array(), "health must have loaded_models array");
-    assert_eq!(json["loaded_model_count"], 0, "health must include loaded model count");
+    assert_eq!(
+        json["status"], "degraded",
+        "health status must be 'degraded' with no models; got: {json}"
+    );
+    assert_eq!(
+        json["ready"], true,
+        "runtime should still be ready without models"
+    );
+    assert_eq!(
+        json["model_available"], false,
+        "health must report no models available"
+    );
+    assert_eq!(
+        json["reason"], "no_models_loaded",
+        "health should explain degraded no-model state"
+    );
+    assert!(
+        json["thermal"].is_string(),
+        "health must have thermal field"
+    );
+    assert!(
+        json["loaded_models"].is_array(),
+        "health must have loaded_models array"
+    );
+    assert_eq!(
+        json["loaded_model_count"], 0,
+        "health must include loaded model count"
+    );
 }
 
 #[tokio::test]
@@ -1254,10 +1553,123 @@ async fn health_with_loaded_model_is_ok() {
     assert_eq!(health_resp.status(), StatusCode::OK);
     let text = body_text(health_resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["status"], "ok", "health should be ok with a loaded model; got: {json}");
+    assert_eq!(
+        json["status"], "ok",
+        "health should be ok with a loaded model; got: {json}"
+    );
     assert_eq!(json["ready"], true);
     assert_eq!(json["model_available"], true);
     assert_eq!(json["loaded_model_count"], 1);
+}
+
+#[tokio::test]
+async fn startup_sequence_moves_from_degraded_to_ok_after_model_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("startup-sequence.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let app = rest::router(layer.clone(), keys.clone());
+
+    let initial_health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial_health.status(), StatusCode::OK);
+    let initial_text = body_text(initial_health).await;
+    let initial_json: serde_json::Value = serde_json::from_str(&initial_text).unwrap();
+    assert_eq!(initial_json["status"], "degraded");
+    assert_eq!(initial_json["ready"], true);
+    assert_eq!(initial_json["model_available"], false);
+    assert_eq!(initial_json["reason"], "no_models_loaded");
+
+    let load_body = serde_json::json!({
+        "model_id": "startup-sequence",
+        "path": path,
+        "backend": "llama_cpp"
+    });
+    let load_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let final_health = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_health.status(), StatusCode::OK);
+    let final_text = body_text(final_health).await;
+    let final_json: serde_json::Value = serde_json::from_str(&final_text).unwrap();
+    assert_eq!(final_json["status"], "ok");
+    assert_eq!(final_json["ready"], true);
+    assert_eq!(final_json["model_available"], true);
+    assert_eq!(final_json["loaded_model_count"], 1);
+}
+
+#[tokio::test]
+async fn failed_model_load_leaves_health_degraded_without_models() {
+    let app = make_app_no_auth();
+    let load_body = serde_json::json!({
+        "model_id": "missing-model",
+        "path": "/definitely/missing/model.gguf"
+    })
+    .to_string();
+
+    let load_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let health_resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_resp.status(), StatusCode::OK);
+    let text = body_text(health_resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], false);
+    assert_eq!(json["loaded_model_count"], 0);
+    assert_eq!(json["reason"], "no_models_loaded");
 }
 
 #[tokio::test]
@@ -1362,7 +1774,11 @@ async fn list_models_returns_list_format() {
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(json["object"], "list");
     assert!(json["data"].is_array());
-    assert_eq!(json["data"].as_array().unwrap().len(), 0, "no models loaded initially");
+    assert_eq!(
+        json["data"].as_array().unwrap().len(),
+        0,
+        "no models loaded initially"
+    );
 }
 
 #[tokio::test]
@@ -1422,9 +1838,18 @@ async fn v1_metrics_returns_scheduler_key() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(json["scheduler"].is_object(), "v1/metrics must include 'scheduler' key");
+    assert!(
+        json["scheduler"].is_object(),
+        "v1/metrics must include 'scheduler' key"
+    );
     assert!(json["scheduler"]["max_inflight"].is_number());
-    assert!(json["cache"].is_object(), "v1/metrics must include 'cache' key");
+    assert!(json["scheduler"]["prefill_tokens_active"].is_number());
+    assert!(json["scheduler"]["decode_sequences_active"].is_number());
+    assert!(json["scheduler"]["split_scheduler_enabled"].is_boolean());
+    assert!(
+        json["cache"].is_object(),
+        "v1/metrics must include 'cache' key"
+    );
     assert!(json["uptime_secs"].is_number());
 }
 
@@ -1443,7 +1868,10 @@ async fn dashboard_returns_html_content() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
-    assert!(text.contains("<!DOCTYPE html>") || text.contains("<html"), "dashboard must return HTML");
+    assert!(
+        text.contains("<!DOCTYPE html>") || text.contains("<html"),
+        "dashboard must return HTML"
+    );
 }
 
 #[tokio::test]
@@ -1462,7 +1890,10 @@ async fn license_get_returns_json() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(json["edition"].is_string(), "license response must include 'edition'");
+    assert!(
+        json["edition"].is_string(),
+        "license response must include 'edition'"
+    );
 }
 
 #[tokio::test]
@@ -1522,9 +1953,7 @@ async fn security_headers_present_on_responses() {
         "X-Content-Type-Options: nosniff must be present"
     );
     assert_eq!(
-        resp.headers()
-            .get("x-frame-options")
-            .map(|v| v.as_bytes()),
+        resp.headers().get("x-frame-options").map(|v| v.as_bytes()),
         Some(b"DENY".as_ref()),
         "X-Frame-Options: DENY must be present"
     );
@@ -1680,7 +2109,8 @@ async fn unload_model_response_has_required_fields() {
     let layer = make_layer();
     let keys = Arc::new(std::collections::HashSet::<String>::new());
     let load_body =
-        serde_json::json!({"model_id": "unload-fields", "path": path.to_string_lossy()}).to_string();
+        serde_json::json!({"model_id": "unload-fields", "path": path.to_string_lossy()})
+            .to_string();
 
     rest::router(Arc::clone(&layer), Arc::clone(&keys))
         .oneshot(
@@ -1723,7 +2153,8 @@ async fn reload_model_response_has_required_fields() {
     let layer = make_layer();
     let keys = Arc::new(std::collections::HashSet::<String>::new());
     let load_body =
-        serde_json::json!({"model_id": "reload-fields", "path": path.to_string_lossy()}).to_string();
+        serde_json::json!({"model_id": "reload-fields", "path": path.to_string_lossy()})
+            .to_string();
 
     rest::router(Arc::clone(&layer), Arc::clone(&keys))
         .oneshot(

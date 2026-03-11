@@ -223,6 +223,35 @@ fn validate_response_format(response_format: Option<&ResponseFormat>) -> Option<
     }
 }
 
+fn estimated_tokens_from_text(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    chars.saturating_add(3) / 4
+}
+
+fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|msg| {
+            let role_tokens = estimated_tokens_from_text(&msg.role);
+            let name_tokens = msg
+                .name
+                .as_deref()
+                .map(estimated_tokens_from_text)
+                .unwrap_or(0);
+            let content_tokens = estimated_tokens_from_text(&msg.content.as_text());
+            role_tokens
+                .saturating_add(name_tokens)
+                .saturating_add(content_tokens)
+                .saturating_add(4)
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
+fn estimate_text_prompt_tokens(prompt: &str) -> u64 {
+    estimated_tokens_from_text(prompt).max(1)
+}
+
 /// POST /v1/chat/completions
 ///
 /// Supports both streaming (SSE) and non-streaming responses.
@@ -319,10 +348,9 @@ pub async fn chat_completions(
     // has an immediate cache hit, we return here without acquiring any admission
     // permits.  True cache hits are free: they consume no scheduler capacity.
     //
-    // In every other case (Leader+miss, Follower) we record state and fall
-    // through to permit acquisition.  Follower waits then happen *after* permits
-    // are acquired (Phase 2 below), so blocked followers count against the
-    // scheduler's inflight budget and are subject to admission back-pressure.
+    // In every other case (Leader+miss, Follower) we record state and continue.
+    // Followers wait in the pre-permit path below, so true deduplicated waiters
+    // do not consume scheduler capacity unless they later promote to leader.
     let mut pending_follower: Option<(String, tokio::sync::broadcast::Receiver<()>)> = None;
 
     if cache_active && let Some(cache) = &layer.cache {
@@ -342,10 +370,7 @@ pub async fn chat_completions(
                                     // Immediate cache hit — bypass admission entirely.
                                     return (
                                         StatusCode::OK,
-                                        [(
-                                            axum::http::header::CONTENT_TYPE,
-                                            "application/json",
-                                        )],
+                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
                                         hit_json,
                                     )
                                         .into_response();
@@ -457,7 +482,9 @@ pub async fn chat_completions(
                                 .fetch_sub(1, Ordering::Relaxed);
                             return (
                                 StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({"error": format!("invalid cache_ttl: {e}")})),
+                                Json(
+                                    serde_json::json!({"error": format!("invalid cache_ttl: {e}")}),
+                                ),
                             )
                                 .into_response();
                         }
@@ -497,7 +524,12 @@ pub async fn chat_completions(
     };
 
     // Acquire global admission slot — returns 429 on queue-full, 503 on timeout/throttle.
-    let permit = match layer.scheduler.acquire().await {
+    let estimated_prompt_tokens = estimate_chat_prompt_tokens(&req.messages);
+    let permit = match layer
+        .scheduler
+        .acquire_with_tokens(estimated_prompt_tokens)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -1054,7 +1086,10 @@ async fn blocking_response(
         tracing::warn!("cache write error: {e}");
     }
 
-    with_timing((StatusCode::OK, Json(response)).into_response(), queue_wait_us)
+    with_timing(
+        (StatusCode::OK, Json(response)).into_response(),
+        queue_wait_us,
+    )
 }
 
 /// POST /v1/completions
@@ -1156,10 +1191,7 @@ pub async fn text_completions(
                                 if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                                     return (
                                         StatusCode::OK,
-                                        [(
-                                            axum::http::header::CONTENT_TYPE,
-                                            "application/json",
-                                        )],
+                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
                                         hit_json,
                                     )
                                         .into_response();
@@ -1259,7 +1291,9 @@ pub async fn text_completions(
                                 .fetch_sub(1, Ordering::Relaxed);
                             return (
                                 StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({"error": format!("invalid cache_ttl: {e}")})),
+                                Json(
+                                    serde_json::json!({"error": format!("invalid cache_ttl: {e}")}),
+                                ),
                             )
                                 .into_response();
                         }
@@ -1296,7 +1330,12 @@ pub async fn text_completions(
         }
     };
 
-    let permit = match layer.scheduler.acquire().await {
+    let estimated_prompt_tokens = estimate_text_prompt_tokens(&req.prompt);
+    let permit = match layer
+        .scheduler
+        .acquire_with_tokens(estimated_prompt_tokens)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -1554,7 +1593,18 @@ fn text_stream_response(
                         // Tool calls are not part of the text completions protocol.
                         GenerateEvent::ToolCall { .. } => Some((
                             Ok(Event::default().comment("")),
-                            (rx, id, model, created, 0, first_token, permit, pm, logprobs, None),
+                            (
+                                rx,
+                                id,
+                                model,
+                                created,
+                                0,
+                                first_token,
+                                permit,
+                                pm,
+                                logprobs,
+                                None,
+                            ),
                         )),
                         // TokenLogprob was resolved above; this arm is unreachable.
                         GenerateEvent::TokenLogprob { .. } => unreachable!(),
@@ -1694,7 +1744,10 @@ async fn text_blocking_response(
         tracing::warn!("cache write error: {e}");
     }
 
-    with_timing((StatusCode::OK, Json(response)).into_response(), queue_wait_us)
+    with_timing(
+        (StatusCode::OK, Json(response)).into_response(),
+        queue_wait_us,
+    )
 }
 
 // ── Other routes ──────────────────────────────────────────────────────────────
@@ -1780,11 +1833,14 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
             "e2e_p95_us": m.e2e_p95_us(),
             "e2e_p99_us": m.e2e_p99_us(),
             "cache_follower_waiting": m.cache_follower_waiting.load(Ordering::Relaxed),
+            "prefill_tokens_active": m.prefill_tokens_active.load(Ordering::Relaxed),
+            "decode_sequences_active": m.decode_sequences_active.load(Ordering::Relaxed),
             "ttft_p50_us": m.ttft_p50_us(),
             "ttft_p95_us": m.ttft_p95_us(),
             "ttft_p99_us": m.ttft_p99_us(),
             "effective_inflight_limit": layer.scheduler.effective_inflight_limit(),
             "adaptive_target_p99_ms": layer.scheduler.adaptive_target_p99_ms(),
+            "split_scheduler_enabled": layer.scheduler.split_enabled,
             "max_inflight": cfg.max_inflight,
             "max_queue": cfg.max_queue,
             "max_wait_ms": cfg.max_wait_ms,
@@ -1917,6 +1973,24 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
     buf.push_str(&format!(
         "axs_cache_follower_waiting {}\n",
         m.cache_follower_waiting.load(Ordering::Relaxed)
+    ));
+
+    buf.push_str(
+        "# HELP axs_scheduler_prefill_tokens_active Estimated prompt tokens currently in prefill\n",
+    );
+    buf.push_str("# TYPE axs_scheduler_prefill_tokens_active gauge\n");
+    buf.push_str(&format!(
+        "axs_scheduler_prefill_tokens_active {}\n",
+        m.prefill_tokens_active.load(Ordering::Relaxed)
+    ));
+
+    buf.push_str(
+        "# HELP axs_scheduler_decode_sequences_active Active sequences currently in decode\n",
+    );
+    buf.push_str("# TYPE axs_scheduler_decode_sequences_active gauge\n");
+    buf.push_str(&format!(
+        "axs_scheduler_decode_sequences_active {}\n",
+        m.decode_sequences_active.load(Ordering::Relaxed)
     ));
 
     buf.push_str(
@@ -2704,8 +2778,18 @@ mod tests {
     #[test]
     fn sampling_params_valid_boundaries_accepted() {
         assert!(
-            validate_sampling_params(0.0, 1.0, Some(1), 0.1, None, None, Some(true), Some(20), Some(2))
-                .is_none()
+            validate_sampling_params(
+                0.0,
+                1.0,
+                Some(1),
+                0.1,
+                None,
+                None,
+                Some(true),
+                Some(20),
+                Some(2)
+            )
+            .is_none()
         );
         assert!(
             validate_sampling_params(

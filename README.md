@@ -2,6 +2,8 @@
 
 The Execution And Serving Control Plane For AX Fabric
 
+[![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
+
 AX Serving is the execution and model-serving control plane for [AX Fabric](https://github.com/defai-digital/ax-fabric). It turns local model runtime into an operational layer for agent workloads with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, scheduling, and benchmarking.
 
 AX Fabric is the product-facing knowledge and retrieval layer. AX Serving exists to power that stack by providing model access, execution control, request routing, and service operations.
@@ -230,6 +232,21 @@ Runtime health contract:
 - `status=ok` means the runtime is ready and at least one model is available
 - `status=degraded` means the process is alive but either no model is loaded or the runtime is thermally constrained
 
+AX Fabric integration contract:
+- documented in [docs/contracts/ax-fabric-runtime-contract.md](docs/contracts/ax-fabric-runtime-contract.md)
+
+### v1.4 Runtime Controls
+
+- `AXS_SPLIT_SCHEDULER=true`
+  - enables prefill/decode activity tracking in scheduler metrics
+- `AXS_MISTRALRS_MAX_SEQS=<n>`
+  - controls `mistralrs` continuous-batching sequence depth
+
+Relevant scheduler metrics:
+- `prefill_tokens_active`
+- `decode_sequences_active`
+- `split_scheduler_enabled`
+
 ---
 
 ## Authentication
@@ -269,11 +286,35 @@ cargo clippy --workspace --tests -- -D warnings
 cargo test --workspace
 ```
 
+Integration tests (no model required — uses in-process mock servers):
+
+```bash
+AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test orchestration
+AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test model_management
+AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test graceful_shutdown
+```
+
 Release build:
 
 ```bash
 cargo build --workspace --release
 ```
+
+### Test Coverage
+
+All tests run automatically in CI on every push and pull request against `main`. No model file or GPU is required — tests use in-process backends (`NullBackend`, `EchoBackend`, `FailingUnloadBackend`) that exercise the full request path without hardware.
+
+| Suite | Count | What It Covers |
+|---|---|---|
+| **Unit — serving API** | 163 | Scheduler (permits, AIMD, TTFT histogram, split prefill/decode), model registry (lifecycle, idle eviction, capacity), orchestration (queue, dispatch policies, worker registry, DashMap), REST helpers (cache key normalisation, cache hit ratio), config (env layering, validation), gRPC status mapping, auth, metrics |
+| **Unit — engine** | 31 | Backend routing, GGUF metadata parsing, thermal state, memory budget |
+| **Unit — C shim** | 22 | Null-safe llama.h ABI compatibility (21 exported functions) |
+| **Integration — model\_management** | 54 | Auth (Bearer, whitespace tolerance, 401+WWW-Authenticate), model load/unload/reload (201/200/409/404/503), health semantics (ok/degraded/critical-thermal/no-models), input validation (400/422 on every field), full inference path (chat + completions via EchoBackend), embeddings (400/404/501), security response headers (nosniff, X-Frame-Options, X-Request-ID), metrics JSON keys, dashboard HTML, license GET/SET |
+| **Integration — orchestration** | 23 | Worker register/heartbeat/eviction, dispatch (least-inflight, weighted round-robin, model-affinity, token-cost), queue admission and backpressure, reroute on 5xx, chaos (all workers fail → 503), overload (queue full → 429) |
+| **Integration — graceful\_shutdown** | 2 | In-flight request drains to completion before server exits |
+| **Total** | **295** | |
+
+Every CI run posts a test summary to the GitHub Actions job summary page — see the [Actions tab](https://github.com/defai-digital/ax-serving/actions) for per-run results.
 
 ---
 

@@ -65,6 +65,15 @@ Lifecycle expectation:
 - after `POST /v1/models`, health should become `status=ok` with `model_available=true`
 - after `DELETE /v1/models/{id}`, health should return to degraded if no models remain loaded
 
+AX Fabric integration should follow the runtime contract in
+`docs/contracts/ax-fabric-runtime-contract.md`.
+
+`v1.4` runtime tuning knobs:
+- `AXS_SPLIT_SCHEDULER=true`
+  - enables prefill/decode activity tracking in scheduler metrics
+- `AXS_MISTRALRS_MAX_SEQS=<n>`
+  - sets `mistralrs` continuous-batching sequence depth
+
 ---
 
 ## Path B: Gateway + Multiple Workers
