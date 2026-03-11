@@ -18,7 +18,7 @@ nats-dispatch = ["dep:async-nats"]
 
 [dependencies]
 ## Optional: NATS JetStream client (only compiled with the `nats-dispatch` feature).
-async-nats = { version = "0.37", optional = true }
+async-nats = { version = "0.46", optional = true }
 ax-serving-engine = { path = "../ax-serving-engine" }
 
 tokio = { workspace = true }
