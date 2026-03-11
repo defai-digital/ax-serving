@@ -193,6 +193,16 @@ impl SchedulerMetrics {
     // across 6 sequential reads, causing concurrent request completions to
     // drop their samples (try_lock() → silent miss). A stale 0 on a scrape
     // is acceptable; the next scrape will observe the current value.
+    //
+    // IMPORTANT: always use queue_wait_percentiles_us() when you need all
+    // three values together.  Calling p50/p95/p99 separately takes three
+    // independent snapshots from different shard subsets under contention,
+    // which can produce p50 > p99 in the output.
+
+    /// Returns (p50_us, p95_us, p99_us) from a single consistent snapshot.
+    pub fn queue_wait_percentiles_us(&self) -> (u64, u64, u64) {
+        self.queue_wait_histogram.percentiles_us()
+    }
 
     pub fn queue_wait_p50_us(&self) -> u64 {
         self.queue_wait_histogram.p50_us()
@@ -208,6 +218,11 @@ impl SchedulerMetrics {
 
     // ── End-to-end percentiles (all admitted requests) ─────────────────────
 
+    /// Returns (p50_us, p95_us, p99_us) from a single consistent snapshot.
+    pub fn e2e_percentiles_us(&self) -> (u64, u64, u64) {
+        self.e2e_histogram.percentiles_us()
+    }
+
     pub fn e2e_p50_us(&self) -> u64 {
         self.e2e_histogram.p50_us()
     }
@@ -221,6 +236,11 @@ impl SchedulerMetrics {
     }
 
     // ── TTFT percentiles (streaming requests only) ─────────────────────────
+
+    /// Returns (p50_us, p95_us, p99_us) from a single consistent snapshot.
+    pub fn ttft_percentiles_us(&self) -> (u64, u64, u64) {
+        self.ttft_histogram.percentiles_us()
+    }
 
     pub fn ttft_p50_us(&self) -> u64 {
         self.ttft_histogram.p50_us()
@@ -283,22 +303,34 @@ impl HistogramShards {
         if saw_data { Some(merged) } else { None }
     }
 
+    /// Returns (p50_us, p95_us, p99_us) from a single consistent snapshot.
+    ///
+    /// All three percentiles are derived from the same merged histogram so the
+    /// invariant p50 ≤ p95 ≤ p99 is always maintained.  Callers that need all
+    /// three values MUST use this method rather than calling p50_us/p95_us/p99_us
+    /// individually — three separate snapshots can sample different shard subsets
+    /// under high write contention (try_lock failing), producing p50 > p99.
+    fn percentiles_us(&self) -> (u64, u64, u64) {
+        match self.snapshot() {
+            Some(h) => (
+                h.p50().as_micros() as u64,
+                h.p95().as_micros() as u64,
+                h.p99().as_micros() as u64,
+            ),
+            None => (0, 0, 0),
+        }
+    }
+
     fn p50_us(&self) -> u64 {
-        self.snapshot()
-            .map(|h| h.p50().as_micros() as u64)
-            .unwrap_or(0)
+        self.percentiles_us().0
     }
 
     fn p95_us(&self) -> u64 {
-        self.snapshot()
-            .map(|h| h.p95().as_micros() as u64)
-            .unwrap_or(0)
+        self.percentiles_us().1
     }
 
     fn p99_us(&self) -> u64 {
-        self.snapshot()
-            .map(|h| h.p99().as_micros() as u64)
-            .unwrap_or(0)
+        self.percentiles_us().2
     }
 }
 

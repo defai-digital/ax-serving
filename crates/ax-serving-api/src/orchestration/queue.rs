@@ -196,12 +196,15 @@ impl GlobalQueue {
     /// Try to acquire a concurrency permit.
     ///
     /// **Fast path** (no mutex): if `active < max_concurrent`, claims the slot
-    /// via a CAS loop and returns immediately.
+    /// via a CAS loop and returns immediately.  `client_key_fn` is **not**
+    /// called on the fast path — the key is only computed when the request
+    /// actually enters the wait queue, avoiding a heap allocation per fast-path
+    /// request.
     ///
     /// **Slow path** (mutex): if at capacity, queues the caller (up to
     /// `max_queue_depth`) and waits up to `wait_ms`.  Applies the overload
     /// policy when the queue is also full.
-    pub async fn acquire(&self, client_key: String) -> AcquireResult {
+    pub async fn acquire(&self, client_key_fn: impl FnOnce() -> String) -> AcquireResult {
         // ── Fast path: lock-free CAS loop ────────────────────────────────────
         let max = self.config.max_concurrent;
         let mut current = self.active.load(Ordering::Acquire);
@@ -280,7 +283,8 @@ impl GlobalQueue {
             }
 
             let (tx, rx) = oneshot::channel::<bool>();
-            waiters.push_back(WaiterEntry { client_key, tx });
+            // Compute the client key only now — first point at which it's needed.
+            waiters.push_back(WaiterEntry { client_key: client_key_fn(), tx });
             rx
         }; // ← waiters mutex released here
 
@@ -351,8 +355,8 @@ fn select_next_waiter(
 mod tests {
     use super::*;
 
-    fn key(name: &str) -> String {
-        name.to_string()
+    fn key(name: &'static str) -> impl FnOnce() -> String {
+        move || name.to_string()
     }
 
     fn cfg(max: usize, depth: usize, wait_ms: u64, policy: OverloadPolicy) -> GlobalQueueConfig {

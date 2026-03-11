@@ -1877,6 +1877,14 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
         .collect::<serde_json::Map<_, _>>()
         .into();
 
+    // Single-snapshot percentiles: compute each histogram's tuple once so that
+    // p50 ≤ p95 ≤ p99 is always maintained in the output. Three independent
+    // calls to snapshot() can read different shard subsets under contention
+    // (try_lock failures), making p50 > p99 possible.
+    let (qw_p50, qw_p95, qw_p99) = m.queue_wait_percentiles_us();
+    let (e2e_p50, e2e_p95, e2e_p99) = m.e2e_percentiles_us();
+    let (ttft_p50, ttft_p95, ttft_p99) = m.ttft_percentiles_us();
+
     Json(serde_json::json!({
         "scheduler": {
             "queue_depth": m.queue_depth.load(Ordering::Relaxed),
@@ -1885,18 +1893,18 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
             "rejected_requests": m.rejected_requests.load(Ordering::Relaxed),
             "queued_requests": m.queued_requests.load(Ordering::Relaxed),
             "avg_queue_wait_us": m.avg_queue_wait_us(),
-            "queue_wait_p50_us": m.queue_wait_p50_us(),
-            "queue_wait_p95_us": m.queue_wait_p95_us(),
-            "queue_wait_p99_us": m.queue_wait_p99_us(),
-            "e2e_p50_us": m.e2e_p50_us(),
-            "e2e_p95_us": m.e2e_p95_us(),
-            "e2e_p99_us": m.e2e_p99_us(),
+            "queue_wait_p50_us": qw_p50,
+            "queue_wait_p95_us": qw_p95,
+            "queue_wait_p99_us": qw_p99,
+            "e2e_p50_us": e2e_p50,
+            "e2e_p95_us": e2e_p95,
+            "e2e_p99_us": e2e_p99,
             "cache_follower_waiting": m.cache_follower_waiting.load(Ordering::Relaxed),
             "prefill_tokens_active": m.prefill_tokens_active.load(Ordering::Relaxed),
             "decode_sequences_active": m.decode_sequences_active.load(Ordering::Relaxed),
-            "ttft_p50_us": m.ttft_p50_us(),
-            "ttft_p95_us": m.ttft_p95_us(),
-            "ttft_p99_us": m.ttft_p99_us(),
+            "ttft_p50_us": ttft_p50,
+            "ttft_p95_us": ttft_p95,
+            "ttft_p99_us": ttft_p99,
             "effective_inflight_limit": layer.scheduler.effective_inflight_limit(),
             "adaptive_target_p99_ms": layer.scheduler.adaptive_target_p99_ms(),
             "split_scheduler_enabled": layer.scheduler.split_enabled,
@@ -1925,6 +1933,10 @@ pub async fn metrics(State(layer): State<Arc<ServingLayer>>) -> Json<serde_json:
 /// Content-Type: `text/plain; version=0.0.4`
 pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl IntoResponse {
     let m = &layer.scheduler.metrics;
+    // Single-snapshot percentile tuples — prevents p50 > p99 under shard contention.
+    let (qw_p50, qw_p95, qw_p99) = m.queue_wait_percentiles_us();
+    let (e2e_p50, e2e_p95, e2e_p99) = m.e2e_percentiles_us();
+    let (ttft_p50, ttft_p95, ttft_p99) = m.ttft_percentiles_us();
     let thermal_val = layer.backend.thermal_state() as u64;
     let models_meta = layer.registry.loaded_models_with_meta();
     let loaded_count = models_meta.len();
@@ -1984,46 +1996,37 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
         "# HELP axs_scheduler_queue_wait_p50_us Rolling P50 queue wait in microseconds (slow-path only)\n",
     );
     buf.push_str("# TYPE axs_scheduler_queue_wait_p50_us gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_queue_wait_p50_us {}\n",
-        m.queue_wait_p50_us()
-    ));
+    buf.push_str(&format!("axs_scheduler_queue_wait_p50_us {qw_p50}\n"));
 
     buf.push_str(
         "# HELP axs_scheduler_queue_wait_p95_us Rolling P95 queue wait in microseconds (slow-path only)\n",
     );
     buf.push_str("# TYPE axs_scheduler_queue_wait_p95_us gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_queue_wait_p95_us {}\n",
-        m.queue_wait_p95_us()
-    ));
+    buf.push_str(&format!("axs_scheduler_queue_wait_p95_us {qw_p95}\n"));
 
     buf.push_str(
         "# HELP axs_scheduler_queue_wait_p99_us Rolling P99 queue wait in microseconds (slow-path only)\n",
     );
     buf.push_str("# TYPE axs_scheduler_queue_wait_p99_us gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_queue_wait_p99_us {}\n",
-        m.queue_wait_p99_us()
-    ));
+    buf.push_str(&format!("axs_scheduler_queue_wait_p99_us {qw_p99}\n"));
 
     buf.push_str(
         "# HELP axs_scheduler_e2e_p50_us Rolling P50 end-to-end latency in microseconds\n",
     );
     buf.push_str("# TYPE axs_scheduler_e2e_p50_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p50_us {}\n", m.e2e_p50_us()));
+    buf.push_str(&format!("axs_scheduler_e2e_p50_us {e2e_p50}\n"));
 
     buf.push_str(
         "# HELP axs_scheduler_e2e_p95_us Rolling P95 end-to-end latency in microseconds\n",
     );
     buf.push_str("# TYPE axs_scheduler_e2e_p95_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p95_us {}\n", m.e2e_p95_us()));
+    buf.push_str(&format!("axs_scheduler_e2e_p95_us {e2e_p95}\n"));
 
     buf.push_str(
         "# HELP axs_scheduler_e2e_p99_us Rolling P99 end-to-end latency in microseconds\n",
     );
     buf.push_str("# TYPE axs_scheduler_e2e_p99_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p99_us {}\n", m.e2e_p99_us()));
+    buf.push_str(&format!("axs_scheduler_e2e_p99_us {e2e_p99}\n"));
 
     buf.push_str(
         "# HELP axs_cache_follower_waiting Cache followers currently waiting pre-permit (WS3)\n",
@@ -2056,19 +2059,19 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
         "# HELP axs_ttft_p50_us Rolling P50 time-to-first-token in microseconds (streaming only)\n",
     );
     buf.push_str("# TYPE axs_ttft_p50_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p50_us {}\n", m.ttft_p50_us()));
+    buf.push_str(&format!("axs_ttft_p50_us {ttft_p50}\n"));
 
     buf.push_str(
         "# HELP axs_ttft_p95_us Rolling P95 time-to-first-token in microseconds (streaming only)\n",
     );
     buf.push_str("# TYPE axs_ttft_p95_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p95_us {}\n", m.ttft_p95_us()));
+    buf.push_str(&format!("axs_ttft_p95_us {ttft_p95}\n"));
 
     buf.push_str(
         "# HELP axs_ttft_p99_us Rolling P99 time-to-first-token in microseconds (streaming only)\n",
     );
     buf.push_str("# TYPE axs_ttft_p99_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p99_us {}\n", m.ttft_p99_us()));
+    buf.push_str(&format!("axs_ttft_p99_us {ttft_p99}\n"));
 
     buf.push_str(
         "# HELP axs_adaptive_inflight_limit Effective inflight limit (adaptive or static)\n",
