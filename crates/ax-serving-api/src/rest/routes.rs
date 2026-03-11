@@ -25,18 +25,17 @@ use crate::auth::RequestId;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
 use crate::project_policy;
 use crate::registry::RegistryError;
-use crate::scheduler::SchedulerPermit;
+use crate::scheduler::{SchedulerError, SchedulerPermit};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// Map a scheduler error to the correct HTTP status code.
 ///
-/// - "admission queue full" → 429 Too Many Requests (queue capacity exceeded; client should retry)
-/// - timeout / thermal throttle / shutdown → 503 Service Unavailable (server-side overload)
+/// - [`SchedulerError::QueueFull`] → 429 Too Many Requests (client should retry with back-off)
+/// - All other variants → 503 Service Unavailable (server-side overload / shutdown)
 fn scheduler_error_status(e: &anyhow::Error) -> StatusCode {
-    if e.to_string().starts_with("admission queue full") {
-        StatusCode::TOO_MANY_REQUESTS
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    match e.downcast_ref::<SchedulerError>() {
+        Some(SchedulerError::QueueFull { .. }) => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -3336,5 +3335,40 @@ mod tests {
                 "expected invalid pooling_type: {v}"
             );
         }
+    }
+
+    #[test]
+    fn scheduler_error_status_queue_full_is_429() {
+        let e: anyhow::Error = crate::scheduler::SchedulerError::QueueFull {
+            waiting: 64,
+            max: 64,
+        }
+        .into();
+        assert_eq!(scheduler_error_status(&e), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn scheduler_error_status_timeout_is_503() {
+        let e: anyhow::Error = crate::scheduler::SchedulerError::Timeout { wait_ms: 250 }.into();
+        assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn scheduler_error_status_throttled_is_503() {
+        let e: anyhow::Error =
+            crate::scheduler::SchedulerError::Throttled { cap: 8 }.into();
+        assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn scheduler_error_status_shutting_down_is_503() {
+        let e: anyhow::Error = crate::scheduler::SchedulerError::ShuttingDown.into();
+        assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn scheduler_error_status_generic_error_is_503() {
+        let e: anyhow::Error = anyhow::anyhow!("some unexpected error");
+        assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -10,7 +10,7 @@
 //!
 //! 1. **Admission queue** (`AXS_SCHED_MAX_QUEUE`, default 64) — maximum requests
 //!    allowed to wait for an inflight slot.  If the queue is full the request is
-//!    rejected with 503.
+//!    rejected with 429 (queue-full) or 503 (timeout / thermal throttle).
 //!
 //! 2. **Inflight semaphore** (`AXS_SCHED_MAX_INFLIGHT`, default 8) — concurrent
 //!    in-flight inference calls.  Excess requests wait in the queue up to
@@ -66,6 +66,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 const HISTOGRAM_SHARDS: usize = 8;
+
+// ── Typed scheduler errors ─────────────────────────────────────────────────────
+
+/// Typed errors produced by the admission scheduler.
+///
+/// Route handlers downcast via `anyhow::Error::downcast_ref::<SchedulerError>()`
+/// to map each variant to the correct HTTP status code — the same pattern used
+/// by [`crate::registry::RegistryError`].
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerError {
+    /// Admission queue is full; the caller should retry with back-off (HTTP 429).
+    #[error("admission queue full: {waiting} requests waiting (max {max}); try again later")]
+    QueueFull { waiting: i64, max: usize },
+    /// Request waited longer than `max_wait_ms` for an inflight slot (HTTP 503).
+    #[error("request timed out after {wait_ms}ms in admission queue")]
+    Timeout { wait_ms: u64 },
+    /// Thermal or adaptive soft cap rejected the request after it acquired the semaphore (HTTP 503).
+    #[error("request throttled: concurrency cap ({cap}) reached; try again later")]
+    Throttled { cap: i64 },
+    /// Server is shutting down (HTTP 503).
+    #[error("scheduler semaphore closed (server shutting down)")]
+    ShuttingDown,
+}
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -552,11 +575,11 @@ impl Scheduler {
             self.metrics
                 .rejected_requests
                 .fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!(
-                "admission queue full: {} requests waiting (max {}); try again later",
-                queue_len,
-                self.config.max_queue
-            );
+            return Err(SchedulerError::QueueFull {
+                waiting: queue_len,
+                max: self.config.max_queue,
+            }
+            .into());
         }
 
         // Count requests that actually enter the wait queue (used as denominator
@@ -585,7 +608,7 @@ impl Scheduler {
                 self.metrics
                     .rejected_requests
                     .fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("scheduler semaphore closed (server shutting down)");
+                return Err(SchedulerError::ShuttingDown.into());
             }
             Err(_) => {
                 // Timeout: request waited the full max_wait_ms. Record that wait.
@@ -597,10 +620,10 @@ impl Scheduler {
                 self.metrics
                     .rejected_requests
                     .fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!(
-                    "request timed out after {}ms in admission queue",
-                    self.config.max_wait_ms
-                );
+                return Err(SchedulerError::Timeout {
+                    wait_ms: self.config.max_wait_ms,
+                }
+                .into());
             }
         };
 
@@ -620,9 +643,10 @@ impl Scheduler {
             self.metrics
                 .rejected_requests
                 .fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!(
-                "request throttled: concurrency cap ({effective_limit_now}) reached; try again later",
-            );
+            return Err(SchedulerError::Throttled {
+                cap: effective_limit_now,
+            }
+            .into());
         }
 
         let queue_wait_us = arrived_at.elapsed().as_micros() as u64;
