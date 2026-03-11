@@ -2839,6 +2839,19 @@ fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value 
             "sched_max_inflight": layer.config.sched_max_inflight,
             "sched_max_queue": layer.config.sched_max_queue,
         },
+        "scheduler": {
+            "effective_inflight_limit": layer.scheduler.effective_inflight_limit(),
+            "split_scheduler_enabled": layer.scheduler.split_enabled,
+            "scheduler_managed_batching": false,
+            "batch_hints_advisory_only": true,
+            "max_batch_size_hint": layer.config.sched_max_batch_size,
+            "batch_window_ms_hint": layer.config.sched_batch_window_ms,
+        },
+        "cache": {
+            "enabled": layer.cache.is_some(),
+            "mode": if layer.cache.is_some() { "exact_response" } else { "disabled" },
+            "kv_prefix_cache": false,
+        },
         "trust": {
             "allowed_model_dirs": allowed_model_dirs,
         },

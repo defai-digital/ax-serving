@@ -395,6 +395,10 @@ fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_js
             "global_queue_depth": layer.config.global_queue_depth,
             "global_queue_wait_ms": layer.config.global_queue_wait_ms,
         },
+        "dispatch_runtime": {
+            "scheduler_managed_batching": false,
+            "batch_hints_advisory_only": true,
+        },
         "project_policy": project_policy::summary_json(&layer.project_policy),
         "governance": {
             "project_policy_enabled": layer.project_policy.enabled,

@@ -2302,6 +2302,12 @@ async fn admin_startup_report_requires_auth_and_returns_runtime_summary() {
     assert_eq!(json["auth_required"], true);
     assert!(json["runtime"]["rest_addr"].is_string());
     assert!(json["license"]["edition"].is_string());
+    assert_eq!(json["scheduler"]["scheduler_managed_batching"], false);
+    assert_eq!(json["scheduler"]["batch_hints_advisory_only"], true);
+    assert!(json["scheduler"]["max_batch_size_hint"].is_u64());
+    assert!(json["scheduler"]["batch_window_ms_hint"].is_u64());
+    assert!(json["cache"]["enabled"].is_boolean());
+    assert_eq!(json["cache"]["kv_prefix_cache"], false);
 }
 
 #[tokio::test]

@@ -1142,6 +1142,8 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
     .unwrap();
     assert_eq!(startup_json["service"], "orchestrator");
     assert_eq!(startup_json["auth_required"], true);
+    assert_eq!(startup_json["dispatch_runtime"]["scheduler_managed_batching"], false);
+    assert_eq!(startup_json["dispatch_runtime"]["batch_hints_advisory_only"], true);
 
     let license_set = app
         .clone()
