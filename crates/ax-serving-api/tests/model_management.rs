@@ -693,6 +693,36 @@ async fn text_completions_project_policy_enforces_max_tokens_limit() {
 }
 
 #[tokio::test]
+async fn embeddings_project_policy_requires_header_before_model_lookup() {
+    let backend: Arc<dyn InferenceBackend> = Arc::new(EchoBackend);
+    let config = ServeConfig {
+        project_policy: sample_project_policy(None),
+        ..ServeConfig::default()
+    };
+    let layer = make_layer_with_backend_and_config(backend, config);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let body = serde_json::json!({
+        "model": "embed-missing",
+        "input": "hello"
+    })
+    .to_string();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn auth_models_wrong_key_401() {
     let app = make_app_with_key("secret");
     let resp = app

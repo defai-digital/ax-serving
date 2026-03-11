@@ -2845,6 +2845,11 @@ pub async fn embeddings(
                 .into_response();
         }
     }
+    if let Err(resp) =
+        project_policy::enforce(&headers, &req.model, None, &layer.config.project_policy)
+    {
+        return resp.into_response();
+    }
     let entry = match layer.registry.get(&req.model) {
         Some(e) => e,
         None => {
@@ -2855,11 +2860,6 @@ pub async fn embeddings(
                 .into_response();
         }
     };
-    if let Err(resp) =
-        project_policy::enforce(&headers, &req.model, None, &layer.config.project_policy)
-    {
-        return resp.into_response();
-    }
 
     let handle = entry.handle;
     let model_name = req.model.clone();
