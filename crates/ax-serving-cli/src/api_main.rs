@@ -81,6 +81,7 @@ fn main() -> Result<()> {
     let serve_config = ServeConfig::load_default();
     let mut config = serve_config.orchestrator;
     let license_config = serve_config.license;
+    let project_policy = serve_config.project_policy;
     if let Some(h) = cli.host {
         config.host = h;
     }
@@ -102,5 +103,5 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(start_orchestrator(config, license_config))
+        .block_on(start_orchestrator(config, license_config, project_policy))
 }

@@ -58,8 +58,9 @@ use self::registry::WorkerRegistry;
 use crate::audit::AuditLog;
 use crate::auth::RequestId;
 use crate::license::LicenseState;
+use crate::project_policy;
 
-pub use crate::config::{LicenseConfig, OrchestratorConfig};
+pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
 
 // ── OrchestratorLayer ─────────────────────────────────────────────────────────
 
@@ -74,6 +75,8 @@ pub struct OrchestratorLayer {
     pub retry_after_secs: u64,
     /// Soft license reminder state.
     pub license: Arc<LicenseState>,
+    /// Project-scoped admission policy shared with the public serving API.
+    pub project_policy: Arc<ProjectPolicyConfig>,
     /// Whether the public proxy requires bearer authentication.
     pub public_auth_required: AtomicBool,
     /// In-process audit log for admin and worker lifecycle actions.
@@ -81,7 +84,11 @@ pub struct OrchestratorLayer {
 }
 
 impl OrchestratorLayer {
-    pub fn new(config: OrchestratorConfig, license_config: LicenseConfig) -> Result<Self> {
+    pub fn new(
+        config: OrchestratorConfig,
+        license_config: LicenseConfig,
+        project_policy: ProjectPolicyConfig,
+    ) -> Result<Self> {
         let policy = policy::policy_from_str(&config.dispatch_policy)?;
         let retry_after_secs = config.retry_after_secs;
         let pool_max_idle = config.pool_max_idle_per_host;
@@ -105,6 +112,7 @@ impl OrchestratorLayer {
             queue: GlobalQueue::new(queue_config),
             retry_after_secs,
             license: LicenseState::new(&license_config),
+            project_policy: Arc::new(project_policy),
             public_auth_required: AtomicBool::new(false),
             audit: AuditLog::default_shared(),
         };
@@ -141,6 +149,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/v1/admin/startup-report", get(proxy_admin_startup_report))
         .route("/v1/admin/diagnostics", get(proxy_admin_diagnostics))
         .route("/v1/admin/audit", get(proxy_admin_audit))
+        .route("/v1/admin/policy", get(proxy_admin_policy))
         .route("/v1/admin/fleet", get(proxy_admin_fleet))
         .route("/dashboard", get(proxy_dashboard))
         .route(
@@ -186,21 +195,41 @@ async fn proxy_inference(
         model: Option<String>,
         #[serde(default)]
         stream: bool,
+        #[serde(default)]
+        max_tokens: Option<u32>,
     }
 
     let auth_header = req_headers.get(header::AUTHORIZATION);
-    let preferred_pool = req_headers
+    let requested_pool = req_headers
         .get("x-ax-worker-pool")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (model_id, stream) = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
-        Ok(v) => (v.model.unwrap_or_else(|| "default".to_string()), v.stream),
+    let (model_id, stream, max_tokens) = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
+        Ok(v) => (
+            v.model.unwrap_or_else(|| "default".to_string()),
+            v.stream,
+            v.max_tokens,
+        ),
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
         }
     };
+
+    let resolved_policy = match project_policy::enforce(
+        &req_headers,
+        &model_id,
+        max_tokens,
+        &layer.project_policy,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
+    let preferred_pool = resolved_policy
+        .as_ref()
+        .and_then(|v| v.worker_pool.as_deref())
+        .or(requested_pool);
 
     // Admission control: acquire a queue slot before dispatching.
     let permit = match layer.queue.acquire(fairness_client_key(&req_headers)).await {
@@ -362,6 +391,10 @@ fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_js
             "global_queue_max": layer.config.global_queue_max,
             "global_queue_depth": layer.config.global_queue_depth,
             "global_queue_wait_ms": layer.config.global_queue_wait_ms,
+        },
+        "project_policy": project_policy::summary_json(&layer.project_policy),
+        "governance": {
+            "project_policy_enabled": layer.project_policy.enabled,
         }
     })
 }
@@ -582,6 +615,10 @@ async fn proxy_admin_diagnostics(
         "workers": workers,
         "audit_tail": layer.audit.tail(50),
     }))
+}
+
+async fn proxy_admin_policy(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
+    Json(project_policy::summary_json(&layer.project_policy))
 }
 
 /// `GET /v1/admin/audit` — authenticated recent audit events.
@@ -855,8 +892,13 @@ async fn proxy_set_license(
 pub async fn start_orchestrator(
     config: OrchestratorConfig,
     license_config: LicenseConfig,
+    project_policy: ProjectPolicyConfig,
 ) -> Result<()> {
-    let layer = Arc::new(OrchestratorLayer::new(config.clone(), license_config)?);
+    let layer = Arc::new(OrchestratorLayer::new(
+        config.clone(),
+        license_config,
+        project_policy,
+    )?);
 
     let public_addr = format!("{}:{}", config.host, config.port);
     let internal_addr = format!("127.0.0.1:{}", config.internal_port);

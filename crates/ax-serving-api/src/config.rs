@@ -75,6 +75,8 @@ pub struct ServeConfig {
     pub orchestrator: OrchestratorConfig,
     /// License reminder and dashboard settings.
     pub license: LicenseConfig,
+    /// Project-scoped runtime admission policy.
+    pub project_policy: ProjectPolicyConfig,
 }
 
 impl Default for ServeConfig {
@@ -103,6 +105,7 @@ impl Default for ServeConfig {
             llamacpp: LlamaCppConfig::default(),
             orchestrator: OrchestratorConfig::default(),
             license: LicenseConfig::default(),
+            project_policy: ProjectPolicyConfig::default(),
         }
     }
 }
@@ -283,6 +286,34 @@ impl Default for LicenseConfig {
     }
 }
 
+// ── ProjectPolicyConfig ───────────────────────────────────────────────────────
+
+/// Project-scoped runtime admission policy.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectPolicyConfig {
+    /// Enable project-scoped admission policy.
+    pub enabled: bool,
+    /// Default project name when the request omits `X-AX-Project`.
+    pub default_project: Option<String>,
+    /// Project rules evaluated by exact project-name match.
+    pub rules: Vec<ProjectRuleConfig>,
+}
+
+/// Per-project runtime admission rule.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectRuleConfig {
+    /// Project name matched against `X-AX-Project`.
+    pub project: String,
+    /// Allowed model IDs or prefixes (`prefix*`). Empty = deny all.
+    pub allowed_models: Vec<String>,
+    /// Maximum allowed requested max_tokens for this project (optional).
+    pub max_tokens_limit: Option<u32>,
+    /// Optional worker pool enforced by policy when routing through the orchestrator.
+    pub worker_pool: Option<String>,
+}
+
 // ── ServeConfig methods ───────────────────────────────────────────────────────
 
 impl ServeConfig {
@@ -374,6 +405,42 @@ impl ServeConfig {
                 self.orchestrator.global_queue_depth,
                 self.orchestrator.global_queue_max
             );
+        }
+
+        // ── Project policy ───────────────────────────────────────────────────
+        if self.project_policy.enabled {
+            let mut seen = std::collections::HashSet::new();
+            for rule in &self.project_policy.rules {
+                let project = rule.project.trim();
+                if project.is_empty() {
+                    anyhow::bail!("project_policy.rules[].project must not be empty");
+                }
+                if !seen.insert(project.to_string()) {
+                    anyhow::bail!("duplicate project_policy rule for project '{project}'");
+                }
+                if rule.allowed_models.is_empty() {
+                    anyhow::bail!(
+                        "project_policy rule '{}' must declare at least one allowed model",
+                        project
+                    );
+                }
+                if let Some(limit) = rule.max_tokens_limit
+                    && limit == 0
+                {
+                    anyhow::bail!(
+                        "project_policy rule '{}' max_tokens_limit must be > 0",
+                        project
+                    );
+                }
+            }
+            if let Some(default_project) = self.project_policy.default_project.as_deref()
+                && !seen.contains(default_project)
+            {
+                anyhow::bail!(
+                    "project_policy.default_project '{}' must match a declared rule",
+                    default_project
+                );
+            }
         }
 
         Ok(())
@@ -768,6 +835,43 @@ mod tests {
         cfg.orchestrator.global_queue_max = 128;
         cfg.orchestrator.global_queue_depth = 128;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_project_policy_rules() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![
+            ProjectRuleConfig {
+                project: "fabric".into(),
+                allowed_models: vec!["embed-*".into()],
+                max_tokens_limit: None,
+                worker_pool: None,
+            },
+            ProjectRuleConfig {
+                project: "fabric".into(),
+                allowed_models: vec!["chat-*".into()],
+                max_tokens_limit: None,
+                worker_pool: None,
+            },
+        ];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate project_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_project() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.default_project = Some("missing".into());
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec!["embed-*".into()],
+            max_tokens_limit: None,
+            worker_pool: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("default_project"), "got: {err}");
     }
 
     // ── apply_env_overrides ────────────────────────────────────────────────────

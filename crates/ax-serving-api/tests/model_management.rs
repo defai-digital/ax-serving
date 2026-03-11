@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ax_serving_api::{ServingLayer, config::ServeConfig, rest};
+use ax_serving_api::{
+    ServingLayer,
+    config::{ProjectPolicyConfig, ProjectRuleConfig, ServeConfig},
+    rest,
+};
 use ax_serving_engine::{
     EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
     GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
@@ -336,6 +340,13 @@ fn make_layer_with_backend(backend: Arc<dyn InferenceBackend>) -> Arc<ServingLay
     Arc::new(ServingLayer::new(backend, config))
 }
 
+fn make_layer_with_backend_and_config(
+    backend: Arc<dyn InferenceBackend>,
+    config: ServeConfig,
+) -> Arc<ServingLayer> {
+    Arc::new(ServingLayer::new(backend, config))
+}
+
 /// Build the Axum router with no API key requirement (auth disabled).
 fn make_app_no_auth() -> axum::Router {
     let layer = make_layer();
@@ -355,6 +366,27 @@ fn make_embedding_layer() -> Arc<ServingLayer> {
 
 fn make_embedding_failure_layer() -> Arc<ServingLayer> {
     make_layer_with_backend(Arc::new(EmbeddingFailureBackend))
+}
+
+fn sample_project_policy(default_project: Option<&str>) -> ProjectPolicyConfig {
+    ProjectPolicyConfig {
+        enabled: true,
+        default_project: default_project.map(str::to_string),
+        rules: vec![
+            ProjectRuleConfig {
+                project: "fabric".into(),
+                allowed_models: vec!["echo-*".into(), "embed-*".into()],
+                max_tokens_limit: Some(64),
+                worker_pool: Some("fabric".into()),
+            },
+            ProjectRuleConfig {
+                project: "ops".into(),
+                allowed_models: vec!["*".into()],
+                max_tokens_limit: None,
+                worker_pool: None,
+            },
+        ],
+    }
 }
 
 struct BlockingEchoBackend {
@@ -517,6 +549,147 @@ async fn auth_models_without_key_401() {
         resp.headers().get("www-authenticate").map(|v| v.as_bytes()),
         Some(b"Bearer".as_ref()),
     );
+}
+
+#[tokio::test]
+async fn admin_policy_requires_auth_and_returns_summary() {
+    let backend: Arc<dyn InferenceBackend> = Arc::new(NullBackend);
+    let config = ServeConfig {
+        project_policy: sample_project_policy(Some("fabric")),
+        ..ServeConfig::default()
+    };
+    let layer = make_layer_with_backend_and_config(backend, config);
+    layer.set_public_auth_required(true);
+    let mut keys = std::collections::HashSet::new();
+    keys.insert("secret".to_string());
+    let app = rest::router(Arc::clone(&layer), Arc::new(keys));
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/policy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/policy")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["enabled"], true);
+    assert_eq!(json["header"], "x-ax-project");
+    assert_eq!(json["default_project"], "fabric");
+    assert_eq!(json["rules"][0]["project"], "fabric");
+}
+
+#[tokio::test]
+async fn chat_completions_project_policy_requires_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("echo-chat.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let backend: Arc<dyn InferenceBackend> = Arc::new(EchoBackend);
+    let config = ServeConfig {
+        project_policy: sample_project_policy(None),
+        ..ServeConfig::default()
+    };
+    let layer = make_layer_with_backend_and_config(backend, config);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "echo-chat", "path": path.to_string_lossy()}).to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let infer_body = serde_json::json!({
+        "model": "echo-chat",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 16
+    })
+    .to_string();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(infer_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn text_completions_project_policy_enforces_max_tokens_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("echo-text.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let backend: Arc<dyn InferenceBackend> = Arc::new(EchoBackend);
+    let config = ServeConfig {
+        project_policy: sample_project_policy(None),
+        ..ServeConfig::default()
+    };
+    let layer = make_layer_with_backend_and_config(backend, config);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "echo-text", "path": path.to_string_lossy()}).to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let infer_body =
+        serde_json::json!({"model": "echo-text", "prompt": "hello", "max_tokens": 128}).to_string();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/completions")
+                .header("Content-Type", "application/json")
+                .header("x-ax-project", "fabric")
+                .body(Body::from(infer_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

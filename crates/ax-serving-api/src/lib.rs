@@ -34,6 +34,7 @@ pub mod grpc;
 pub mod license;
 pub mod metrics;
 pub mod orchestration;
+pub mod project_policy;
 pub mod registry;
 pub mod rest;
 pub mod scheduler;

@@ -11,7 +11,7 @@ use ax_serving_engine::{
 };
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::{self, Stream};
@@ -23,6 +23,7 @@ use super::schema::*;
 use crate::ServingLayer;
 use crate::auth::RequestId;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
+use crate::project_policy;
 use crate::registry::RegistryError;
 use crate::scheduler::SchedulerPermit;
 use tokio::sync::OwnedSemaphorePermit;
@@ -258,6 +259,7 @@ fn estimate_text_prompt_tokens(prompt: &str) -> u64 {
 /// Supports both streaming (SSE) and non-streaming responses.
 pub async fn chat_completions(
     State(layer): State<Arc<ServingLayer>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Input validation.
@@ -321,6 +323,11 @@ pub async fn chat_completions(
         let d = layer.default_max_tokens;
         if d > 0 { Some(d) } else { None }
     });
+    if let Err(resp) =
+        project_policy::enforce(&headers, &req.model, effective_max_tokens, &layer.config.project_policy)
+    {
+        return resp.into_response();
+    }
 
     // Look up the model in the registry.
     let entry = match layer.registry.get(&req.model) {
@@ -1155,6 +1162,7 @@ async fn blocking_response(
 /// non-streaming responses.
 pub async fn text_completions(
     State(layer): State<Arc<ServingLayer>>,
+    headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     // Input validation.
@@ -1207,6 +1215,11 @@ pub async fn text_completions(
         let d = layer.default_max_tokens;
         if d > 0 { Some(d) } else { None }
     });
+    if let Err(resp) =
+        project_policy::enforce(&headers, &req.model, effective_max_tokens, &layer.config.project_policy)
+    {
+        return resp.into_response();
+    }
 
     let entry = match layer.registry.get(&req.model) {
         Some(e) => e,
@@ -1999,6 +2012,11 @@ pub async fn admin_diagnostics(
     }))
 }
 
+/// `GET /v1/admin/policy` — authenticated project-policy summary.
+pub async fn admin_policy(State(layer): State<Arc<ServingLayer>>) -> impl IntoResponse {
+    Json(project_policy::summary_json(&layer.config.project_policy))
+}
+
 /// `GET /v1/admin/audit` — authenticated recent audit events.
 pub async fn admin_audit(
     State(layer): State<Arc<ServingLayer>>,
@@ -2783,6 +2801,10 @@ fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value 
         },
         "trust": {
             "allowed_model_dirs": allowed_model_dirs,
+        },
+        "project_policy": project_policy::summary_json(&layer.config.project_policy),
+        "governance": {
+            "project_policy_enabled": layer.config.project_policy.enabled,
         }
     })
 }
@@ -2796,6 +2818,7 @@ fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value 
 /// not implement embeddings (e.g. native mistralrs backend).
 pub async fn embeddings(
     State(layer): State<Arc<ServingLayer>>,
+    headers: HeaderMap,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Response {
     use ax_serving_engine::{EmbedConfig, EmbedInput};
@@ -2832,6 +2855,11 @@ pub async fn embeddings(
                 .into_response();
         }
     };
+    if let Err(resp) =
+        project_policy::enforce(&headers, &req.model, None, &layer.config.project_policy)
+    {
+        return resp.into_response();
+    }
 
     let handle = entry.handle;
     let model_name = req.model.clone();

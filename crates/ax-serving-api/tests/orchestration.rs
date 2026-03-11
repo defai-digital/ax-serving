@@ -15,7 +15,7 @@ use ax_serving_api::orchestration::{
     policy::{DispatchContext, DispatchPolicy, policy_from_str},
     queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy},
     registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry, WorkerStatus},
-    LicenseConfig, OrchestratorConfig, OrchestratorLayer,
+    LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
 };
 use axum::{Router, middleware, routing::post};
 use reqwest::Client;
@@ -138,6 +138,27 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
         chip_model: None,
         worker_pool: None,
         node_class: None,
+    }
+}
+
+fn sample_project_policy(default_project: Option<&str>) -> ProjectPolicyConfig {
+    ProjectPolicyConfig {
+        enabled: true,
+        default_project: default_project.map(str::to_string),
+        rules: vec![
+            ax_serving_api::config::ProjectRuleConfig {
+                project: "fabric".into(),
+                allowed_models: vec!["pool-model".into(), "ops-model".into()],
+                max_tokens_limit: Some(64),
+                worker_pool: Some("green".into()),
+            },
+            ax_serving_api::config::ProjectRuleConfig {
+                project: "ops".into(),
+                allowed_models: vec!["*".into()],
+                max_tokens_limit: None,
+                worker_pool: None,
+            },
+        ],
     }
 }
 
@@ -480,7 +501,12 @@ async fn test_health_endpoint_shape() {
     // use OrchestratorLayer directly and call proxy_health logic via a
     // one-shot axum server.
     let layer = Arc::new(
-        OrchestratorLayer::new(cfg, ax_serving_api::config::LicenseConfig::default()).unwrap(),
+        OrchestratorLayer::new(
+            cfg,
+            ax_serving_api::config::LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
     );
 
     let public_router = {
@@ -872,6 +898,7 @@ async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -969,6 +996,7 @@ async fn test_admin_status_requires_auth_and_returns_operational_summary() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1031,6 +1059,7 @@ async fn test_admin_status_reports_auth_required_from_runtime_state() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1085,6 +1114,7 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1195,6 +1225,7 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1240,12 +1271,48 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
 }
 
 #[tokio::test]
+async fn test_admin_policy_returns_project_policy_summary() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            sample_project_policy(Some("fabric")),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/policy")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["enabled"], true);
+    assert_eq!(json["default_project"], "fabric");
+    assert_eq!(json["rules"][0]["worker_pool"], "green");
+}
+
+#[tokio::test]
 async fn test_license_validation_errors_are_audited() {
     let _config_home = TestConfigHome::new();
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1299,6 +1366,7 @@ async fn test_pool_header_prefers_matching_worker_pool() {
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1345,11 +1413,97 @@ async fn test_pool_header_prefers_matching_worker_pool() {
 }
 
 #[tokio::test]
+async fn test_project_policy_proxy_requires_header() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            sample_project_policy(None),
+        )
+        .unwrap(),
+    );
+    let worker = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#).await);
+    layer
+        .registry
+        .register(reg_req_with_pool(worker, &["ops-model"], Some("green"), Some("m3-pro")), 5000);
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"model":"ops-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_project_policy_enforces_worker_pool() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            sample_project_policy(None),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    let green = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"green"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["pool-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-project", "fabric")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("green"),
+        "expected policy-enforced green pool response, got {text}"
+    );
+}
+
+#[tokio::test]
 async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
             LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
         )
         .unwrap(),
     );
@@ -1471,7 +1625,12 @@ async fn spawn_orchestrator_with_layer(
 )> {
     use ax_serving_api::orchestration::{OrchestratorLayer, proxy_router};
     let layer = Arc::new(
-        OrchestratorLayer::new(cfg, ax_serving_api::config::LicenseConfig::default()).ok()?,
+        OrchestratorLayer::new(
+            cfg,
+            ax_serving_api::config::LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .ok()?,
     );
     let router = proxy_router(Arc::clone(&layer));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
