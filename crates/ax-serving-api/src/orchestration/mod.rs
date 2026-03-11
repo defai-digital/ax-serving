@@ -746,14 +746,31 @@ async fn proxy_drain_worker(
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
+    let actor = audit_actor(req_id);
     let Some(id) = WorkerId::parse(&id_str) else {
+        layer.audit.record(
+            actor,
+            "worker_drain",
+            "worker",
+            Some(id_str),
+            "error",
+            Some(serde_json::json!({"error": "invalid worker id"})),
+        );
         return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
     };
     if !layer.registry.mark_drain(id) {
+        layer.audit.record(
+            actor,
+            "worker_drain",
+            "worker",
+            Some(id.to_string()),
+            "error",
+            Some(serde_json::json!({"error": "worker not found"})),
+        );
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
     layer.audit.record(
-        audit_actor(req_id),
+        actor,
         "worker_drain",
         "worker",
         Some(id.to_string()),
@@ -771,15 +788,32 @@ async fn proxy_drain_complete_worker(
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
+    let actor = audit_actor(req_id);
     let Some(id) = WorkerId::parse(&id_str) else {
+        layer.audit.record(
+            actor,
+            "worker_drain_complete",
+            "worker",
+            Some(id_str),
+            "error",
+            Some(serde_json::json!({"error": "invalid worker id"})),
+        );
         return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
     };
     if layer.registry.get_snapshot(id).is_none() {
+        layer.audit.record(
+            actor,
+            "worker_drain_complete",
+            "worker",
+            Some(id.to_string()),
+            "error",
+            Some(serde_json::json!({"error": "worker not found"})),
+        );
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
     layer.registry.evict(id);
     layer.audit.record(
-        audit_actor(req_id),
+        actor,
         "worker_drain_complete",
         "worker",
         Some(id.to_string()),
@@ -802,16 +836,33 @@ async fn proxy_delete_worker(
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
+    let actor = audit_actor(req_id);
     let Some(id) = WorkerId::parse(&id_str) else {
+        layer.audit.record(
+            actor,
+            "worker_delete",
+            "worker",
+            Some(id_str),
+            "error",
+            Some(serde_json::json!({"error": "invalid worker id"})),
+        );
         return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
     };
     // mark_drain returns false when the worker does not exist.
     if !layer.registry.mark_drain(id) {
+        layer.audit.record(
+            actor,
+            "worker_delete",
+            "worker",
+            Some(id.to_string()),
+            "error",
+            Some(serde_json::json!({"error": "worker not found"})),
+        );
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
     }
     layer.registry.evict(id);
     layer.audit.record(
-        audit_actor(req_id),
+        actor,
         "worker_delete",
         "worker",
         Some(id.to_string()),

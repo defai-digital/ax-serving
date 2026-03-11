@@ -1364,6 +1364,83 @@ async fn test_license_validation_errors_are_audited() {
 }
 
 #[tokio::test]
+async fn test_worker_admin_validation_errors_are_audited() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let missing_worker = WorkerId::new();
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/workers/not-a-worker-id/drain")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-request-id", "req-invalid-worker-id")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let missing = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::DELETE)
+                .uri(format!("/v1/workers/{missing_worker}"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-request-id", "req-missing-worker")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+
+    let audit = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/audit?limit=10")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), axum::http::StatusCode::OK);
+    let audit_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let events = audit_json["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| {
+        e["action"] == "worker_drain"
+            && e["actor"] == "request:req-invalid-worker-id"
+            && e["outcome"] == "error"
+            && e["detail"]["error"] == "invalid worker id"
+    }));
+    assert!(events.iter().any(|e| {
+        e["action"] == "worker_delete"
+            && e["actor"] == "request:req-missing-worker"
+            && e["outcome"] == "error"
+            && e["target_id"] == missing_worker.to_string()
+            && e["detail"]["error"] == "worker not found"
+    }));
+}
+
+#[tokio::test]
 async fn test_pool_header_prefers_matching_worker_pool() {
     let layer = Arc::new(
         OrchestratorLayer::new(
