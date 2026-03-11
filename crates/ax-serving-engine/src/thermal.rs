@@ -70,7 +70,9 @@ impl ThermalMonitor {
     /// Spawns the background polling thread immediately.
     pub fn with_poll(poll_secs: u64) -> Self {
         let poll_secs = poll_secs.max(1);
-        let state = Arc::new(AtomicU8::new(ThermalState::Nominal as u8));
+        // Read the actual current thermal state immediately so callers never
+        // observe a stale Nominal during the first poll interval.
+        let state = Arc::new(AtomicU8::new(read_nsprocessinfo_thermal_state()));
         let max_cpus = detect_performance_core_count().max(1);
 
         // Spawn background poller. It holds a Weak reference so it exits
@@ -215,8 +217,10 @@ mod tests {
 
     #[test]
     fn thermal_monitor_current_starts_nominal() {
-        // Fresh monitor must start at Nominal (the AtomicU8 is initialised to 0).
-        let monitor = ThermalMonitor::with_poll(60); // long poll — won't fire during test
+        // On a test/CI machine there is no thermal pressure, so the initial
+        // synchronous read returns Nominal.  The long poll interval ensures the
+        // background thread never fires during the test.
+        let monitor = ThermalMonitor::with_poll(60);
         assert_eq!(monitor.current(), ThermalState::Nominal);
     }
 

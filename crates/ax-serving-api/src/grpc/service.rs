@@ -92,7 +92,8 @@ impl AxServingServiceTrait for AxServingService {
             vocab_size: meta.vocab_size,
             context_length: meta.context_length,
             file_size_bytes,
-            backend: req.backend,
+            // Report the resolved backend, not the client-supplied hint.
+            backend: engine_backend_type_to_proto(meta.resolved_backend) as i32,
         };
 
         Ok(Response::new(proto::LoadModelResponse {
@@ -147,7 +148,8 @@ impl AxServingServiceTrait for AxServingService {
                     vocab_size: entry.metadata.vocab_size,
                     context_length: entry.metadata.context_length,
                     file_size_bytes,
-                    backend: proto::BackendType::Auto as i32,
+                    // Report the resolved backend, not the hardcoded Auto default.
+                    backend: engine_backend_type_to_proto(entry.metadata.resolved_backend) as i32,
                 }
             })
             .collect();
@@ -165,13 +167,9 @@ impl AxServingServiceTrait for AxServingService {
     ) -> Result<Response<Self::InferStream>, Status> {
         let req = request.into_inner();
 
-        let permit = self
-            .layer
-            .scheduler
-            .acquire()
-            .await
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
-
+        // Validate model and input BEFORE acquiring the scheduler permit so
+        // that invalid or missing-model requests never consume a concurrency
+        // slot that could have served a valid request.
         let entry = self
             .layer
             .registry
@@ -197,6 +195,14 @@ impl AxServingServiceTrait for AxServingService {
                 "either prompt or messages must be non-empty",
             ));
         };
+
+        // All validation passed — now acquire the concurrency permit.
+        let permit = self
+            .layer
+            .scheduler
+            .acquire()
+            .await
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         let s = req.sampling.as_ref();
         let params = GenerationParams {
@@ -342,6 +348,14 @@ fn proto_backend_to_engine(backend: i32) -> BackendType {
         x if x == proto::BackendType::Cpu as i32 => BackendType::Cpu,
         x if x == proto::BackendType::Metal as i32 => BackendType::Metal,
         _ => BackendType::Auto,
+    }
+}
+
+fn engine_backend_type_to_proto(backend: BackendType) -> proto::BackendType {
+    match backend {
+        BackendType::Metal => proto::BackendType::Metal,
+        BackendType::Cpu => proto::BackendType::Cpu,
+        BackendType::Auto => proto::BackendType::Auto,
     }
 }
 

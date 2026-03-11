@@ -235,6 +235,8 @@ impl InferenceBackend for MistralrsBackend {
             context_length,
             load_time_ms: load_ms,
             peak_rss_bytes: rss_after.saturating_sub(rss_before),
+            // mistralrs always uses Metal on Apple Silicon.
+            resolved_backend: crate::BackendType::Metal,
         };
 
         let handle = next_handle();

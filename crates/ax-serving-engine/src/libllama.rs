@@ -325,6 +325,8 @@ impl InferenceBackend for LibLlamaBackend {
             context_length: ctx_len,
             load_time_ms: load_ms,
             peak_rss_bytes: peak_rss,
+            // LibLlama uses Metal (in-process GPU kernels) on Apple Silicon.
+            resolved_backend: crate::BackendType::Metal,
         };
 
         // ── Create context pool ───────────────────────────────────────────────

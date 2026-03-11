@@ -55,6 +55,7 @@ impl InferenceBackend for NullBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }
@@ -119,6 +120,7 @@ impl InferenceBackend for CriticalBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }
@@ -183,6 +185,7 @@ impl InferenceBackend for EmbeddingBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }
@@ -272,6 +275,7 @@ impl InferenceBackend for EmbeddingFailureBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }
@@ -413,6 +417,7 @@ impl InferenceBackend for BlockingEchoBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }
@@ -1214,6 +1219,7 @@ impl InferenceBackend for EchoBackend {
                 context_length: 2048,
                 load_time_ms: 1,
                 peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
             },
         ))
     }

@@ -567,7 +567,14 @@ impl InferenceBackend for LlamaCppBackend {
         let load_ms = start.elapsed().as_millis() as u64;
         info!("llama-server ready on port {port} in {load_ms}ms");
 
-        let meta = fetch_model_meta(&self.http, port, config.context_length, load_ms, gguf_meta);
+        // Metal is used unless the caller explicitly requested 0 GPU layers
+        // (CPU-only mode).  The default (None) maps to -ngl 99 (all layers on GPU).
+        let resolved_backend = if config.llama_cpp_n_gpu_layers == Some(0) {
+            crate::BackendType::Cpu
+        } else {
+            crate::BackendType::Metal
+        };
+        let meta = fetch_model_meta(&self.http, port, config.context_length, load_ms, gguf_meta, resolved_backend);
         let handle = next_llamacpp_handle();
 
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
@@ -1880,6 +1887,7 @@ fn fetch_model_meta(
     ctx_override: u32,
     load_ms: u64,
     gguf_meta: Option<GgufMeta>,
+    resolved_backend: crate::BackendType,
 ) -> ModelMetadata {
     // Prefer the server's reported context length (honours ctx_override) over
     // the GGUF header value since llama-server may apply its own capping.
@@ -1917,6 +1925,7 @@ fn fetch_model_meta(
             context_length,
             load_time_ms: load_ms,
             peak_rss_bytes: 0,
+            resolved_backend,
         },
         None => ModelMetadata {
             architecture: "gguf-llamacpp".into(),
@@ -1928,6 +1937,7 @@ fn fetch_model_meta(
             context_length,
             load_time_ms: load_ms,
             peak_rss_bytes: 0,
+            resolved_backend,
         },
     }
 }

@@ -113,6 +113,13 @@ pub struct ModelMetadata {
     pub context_length: u32,
     pub load_time_ms: u64,
     pub peak_rss_bytes: u64,
+    /// The backend hardware type that was actually used to load the model.
+    ///
+    /// Set by each backend implementation (`MistralrsBackend` → `Metal`,
+    /// `LlamaCppBackend` → `Metal` when GPU layers > 0 else `Cpu`,
+    /// `LibLlamaBackend` → `Metal`).  Allows callers to report the resolved
+    /// backend rather than echoing the client-supplied `Auto` hint.
+    pub resolved_backend: BackendType,
 }
 
 impl ModelMetadata {
