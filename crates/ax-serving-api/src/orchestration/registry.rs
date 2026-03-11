@@ -122,6 +122,10 @@ pub struct WorkerEntry {
     pub friendly_name: Option<String>,
     /// Apple Silicon chip identifier (e.g. "Apple M3 Pro"), set at registration.
     pub chip_model: Option<String>,
+    /// Optional worker pool label for placement and maintenance grouping.
+    pub worker_pool: Option<String>,
+    /// Optional node class label for fleet summaries and placement hints.
+    pub node_class: Option<String>,
     /// Active inference sequences from the last heartbeat (for token-cost dispatch).
     pub active_sequences: usize,
     /// Recent decode throughput in tokens/second (0 = unknown).
@@ -150,6 +154,12 @@ pub struct RegisterRequest {
     /// Apple Silicon chip (e.g. "Apple M3 Pro") from `system_profiler` (optional).
     #[serde(default)]
     pub chip_model: Option<String>,
+    /// Operator-defined worker pool label (e.g. "blue", "canary", "studio-a").
+    #[serde(default)]
+    pub worker_pool: Option<String>,
+    /// Operator-defined node class label (e.g. "m3-max-128g").
+    #[serde(default)]
+    pub node_class: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -213,6 +223,10 @@ pub struct WorkerStatus {
     pub decode_tok_per_sec: f64,
     /// P95 TTFT in milliseconds (0 = unknown / no streaming requests yet).
     pub ttft_p95_ms: u64,
+    /// Optional pool label for placement hints.
+    pub worker_pool: Option<String>,
+    /// Optional node class for topology and fleet inventory.
+    pub node_class: Option<String>,
 }
 
 // ── JSON snapshot for the listing endpoints ───────────────────────────────────
@@ -240,6 +254,12 @@ pub struct WorkerSnapshot {
     /// Apple Silicon chip identifier (e.g. "Apple M3 Pro").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chip_model: Option<String>,
+    /// Optional worker pool label for placement and maintenance grouping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_pool: Option<String>,
+    /// Optional node class label for fleet summaries and placement hints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_class: Option<String>,
     /// Active inference sequences (token-cost dispatch telemetry).
     pub active_sequences: usize,
     /// Recent decode throughput in tokens/second (0 = unknown).
@@ -310,6 +330,12 @@ impl WorkerRegistry {
                 if req.chip_model.is_some() {
                     existing.chip_model = req.chip_model.clone();
                 }
+                if req.worker_pool.is_some() {
+                    existing.worker_pool = req.worker_pool.clone();
+                }
+                if req.node_class.is_some() {
+                    existing.node_class = req.node_class.clone();
+                }
             })
             .or_insert_with(|| WorkerEntry {
                 id,
@@ -325,6 +351,8 @@ impl WorkerRegistry {
                 rss_bytes: 0,
                 friendly_name: req.friendly_name,
                 chip_model: req.chip_model,
+                worker_pool: req.worker_pool,
+                node_class: req.node_class,
                 active_sequences: 0,
                 decode_tok_per_sec: 0.0,
                 ttft_p95_ms: 0,
@@ -412,6 +440,8 @@ impl WorkerRegistry {
                     active_sequences: e.active_sequences,
                     decode_tok_per_sec: e.decode_tok_per_sec,
                     ttft_p95_ms: e.ttft_p95_ms,
+                    worker_pool: e.worker_pool.clone(),
+                    node_class: e.node_class.clone(),
                 }
             })
             .collect()
@@ -552,6 +582,8 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         rss_bytes: e.rss_bytes,
         friendly_name: e.friendly_name.clone(),
         chip_model: e.chip_model.clone(),
+        worker_pool: e.worker_pool.clone(),
+        node_class: e.node_class.clone(),
         active_sequences: e.active_sequences,
         decode_tok_per_sec: e.decode_tok_per_sec,
         ttft_p95_ms: e.ttft_p95_ms,
@@ -573,6 +605,8 @@ mod tests {
             max_inflight: max,
             friendly_name: None,
             chip_model: None,
+            worker_pool: None,
+            node_class: None,
         }
     }
 
@@ -775,6 +809,8 @@ mod tests {
             max_inflight: 4,
             friendly_name: Some("Aki's MacBook Pro".to_string()),
             chip_model: Some("Apple M3 Pro".to_string()),
+            worker_pool: Some("blue".to_string()),
+            node_class: Some("m3-pro".to_string()),
         };
         let resp = r.register(req, 5000);
         let id = WorkerId::parse(&resp.worker_id).unwrap();
@@ -782,6 +818,8 @@ mod tests {
         let snap = r.get_snapshot(id).unwrap();
         assert_eq!(snap.friendly_name.as_deref(), Some("Aki's MacBook Pro"));
         assert_eq!(snap.chip_model.as_deref(), Some("Apple M3 Pro"));
+        assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
+        assert_eq!(snap.node_class.as_deref(), Some("m3-pro"));
     }
 
     #[test]

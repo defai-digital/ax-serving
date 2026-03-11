@@ -26,6 +26,7 @@ use super::registry::{WorkerId, WorkerStatus};
 pub struct DispatchContext<'a> {
     pub model_id: &'a str,
     pub stream: bool,
+    pub preferred_pool: Option<&'a str>,
 }
 
 /// Pluggable worker selection algorithm.
@@ -405,6 +406,8 @@ mod tests {
             active_sequences: inflight,
             decode_tok_per_sec: 0.0,
             ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
         }
     }
 
@@ -412,6 +415,7 @@ mod tests {
         DispatchContext {
             model_id: "m1",
             stream: false,
+            preferred_pool: None,
         }
     }
 
@@ -485,6 +489,8 @@ mod tests {
             active_sequences: 0,
             decode_tok_per_sec: 0.0,
             ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
         };
         let w_low = WorkerStatus {
             id: WorkerId(Uuid::new_v4()),
@@ -495,6 +501,8 @@ mod tests {
             active_sequences: 0,
             decode_tok_per_sec: 0.0,
             ttft_p95_ms: 0,
+            worker_pool: None,
+            node_class: None,
         };
         let workers = vec![w_high.clone(), w_low.clone()];
 
@@ -558,6 +566,7 @@ mod tests {
                 &DispatchContext {
                     model_id: "m1",
                     stream: false,
+                    preferred_pool: None,
                 },
             )
             .unwrap();
@@ -578,6 +587,7 @@ mod tests {
                 &DispatchContext {
                     model_id: "m1",
                     stream: false,
+                    preferred_pool: None,
                 },
             )
             .unwrap();
@@ -601,6 +611,7 @@ mod tests {
                 &DispatchContext {
                     model_id: "m1",
                     stream: false,
+                    preferred_pool: None,
                 },
             )
             .unwrap();
@@ -653,6 +664,8 @@ mod tests {
             active_sequences: inflight,
             decode_tok_per_sec: 0.0,
             ttft_p95_ms,
+            worker_pool: None,
+            node_class: None,
         }
     }
 

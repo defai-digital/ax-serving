@@ -141,6 +141,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/v1/admin/startup-report", get(proxy_admin_startup_report))
         .route("/v1/admin/diagnostics", get(proxy_admin_diagnostics))
         .route("/v1/admin/audit", get(proxy_admin_audit))
+        .route("/v1/admin/fleet", get(proxy_admin_fleet))
         .route("/dashboard", get(proxy_dashboard))
         .route(
             "/v1/license",
@@ -188,6 +189,11 @@ async fn proxy_inference(
     }
 
     let auth_header = req_headers.get(header::AUTHORIZATION);
+    let preferred_pool = req_headers
+        .get("x-ax-worker-pool")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let (model_id, stream) = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
         Ok(v) => (v.model.unwrap_or_else(|| "default".to_string()), v.stream),
@@ -246,6 +252,7 @@ async fn proxy_inference(
             layer.policy.as_ref(),
             &model_id,
             stream,
+            preferred_pool,
             worker_path,
             body,
             auth_header,
@@ -585,6 +592,75 @@ async fn proxy_admin_audit(
     Json(serde_json::json!({
         "events": layer.audit.tail(query.limit.clamp(1, 200)),
     }))
+}
+
+/// `GET /v1/admin/fleet` — authenticated fleet inventory and capacity summary.
+async fn proxy_admin_fleet(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
+    let workers = layer.registry.list_all();
+    let mut pools = serde_json::Map::new();
+    let mut node_classes = serde_json::Map::new();
+    let mut backends = serde_json::Map::new();
+
+    for worker in &workers {
+        accumulate_fleet_bucket(&mut pools, worker.worker_pool.as_deref().unwrap_or("default"), worker);
+        accumulate_fleet_bucket(
+            &mut node_classes,
+            worker.node_class.as_deref().unwrap_or("unknown"),
+            worker,
+        );
+        accumulate_fleet_bucket(&mut backends, &worker.backend, worker);
+    }
+
+    Json(serde_json::json!({
+        "total_workers": workers.len(),
+        "eligible_workers": layer.registry.eligible_healthy_count(),
+        "pools": pools,
+        "node_classes": node_classes,
+        "backends": backends,
+        "workers": workers,
+    }))
+}
+
+fn accumulate_fleet_bucket(
+    buckets: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    worker: &self::registry::WorkerSnapshot,
+) {
+    let entry = buckets
+        .entry(key.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "workers": 0usize,
+                "healthy": 0usize,
+                "draining": 0usize,
+                "eligible": 0usize,
+                "total_inflight": 0usize,
+                "total_active_sequences": 0usize,
+            })
+        });
+    let obj = entry.as_object_mut().expect("fleet bucket must be object");
+    increment_bucket(obj, "workers", 1_u64);
+    if worker.health == "healthy" {
+        increment_bucket(obj, "healthy", 1_u64);
+    }
+    if worker.drain {
+        increment_bucket(obj, "draining", 1_u64);
+    }
+    if worker.health == "healthy" && !worker.drain {
+        increment_bucket(obj, "eligible", 1_u64);
+    }
+    increment_bucket(obj, "total_inflight", worker.inflight as u64);
+    increment_bucket(obj, "total_active_sequences", worker.active_sequences as u64);
+}
+
+fn increment_bucket(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    amount: impl Into<u64>,
+) {
+    let amount = amount.into();
+    let current = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    obj.insert(key.to_string(), serde_json::json!(current + amount));
 }
 
 /// `GET /v1/workers` — authenticated worker inventory for the public admin API.

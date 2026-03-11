@@ -90,11 +90,12 @@ impl DirectDispatcher {
         policy: &dyn DispatchPolicy,
         model_id: &str,
         stream: bool,
+        preferred_pool: Option<&str>,
         path: &str,
         body: Bytes,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers = registry.eligible_workers(model_id);
+        let workers = preferred_pool_workers(registry.eligible_workers(model_id), preferred_pool);
         if workers.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -103,7 +104,11 @@ impl DirectDispatcher {
                 .into_response();
         }
 
-        let ctx = DispatchContext { model_id, stream };
+        let ctx = DispatchContext {
+            model_id,
+            stream,
+            preferred_pool,
+        };
         let selected = match policy.select(&workers, &ctx) {
             Some(w) => w,
             None => {
@@ -195,7 +200,7 @@ impl DirectDispatcher {
         auth_header: Option<&HeaderValue>,
     ) -> Response {
         let workers2 = registry.eligible_workers(ctx.model_id);
-        let candidates: Vec<_> = workers2
+        let candidates: Vec<_> = preferred_pool_workers(workers2, ctx.preferred_pool)
             .into_iter()
             .filter(|w| w.id != excluded_id)
             .collect();
@@ -341,12 +346,34 @@ fn worker_url(addr: std::net::SocketAddr, path: &str) -> String {
     }
 }
 
+fn preferred_pool_workers(
+    workers: Vec<super::registry::WorkerStatus>,
+    preferred_pool: Option<&str>,
+) -> Vec<super::registry::WorkerStatus> {
+    let Some(pool) = preferred_pool.map(str::trim).filter(|s| !s.is_empty()) else {
+        return workers;
+    };
+    let preferred: Vec<_> = workers
+        .iter()
+        .filter(|w| w.worker_pool.as_deref() == Some(pool))
+        .cloned()
+        .collect();
+    if preferred.is_empty() {
+        workers
+    } else {
+        preferred
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{InflightGuard, worker_url};
+    use crate::orchestration::registry::{WorkerId, WorkerStatus};
+    use uuid::Uuid;
+
+    use super::{InflightGuard, preferred_pool_workers, worker_url};
 
     #[test]
     fn worker_url_with_leading_slash() {
@@ -388,5 +415,39 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    fn worker_with_pool(pool: Option<&str>) -> WorkerStatus {
+        WorkerStatus {
+            id: WorkerId(Uuid::new_v4()),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+            inflight: 0,
+            max_inflight: 4,
+            inflight_counter: Arc::new(AtomicUsize::new(0)),
+            active_sequences: 0,
+            decode_tok_per_sec: 0.0,
+            ttft_p95_ms: 0,
+            worker_pool: pool.map(str::to_string),
+            node_class: None,
+        }
+    }
+
+    #[test]
+    fn preferred_pool_workers_prefers_matching_pool_when_present() {
+        let blue = worker_with_pool(Some("blue"));
+        let green = worker_with_pool(Some("green"));
+        let selected = preferred_pool_workers(vec![green, blue.clone()], Some("blue"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, blue.id);
+    }
+
+    #[test]
+    fn preferred_pool_workers_falls_back_when_pool_missing() {
+        let blue = worker_with_pool(Some("blue"));
+        let green = worker_with_pool(Some("green"));
+        let selected = preferred_pool_workers(vec![blue.clone(), green.clone()], Some("red"));
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|w| w.id == blue.id));
+        assert!(selected.iter().any(|w| w.id == green.id));
     }
 }

@@ -339,6 +339,8 @@ struct HeartbeatConfig {
     max_inflight: usize,
     friendly_name: String,
     chip_model: Option<String>,
+    worker_pool: Option<String>,
+    node_class: Option<String>,
 }
 
 struct RegisterConfig<'a> {
@@ -346,6 +348,8 @@ struct RegisterConfig<'a> {
     max_inflight: usize,
     friendly_name: &'a str,
     chip_model: Option<&'a str>,
+    worker_pool: Option<&'a str>,
+    node_class: Option<&'a str>,
     internal_api_token: Option<&'a str>,
 }
 
@@ -367,6 +371,8 @@ async fn register_with_orchestrator(
         "max_inflight": cfg.max_inflight,
         "friendly_name": cfg.friendly_name,
         "chip_model": cfg.chip_model,
+        "worker_pool": cfg.worker_pool,
+        "node_class": cfg.node_class,
     });
     let mut req = client.post(&url).json(&body);
     if let Some(token) = cfg.internal_api_token {
@@ -471,6 +477,8 @@ async fn heartbeat_loop(
                         max_inflight: cfg.max_inflight,
                         friendly_name: &cfg.friendly_name,
                         chip_model: cfg.chip_model.as_deref(),
+                        worker_pool: cfg.worker_pool.as_deref(),
+                        node_class: cfg.node_class.as_deref(),
                         internal_api_token: cfg.internal_api_token.as_deref(),
                     },
                 )
@@ -610,6 +618,14 @@ fn run_serve(
     // Gather system identity once at startup (blocking I/O, safe before tokio).
     let friendly_name = get_friendly_name();
     let chip_model = get_chip_model();
+    let worker_pool = std::env::var("AXS_WORKER_POOL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let node_class = std::env::var("AXS_WORKER_NODE_CLASS")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Max inflight reported to the orchestrator.  Must be at least 1: zero
     // would make this worker permanently unselectable by WeightedRoundRobin
@@ -646,6 +662,8 @@ fn run_serve(
                         max_inflight,
                         friendly_name: &friendly_name,
                         chip_model: chip_model.as_deref(),
+                        worker_pool: worker_pool.as_deref(),
+                        node_class: node_class.as_deref(),
                         internal_api_token: internal_api_token.as_deref(),
                     },
                 )
@@ -679,6 +697,8 @@ fn run_serve(
                     max_inflight,
                     friendly_name: friendly_name.clone(),
                     chip_model: chip_model.clone(),
+                    worker_pool: worker_pool.clone(),
+                    node_class: node_class.clone(),
                 };
                 tokio::spawn(heartbeat_loop(client.clone(), Arc::clone(&layer), cfg))
             });

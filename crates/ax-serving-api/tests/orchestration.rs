@@ -136,7 +136,21 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
         max_inflight: 8,
         friendly_name: None,
         chip_model: None,
+        worker_pool: None,
+        node_class: None,
     }
+}
+
+fn reg_req_with_pool(
+    addr: SocketAddr,
+    caps: &[&str],
+    worker_pool: Option<&str>,
+    node_class: Option<&str>,
+) -> RegisterRequest {
+    let mut req = reg_req(addr, caps);
+    req.worker_pool = worker_pool.map(str::to_string);
+    req.node_class = node_class.map(str::to_string);
+    req
 }
 
 struct CountingPolicy {
@@ -206,6 +220,7 @@ async fn test_dispatch_to_mock_worker() {
             policy.as_ref(),
             "test-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -236,6 +251,7 @@ async fn test_no_affinity_record_on_primary_4xx() {
             &policy,
             "m4xx",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -294,6 +310,7 @@ async fn test_reroute_on_5xx() {
             policy.as_ref(),
             "m",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -329,6 +346,7 @@ async fn test_reroute_no_alternative_returns_503() {
             policy.as_ref(),
             "only-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -433,6 +451,7 @@ async fn test_reroute_counter_increments() {
             policy.as_ref(),
             "mdl",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -544,6 +563,7 @@ async fn test_failure_worker_connection_refused() {
             policy.as_ref(),
             "gone-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -588,6 +608,7 @@ async fn test_failure_all_workers_evicted() {
             policy.as_ref(),
             "evict-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -642,6 +663,7 @@ async fn test_failure_worker_restart_reregister() {
             policy.as_ref(),
             "restart-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -733,6 +755,8 @@ async fn test_wrr_dispatch_proportional() {
             max_inflight: 4,
             friendly_name: None,
             chip_model: None,
+            worker_pool: None,
+            node_class: None,
         },
         5000,
     );
@@ -745,6 +769,8 @@ async fn test_wrr_dispatch_proportional() {
             max_inflight: 1,
             friendly_name: None,
             chip_model: None,
+            worker_pool: None,
+            node_class: None,
         },
         5000,
     );
@@ -764,6 +790,7 @@ async fn test_wrr_dispatch_proportional() {
                 policy.as_ref(),
                 "wrr-model",
                 false,
+                None,
                 "/v1/chat/completions",
                 body,
                 None,
@@ -1163,6 +1190,56 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
 }
 
 #[tokio::test]
+async fn test_admin_fleet_summarizes_pools_and_node_classes() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    let green = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"green"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["fleet-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["fleet-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/fleet")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["total_workers"], 2);
+    assert_eq!(json["pools"]["blue"]["workers"], 1);
+    assert_eq!(json["pools"]["green"]["workers"], 1);
+    assert_eq!(json["node_classes"]["m3-max"]["workers"], 1);
+    assert_eq!(json["node_classes"]["m3-pro"]["workers"], 1);
+}
+
+#[tokio::test]
 async fn test_license_validation_errors_are_audited() {
     let _config_home = TestConfigHome::new();
     let layer = Arc::new(
@@ -1214,6 +1291,57 @@ async fn test_license_validation_errors_are_audited() {
             && e["outcome"] == "error"
             && e["detail"]["error"] == "missing field: key"
     }));
+}
+
+#[tokio::test]
+async fn test_pool_header_prefers_matching_worker_pool() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    let green = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"green"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["pool-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-worker-pool", "green")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("green"),
+        "expected green-pool worker response, got {text}"
+    );
 }
 
 #[tokio::test]
@@ -1623,6 +1751,7 @@ async fn test_chaos_mid_stream_crash() {
             policy.as_ref(),
             "stream-crash",
             true,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -1673,6 +1802,7 @@ async fn test_chaos_restart_reroutes_to_healthy_worker() {
             policy.as_ref(),
             "restart-chaos",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -1707,6 +1837,7 @@ async fn test_chaos_concurrent_dispatch_no_deadlock() {
             policy.as_ref(),
             "concurrent-model",
             false,
+            None,
             "/v1/chat/completions",
             axum::body::Bytes::from(r#"{"model":"concurrent-model","messages":[]}"#),
             None,
@@ -1716,6 +1847,7 @@ async fn test_chaos_concurrent_dispatch_no_deadlock() {
             policy.as_ref(),
             "concurrent-model",
             false,
+            None,
             "/v1/chat/completions",
             axum::body::Bytes::from(r#"{"model":"concurrent-model","messages":[]}"#),
             None,
@@ -1755,6 +1887,7 @@ async fn test_model_affinity_prefers_warm_worker() {
             policy.as_ref(),
             "affinity-model",
             false,
+            None,
             "/v1/chat/completions",
             body,
             None,
@@ -1772,6 +1905,7 @@ async fn test_model_affinity_prefers_warm_worker() {
                 policy.as_ref(),
                 "affinity-model",
                 false,
+                None,
                 "/v1/chat/completions",
                 body,
                 None,
