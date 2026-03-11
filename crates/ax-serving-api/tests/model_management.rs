@@ -2348,6 +2348,7 @@ async fn admin_status_requires_auth_and_returns_operational_summary() {
     .unwrap();
     assert_eq!(json["request_id"], "req-admin-status");
     assert_eq!(json["service"], "serving");
+    assert_eq!(json["status"], "degraded");
     assert_eq!(json["auth_required"], true);
     assert!(json["models"]["loaded_model_count"].is_u64());
     assert!(json["scheduler"]["queue_depth"].is_i64());

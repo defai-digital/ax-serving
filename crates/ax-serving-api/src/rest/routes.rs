@@ -1925,13 +1925,18 @@ pub async fn admin_status(
 ) -> impl IntoResponse {
     let thermal = layer.backend.thermal_state();
     let loaded_models = layer.registry.list_ids();
+    let status = if thermal.as_str() == "Critical" || loaded_models.is_empty() {
+        "degraded"
+    } else {
+        "ok"
+    };
     let scheduler = &layer.scheduler.metrics;
     let metrics = &layer.metrics;
 
     Json(serde_json::json!({
         "request_id": req_id.map(|v| v.0.0).unwrap_or_default(),
         "service": "serving",
-        "status": if thermal.as_str() == "Critical" { "degraded" } else { "ok" },
+        "status": status,
         "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
         "license": layer.license.to_json(),
         "runtime": {
