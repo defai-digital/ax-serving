@@ -24,6 +24,21 @@ which llama-server
 
 One process handles everything — model loading, serving, and admission control.
 
+Recommended for offline enterprise pilots:
+
+```bash
+AXS_CONFIG=config/serving.offline-enterprise.yaml \
+AXS_API_KEY="change-me" \
+AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
+cargo run -p ax-serving-cli --bin ax-serving -- serve \
+  -m /absolute/path/to/models/<model>.gguf \
+  --model-id default \
+  --host 127.0.0.1 \
+  --port 18080
+```
+
+For ad hoc local development, you can still use the simpler no-auth startup below:
+
 ```bash
 AXS_ALLOW_NO_AUTH=true \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
@@ -39,6 +54,16 @@ Verify it is up:
 curl -sS http://127.0.0.1:18080/health
 curl -sS http://127.0.0.1:18080/v1/models
 ```
+
+`/health` is the runtime health contract for integration:
+- `status`: `ok` or `degraded`
+- `ready`: whether the runtime is able to serve
+- `model_available`: whether at least one model is loaded
+- `reason`: present when health is degraded
+
+Lifecycle expectation:
+- after `POST /v1/models`, health should become `status=ok` with `model_available=true`
+- after `DELETE /v1/models/{id}`, health should return to degraded if no models remain loaded
 
 ---
 
@@ -512,7 +537,9 @@ Additional modes: `compare`, `regression-check`, `multi-worker`.
 | `AXS_LOG` | Log level: `debug`, `info`, `warn`, `error` |
 | `AXS_LOG_FORMAT` | `pretty` (default) or `json` |
 
-See `config/serving.example.yaml` for the full configuration reference.
+Recommended profiles:
+- `config/serving.offline-enterprise.yaml` — secure starter profile for offline enterprise pilots
+- `config/serving.example.yaml` — full configuration reference
 
 ---
 
@@ -534,6 +561,7 @@ See `config/serving.example.yaml` for the full configuration reference.
 ## Next references
 
 - [README.md](README.md)
+- `docs/contracts/ax-fabric-runtime-contract.md` — supported AX Fabric integration contract
 - `config/serving.example.yaml` — full configuration reference
 - `config/backends.yaml` — backend routing rules
 - `docs/runbooks/multi-worker.md` — multi-worker deployment guide

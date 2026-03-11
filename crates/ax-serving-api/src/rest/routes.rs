@@ -1719,10 +1719,30 @@ pub async fn list_models(State(layer): State<Arc<ServingLayer>>) -> Json<ModelsR
 
 /// GET /health
 pub async fn health(State(layer): State<Arc<ServingLayer>>) -> Json<HealthResponse> {
+    let thermal = layer.backend.thermal_state();
+    let loaded_models = layer.registry.list_ids();
+    let model_available = !loaded_models.is_empty();
+    let ready = !matches!(thermal, ax_serving_engine::ThermalState::Critical);
+    let reason = match (ready, model_available) {
+        (false, false) => Some("thermal_critical_no_models"),
+        (false, true) => Some("thermal_critical"),
+        (true, false) => Some("no_models_loaded"),
+        (true, true) => None,
+    };
+    let status = if ready && model_available {
+        "ok"
+    } else {
+        "degraded"
+    };
+
     Json(HealthResponse {
-        status: "ok",
-        thermal: layer.backend.thermal_state().as_str().to_string(),
-        loaded_models: layer.registry.list_ids(),
+        status,
+        ready,
+        model_available,
+        reason,
+        thermal: thermal.as_str().to_string(),
+        loaded_models: loaded_models.clone(),
+        loaded_model_count: loaded_models.len(),
         uptime_secs: layer.metrics.uptime_secs(),
     })
 }
@@ -2119,25 +2139,33 @@ pub async fn rest_load_model(
         pooling_type,
     };
     let model_id = req.model_id.clone();
+    let layer_for_load = Arc::clone(&layer);
 
     let result = tokio::task::spawn_blocking(move || {
-        layer
+        layer_for_load
             .registry
-            .load(&model_id, &path, config, layer.backend.as_ref())
+            .load(&model_id, &path, config, layer_for_load.backend.as_ref())
     })
     .await;
 
     match result {
-        Ok(Ok(entry)) => (
-            StatusCode::CREATED,
-            Json(LoadModelResponse {
-                model_id: entry.id.clone(),
-                architecture: entry.metadata.architecture.clone(),
-                context_length: entry.metadata.context_length,
-                load_time_ms: entry.metadata.load_time_ms,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(entry)) => {
+            let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
+            (
+                StatusCode::CREATED,
+                Json(LoadModelResponse {
+                    model_id: entry.id.clone(),
+                    state: "loaded",
+                    ready,
+                    model_available,
+                    loaded_model_count,
+                    architecture: entry.metadata.architecture.clone(),
+                    context_length: entry.metadata.context_length,
+                    load_time_ms: entry.metadata.load_time_ms,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => {
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::AlreadyLoaded(_)) => StatusCode::CONFLICT,
@@ -2176,25 +2204,45 @@ fn normalize_pooling_type(s: &str) -> Option<String> {
     }
 }
 
+fn lifecycle_snapshot(layer: &Arc<ServingLayer>) -> (bool, bool, usize) {
+    let loaded_model_count = layer.registry.list_ids().len();
+    let model_available = loaded_model_count > 0;
+    let ready = !matches!(
+        layer.backend.thermal_state(),
+        ax_serving_engine::ThermalState::Critical
+    );
+    (ready, model_available, loaded_model_count)
+}
+
 /// DELETE /v1/models/:id — unload a loaded model.
 pub async fn rest_unload_model(
     State(layer): State<Arc<ServingLayer>>,
     Path(model_id): Path<String>,
 ) -> Response {
     let id_for_response = model_id.clone();
+    let layer_for_unload = Arc::clone(&layer);
     let result = tokio::task::spawn_blocking(move || {
-        layer.registry.unload(&model_id, layer.backend.as_ref())
+        layer_for_unload
+            .registry
+            .unload(&model_id, layer_for_unload.backend.as_ref())
     })
     .await;
 
     match result {
-        Ok(Ok(())) => (
-            StatusCode::OK,
-            Json(UnloadModelResponse {
-                model_id: id_for_response,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(())) => {
+            let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
+            (
+                StatusCode::OK,
+                Json(UnloadModelResponse {
+                    model_id: id_for_response,
+                    state: "unloaded",
+                    ready,
+                    model_available,
+                    loaded_model_count,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => {
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,
@@ -2215,21 +2263,31 @@ pub async fn rest_reload_model(
     State(layer): State<Arc<ServingLayer>>,
     Path(model_id): Path<String>,
 ) -> Response {
+    let layer_for_reload = Arc::clone(&layer);
     let result = tokio::task::spawn_blocking(move || {
-        layer.registry.reload(&model_id, layer.backend.as_ref())
+        layer_for_reload
+            .registry
+            .reload(&model_id, layer_for_reload.backend.as_ref())
     })
     .await;
 
     match result {
-        Ok(Ok(entry)) => (
-            StatusCode::OK,
-            Json(ReloadModelResponse {
-                model_id: entry.id.clone(),
-                architecture: entry.metadata.architecture.clone(),
-                load_time_ms: entry.metadata.load_time_ms,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(entry)) => {
+            let (ready, model_available, loaded_model_count) = lifecycle_snapshot(&layer);
+            (
+                StatusCode::OK,
+                Json(ReloadModelResponse {
+                    model_id: entry.id.clone(),
+                    state: "loaded",
+                    ready,
+                    model_available,
+                    loaded_model_count,
+                    architecture: entry.metadata.architecture.clone(),
+                    load_time_ms: entry.metadata.load_time_ms,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => {
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,

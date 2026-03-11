@@ -92,6 +92,70 @@ impl InferenceBackend for NullBackend {
     }
 }
 
+struct CriticalBackend;
+
+impl InferenceBackend for CriticalBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(2),
+            ModelMetadata {
+                architecture: "critical".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Critical
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        1
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn make_layer() -> Arc<ServingLayer> {
@@ -101,9 +165,21 @@ fn make_layer() -> Arc<ServingLayer> {
     Arc::new(ServingLayer::new(backend, config))
 }
 
+fn make_layer_with_backend(backend: Arc<dyn InferenceBackend>) -> Arc<ServingLayer> {
+    let mut config = ServeConfig::default();
+    config.cache.enabled = false;
+    Arc::new(ServingLayer::new(backend, config))
+}
+
 /// Build the Axum router with no API key requirement (auth disabled).
 fn make_app_no_auth() -> axum::Router {
     let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    rest::router(layer, keys)
+}
+
+fn make_app_with_backend_no_auth(backend: Arc<dyn InferenceBackend>) -> axum::Router {
+    let layer = make_layer_with_backend(backend);
     let keys = Arc::new(std::collections::HashSet::<String>::new());
     rest::router(layer, keys)
 }
@@ -386,6 +462,13 @@ async fn load_then_unload_200() {
         .await
         .unwrap();
     assert_eq!(unload_resp.status(), StatusCode::OK);
+    let text = body_text(unload_resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["model_id"], "unload-test");
+    assert_eq!(json["state"], "unloaded");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], false);
+    assert_eq!(json["loaded_model_count"], 0);
 }
 
 #[tokio::test]
@@ -430,6 +513,15 @@ async fn load_then_reload_200() {
         .await
         .unwrap();
     assert_eq!(reload_resp.status(), StatusCode::OK);
+    let text = body_text(reload_resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["model_id"], "reload-test");
+    assert_eq!(json["state"], "loaded");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], true);
+    assert_eq!(json["loaded_model_count"], 1);
+    assert!(json["architecture"].is_string());
+    assert!(json["load_time_ms"].is_number());
 
     // Model should still be registered after reload.
     assert!(layer.registry.get("reload-test").is_some());
@@ -1096,7 +1188,7 @@ async fn embeddings_not_implemented_501() {
 // ── Basic endpoint format tests ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn health_returns_ok_status() {
+async fn health_without_models_is_degraded_but_ready() {
     let app = make_app_no_auth();
     let resp = app
         .oneshot(
@@ -1111,9 +1203,145 @@ async fn health_returns_ok_status() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["status"], "ok", "health status must be 'ok'; got: {json}");
+    assert_eq!(json["status"], "degraded", "health status must be 'degraded' with no models; got: {json}");
+    assert_eq!(json["ready"], true, "runtime should still be ready without models");
+    assert_eq!(json["model_available"], false, "health must report no models available");
+    assert_eq!(json["reason"], "no_models_loaded", "health should explain degraded no-model state");
     assert!(json["thermal"].is_string(), "health must have thermal field");
     assert!(json["loaded_models"].is_array(), "health must have loaded_models array");
+    assert_eq!(json["loaded_model_count"], 0, "health must include loaded model count");
+}
+
+#[tokio::test]
+async fn health_with_loaded_model_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("health-model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body = serde_json::json!({
+        "model_id": "health-model",
+        "path": path,
+        "backend": "llama_cpp"
+    });
+
+    let app = rest::router(layer.clone(), keys.clone());
+    let load_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let health_resp = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_resp.status(), StatusCode::OK);
+    let text = body_text(health_resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["status"], "ok", "health should be ok with a loaded model; got: {json}");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], true);
+    assert_eq!(json["loaded_model_count"], 1);
+}
+
+#[tokio::test]
+async fn health_after_unload_returns_to_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("health-unload.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body = serde_json::json!({
+        "model_id": "health-unload",
+        "path": path,
+        "backend": "llama_cpp"
+    });
+
+    let app = rest::router(layer.clone(), keys.clone());
+    let load_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let unload_resp = rest::router(layer.clone(), keys.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/models/health-unload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unload_resp.status(), StatusCode::OK);
+
+    let health_resp = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_resp.status(), StatusCode::OK);
+    let text = body_text(health_resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], false);
+    assert_eq!(json["reason"], "no_models_loaded");
+    assert_eq!(json["loaded_model_count"], 0);
+}
+
+#[tokio::test]
+async fn health_critical_thermal_is_not_ready() {
+    let app = make_app_with_backend_no_auth(Arc::new(CriticalBackend));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["ready"], false);
+    assert_eq!(json["model_available"], false);
+    assert_eq!(json["reason"], "thermal_critical_no_models");
+    assert_eq!(json["thermal"], "Critical");
 }
 
 #[tokio::test]
@@ -1434,8 +1662,100 @@ async fn load_model_response_has_required_fields() {
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(json["model_id"], "field-check");
+    assert_eq!(json["state"], "loaded");
+    assert_eq!(json["ready"], true);
+    assert_eq!(json["model_available"], true);
+    assert_eq!(json["loaded_model_count"], 1);
     assert!(json["architecture"].is_string());
     assert!(json["context_length"].is_number());
+    assert!(json["load_time_ms"].is_number());
+}
+
+#[tokio::test]
+async fn unload_model_response_has_required_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body =
+        serde_json::json!({"model_id": "unload-fields", "path": path.to_string_lossy()}).to_string();
+
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/models/unload-fields")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["model_id"], "unload-fields");
+    assert_eq!(json["state"], "unloaded");
+    assert!(json["ready"].is_boolean());
+    assert!(json["model_available"].is_boolean());
+    assert!(json["loaded_model_count"].is_number());
+}
+
+#[tokio::test]
+async fn reload_model_response_has_required_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body =
+        serde_json::json!({"model_id": "reload-fields", "path": path.to_string_lossy()}).to_string();
+
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models/reload-fields/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_text(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["model_id"], "reload-fields");
+    assert_eq!(json["state"], "loaded");
+    assert!(json["ready"].is_boolean());
+    assert!(json["model_available"].is_boolean());
+    assert!(json["loaded_model_count"].is_number());
+    assert!(json["architecture"].is_string());
     assert!(json["load_time_ms"].is_number());
 }
 

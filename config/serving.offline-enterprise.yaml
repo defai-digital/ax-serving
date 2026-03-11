@@ -1,0 +1,87 @@
+# AX Serving offline enterprise starter profile
+#
+# Intended for local or controlled-network enterprise pilots where:
+# - cloud dependency is not allowed for core runtime value
+# - authenticated access is expected
+# - model management should stay within approved local directories
+# - the runtime should remain loopback-bound by default
+#
+# Usage:
+#   AXS_CONFIG=config/serving.offline-enterprise.yaml \
+#   AXS_API_KEY="change-me" \
+#   AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
+#   cargo run -p ax-serving-cli --bin ax-serving -- serve \
+#     -m /absolute/path/to/models/<model>.gguf \
+#     --model-id default
+#
+# Notes:
+# - Keep `rest_addr` and `grpc_host` on loopback unless you intentionally place
+#   the service behind a controlled network boundary.
+# - `AXS_API_KEY` is still supplied via env so secrets do not live in the repo.
+# - `AXS_MODEL_ALLOWED_DIRS` is also supplied via env because it is environment-specific.
+
+rest_addr: "127.0.0.1:18080"
+grpc_socket: "/tmp/ax-serving.sock"
+grpc_host: "127.0.0.1"
+grpc_port: null
+
+sched_max_inflight: 16
+sched_max_queue: 128
+sched_max_wait_ms: 120000
+sched_overload_policy: "queue"
+sched_per_model_max_inflight: 4
+default_max_tokens: 2048
+idle_timeout_secs: 0
+thermal_poll_secs: 5
+
+cache:
+  enabled: false
+
+registry:
+  max_loaded_models: 8
+  idle_check_interval_secs: 60
+
+dispatcher:
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  retry_after_secs: 5
+  cache_inflight_max_retries: 3
+
+llamacpp:
+  host: "127.0.0.1"
+  port: 18181
+  token_batch_size: 4
+  token_batch_max: 32
+  circuit_breaker_trip_threshold: 3
+  circuit_breaker_recovery_ms: 10000
+  http_request_timeout_secs: 300
+  server_startup_timeout_secs: 120
+  server_restart_timeout_secs: 60
+  wait_ready_poll_interval_ms: 500
+  wait_ready_check_timeout_secs: 1
+  health_poller_interval_secs: 5
+  health_poller_check_timeout_secs: 2
+  health_poller_restart_threshold: 3
+  health_poller_max_restarts: 3
+  cache_prompt: true
+
+orchestrator:
+  host: "127.0.0.1"
+  port: 18080
+  internal_port: 19090
+  worker_heartbeat_ms: 5000
+  worker_ttl_ms: 15000
+  dispatch_policy: "least_inflight"
+  retry_after_secs: 5
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  global_queue_max: 128
+  global_queue_depth: 256
+  global_queue_wait_ms: 10000
+  global_queue_policy: "queue"
+
+license:
+  buy_link: "https://license.automatosx.com"
+  config_dir: "ax-serving"
+  key_file: "license.key"
+  dashboard_poll_ms: 2000

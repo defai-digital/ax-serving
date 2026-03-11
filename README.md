@@ -225,12 +225,28 @@ Primary REST endpoints:
 - `GET /dashboard`
 - `GET/POST /v1/license`
 
+Runtime health contract:
+- `GET /health` is liveness plus readiness, not just process-up status
+- `status=ok` means the runtime is ready and at least one model is available
+- `status=degraded` means the process is alive but either no model is loaded or the runtime is thermally constrained
+
 ---
 
 ## Authentication
 
 - If `AXS_API_KEY` is set, protected endpoints require bearer auth.
 - If `AXS_API_KEY` is unset, startup requires `AXS_ALLOW_NO_AUTH=true`.
+
+Recommended offline enterprise startup:
+
+```bash
+AXS_CONFIG=config/serving.offline-enterprise.yaml \
+AXS_API_KEY="change-me" \
+AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
+cargo run -p ax-serving-cli --bin ax-serving -- serve \
+  -m /absolute/path/to/models/<model>.gguf \
+  --model-id default
+```
 
 ```bash
 AXS_API_KEY="token1,token2" cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/<model>.gguf
@@ -296,6 +312,7 @@ Other benchmark modes:
 
 - [QUICKSTART.md](QUICKSTART.md)
 - [ROADMAP.md](ROADMAP.md)
+- `docs/contracts/ax-fabric-runtime-contract.md`
 - `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
 - `sdk/python/` (Python SDK)
 - `docs/runbooks/multi-worker.md`

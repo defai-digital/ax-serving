@@ -367,6 +367,10 @@ pub struct LoadModelRequest {
 #[derive(Debug, Serialize)]
 pub struct LoadModelResponse {
     pub model_id: String,
+    pub state: &'static str,
+    pub ready: bool,
+    pub model_available: bool,
+    pub loaded_model_count: usize,
     pub architecture: String,
     pub context_length: u32,
     pub load_time_ms: u64,
@@ -376,12 +380,20 @@ pub struct LoadModelResponse {
 #[derive(Debug, Serialize)]
 pub struct UnloadModelResponse {
     pub model_id: String,
+    pub state: &'static str,
+    pub ready: bool,
+    pub model_available: bool,
+    pub loaded_model_count: usize,
 }
 
 /// POST /v1/models/:id/reload — atomically reload from same path and config.
 #[derive(Debug, Serialize)]
 pub struct ReloadModelResponse {
     pub model_id: String,
+    pub state: &'static str,
+    pub ready: bool,
+    pub model_available: bool,
+    pub loaded_model_count: usize,
     pub architecture: String,
     pub load_time_ms: u64,
 }
@@ -518,7 +530,12 @@ pub struct EmbeddingUsage {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+    pub ready: bool,
+    pub model_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
     pub thermal: String,
     pub loaded_models: Vec<String>,
+    pub loaded_model_count: usize,
     pub uptime_secs: u64,
 }
