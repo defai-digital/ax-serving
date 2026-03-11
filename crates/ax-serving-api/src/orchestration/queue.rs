@@ -87,6 +87,11 @@ pub struct QueuePermit {
     /// Waiter queue — locked only when transferring a slot to a queued request.
     waiters: Arc<Mutex<VecDeque<WaiterEntry>>>,
     last_served_client: Arc<Mutex<Option<String>>>,
+    /// The client that owns this permit. Used as a fairness hint in `drop()`:
+    /// when `last_served_client` is `None` (e.g. first handoff), we seed the
+    /// hint with this permit's own client key so the next waiter from a
+    /// *different* client is preferred.
+    client_key: String,
 }
 
 impl Drop for QueuePermit {
@@ -109,8 +114,18 @@ impl Drop for QueuePermit {
         // (rx was dropped because the request timed out). When multiple clients
         // are queued, prefer a different client than the one most recently
         // served to prevent a single hot client from monopolizing the queue.
+        //
+        // Hint priority: (1) last_served_client (set on previous handoffs),
+        // (2) this permit's own client_key (first handoff — permit was obtained
+        //     on the fast path without updating last_served_client).
+        let hint: Option<&str> = last_served
+            .as_deref()
+            .and_then(|v| v.as_deref())
+            .or_else(|| {
+                if self.client_key.is_empty() { None } else { Some(self.client_key.as_str()) }
+            });
         loop {
-            let next = select_next_waiter(&mut waiters, last_served.as_deref().and_then(|v| v.as_ref()));
+            let next = select_next_waiter(&mut waiters, hint);
             match next {
                 Some(entry) => {
                     if entry.tx.send(true).is_ok() {
@@ -185,26 +200,25 @@ impl GlobalQueue {
 
     /// Build a `QueuePermit` that shares the same `active` counter and
     /// `waiters` queue as this `GlobalQueue`.
-    fn make_permit(&self) -> QueuePermit {
+    fn make_permit(&self, client_key: String) -> QueuePermit {
         QueuePermit {
             active: Arc::clone(&self.active),
             waiters: Arc::clone(&self.waiters),
             last_served_client: Arc::clone(&self.last_served_client),
+            client_key,
         }
     }
 
     /// Try to acquire a concurrency permit.
     ///
     /// **Fast path** (no mutex): if `active < max_concurrent`, claims the slot
-    /// via a CAS loop and returns immediately.  `client_key_fn` is **not**
-    /// called on the fast path — the key is only computed when the request
-    /// actually enters the wait queue, avoiding a heap allocation per fast-path
-    /// request.
+    /// via a CAS loop and returns immediately.  The client key is stored in the
+    /// permit so that `drop()` can seed the fairness hint on the first handoff.
     ///
     /// **Slow path** (mutex): if at capacity, queues the caller (up to
     /// `max_queue_depth`) and waits up to `wait_ms`.  Applies the overload
     /// policy when the queue is also full.
-    pub async fn acquire(&self, client_key_fn: impl FnOnce() -> String) -> AcquireResult {
+    pub async fn acquire(&self, client_key: String) -> AcquireResult {
         // ── Fast path: lock-free CAS loop ────────────────────────────────────
         let max = self.config.max_concurrent;
         let mut current = self.active.load(Ordering::Acquire);
@@ -217,10 +231,11 @@ impl GlobalQueue {
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    // Fast path: no waiters to wake, so fairness tracking is
-                    // not needed — skip last_served_client to stay lock-free.
+                    // Fast path: no mutex acquired — last_served_client is not
+                    // updated here.  The client key is stored in the permit so
+                    // drop() can use it as a fallback hint on the first handoff.
                     self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
-                    return AcquireResult::Permit(self.make_permit());
+                    return AcquireResult::Permit(self.make_permit(client_key));
                 }
                 Err(actual) => current = actual, // Retry (contention or spurious).
             }
@@ -245,10 +260,8 @@ impl GlobalQueue {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        // Slow-path re-check: fairness not needed here either
-                        // (we're about to return without waking a waiter).
                         self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
-                        return AcquireResult::Permit(self.make_permit());
+                        return AcquireResult::Permit(self.make_permit(client_key));
                     }
                     Err(actual) => a = actual,
                 }
@@ -283,8 +296,9 @@ impl GlobalQueue {
             }
 
             let (tx, rx) = oneshot::channel::<bool>();
-            // Compute the client key only now — first point at which it's needed.
-            waiters.push_back(WaiterEntry { client_key: client_key_fn(), tx });
+            // Clone key into the waiter entry (for fairness tracking during
+            // handoff); the original moves into the permit when we wake up.
+            waiters.push_back(WaiterEntry { client_key: client_key.clone(), tx });
             rx
         }; // ← waiters mutex released here
 
@@ -294,7 +308,7 @@ impl GlobalQueue {
             Ok(Ok(true)) => {
                 // Slot handed off from a completing request.
                 self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
-                AcquireResult::Permit(self.make_permit())
+                AcquireResult::Permit(self.make_permit(client_key))
             }
             Ok(Ok(false)) => {
                 // Shed by a newer incoming request.
@@ -329,12 +343,12 @@ struct WaiterEntry {
 
 fn select_next_waiter(
     waiters: &mut VecDeque<WaiterEntry>,
-    last_served_client: Option<&String>,
+    last_served_client: Option<&str>,
 ) -> Option<WaiterEntry> {
     let preferred_idx = last_served_client.and_then(|last| {
         waiters
             .iter()
-            .position(|entry| !entry.tx.is_closed() && &entry.client_key != last)
+            .position(|entry| !entry.tx.is_closed() && entry.client_key != last)
     });
 
     if let Some(idx) = preferred_idx {
@@ -355,8 +369,8 @@ fn select_next_waiter(
 mod tests {
     use super::*;
 
-    fn key(name: &'static str) -> impl FnOnce() -> String {
-        move || name.to_string()
+    fn key(name: &'static str) -> String {
+        name.to_string()
     }
 
     fn cfg(max: usize, depth: usize, wait_ms: u64, policy: OverloadPolicy) -> GlobalQueueConfig {

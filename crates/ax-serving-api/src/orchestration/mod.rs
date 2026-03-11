@@ -176,9 +176,7 @@ async fn proxy_inference(
     };
 
     // Admission control: acquire a queue slot before dispatching.
-    // The client key closure is only evaluated on the slow path (when the
-    // request is actually queued) — fast-path requests pay no allocation cost.
-    let permit = match layer.queue.acquire(|| fairness_client_key(&req_headers)).await {
+    let permit = match layer.queue.acquire(fairness_client_key(&req_headers)).await {
         AcquireResult::Permit(p) => p,
 
         AcquireResult::Rejected => {
