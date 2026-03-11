@@ -95,6 +95,15 @@ Goal: become production-grade enterprise control-plane infrastructure
 - Improve authentication, role separation, and auditability assumptions
 - Support real enterprise runbooks for offline and controlled-network setups
 
+Delivered scope:
+
+- authenticated `GET /v1/admin/status` for control-plane operational summary
+- authenticated public worker inventory and lifecycle APIs:
+  `GET /v1/workers`, `GET /v1/workers/{id}`, `POST /v1/workers/{id}/drain`,
+  `POST /v1/workers/{id}/drain-complete`, `DELETE /v1/workers/{id}`
+- request-ID propagation into admin responses for operator correlation
+- updated multi-worker runbook for authenticated public admin operations
+
 ### v1.6+
 
 Goal: differentiated offline enterprise infrastructure for advanced deployments

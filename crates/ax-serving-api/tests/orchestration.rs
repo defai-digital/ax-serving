@@ -4,6 +4,7 @@
 //! so that `DirectDispatcher` exercises actual HTTP round-trips.
 
 use std::net::SocketAddr;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,7 +16,7 @@ use ax_serving_api::orchestration::{
     registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry, WorkerStatus},
     LicenseConfig, OrchestratorConfig, OrchestratorLayer,
 };
-use axum::{Router, routing::post};
+use axum::{Router, middleware, routing::post};
 use reqwest::Client;
 use tower::ServiceExt;
 
@@ -47,6 +48,23 @@ async fn spawn_mock_worker(status: u16, body: &'static str) -> Option<SocketAddr
         axum::serve(listener, app).await.ok();
     });
     Some(addr)
+}
+
+fn proxy_router_with_key(
+    layer: Arc<OrchestratorLayer>,
+    key: &str,
+) -> Router {
+    layer.set_public_auth_required(true);
+    let mut keys = HashSet::new();
+    keys.insert(key.to_string());
+    ax_serving_api::orchestration::proxy_router(layer)
+        .route_layer(middleware::from_fn_with_state(
+            Arc::new(keys),
+            ax_serving_api::auth::auth_middleware,
+        ))
+        .layer(middleware::from_fn(
+            ax_serving_api::auth::request_id_and_headers_middleware,
+        ))
 }
 
 /// Unwrap a `spawn_mock_worker` / `TcpListener::bind` result, skipping the
@@ -870,6 +888,234 @@ async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
     assert_eq!(worker_json["decode_tok_per_sec"], 42.5);
     assert_eq!(worker_json["ttft_p95_ms"], 150);
     assert_eq!(worker_json["capabilities"][0], "hb-model");
+}
+
+#[tokio::test]
+async fn test_admin_status_requires_auth_and_returns_operational_summary() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let worker_addr = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[]}"#).await);
+    layer
+        .registry
+        .register(reg_req(worker_addr, &["ops-model"]), 5000);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/status")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-request-id", "req-admin-123")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("req-admin-123")
+    );
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["request_id"], "req-admin-123");
+    assert_eq!(json["mode"], "direct");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["auth_required"], true);
+    assert_eq!(json["workers"]["total"], 1);
+    assert_eq!(json["workers"]["eligible"], 1);
+    assert!(json["license"]["edition"].is_string());
+}
+
+#[tokio::test]
+async fn test_admin_status_reports_auth_required_from_runtime_state() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = ax_serving_api::orchestration::proxy_router(Arc::clone(&layer)).layer(
+        middleware::from_fn(ax_serving_api::auth::request_id_and_headers_middleware),
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["auth_required"], false);
+
+    layer.set_public_auth_required(true);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["auth_required"], true);
+}
+
+#[tokio::test]
+async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let worker_addr = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[]}"#).await);
+    let register = layer.registry.register(reg_req(worker_addr, &["ops-model"]), 5000);
+    let worker_id = register.worker_id;
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/workers")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), axum::http::StatusCode::OK);
+    let list_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(list_json["workers"].as_array().unwrap().len(), 1);
+    assert_eq!(list_json["workers"][0]["id"], worker_id);
+
+    let get_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/workers/{worker_id}"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+
+    let drain_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(format!("/v1/workers/{worker_id}/drain"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drain_resp.status(), axum::http::StatusCode::OK);
+
+    let drained = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/workers/{worker_id}"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let drained_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(drained.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(drained_json["drain"], true);
+
+    let complete_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(format!("/v1/workers/{worker_id}/drain-complete"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete_resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+    let missing = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/workers/{worker_id}"))
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
 }
 
 // ── Overload scenario helpers ─────────────────────────────────────────────────

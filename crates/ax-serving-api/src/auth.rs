@@ -9,6 +9,10 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use uuid::Uuid;
 
+/// Request correlation ID inserted by middleware for downstream handlers.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
 /// Load API keys from the `AXS_API_KEY` environment variable (comma-separated).
 ///
 /// Returns an empty set when `AXS_API_KEY` is unset or empty.  The caller
@@ -125,6 +129,11 @@ pub async fn request_id_and_headers_middleware(request: Request, next: Next) -> 
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
 
     let mut response = next.run(request).await;
     let headers = response.headers_mut();

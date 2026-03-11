@@ -33,13 +33,13 @@ pub mod queue;
 pub mod registry;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use axum::{
     Json, Router,
     body::{Body, BodyDataStream, Bytes},
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse},
@@ -72,6 +72,8 @@ pub struct OrchestratorLayer {
     pub retry_after_secs: u64,
     /// Soft license reminder state.
     pub license: Arc<LicenseState>,
+    /// Whether the public proxy requires bearer authentication.
+    pub public_auth_required: AtomicBool,
 }
 
 impl OrchestratorLayer {
@@ -99,7 +101,12 @@ impl OrchestratorLayer {
             queue: GlobalQueue::new(queue_config),
             retry_after_secs,
             license: LicenseState::new(&license_config),
+            public_auth_required: AtomicBool::new(false),
         })
+    }
+
+    pub fn set_public_auth_required(&self, required: bool) {
+        self.public_auth_required.store(required, Ordering::Relaxed);
     }
 }
 
@@ -112,14 +119,21 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/v1/models", get(proxy_models))
         .route("/health", get(proxy_health))
         .route("/v1/metrics", get(proxy_metrics))
+        .route("/v1/admin/status", get(proxy_admin_status))
         .route("/dashboard", get(proxy_dashboard))
         .route(
             "/v1/license",
             get(proxy_get_license).post(proxy_set_license),
         )
+        .route("/v1/workers", get(proxy_list_workers))
         .route(
             "/v1/workers/{id}",
-            axum::routing::delete(proxy_delete_worker),
+            get(proxy_get_worker).delete(proxy_delete_worker),
+        )
+        .route("/v1/workers/{id}/drain", post(proxy_drain_worker))
+        .route(
+            "/v1/workers/{id}/drain-complete",
+            post(proxy_drain_complete_worker),
         )
         .with_state(layer)
 }
@@ -367,6 +381,106 @@ async fn proxy_metrics(State(layer): State<Arc<OrchestratorLayer>>) -> impl Into
     }))
 }
 
+/// `GET /v1/admin/status` — authenticated operational summary for enterprise ops.
+async fn proxy_admin_status(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    req_id: Option<axum::extract::Extension<crate::auth::RequestId>>,
+) -> impl IntoResponse {
+    let (healthy, unhealthy, draining) = layer.registry.counts();
+    let workers = layer.registry.list_all();
+    let total_workers = workers.len();
+    let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
+    let total_active_sequences: usize = workers.iter().map(|w| w.active_sequences).sum();
+    let eligible = layer.registry.eligible_healthy_count();
+    let qm = &layer.queue.metrics;
+
+    Json(serde_json::json!({
+        "request_id": req_id.map(|v| v.0.0).unwrap_or_default(),
+        "mode": "direct",
+        "status": if eligible > 0 { "ok" } else { "degraded" },
+        "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
+        "dispatch_policy": layer.config.dispatch_policy,
+        "license": layer.license.to_json(),
+        "workers": {
+            "total": total_workers,
+            "healthy": healthy,
+            "unhealthy": unhealthy,
+            "draining": draining,
+            "eligible": eligible,
+            "total_inflight": total_inflight,
+            "total_active_sequences": total_active_sequences,
+        },
+        "queue": {
+            "active": layer.queue.active(),
+            "queued": layer.queue.queued(),
+            "permit_total": qm.permit_total.load(Ordering::Relaxed),
+            "rejected_total": qm.rejected_total.load(Ordering::Relaxed),
+            "shed_total": qm.shed_total.load(Ordering::Relaxed),
+            "timeout_total": qm.timeout_total.load(Ordering::Relaxed),
+        },
+        "dispatcher": {
+            "reroute_total": layer.dispatcher.reroutes(),
+            "request_timeout_secs": layer.config.request_timeout_secs,
+            "retry_after_secs": layer.retry_after_secs,
+        }
+    }))
+}
+
+/// `GET /v1/workers` — authenticated worker inventory for the public admin API.
+async fn proxy_list_workers(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "workers": layer.registry.list_all(),
+    }))
+}
+
+/// `GET /v1/workers/{id}` — authenticated single-worker snapshot.
+async fn proxy_get_worker(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    use self::registry::WorkerId;
+    let Some(id) = WorkerId::parse(&id_str) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
+    };
+    match layer.registry.get_snapshot(id) {
+        Some(worker) => Json(worker).into_response(),
+        None => (StatusCode::NOT_FOUND, "worker not found").into_response(),
+    }
+}
+
+/// `POST /v1/workers/{id}/drain` — authenticated graceful drain start.
+async fn proxy_drain_worker(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    use self::registry::WorkerId;
+    let Some(id) = WorkerId::parse(&id_str) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
+    };
+    if !layer.registry.mark_drain(id) {
+        return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
+    tracing::info!(%id, "worker marked for drain via public API");
+    StatusCode::OK.into_response()
+}
+
+/// `POST /v1/workers/{id}/drain-complete` — authenticated graceful worker removal.
+async fn proxy_drain_complete_worker(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    use self::registry::WorkerId;
+    let Some(id) = WorkerId::parse(&id_str) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
+    };
+    if layer.registry.get_snapshot(id).is_none() {
+        return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
+    layer.registry.evict(id);
+    tracing::info!(%id, "worker drain complete via public API");
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// `DELETE /v1/workers/{id}` — force-remove a worker (auth-protected).
 ///
 /// One-step remove: marks the worker as draining then evicts it immediately.
@@ -375,7 +489,7 @@ async fn proxy_metrics(State(layer): State<Arc<OrchestratorLayer>>) -> impl Into
 /// and not reachable from a browser dashboard).
 async fn proxy_delete_worker(
     State(layer): State<Arc<OrchestratorLayer>>,
-    axum::extract::Path(id_str): axum::extract::Path<String>,
+    Path(id_str): Path<String>,
 ) -> impl IntoResponse {
     use self::registry::WorkerId;
     let Some(id) = WorkerId::parse(&id_str) else {
@@ -524,6 +638,7 @@ pub async fn start_orchestrator(
             api_keys.len()
         );
     }
+    layer.set_public_auth_required(!api_keys.is_empty());
 
     let public_app = proxy_router(Arc::clone(&layer))
         .route_layer(middleware::from_fn_with_state(

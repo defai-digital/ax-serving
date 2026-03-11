@@ -202,8 +202,16 @@ nats consumer ls ax-serving
 # Gateway health (workers + queue summary)
 curl -s http://127.0.0.1:18080/health | jq .
 
+# Authenticated admin status (queue, dispatch, license, worker summary)
+curl -s http://127.0.0.1:18080/v1/admin/status \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
+
 # Detailed metrics including per-worker inflight and reroute count
 curl -s http://127.0.0.1:18080/v1/metrics | jq .
+
+# Public worker inventory for dashboards and operator tooling
+curl -s http://127.0.0.1:18080/v1/workers \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
 
 # Internal worker list (loopback only)
 curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, health, inflight, addr}'
@@ -231,6 +239,27 @@ AXS_LOG=debug ax-serving-api
 
 # Key structured log fields:
 #   worker_id, model_id, inflight, policy, reroute, request_id
+```
+
+### Public admin worker lifecycle
+
+Use the authenticated public API when operations tooling or browser dashboards
+cannot reach the loopback-only internal router.
+
+```bash
+WORKER_ID="<uuid from /v1/workers>"
+
+# Start graceful drain
+curl -s -X POST http://127.0.0.1:18080/v1/workers/${WORKER_ID}/drain \
+  -H "Authorization: Bearer ${AXS_API_KEY}"
+
+# Inspect a single worker snapshot
+curl -s http://127.0.0.1:18080/v1/workers/${WORKER_ID} \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
+
+# Complete drain and remove worker from registry
+curl -i -X POST http://127.0.0.1:18080/v1/workers/${WORKER_ID}/drain-complete \
+  -H "Authorization: Bearer ${AXS_API_KEY}"
 ```
 
 ---

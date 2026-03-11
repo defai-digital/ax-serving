@@ -230,6 +230,12 @@ Primary REST endpoints:
 - `GET /metrics`
 - `GET /dashboard`
 - `GET/POST /v1/license`
+- `GET /v1/admin/status`
+- `GET /v1/workers`
+- `GET /v1/workers/{id}`
+- `POST /v1/workers/{id}/drain`
+- `POST /v1/workers/{id}/drain-complete`
+- `DELETE /v1/workers/{id}`
 
 Runtime health contract:
 - `GET /health` is liveness plus readiness, not just process-up status
@@ -238,6 +244,21 @@ Runtime health contract:
 
 AX Fabric integration contract:
 - documented in [docs/contracts/ax-fabric-runtime-contract.md](docs/contracts/ax-fabric-runtime-contract.md)
+
+### v1.5 Control-Plane Surface
+
+`v1.5` makes the orchestrator usable as a production-facing admin surface, not
+just a request proxy.
+
+- `GET /v1/admin/status` gives an authenticated operational summary for queue,
+  dispatch policy, license state, worker counts, and reroute totals
+- `GET /v1/workers` and `GET /v1/workers/{id}` expose authenticated worker
+  inventory and per-worker telemetry
+- `POST /v1/workers/{id}/drain` and `POST /v1/workers/{id}/drain-complete`
+  support the public graceful-drain lifecycle for browser dashboards and ops
+  tooling
+- all authenticated admin responses preserve `X-Request-ID` so operators can
+  correlate API calls with logs and incident notes
 
 ### v1.4 Runtime Controls
 
