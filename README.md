@@ -5,7 +5,7 @@ The Offline Serving And Orchestration Plane For AX Fabric
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/defai-digital/ax-serving)
 [![rust-1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
-[![Tests: CI](https://img.shields.io/badge/tests-CI%20verified-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
+[![Tests: 384 passing](https://img.shields.io/badge/tests-384%20passing-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![license-AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 AX Serving is the offline serving and orchestration layer behind [AX Fabric](https://github.com/defai-digital/ax-fabric). It provides OpenAI-compatible APIs, runtime model lifecycle control, scheduling, metrics, and multi-worker routing on Apple Silicon.

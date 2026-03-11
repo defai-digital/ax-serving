@@ -140,6 +140,10 @@ impl LicenseState {
 mod tests {
     use super::*;
 
+    // Env var mutations are process-global.  Serialize all tests that call
+    // set_var / remove_var to prevent data races between parallel test threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn default_state() -> LicenseState {
         LicenseState {
             key: Mutex::new(None),
@@ -212,5 +216,117 @@ mod tests {
         let j = ls.to_json();
         assert_eq!(j["buy_link"], "https://example.com/buy");
         assert_eq!(j["dashboard_poll_ms"], 5000u64);
+    }
+
+    // ── file_path: returns None when no home directories configured ───────────
+
+    #[test]
+    fn file_path_returns_none_when_home_and_xdg_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Remove both env vars so file_path() has nowhere to look.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("HOME");
+        }
+        let path = LicenseState::file_path("ax-serving", "license.key");
+        // Restore a sane HOME (using /tmp as a safe stand-in) to avoid polluting
+        // other tests that depend on HOME being set.
+        unsafe { std::env::set_var("HOME", "/tmp") };
+        assert!(
+            path.is_none(),
+            "file_path must return None when neither XDG_CONFIG_HOME nor HOME is set"
+        );
+    }
+
+    // ── set_key: updates in-memory state even when no file path is available ──
+
+    #[test]
+    fn set_key_updates_memory_without_file_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Remove both so license_file_path() returns None → no disk I/O.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("HOME");
+        }
+        let ls = LicenseState {
+            key: std::sync::Mutex::new(None),
+            remote_worker_seen: std::sync::atomic::AtomicBool::new(false),
+            buy_link: "https://example.com".into(),
+            config_dir: "ax-serving".into(),
+            key_file: "license.key".into(),
+            dashboard_poll_ms: 2000,
+        };
+        // Restore HOME so later tests work.
+        unsafe { std::env::set_var("HOME", "/tmp") };
+        let result = ls.set_key("my-license-key".to_string());
+        assert!(result.is_ok(), "set_key must succeed even without a file path");
+        assert!(ls.has_key(), "key must be stored in memory");
+        assert_eq!(ls.edition(), "business");
+    }
+
+    // ── set_key: persists to disk and updates in-memory state ─────────────────
+
+    #[test]
+    fn set_key_persists_to_disk() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Point XDG_CONFIG_HOME at our temp dir so license_file_path() resolves there.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().to_str().unwrap()) };
+
+        let ls = LicenseState {
+            key: std::sync::Mutex::new(None),
+            remote_worker_seen: std::sync::atomic::AtomicBool::new(false),
+            buy_link: "https://example.com".into(),
+            config_dir: "ax-serving".into(),
+            key_file: "license.key".into(),
+            dashboard_poll_ms: 2000,
+        };
+        ls.set_key("prod-key-abc".to_string()).expect("set_key must succeed");
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+
+        // The key should be in memory.
+        assert!(ls.has_key());
+        // The key should have been written to disk.
+        let expected_path = dir.path().join("ax-serving").join("license.key");
+        let on_disk = std::fs::read_to_string(&expected_path).expect("file should exist");
+        assert_eq!(on_disk, "prod-key-abc");
+    }
+
+    // ── new: env key takes priority over file key ──────────────────────────────
+
+    #[test]
+    fn new_prefers_env_key_over_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Pre-create a file with a different key.
+        let key_dir = dir.path().join("ax-serving");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("license.key"), "file-key").unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path().to_str().unwrap());
+            std::env::set_var("AXS_LICENSE_KEY", "env-key");
+        }
+
+        let config = LicenseConfig {
+            buy_link: "https://example.com".into(),
+            config_dir: "ax-serving".into(),
+            key_file: "license.key".into(),
+            dashboard_poll_ms: 2000,
+        };
+        let ls = LicenseState::new(&config);
+
+        unsafe {
+            std::env::remove_var("AXS_LICENSE_KEY");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        // The env key should win over the file key.
+        assert!(ls.has_key());
+        assert_eq!(ls.edition(), "business");
+        // Verify the in-memory key is "env-key" not "file-key".
+        let key_guard = ls.key.lock().unwrap();
+        assert_eq!(key_guard.as_deref(), Some("env-key"));
     }
 }

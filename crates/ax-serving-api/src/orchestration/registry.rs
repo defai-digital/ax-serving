@@ -1030,6 +1030,25 @@ mod tests {
         );
     }
 
+    // ── mark_drain / mark_unhealthy on unknown worker ────────────────────────
+
+    #[test]
+    fn mark_drain_returns_false_for_unknown_worker() {
+        let r = WorkerRegistry::new();
+        assert!(
+            !r.mark_drain(WorkerId::new()),
+            "mark_drain must return false for an unregistered worker"
+        );
+    }
+
+    #[test]
+    fn mark_unhealthy_noop_for_unknown_worker() {
+        // Should not panic — no entry exists, so the call is silently ignored.
+        let r = WorkerRegistry::new();
+        r.mark_unhealthy(WorkerId::new()); // must not panic
+        assert!(r.list_all().is_empty());
+    }
+
     #[test]
     fn heartbeat_resets_health() {
         let r = WorkerRegistry::new();

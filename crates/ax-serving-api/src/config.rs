@@ -1057,4 +1057,96 @@ mod tests {
         let result = ServeConfig::from_file(&path);
         assert!(result.is_err(), "must error for invalid YAML");
     }
+
+    // ── validate: remaining constraint coverage ────────────────────────────────
+
+    #[test]
+    fn validate_rejects_zero_per_model_max_inflight() {
+        let mut cfg = valid_cfg();
+        cfg.sched_per_model_max_inflight = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sched_per_model_max_inflight"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_wait_ms() {
+        let mut cfg = valid_cfg();
+        cfg.sched_max_wait_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sched_max_wait_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_orchestrator_request_timeout() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.request_timeout_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cache_default_ttl_exceeds_max_ttl() {
+        let mut cfg = valid_cfg();
+        cfg.cache.enabled = true;
+        cfg.cache.default_ttl = "30d".into(); // 30 days
+        cfg.cache.max_ttl = "1h".into(); // 1 hour — less than default
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("default_ttl") || err.contains("max_ttl"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_malformed_cache_default_ttl() {
+        let mut cfg = valid_cfg();
+        cfg.cache.enabled = true;
+        cfg.cache.default_ttl = "not-a-duration".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("default_ttl") || err.contains("invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_project_policy_empty_project_name() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "   ".into(), // whitespace-only → trimmed to ""
+            allowed_models: vec!["*".into()],
+            max_tokens_limit: None,
+            worker_pool: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("project") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_project_policy_empty_allowed_models() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec![], // no models declared
+            max_tokens_limit: None,
+            worker_pool: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("allowed model"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_project_policy_zero_max_tokens_limit() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec!["*".into()],
+            max_tokens_limit: Some(0),
+            worker_pool: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_tokens_limit"), "got: {err}");
+    }
 }

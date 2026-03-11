@@ -270,4 +270,12 @@ mod tests {
         assert!(!model_matches("embed-*", "embeddings"));
         assert!(!model_matches("embed-*", "chat-main"));
     }
+
+    #[test]
+    fn model_matches_no_suffix_star_is_exact_match() {
+        // "embed-" (no trailing *) is a literal exact match, not a glob.
+        assert!(model_matches("embed-", "embed-"));
+        assert!(!model_matches("embed-", "embed-small"), "no star → not a prefix glob");
+        assert!(!model_matches("embed-", "embed-large"));
+    }
 }
