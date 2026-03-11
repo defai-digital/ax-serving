@@ -4,7 +4,7 @@ This commercial licensing section applies to AX Serving (`ax-serving`).
 AX Serving is a component of the AutomatosX ecosystem by DEFAI Private Limited.
 
 The community/open-source option for this repository is GNU AGPL v3 only
-(see `LICENSE` and `LICENSE-AGPL.md`).
+(see `LICENSE`).
 
 Business and Enterprise edition rights, including distributed node features and commercial support terms, are provided under separate commercial agreements.
 

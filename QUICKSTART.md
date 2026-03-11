@@ -1,6 +1,8 @@
 # AX Serving Quickstart
 
-This guide gets you from checkout to a working local LLM server.
+This guide gets you from checkout to a working AX Serving runtime.
+
+AX Serving works best with [AX Fabric](https://github.com/defai-digital/ax-fabric): AX Serving handles agent orchestration and model runtime, while AX Fabric handles local retrieval, vector search, and document ingestion.
 
 ## Prerequisites
 
@@ -537,7 +539,6 @@ See `config/serving.example.yaml` for the full configuration reference.
 - `docs/runbooks/multi-worker.md` — multi-worker deployment guide
 - `docs/perf/service-tuning.md` — throughput and latency tuning
 - [LICENSE](LICENSE) — full AGPL-3.0-only text
-- [LICENSE-AGPL.md](LICENSE-AGPL.md) — AGPL reference
 - [LICENSING.md](LICENSING.md) — dual-license policy
 - [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — commercial terms
 - [CONTRIBUTING.md](CONTRIBUTING.md) — issue reporting and patch policy

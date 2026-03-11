@@ -1,14 +1,18 @@
 # AX Serving
 
-The Local LLM Serving Layer for Apple Silicon
+The Execution And Serving Control Plane For AX Fabric
 
-AX Serving turns local model runtime into a production-style service with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, and built-in benchmarking.
+AX Serving is the execution and model-serving control plane for [AX Fabric](https://github.com/defai-digital/ax-fabric). It turns local model runtime into an operational layer for agent workloads with OpenAI-compatible APIs, model lifecycle control, multi-worker orchestration, scheduling, and benchmarking.
+
+AX Fabric is the product-facing knowledge and retrieval layer. AX Serving exists to power that stack by providing model access, execution control, request routing, and service operations.
 
 Status: Production Ready | Rust Workspace | Apple Silicon (`aarch64-apple-darwin`) | OpenAI-Compatible REST + gRPC
 
-> What AX Serving does: runs GGUF models as a real service, not just a single-process inference script.
+> What AX Serving is: the execution/control-plane subsystem behind AX Fabric.
 
-> Why teams use it: same local model workflow, but with queueing, health-aware routing, runtime load/unload, and operator visibility.
+> What AX Serving does: provides model serving, execution orchestration, routing, queueing, runtime load/unload, and operator visibility for AX Fabric deployments.
+
+> Product positioning: AX Fabric is the primary product; AX Serving is the infrastructure layer that makes AX Fabric deployable, scalable, and operable.
 
 * * *
 
@@ -115,7 +119,15 @@ npm run build
 
 ## Why AX Serving
 
-Most local runtimes optimize single-process inference. AX Serving focuses on service behavior around inference.
+Most local runtimes optimize single-process inference. AX Serving focuses on the execution and serving layer required to run AX Fabric reliably, with model inference exposed as a managed runtime behind the product.
+
+### Positioning
+
+AX Serving should be understood as infrastructure, not as the top-level product.
+
+- AX Fabric: the product users adopt for local retrieval, memory, ingestion, and grounded agent workflows
+- AX Serving: the runtime/control plane that powers model execution, APIs, routing, scheduling, and deployment for AX Fabric
+- Together: a complete local stack for grounded AI agents, with AX Fabric as the product surface and AX Serving as the execution substrate
 
 - OpenAI-compatible REST endpoints
 - gRPC serving/control plane
@@ -123,6 +135,14 @@ Most local runtimes optimize single-process inference. AX Serving focuses on ser
 - Admission queue + concurrency controls
 - Multi-worker orchestrator with health-aware dispatch
 - Built-in benchmark and soak tooling in the same repo
+
+### Best With AX Fabric
+
+AX Serving is designed to work with AX Fabric as part of one complete system.
+
+- AX Serving: execution control plane, model lifecycle, routing, scheduling, APIs
+- AX Fabric: document ingestion, vector search, BM25/hybrid retrieval, MCP-native data access
+- Together: AX Fabric is the product layer; AX Serving is the execution layer underneath it
 
 ---
 
@@ -275,16 +295,16 @@ Other benchmark modes:
 ## Documentation
 
 - [QUICKSTART.md](QUICKSTART.md)
+- [ROADMAP.md](ROADMAP.md)
 - `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
 - `sdk/python/` (Python SDK)
 - `docs/runbooks/multi-worker.md`
 - `docs/perf/service-tuning.md`
-- `automatosx/prd/BMS-AX-SERVING-v1.0.md`
 
 ---
 
 ## Licensing
 
-- Open-source option: [LICENSE](LICENSE), [LICENSE-AGPL.md](LICENSE-AGPL.md), and [LICENSING.md](LICENSING.md) (AGPL-3.0-only)
-- Commercial option: [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)
+- Open-source terms: [AGPL v3 text](LICENSE) and [licensing guide](LICENSING.md)
+- Commercial terms: [commercial license](LICENSE-COMMERCIAL.md)
 - Issue reporting policy: [CONTRIBUTING.md](CONTRIBUTING.md)

@@ -14,7 +14,6 @@ License, version 3 only.
 See:
 
 - [LICENSE](LICENSE)
-- [LICENSE-AGPL.md](LICENSE-AGPL.md)
 
 ## Commercial Option
 
