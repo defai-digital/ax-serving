@@ -2849,6 +2849,14 @@ pub async fn set_license(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(key) = body.get("key").and_then(|v| v.as_str()) else {
+        layer.audit.record(
+            audit_actor(req_id),
+            "license_set",
+            "license",
+            None,
+            "error",
+            Some(serde_json::json!({"error": "missing field: key"})),
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "missing field: key"})),
@@ -2857,6 +2865,14 @@ pub async fn set_license(
     };
     let key = key.trim().to_string();
     if key.is_empty() {
+        layer.audit.record(
+            audit_actor(req_id),
+            "license_set",
+            "license",
+            None,
+            "error",
+            Some(serde_json::json!({"error": "key must not be empty"})),
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "key must not be empty"})),
@@ -2875,11 +2891,21 @@ pub async fn set_license(
             );
             Json(layer.license.to_json()).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            layer.audit.record(
+                audit_actor(req_id),
+                "license_set",
+                "license",
+                None,
+                "error",
+                Some(serde_json::json!({"error": e.to_string()})),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 

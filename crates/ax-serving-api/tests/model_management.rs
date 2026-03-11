@@ -2172,6 +2172,52 @@ async fn license_set_empty_key_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn license_set_validation_errors_are_audited() {
+    let (_layer, app) = make_app_with_key_and_layer("secret");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/license")
+                .header("Authorization", "Bearer secret")
+                .header("Content-Type", "application/json")
+                .header("X-Request-ID", "req-license-invalid")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let audit = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/audit?limit=10")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), StatusCode::OK);
+    let audit_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(audit_json["events"].as_array().unwrap().iter().any(|e| {
+        e["action"] == "license_set"
+            && e["actor"] == "request:req-license-invalid"
+            && e["outcome"] == "error"
+            && e["detail"]["error"] == "missing field: key"
+    }));
+}
+
 // ── Security header tests ─────────────────────────────────────────────────────
 
 #[tokio::test]

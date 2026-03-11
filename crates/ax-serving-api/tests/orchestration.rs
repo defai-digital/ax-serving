@@ -1163,6 +1163,60 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
 }
 
 #[tokio::test]
+async fn test_license_validation_errors_are_audited() {
+    let _config_home = TestConfigHome::new();
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/license")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-request-id", "req-orch-license-invalid")
+                .body(axum::body::Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let audit = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/audit?limit=10")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), axum::http::StatusCode::OK);
+    let audit_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(audit_json["events"].as_array().unwrap().iter().any(|e| {
+        e["action"] == "license_set"
+            && e["actor"] == "request:req-orch-license-invalid"
+            && e["outcome"] == "error"
+            && e["detail"]["error"] == "missing field: key"
+    }));
+}
+
+#[tokio::test]
 async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     let layer = Arc::new(
         OrchestratorLayer::new(
