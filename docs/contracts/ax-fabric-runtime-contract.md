@@ -207,9 +207,18 @@ These metrics are intended for readiness decisions, integration diagnostics, and
 
 ## Non-Contract Items
 
-The following are not treated as a stable AX Fabric integration contract in `v1.3`:
+The following are not treated as a stable AX Fabric integration contract in `v1.4`:
 
 - internal orchestrator endpoints
 - dashboard HTML structure
 - benchmark report file formats
-- any scheduler metric not explicitly listed in the Metrics Contract section
+- scheduler metrics other than:
+  - `scheduler.queue_depth`
+  - `scheduler.inflight_count`
+  - `scheduler.cache_follower_waiting`
+  - `scheduler.ttft_p50_us`
+  - `scheduler.ttft_p95_us`
+  - `scheduler.ttft_p99_us`
+  - `scheduler.prefill_tokens_active`
+  - `scheduler.decode_sequences_active`
+  - `scheduler.split_scheduler_enabled`
