@@ -6,6 +6,8 @@
 //!
 //! To start the multi-worker API gateway, use `ax-serving-api` instead.
 
+mod thor;
+
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 compile_error!("ax-serving-cli only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
@@ -128,6 +130,93 @@ enum Command {
         #[arg(long)]
         orchestrator: Option<String>,
     },
+    /// Prepare and inspect a managed Thor worker node.
+    Thor {
+        #[command(subcommand)]
+        command: ThorCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ThorCommand {
+    /// Write the local ax-thor-agent environment file and run basic preflight checks.
+    Install {
+        /// Optional control-plane internal URL (e.g. http://127.0.0.1:19090).
+        #[arg(long)]
+        control_plane: Option<String>,
+        /// Local thor-agent listen address.
+        #[arg(long, default_value = "0.0.0.0:18081")]
+        listen_addr: String,
+        /// Worker address the control plane should route to.
+        #[arg(long)]
+        advertised_addr: Option<String>,
+        /// Local SGLang base URL.
+        #[arg(long, default_value = "http://127.0.0.1:30000")]
+        sglang_url: String,
+        /// Internal worker token for control-plane auth.
+        #[arg(long)]
+        worker_token: Option<String>,
+        /// Max concurrent requests this Thor worker should advertise.
+        #[arg(long, default_value_t = 8)]
+        max_inflight: usize,
+        /// Optional worker pool label.
+        #[arg(long)]
+        worker_pool: Option<String>,
+        /// Optional node class label.
+        #[arg(long, default_value = "thor")]
+        node_class: String,
+        /// Optional friendly node name.
+        #[arg(long)]
+        friendly_name: Option<String>,
+        /// Optional chip model override.
+        #[arg(long)]
+        chip_model: Option<String>,
+        /// Output env-file path. Defaults to ~/.config/ax-serving/thor.env
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Update Thor control-plane settings and validate registration readiness.
+    Join {
+        /// Control-plane internal URL (e.g. http://127.0.0.1:19090).
+        #[arg(long)]
+        control_plane: String,
+        /// Worker address the control plane should route to.
+        #[arg(long)]
+        advertised_addr: Option<String>,
+        /// Local thor-agent listen address.
+        #[arg(long)]
+        listen_addr: Option<String>,
+        /// Local SGLang base URL.
+        #[arg(long)]
+        sglang_url: Option<String>,
+        /// Internal worker token for control-plane auth.
+        #[arg(long)]
+        worker_token: Option<String>,
+        /// Max concurrent requests this Thor worker should advertise.
+        #[arg(long)]
+        max_inflight: Option<usize>,
+        /// Optional worker pool label.
+        #[arg(long)]
+        worker_pool: Option<String>,
+        /// Optional node class label.
+        #[arg(long)]
+        node_class: Option<String>,
+        /// Optional friendly node name.
+        #[arg(long)]
+        friendly_name: Option<String>,
+        /// Optional chip model override.
+        #[arg(long)]
+        chip_model: Option<String>,
+        /// Env-file path. Defaults to ~/.config/ax-serving/thor.env
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Show Thor local health and control-plane-visible registration state.
+    Status {
+        /// Env-file path. Defaults to ~/.config/ax-serving/thor.env
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -167,6 +256,71 @@ fn main() -> Result<()> {
             routing_config,
             orchestrator,
         ),
+        Some(Command::Thor { command }) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                match command {
+                    ThorCommand::Install {
+                        control_plane,
+                        listen_addr,
+                        advertised_addr,
+                        sglang_url,
+                        worker_token,
+                        max_inflight,
+                        worker_pool,
+                        node_class,
+                        friendly_name,
+                        chip_model,
+                        output,
+                    } => thor::install(thor::InstallArgs {
+                        control_plane,
+                        listen_addr,
+                        advertised_addr,
+                        sglang_url,
+                        worker_token,
+                        max_inflight,
+                        worker_pool,
+                        node_class,
+                        friendly_name,
+                        chip_model,
+                        output,
+                    }),
+                    ThorCommand::Join {
+                        control_plane,
+                        advertised_addr,
+                        listen_addr,
+                        sglang_url,
+                        worker_token,
+                        max_inflight,
+                        worker_pool,
+                        node_class,
+                        friendly_name,
+                        chip_model,
+                        output,
+                    } => {
+                        thor::join(thor::JoinArgs {
+                            control_plane,
+                            advertised_addr,
+                            listen_addr,
+                            sglang_url,
+                            worker_token,
+                            max_inflight,
+                            worker_pool,
+                            node_class,
+                            friendly_name,
+                            chip_model,
+                            output,
+                        })
+                        .await
+                    }
+                    ThorCommand::Status { config } => {
+                        thor::status(thor::StatusArgs { config }).await
+                    }
+                }
+            })
+        }
         None => {
             // Inference mode: MistralrsBackend owns its own runtime internally.
             // Run everything synchronously to avoid nested-runtime panics.

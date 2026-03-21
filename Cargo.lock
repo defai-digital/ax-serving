@@ -432,6 +432,7 @@ dependencies = [
  "ax-serving-engine",
  "clap",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -482,6 +483,22 @@ dependencies = [
  "libc",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ax-thor-agent"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.22.0",
 ]
 
 [[package]]

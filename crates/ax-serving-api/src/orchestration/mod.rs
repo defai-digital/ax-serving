@@ -510,7 +510,7 @@ async fn proxy_models(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoR
         // Unhealthy workers may recover but are not currently routable, so
         // advertising their models here would produce 503s on inference.
         .filter(|w| !w.drain && w.health == "healthy")
-        .flat_map(|w| w.capabilities.iter().cloned())
+        .flat_map(|w| w.capability_descriptor.models.iter().cloned())
         .collect();
     models.sort_unstable();
     models.dedup();
@@ -754,6 +754,8 @@ fn accumulate_fleet_bucket(
                 "eligible": 0usize,
                 "total_inflight": 0usize,
                 "total_active_sequences": 0usize,
+                "total_queue_depth": 0usize,
+                "max_error_rate": 0.0_f64,
             })
         });
     let obj = entry.as_object_mut().expect("fleet bucket must be object");
@@ -769,6 +771,17 @@ fn accumulate_fleet_bucket(
     }
     increment_bucket(obj, "total_inflight", worker.inflight as u64);
     increment_bucket(obj, "total_active_sequences", worker.active_sequences as u64);
+    increment_bucket(obj, "total_queue_depth", worker.queue_depth as u64);
+    let current_max = obj
+        .get("max_error_rate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if worker.error_rate > current_max {
+        obj.insert(
+            "max_error_rate".to_string(),
+            serde_json::Value::from(worker.error_rate),
+        );
+    }
 }
 
 fn increment_bucket(

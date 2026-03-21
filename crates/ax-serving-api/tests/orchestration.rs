@@ -1392,14 +1392,44 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     let green = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"green"}}]}"#).await
     );
-    layer.registry.register(
+    let blue_id = layer.registry.register(
         reg_req_with_pool(blue, &["fleet-model"], Some("blue"), Some("m3-max")),
         5000,
     );
-    layer.registry.register(
+    let green_id = layer.registry.register(
         reg_req_with_pool(green, &["fleet-model"], Some("green"), Some("m3-pro")),
         5000,
     );
+    let blue_id = WorkerId::parse(&blue_id.worker_id).unwrap();
+    let green_id = WorkerId::parse(&green_id.worker_id).unwrap();
+    assert!(layer.registry.heartbeat(
+        blue_id,
+        HeartbeatRequest {
+            inflight: 2,
+            thermal_state: "nominal".into(),
+            model_ids: vec!["fleet-model".into()],
+            rss_bytes: 0,
+            active_sequences: 2,
+            decode_tok_per_sec: 100.0,
+            ttft_p95_ms: 50,
+            queue_depth: 3,
+            error_rate: 0.25,
+        }
+    ));
+    assert!(layer.registry.heartbeat(
+        green_id,
+        HeartbeatRequest {
+            inflight: 1,
+            thermal_state: "nominal".into(),
+            model_ids: vec!["fleet-model".into()],
+            rss_bytes: 0,
+            active_sequences: 1,
+            decode_tok_per_sec: 120.0,
+            ttft_p95_ms: 40,
+            queue_depth: 1,
+            error_rate: 0.05,
+        }
+    ));
 
     let app = proxy_router_with_key(Arc::clone(&layer), "secret");
     let resp = app
@@ -1425,6 +1455,71 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     assert_eq!(json["pools"]["green"]["workers"], 1);
     assert_eq!(json["node_classes"]["m3-max"]["workers"], 1);
     assert_eq!(json["node_classes"]["m3-pro"]["workers"], 1);
+    assert_eq!(json["pools"]["blue"]["total_queue_depth"], 3);
+    assert_eq!(json["pools"]["green"]["total_queue_depth"], 1);
+    assert_eq!(json["pools"]["blue"]["max_error_rate"], 0.25);
+    assert_eq!(json["pools"]["green"]["max_error_rate"], 0.05);
+}
+
+#[tokio::test]
+async fn test_proxy_models_uses_structured_capability_models() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: "127.0.0.1:28081".into(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: true,
+                vision: false,
+                models: vec!["qwen2-72b".into(), "yolo11m".into()],
+                max_context: Some(131072),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 8,
+            friendly_name: Some("thor-01".into()),
+            chip_model: Some("RTX".into()),
+            worker_pool: Some("thor".into()),
+            node_class: Some("thor".into()),
+        },
+        5000,
+    );
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/models")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ids: Vec<_> = json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"qwen2-72b"));
+    assert!(ids.contains(&"yolo11m"));
 }
 
 #[tokio::test]

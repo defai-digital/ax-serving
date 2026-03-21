@@ -58,6 +58,8 @@
   .stat-value.err { color: var(--red); }
   .status-ok { color: var(--green); }
   .status-degraded { color: var(--red); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .subtle { color: var(--muted); font-size: 12px; }
   #error-bar { display: none; background: #2d0000; border: 1px solid var(--red); border-radius: 6px; padding: 10px 16px; color: #fca5a5; font-size: 13px; }
 </style>
 </head>
@@ -101,10 +103,11 @@
       <thead>
         <tr>
           <th>Machine</th>
-          <th>Chip</th>
+          <th>Backend</th>
           <th>Health</th>
-          <th>Inflight</th>
-          <th>Thermal</th>
+          <th>Load</th>
+          <th>Queue</th>
+          <th>Error</th>
           <th>Models</th>
           <th></th>
         </tr>
@@ -220,18 +223,25 @@
     tbody.innerHTML = workers.map(w => {
       const healthColor = dotColor(w);
       const name = w.friendly_name || w.addr || w.id || '—';
+      const backend = w.backend || '—';
+      const nodeClass = w.node_class || '—';
       const chip = w.chip_model || '—';
-      const models = (w.capabilities || []).join(', ') || '—';
-      const thermal = w.thermal_state || '—';
+      const models = ((w.capability_descriptor && w.capability_descriptor.models) || w.capabilities || []).join(', ') || '—';
       const inflight = w.inflight != null ? `${w.inflight}/${w.max_inflight||'?'}` : '—';
+      const queue = w.queue_depth != null ? String(w.queue_depth) : '—';
+      const errorRate = w.error_rate != null ? `${(w.error_rate * 100).toFixed(1)}%` : '—';
       const healthLabel = w.drain ? 'draining' : (w.health || 'unknown');
       return `<tr>
-        <td>${esc(name)}</td>
-        <td style="color:var(--muted)">${esc(chip)}</td>
+        <td>
+          <div>${esc(name)}</div>
+          <div class="subtle">${esc(chip)} · ${esc(nodeClass)}</div>
+        </td>
+        <td><span class="mono">${esc(backend)}</span></td>
         <td><span class="dot ${healthColor}"></span>${esc(healthLabel)}</td>
         <td>${esc(inflight)}</td>
-        <td style="color:var(--muted)">${esc(thermal)}</td>
-        <td style="color:var(--muted);font-size:12px">${esc(models)}</td>
+        <td>${esc(queue)}</td>
+        <td>${esc(errorRate)}</td>
+        <td class="mono" style="color:var(--muted)">${esc(models)}</td>
         <td><button class="danger" data-worker-id="${esc(w.id)}" onclick="removeWorker(this.dataset.workerId)">Remove</button></td>
       </tr>`;
     }).join('') || '<tr><td colspan="7" style="color:var(--muted);padding:16px 0">No workers registered</td></tr>';
