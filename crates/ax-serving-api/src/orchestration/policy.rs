@@ -396,7 +396,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::orchestration::registry::WorkerId;
+    use crate::orchestration::registry::{WorkerCapabilities, WorkerId};
 
     fn make_worker(inflight: usize, max_inflight: usize) -> WorkerStatus {
         WorkerStatus {
@@ -410,6 +410,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         }
     }
 
@@ -493,6 +496,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         };
         let w_low = WorkerStatus {
             id: WorkerId(Uuid::new_v4()),
@@ -505,6 +511,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         };
         let workers = vec![w_high.clone(), w_low.clone()];
 
@@ -668,6 +677,9 @@ mod tests {
             ttft_p95_ms,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         }
     }
 
@@ -735,6 +747,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         };
         let modern_idle = WorkerStatus {
             id: WorkerId(Uuid::new_v4()),
@@ -747,6 +762,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         };
         let workers = vec![legacy_busy.clone(), modern_idle.clone()];
         let sel = TokenCostPolicy::new().select(&workers, &ctx()).unwrap();
@@ -768,6 +786,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: None,
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         };
         assert!(
             TokenCostPolicy::new().select(&[legacy_full], &ctx()).is_none(),

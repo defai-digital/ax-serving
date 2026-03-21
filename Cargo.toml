@@ -59,6 +59,7 @@ rstest = "0.24"
 # Utilities
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
+ipnet = "2"
 
 # HTTP client (llama.cpp backend subprocess proxy)
 reqwest = { version = "0.12", features = ["json", "blocking"] }

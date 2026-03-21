@@ -381,6 +381,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "hex",
+ "ipnet",
  "prost",
  "redis",
  "reqwest 0.12.28",

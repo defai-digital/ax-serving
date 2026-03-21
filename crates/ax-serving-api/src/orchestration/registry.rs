@@ -60,6 +60,7 @@ impl std::fmt::Display for WorkerId {
 pub enum BackendKind {
     Native,
     LlamaCpp,
+    SgLang,
     Auto,
 }
 
@@ -67,6 +68,7 @@ impl BackendKind {
     pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
+            "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
             "native" => Self::Native,
             _ => Self::Auto,
         }
@@ -76,9 +78,86 @@ impl BackendKind {
         match self {
             Self::Native => "native",
             Self::LlamaCpp => "llama_cpp",
+            Self::SgLang => "sglang",
             Self::Auto => "auto",
         }
     }
+}
+
+fn backend_filter_from_hint(hint: Option<&str>) -> Option<BackendKind> {
+    let raw = hint?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match BackendKind::parse(raw) {
+        BackendKind::Auto => None,
+        kind => Some(kind),
+    }
+}
+
+// ── WorkerCapabilities ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCapabilities {
+    #[serde(default)]
+    pub llm: bool,
+    #[serde(default)]
+    pub embedding: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub max_context: Option<u32>,
+}
+
+impl WorkerCapabilities {
+    fn from_legacy_models(models: Vec<String>) -> Self {
+        Self {
+            llm: true,
+            embedding: false,
+            vision: false,
+            models,
+            max_context: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RegisterCapabilities {
+    Legacy(Vec<String>),
+    Structured(WorkerCapabilities),
+}
+
+impl Default for RegisterCapabilities {
+    fn default() -> Self {
+        Self::Legacy(Vec::new())
+    }
+}
+
+impl RegisterCapabilities {
+    fn into_parts(self) -> (WorkerCapabilities, CapabilitySource) {
+        match self {
+            Self::Legacy(models) => (
+                WorkerCapabilities::from_legacy_models(models),
+                CapabilitySource::Legacy,
+            ),
+            Self::Structured(capabilities) => (capabilities, CapabilitySource::Structured),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilitySource {
+    Legacy,
+    Structured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    Llm,
+    Embedding,
 }
 
 // ── WorkerHealth ──────────────────────────────────────────────────────────────
@@ -106,7 +185,8 @@ impl WorkerHealth {
 pub struct WorkerEntry {
     pub id: WorkerId,
     pub addr: SocketAddr,
-    pub capabilities: Vec<String>,
+    pub capabilities: WorkerCapabilities,
+    capability_source: CapabilitySource,
     pub backend: BackendKind,
     pub max_inflight: usize,
     /// Atomically updated by the dispatcher without taking the registry lock.
@@ -132,6 +212,10 @@ pub struct WorkerEntry {
     pub decode_tok_per_sec: f64,
     /// P95 TTFT in milliseconds from the worker's scheduler metrics (0 = unknown).
     pub ttft_p95_ms: u64,
+    /// Current pending queue depth reported by the worker.
+    pub queue_depth: usize,
+    /// Recent error rate fraction from the worker (0.0 = unknown / no errors).
+    pub error_rate: f64,
 }
 
 // ── Payloads (serialised over the internal REST API) ─────────────────────────
@@ -142,8 +226,9 @@ pub struct RegisterRequest {
     pub worker_id: Option<String>,
     /// `"127.0.0.1:8081"` — loopback address the orchestrator can reach.
     pub addr: String,
-    /// Model IDs this worker has loaded.
-    pub capabilities: Vec<String>,
+    /// Either a legacy model-id list or a structured capability descriptor.
+    #[serde(default)]
+    pub capabilities: RegisterCapabilities,
     /// `"native"` | `"llama_cpp"` | `"auto"`
     #[serde(default = "default_backend")]
     pub backend: String,
@@ -198,6 +283,12 @@ pub struct HeartbeatRequest {
     /// 0 = unknown / no streaming requests yet.
     #[serde(default)]
     pub ttft_p95_ms: u64,
+    /// Current pending queue depth at the worker.
+    #[serde(default)]
+    pub queue_depth: usize,
+    /// Recent worker-side error rate fraction (0.0-1.0).
+    #[serde(default)]
+    pub error_rate: f64,
 }
 
 // ── Read-only snapshot for dispatch policies ──────────────────────────────────
@@ -227,6 +318,12 @@ pub struct WorkerStatus {
     pub worker_pool: Option<String>,
     /// Optional node class for topology and fleet inventory.
     pub node_class: Option<String>,
+    /// Structured worker capabilities used by capability-aware filtering.
+    pub capabilities: WorkerCapabilities,
+    /// Current pending queue depth reported by the worker.
+    pub queue_depth: usize,
+    /// Recent worker-side error rate fraction.
+    pub error_rate: f64,
 }
 
 // ── JSON snapshot for the listing endpoints ───────────────────────────────────
@@ -236,6 +333,7 @@ pub struct WorkerSnapshot {
     pub id: WorkerId,
     pub addr: String,
     pub capabilities: Vec<String>,
+    pub capability_descriptor: WorkerCapabilities,
     pub backend: String,
     pub max_inflight: usize,
     pub inflight: usize,
@@ -266,6 +364,10 @@ pub struct WorkerSnapshot {
     pub decode_tok_per_sec: f64,
     /// P95 TTFT in milliseconds (0 = unknown).
     pub ttft_p95_ms: u64,
+    /// Current pending queue depth at the worker.
+    pub queue_depth: usize,
+    /// Recent worker-side error rate fraction.
+    pub error_rate: f64,
 }
 
 // ── WorkerRegistry ────────────────────────────────────────────────────────────
@@ -300,62 +402,79 @@ impl WorkerRegistry {
 
     /// Register (or re-register) a worker.  Returns the assigned `WorkerId`.
     pub fn register(&self, req: RegisterRequest, heartbeat_interval_ms: u64) -> RegisterResponse {
-        let id = req
-            .worker_id
+        let RegisterRequest {
+            worker_id,
+            addr: raw_addr,
+            capabilities,
+            backend,
+            max_inflight,
+            friendly_name,
+            chip_model,
+            worker_pool,
+            node_class,
+        } = req;
+        let id = worker_id
             .as_deref()
             .and_then(WorkerId::parse)
             .unwrap_or_default();
 
-        let addr: SocketAddr = req.addr.parse().unwrap_or_else(|e| {
+        let addr: SocketAddr = raw_addr.parse().unwrap_or_else(|e| {
             // Fallback: loopback on a non-routable port so the registry isn't
             // poisoned but the worker will never receive traffic.
-            warn!(raw_addr = %req.addr, err = %e, "worker registered with unparseable address; it will never receive traffic");
+            warn!(raw_addr = %raw_addr, err = %e, "worker registered with unparseable address; it will never receive traffic");
             "127.0.0.1:1".parse().unwrap()
         });
+        let backend = BackendKind::parse(&backend);
+        let (capabilities, capability_source) = capabilities.into_parts();
 
         self.inner
             .entry(id)
             .and_modify(|existing| {
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
-                existing.capabilities = req.capabilities.clone();
-                existing.max_inflight = req.max_inflight;
+                existing.capabilities = capabilities.clone();
+                existing.capability_source = capability_source;
+                existing.backend = backend.clone();
+                existing.max_inflight = max_inflight;
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
                 existing.drain = false;
                 // Preserve richer identity fields if re-registering with them.
-                if req.friendly_name.is_some() {
-                    existing.friendly_name = req.friendly_name.clone();
+                if friendly_name.is_some() {
+                    existing.friendly_name = friendly_name.clone();
                 }
-                if req.chip_model.is_some() {
-                    existing.chip_model = req.chip_model.clone();
+                if chip_model.is_some() {
+                    existing.chip_model = chip_model.clone();
                 }
-                if req.worker_pool.is_some() {
-                    existing.worker_pool = req.worker_pool.clone();
+                if worker_pool.is_some() {
+                    existing.worker_pool = worker_pool.clone();
                 }
-                if req.node_class.is_some() {
-                    existing.node_class = req.node_class.clone();
+                if node_class.is_some() {
+                    existing.node_class = node_class.clone();
                 }
             })
             .or_insert_with(|| WorkerEntry {
                 id,
                 addr,
-                capabilities: req.capabilities,
-                backend: BackendKind::parse(&req.backend),
-                max_inflight: req.max_inflight,
+                capabilities,
+                capability_source,
+                backend,
+                max_inflight,
                 inflight: Arc::new(AtomicUsize::new(0)),
                 health: WorkerHealth::Healthy,
                 last_heartbeat: Instant::now(),
                 drain: false,
                 thermal_state: String::new(),
                 rss_bytes: 0,
-                friendly_name: req.friendly_name,
-                chip_model: req.chip_model,
-                worker_pool: req.worker_pool,
-                node_class: req.node_class,
+                friendly_name,
+                chip_model,
+                worker_pool,
+                node_class,
                 active_sequences: 0,
                 decode_tok_per_sec: 0.0,
                 ttft_p95_ms: 0,
+                queue_depth: 0,
+                error_rate: 0.0,
             });
 
         RegisterResponse {
@@ -375,13 +494,15 @@ impl WorkerRegistry {
                 e.rss_bytes = req.rss_bytes;
                 // Authoritative capability snapshot from worker heartbeat.
                 // Empty model_ids means the worker currently has no models.
-                e.capabilities = req.model_ids;
+                e.capabilities.models = req.model_ids;
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
                 e.active_sequences = req.active_sequences;
                 e.decode_tok_per_sec = req.decode_tok_per_sec;
                 e.ttft_p95_ms = req.ttft_p95_ms;
+                e.queue_depth = req.queue_depth;
+                e.error_rate = req.error_rate;
                 true
             }
             None => false,
@@ -421,13 +542,37 @@ impl WorkerRegistry {
     /// Returns workers eligible to receive a request for `model_id`:
     /// healthy, not draining, and has `model_id` in capabilities.
     pub fn eligible_workers(&self, model_id: &str) -> Vec<WorkerStatus> {
+        self.eligible_workers_filtered(model_id, RequestKind::Llm, None, None)
+    }
+
+    /// Returns workers eligible to receive a request for `model_id` and request kind:
+    /// healthy, not draining, advertises the model, and supports the request kind.
+    pub fn eligible_workers_for(&self, model_id: &str, request_kind: RequestKind) -> Vec<WorkerStatus> {
+        self.eligible_workers_filtered(model_id, request_kind, None, None)
+    }
+
+    pub fn eligible_workers_filtered(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+    ) -> Vec<WorkerStatus> {
+        let backend_filter = backend_filter_from_hint(backend_hint);
         self.inner
             .iter()
             .filter(|r| {
                 let e = r.value();
                 !e.drain
                     && matches!(e.health, WorkerHealth::Healthy)
-                    && e.capabilities.iter().any(|c| c == model_id)
+                    && e.capabilities.models.iter().any(|c| c == model_id)
+                    && supports_request_kind(e, request_kind)
+                    && backend_filter.as_ref().is_none_or(|kind| &e.backend == kind)
+                    && min_context.is_none_or(|required| {
+                        e.capabilities
+                            .max_context
+                            .is_none_or(|worker_max| worker_max >= required)
+                    })
             })
             .map(|r| {
                 let e = r.value();
@@ -442,6 +587,9 @@ impl WorkerRegistry {
                     ttft_p95_ms: e.ttft_p95_ms,
                     worker_pool: e.worker_pool.clone(),
                     node_class: e.node_class.clone(),
+                    capabilities: e.capabilities.clone(),
+                    queue_depth: e.queue_depth,
+                    error_rate: e.error_rate,
                 }
             })
             .collect()
@@ -570,7 +718,8 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
     WorkerSnapshot {
         id: e.id,
         addr: e.addr.to_string(),
-        capabilities: e.capabilities.clone(),
+        capabilities: e.capabilities.models.clone(),
+        capability_descriptor: e.capabilities.clone(),
         backend: e.backend.as_str().to_string(),
         max_inflight: e.max_inflight,
         inflight,
@@ -587,6 +736,19 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         active_sequences: e.active_sequences,
         decode_tok_per_sec: e.decode_tok_per_sec,
         ttft_p95_ms: e.ttft_p95_ms,
+        queue_depth: e.queue_depth,
+        error_rate: e.error_rate,
+    }
+}
+
+fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool {
+    match entry.capability_source {
+        // Compatibility path: legacy workers historically routed by model-id only.
+        CapabilitySource::Legacy => true,
+        CapabilitySource::Structured => match request_kind {
+            RequestKind::Llm => entry.capabilities.llm,
+            RequestKind::Embedding => entry.capabilities.embedding,
+        },
     }
 }
 
@@ -600,7 +762,9 @@ mod tests {
         RegisterRequest {
             worker_id: None,
             addr: addr.into(),
-            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            capabilities: RegisterCapabilities::Legacy(
+                caps.iter().map(|s| s.to_string()).collect(),
+            ),
             backend: "native".into(),
             max_inflight: max,
             friendly_name: None,
@@ -622,6 +786,193 @@ mod tests {
 
         // Unknown model → empty
         assert!(r.eligible_workers("unknown-model").is_empty());
+    }
+
+    #[test]
+    fn parse_sglang_backend() {
+        assert_eq!(BackendKind::parse("sglang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::parse("sg_lang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::parse("sg-lang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::SgLang.as_str(), "sglang");
+    }
+
+    #[test]
+    fn structured_capabilities_registration_is_preserved() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["embed-1".into()],
+                    max_context: Some(8192),
+                }),
+                backend: "sglang".into(),
+                max_inflight: 8,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: Some("thor".into()),
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.backend, "sglang");
+        assert_eq!(snapshot.capabilities, vec!["embed-1".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
+    }
+
+    #[test]
+    fn structured_embedding_only_worker_is_not_llm_eligible() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["embed-1".into()],
+                    max_context: None,
+                }),
+                backend: "sglang".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: Some("thor".into()),
+            },
+            5000,
+        );
+
+        assert!(r.eligible_workers("embed-1").is_empty());
+        assert_eq!(
+            r.eligible_workers_for("embed-1", RequestKind::Embedding).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn backend_hint_filters_workers() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["shared-model".into()],
+                    max_context: Some(4096),
+                }),
+                backend: "native".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: Some("mac".into()),
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["shared-model".into()],
+                    max_context: Some(16384),
+                }),
+                backend: "sglang".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: Some("thor".into()),
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_filtered("shared-model", RequestKind::Llm, Some("sglang"), None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            r.eligible_workers_filtered("shared-model", RequestKind::Llm, Some("native"), None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            r.eligible_workers_filtered("shared-model", RequestKind::Llm, Some("unknown"), None)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn min_context_filters_workers() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["ctx-model".into()],
+                    max_context: Some(4096),
+                }),
+                backend: "native".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["ctx-model".into()],
+                    max_context: Some(16384),
+                }),
+                backend: "sglang".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_filtered("ctx-model", RequestKind::Llm, None, Some(8000))
+                .len(),
+            1
+        );
+        assert_eq!(
+            r.eligible_workers_filtered("ctx-model", RequestKind::Llm, None, Some(20000))
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -804,7 +1155,7 @@ mod tests {
         let req = RegisterRequest {
             worker_id: None,
             addr: "127.0.0.1:8081".into(),
-            capabilities: vec![],
+            capabilities: RegisterCapabilities::Legacy(vec![]),
             backend: "auto".into(),
             max_inflight: 4,
             friendly_name: Some("Aki's MacBook Pro".to_string()),
@@ -903,7 +1254,7 @@ mod tests {
             RegisterRequest {
                 worker_id: None,
                 addr: "not-a-valid:addr:at:all".into(),
-                capabilities: vec!["m1".to_string()],
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".to_string()]),
                 backend: "auto".into(),
                 max_inflight: 4,
                 friendly_name: None,

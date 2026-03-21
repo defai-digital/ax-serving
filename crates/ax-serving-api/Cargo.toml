@@ -44,6 +44,7 @@ base64 = { workspace = true }
 tower-http = { workspace = true }
 hdrhistogram = { workspace = true }
 dashmap = { workspace = true }
+ipnet = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

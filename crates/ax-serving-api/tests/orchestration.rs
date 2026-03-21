@@ -11,11 +11,18 @@ use std::sync::{Mutex, MutexGuard};
 
 use ax_serving_api::orchestration::{
     direct::DirectDispatcher,
-    internal_routes::{InternalState, router as internal_router},
+    internal_routes::{
+        InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
+        router as internal_router,
+    },
     policy::{DispatchContext, DispatchPolicy, policy_from_str},
     queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy},
-    registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry, WorkerStatus},
+    registry::{
+        HeartbeatRequest, RegisterCapabilities, RegisterRequest, RequestKind, WorkerCapabilities,
+        WorkerId, WorkerRegistry, WorkerStatus,
+    },
     LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
+    start_orchestrator,
 };
 use axum::{Router, middleware, routing::post};
 use reqwest::Client;
@@ -63,6 +70,51 @@ impl Drop for TestConfigHome {
             match &self.previous_home {
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
+
+struct EnvVarsGuard {
+    _guard: MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvVarsGuard {
+    fn new() -> Self {
+        let guard = ENV_LOCK.lock().unwrap();
+        Self {
+            _guard: guard,
+            previous: Vec::new(),
+        }
+    }
+
+    fn set(&mut self, key: &'static str, value: &str) {
+        self.previous.push((key, std::env::var_os(key)));
+        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove(&mut self, key: &'static str) {
+        self.previous.push((key, std::env::var_os(key)));
+        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+impl Drop for EnvVarsGuard {
+    fn drop(&mut self) {
+        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
+        unsafe {
+            for (key, previous) in self.previous.iter().rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -132,7 +184,7 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
     RegisterRequest {
         worker_id: None,
         addr: addr.to_string(),
-        capabilities: caps.iter().map(|s| s.to_string()).collect(),
+        capabilities: RegisterCapabilities::Legacy(caps.iter().map(|s| s.to_string()).collect()),
         backend: "native".into(),
         max_inflight: 8,
         friendly_name: None,
@@ -537,6 +589,104 @@ async fn test_health_endpoint_shape() {
     assert!(body.get("queue").is_some(), "health must have 'queue'");
 }
 
+#[tokio::test]
+async fn test_non_loopback_internal_bind_requires_token() {
+    let mut env = EnvVarsGuard::new();
+    env.set("AXS_ALLOW_NO_AUTH", "true");
+    env.remove("AXS_INTERNAL_API_TOKEN");
+
+    let result = start_orchestrator(
+        OrchestratorConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            internal_port: 0,
+            internal_bind_addr: "0.0.0.0".into(),
+            ..OrchestratorConfig::default()
+        },
+        LicenseConfig::default(),
+        ProjectPolicyConfig::default(),
+    )
+    .await;
+
+    let err = result.expect_err("non-loopback internal bind without token must fail");
+    assert!(
+        err.to_string().contains("AXS_INTERNAL_API_TOKEN"),
+        "error should mention missing internal token: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_allowed_node_cidrs_fails_startup() {
+    let mut env = EnvVarsGuard::new();
+    env.set("AXS_ALLOW_NO_AUTH", "true");
+    env.set("AXS_INTERNAL_API_TOKEN", "secret");
+
+    let result = start_orchestrator(
+        OrchestratorConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            internal_port: 0,
+            internal_bind_addr: "127.0.0.1".into(),
+            allowed_node_cidrs: "not-a-cidr".into(),
+            ..OrchestratorConfig::default()
+        },
+        LicenseConfig::default(),
+        ProjectPolicyConfig::default(),
+    )
+    .await;
+
+    let err = result.expect_err("invalid allowlist must fail startup");
+    assert!(
+        err.to_string().contains("AXS_ALLOWED_NODE_CIDRS"),
+        "error should mention malformed allowlist: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_internal_router_real_server_enforces_token_and_allowlist() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let state = InternalState {
+        registry: layer.registry.clone(),
+        config: Arc::clone(&layer.config),
+        license: Arc::clone(&layer.license),
+    };
+    let addr = skip_if_no_socket!(spawn_internal_router_with_auth(
+        state,
+        Some(InternalAuthState {
+            token: Some(Arc::new("secret".to_string())),
+            allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
+        }),
+    )
+    .await);
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let unauthorized = client
+        .get(format!("http://{addr}/internal/workers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let authorized = client
+        .get(format!("http://{addr}/internal/workers"))
+        .header("x-internal-token", "secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), axum::http::StatusCode::OK);
+}
+
 // Minimal health handler for the shape test above.
 async fn health_handler(
     axum::extract::State(layer): axum::extract::State<
@@ -777,7 +927,7 @@ async fn test_wrr_dispatch_proportional() {
         RegisterRequest {
             worker_id: None,
             addr: addr_a.to_string(),
-            capabilities: vec!["wrr-model".into()],
+            capabilities: RegisterCapabilities::Legacy(vec!["wrr-model".into()]),
             backend: "native".into(),
             max_inflight: 4,
             friendly_name: None,
@@ -791,7 +941,7 @@ async fn test_wrr_dispatch_proportional() {
         RegisterRequest {
             worker_id: None,
             addr: addr_b.to_string(),
-            capabilities: vec!["wrr-model".into()],
+            capabilities: RegisterCapabilities::Legacy(vec!["wrr-model".into()]),
             backend: "native".into(),
             max_inflight: 1,
             friendly_name: None,
@@ -862,6 +1012,8 @@ async fn test_token_cost_dispatch_prefers_lower_cost_worker() {
             active_sequences: 3,
             decode_tok_per_sec: 20.0,
             ttft_p95_ms: 400,
+            queue_depth: 0,
+            error_rate: 0.0,
         }
     ));
     assert!(layer.registry.heartbeat(
@@ -874,6 +1026,8 @@ async fn test_token_cost_dispatch_prefers_lower_cost_worker() {
             active_sequences: 1,
             decode_tok_per_sec: 80.0,
             ttft_p95_ms: 100,
+            queue_depth: 0,
+            error_rate: 0.0,
         }
     ));
 
@@ -1641,6 +1795,344 @@ async fn test_proxy_embeddings_route_and_project_policy() {
 }
 
 #[tokio::test]
+async fn test_structured_embedding_worker_is_not_used_for_chat() {
+    let worker_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#).await
+    );
+
+    let registry = WorkerRegistry::new();
+    registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: worker_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: false,
+                embedding: true,
+                vision: false,
+                models: vec!["embed-only".into()],
+                max_context: None,
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+        },
+        5000,
+    );
+
+    let policy = policy_from_str("least_inflight").unwrap();
+    let dispatcher = DirectDispatcher::new(8, 300);
+
+    let chat_resp = dispatcher
+        .forward(
+            &registry,
+            policy.as_ref(),
+            "embed-only",
+            false,
+            None,
+            "/v1/chat/completions",
+            axum::body::Bytes::from(r#"{"model":"embed-only","messages":[]}"#),
+            None,
+        )
+        .await;
+    assert_eq!(chat_resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+    let embedding_resp = dispatcher
+        .forward_kind(
+            &registry,
+            policy.as_ref(),
+            "embed-only",
+            RequestKind::Embedding,
+            None,
+            None,
+            false,
+            None,
+            "/v1/embeddings",
+            axum::body::Bytes::from(r#"{"model":"embed-only","input":"hello"}"#),
+            None,
+        )
+        .await;
+    assert_eq!(embedding_resp.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_backend_hint_routes_to_matching_worker() {
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let native_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"native"}}]}"#).await
+    );
+    let sglang_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"sglang"}}]}"#).await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: native_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["shared-backend-model".into()],
+                max_context: Some(4096),
+            }),
+            backend: "native".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("mac".into()),
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: sglang_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["shared-backend-model".into()],
+                max_context: Some(16384),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+        },
+        5000,
+    );
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"shared-backend-model",
+            "backend":"sglang",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "sglang");
+}
+
+#[tokio::test]
+async fn test_routing_trace_header_includes_selected_worker() {
+    let mut env = EnvVarsGuard::new();
+    env.set("AXS_ROUTING_TRACE", "true");
+
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let native_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"native"}}]}"#).await
+    );
+    let sglang_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"sglang"}}]}"#).await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: native_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["trace-model".into()],
+                max_context: Some(4096),
+            }),
+            backend: "native".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("mac".into()),
+        },
+        5000,
+    );
+    let sglang_reg = layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: sglang_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["trace-model".into()],
+                max_context: Some(16384),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+        },
+        5000,
+    );
+
+    let sglang_worker_id = sglang_reg.worker_id;
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"trace-model",
+            "backend":"sglang",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let trace = resp
+        .headers()
+        .get("x-ax-routing-trace")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(trace.contains("candidates=1"));
+    assert!(trace.contains(&format!("selected={sglang_worker_id}")));
+    assert!(trace.contains("reason=primary"));
+}
+
+#[tokio::test]
+async fn test_routing_trace_header_on_no_eligible_worker() {
+    let mut env = EnvVarsGuard::new();
+    env.set("AXS_ROUTING_TRACE", "true");
+
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, _layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"missing-model",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let trace = resp
+        .headers()
+        .get("x-ax-routing-trace")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(trace.contains("candidates=0"));
+    assert!(trace.contains("selected=none"));
+    assert!(trace.contains("reason=no_eligible_worker"));
+}
+
+#[tokio::test]
+async fn test_prompt_size_routes_to_sufficient_context_worker() {
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let short_ctx_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"short-ctx"}}]}"#).await
+    );
+    let long_ctx_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"long-ctx"}}]}"#).await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: short_ctx_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["ctx-route-model".into()],
+                max_context: Some(32),
+            }),
+            backend: "native".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("mac".into()),
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: long_ctx_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["ctx-route-model".into()],
+                max_context: Some(4096),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+        },
+        5000,
+    );
+
+    let long_prompt = "x".repeat(400);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"ctx-route-model",
+            "messages":[{"role":"user","content": long_prompt}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "long-ctx");
+}
+
+#[tokio::test]
 async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -1782,6 +2274,32 @@ async fn spawn_orchestrator_with_layer(
         axum::serve(listener, router).await.ok();
     });
     Some((addr, layer))
+}
+
+async fn spawn_internal_router_with_auth(
+    state: InternalState,
+    auth_state: Option<InternalAuthState>,
+) -> Option<SocketAddr> {
+    let app = if let Some(auth_state) = auth_state {
+        internal_router(state).route_layer(middleware::from_fn_with_state(
+            auth_state,
+            internal_auth_middleware,
+        ))
+    } else {
+        internal_router(state)
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+    Some(addr)
 }
 
 // ── Step 3: Overload scenario tests ───────────────────────────────────────────

@@ -204,6 +204,12 @@ pub struct OrchestratorConfig {
     /// Internal API port (workers register / heartbeat here).
     /// env: `AXS_INTERNAL_PORT`
     pub internal_port: u16,
+    /// Internal API bind host.
+    /// env: `AXS_INTERNAL_BIND_ADDR`
+    pub internal_bind_addr: String,
+    /// Comma-separated worker source IP/CIDR allowlist for the internal API.
+    /// env: `AXS_ALLOWED_NODE_CIDRS`
+    pub allowed_node_cidrs: String,
     /// How often workers should send heartbeats (ms).
     /// env: `AXS_WORKER_HEARTBEAT_MS`
     pub worker_heartbeat_ms: u64,
@@ -241,6 +247,8 @@ impl Default for OrchestratorConfig {
             host: "127.0.0.1".into(),
             port: 18080,
             internal_port: 19090,
+            internal_bind_addr: "127.0.0.1".into(),
+            allowed_node_cidrs: String::new(),
             worker_heartbeat_ms: 5_000,
             worker_ttl_ms: 15_000,
             dispatch_policy: "least_inflight".into(),
@@ -629,6 +637,12 @@ impl ServeConfig {
         {
             self.orchestrator.internal_port = p;
         }
+        if let Ok(v) = std::env::var("AXS_INTERNAL_BIND_ADDR") {
+            self.orchestrator.internal_bind_addr = v;
+        }
+        if let Ok(v) = std::env::var("AXS_ALLOWED_NODE_CIDRS") {
+            self.orchestrator.allowed_node_cidrs = v;
+        }
         if let Ok(v) = std::env::var("AXS_WORKER_HEARTBEAT_MS")
             && let Ok(ms) = v.parse::<u64>()
         {
@@ -934,15 +948,21 @@ mod tests {
         unsafe {
             std::env::set_var("AXS_ORCHESTRATOR_PORT", "9000");
             std::env::set_var("AXS_INTERNAL_PORT", "9001");
+            std::env::set_var("AXS_INTERNAL_BIND_ADDR", "0.0.0.0");
+            std::env::set_var("AXS_ALLOWED_NODE_CIDRS", "127.0.0.1/32,10.0.0.0/8");
         }
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
         unsafe {
             std::env::remove_var("AXS_ORCHESTRATOR_PORT");
             std::env::remove_var("AXS_INTERNAL_PORT");
+            std::env::remove_var("AXS_INTERNAL_BIND_ADDR");
+            std::env::remove_var("AXS_ALLOWED_NODE_CIDRS");
         }
         assert_eq!(cfg.orchestrator.port, 9000);
         assert_eq!(cfg.orchestrator.internal_port, 9001);
+        assert_eq!(cfg.orchestrator.internal_bind_addr, "0.0.0.0");
+        assert_eq!(cfg.orchestrator.allowed_node_cidrs, "127.0.0.1/32,10.0.0.0/8");
     }
 
     #[test]

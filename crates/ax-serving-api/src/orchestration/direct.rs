@@ -24,7 +24,7 @@ use reqwest::Client;
 use tracing::{error, warn};
 
 use super::policy::{DispatchContext, DispatchPolicy};
-use super::registry::{WorkerId, WorkerRegistry};
+use super::registry::{RequestKind, WorkerId, WorkerRegistry};
 
 // ── InflightGuard ─────────────────────────────────────────────────────────────
 
@@ -95,14 +95,54 @@ impl DirectDispatcher {
         body: Bytes,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers = preferred_pool_workers(registry.eligible_workers(model_id), preferred_pool);
+        self.forward_kind(
+            registry,
+            policy,
+            model_id,
+            RequestKind::Llm,
+            None,
+            None,
+            stream,
+            preferred_pool,
+            path,
+            body,
+            auth_header,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_kind(
+        &self,
+        registry: &WorkerRegistry,
+        policy: &dyn DispatchPolicy,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+        stream: bool,
+        preferred_pool: Option<&str>,
+        path: &str,
+        body: Bytes,
+        auth_header: Option<&HeaderValue>,
+    ) -> Response {
+        let workers = preferred_pool_workers(
+            registry.eligible_workers_filtered(model_id, request_kind, backend_hint, min_context),
+            preferred_pool,
+        );
         if workers.is_empty() {
-            return (
+            return trace_response(
+                (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("no eligible workers for model '{model_id}'"),
             )
-                .into_response();
+                    .into_response(),
+                0,
+                None,
+                "no_eligible_worker",
+            );
         }
+        let candidate_count = workers.len();
 
         let ctx = DispatchContext {
             model_id,
@@ -112,11 +152,16 @@ impl DirectDispatcher {
         let selected = match policy.select(&workers, &ctx) {
             Some(w) => w,
             None => {
-                return (
+                return trace_response(
+                    (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("all workers for '{model_id}' are at capacity"),
                 )
-                    .into_response();
+                        .into_response(),
+                    candidate_count,
+                    None,
+                    "all_at_capacity",
+                );
             }
         };
 
@@ -159,10 +204,15 @@ impl DirectDispatcher {
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
 
             let Some(retry_body) = retry_body else {
-                return worker_failure_response(format!(
-                    "no alternative worker for '{}' after reroute",
-                    ctx.model_id
-                ));
+                return trace_response(
+                    worker_failure_response(format!(
+                        "no alternative worker for '{}' after reroute",
+                        ctx.model_id
+                    )),
+                    candidate_count,
+                    Some(selected_id),
+                    "reroute_exhausted",
+                );
             };
 
             return self
@@ -170,6 +220,9 @@ impl DirectDispatcher {
                     registry,
                     policy,
                     &ctx,
+                    request_kind,
+                    backend_hint,
+                    min_context,
                     path,
                     retry_body,
                     selected_id,
@@ -183,22 +236,30 @@ impl DirectDispatcher {
         if matches!(&result, Ok(r) if r.status().is_success()) {
             policy.record_dispatch(selected_id, model_id);
         }
-        self.build_response(result, url, stream, guard).await
+        trace_response(
+            self.build_response(result, url, stream, guard).await,
+            candidate_count,
+            Some(selected_id),
+            "primary",
+        )
     }
 
     /// Try once more with a different worker (excluding `excluded_id`).
-    #[allow(clippy::too_many_arguments)]
     async fn reroute(
         &self,
         registry: &WorkerRegistry,
         policy: &dyn DispatchPolicy,
         ctx: &DispatchContext<'_>,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
         path: &str,
         body: Bytes,
         excluded_id: WorkerId,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers2 = registry.eligible_workers(ctx.model_id);
+        let workers2 =
+            registry.eligible_workers_filtered(ctx.model_id, request_kind, backend_hint, min_context);
         let candidates: Vec<_> = preferred_pool_workers(workers2, ctx.preferred_pool)
             .into_iter()
             .filter(|w| w.id != excluded_id)
@@ -207,11 +268,16 @@ impl DirectDispatcher {
         let selected2 = match policy.select(&candidates, ctx) {
             Some(w) => w,
             None => {
-                return (
+                return trace_response(
+                    (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("no alternative worker for '{}' after reroute", ctx.model_id),
                 )
-                    .into_response();
+                        .into_response(),
+                    candidates.len(),
+                    None,
+                    "reroute_no_candidate",
+                );
             }
         };
 
@@ -243,7 +309,12 @@ impl DirectDispatcher {
                 }
             }
             registry.mark_unhealthy(selected2_id);
-            return worker_failure_response("all workers failed for this request");
+            return trace_response(
+                worker_failure_response("all workers failed for this request"),
+                candidates.len(),
+                Some(selected2_id),
+                "reroute_failed",
+            );
         }
 
         // Record affinity only on 2xx — not on 4xx, to avoid biasing future
@@ -252,7 +323,12 @@ impl DirectDispatcher {
             policy.record_dispatch(selected2_id, ctx.model_id);
         }
 
-        self.build_response(result2, url2, ctx.stream, guard2).await
+        trace_response(
+            self.build_response(result2, url2, ctx.stream, guard2).await,
+            candidates.len(),
+            Some(selected2_id),
+            "reroute",
+        )
     }
 
     /// Build an axum `Response` from a reqwest result.
@@ -341,6 +417,34 @@ fn worker_url(addr: std::net::SocketAddr, path: &str) -> String {
     }
 }
 
+fn routing_trace_enabled() -> bool {
+    std::env::var("AXS_ROUTING_TRACE")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+fn trace_response(
+    mut response: Response,
+    candidates: usize,
+    selected: Option<WorkerId>,
+    reason: &'static str,
+) -> Response {
+    if !routing_trace_enabled() {
+        return response;
+    }
+
+    let selected = selected
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let value = format!("candidates={candidates},selected={selected},reason={reason}");
+    if let Ok(header) = HeaderValue::from_str(&value) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-ax-routing-trace"), header);
+    }
+    response
+}
+
 fn preferred_pool_workers(
     workers: Vec<super::registry::WorkerStatus>,
     preferred_pool: Option<&str>,
@@ -374,7 +478,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::orchestration::registry::{WorkerId, WorkerStatus};
+    use crate::orchestration::registry::{WorkerCapabilities, WorkerId, WorkerStatus};
     use uuid::Uuid;
 
     use super::{InflightGuard, preferred_pool_workers, worker_url};
@@ -433,6 +537,9 @@ mod tests {
             ttft_p95_ms: 0,
             worker_pool: pool.map(str::to_string),
             node_class: None,
+            capabilities: WorkerCapabilities::default(),
+            queue_depth: 0,
+            error_rate: 0.0,
         }
     }
 

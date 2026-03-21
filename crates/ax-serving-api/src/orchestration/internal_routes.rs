@@ -1,7 +1,7 @@
 //! Internal REST API — `/internal/workers/*`.
 //!
-//! **Only bind this router to loopback.**  It is not authenticated; exposing it
-//! on a non-loopback interface would allow any host to register or drain workers.
+//! Bind this router to loopback by default. When exposed on a non-loopback
+//! interface, it must be protected with worker token auth and source-IP filtering.
 //!
 //! # Endpoints
 //!
@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    extract::ConnectInfo,
     extract::Request,
     extract::{Path, State},
     http::HeaderValue,
@@ -35,6 +36,7 @@ use std::net::SocketAddr;
 use super::OrchestratorConfig;
 use super::registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry};
 use crate::license::LicenseState;
+use ipnet::IpNet;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -46,11 +48,17 @@ pub struct InternalState {
     pub license: Arc<LicenseState>,
 }
 
+#[derive(Clone)]
+pub struct InternalAuthState {
+    pub token: Option<Arc<String>>,
+    pub allowed_sources: Arc<Vec<IpNet>>,
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Build the internal Axum router.
 ///
-/// Bind the returned router **only** to `127.0.0.1:{internal_port}`.
+/// Bind the returned router to the configured internal listener address.
 pub fn router(state: InternalState) -> Router {
     Router::new()
         .route("/internal/workers/register", post(handle_register))
@@ -73,29 +81,167 @@ pub fn router(state: InternalState) -> Router {
 /// Enable by setting `AXS_INTERNAL_API_TOKEN` in both orchestrator and workers.
 /// Workers send the token in `X-Internal-Token`.
 pub async fn internal_auth_middleware(
-    State(token): State<Arc<String>>,
+    State(state): State<InternalAuthState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let provided = request
-        .headers()
-        .get("x-internal-token")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .unwrap_or("");
+    if !state.allowed_sources.is_empty() {
+        let peer_ip = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|v| v.0.ip());
 
-    if crate::auth::constant_time_eq_str(provided, token.as_str()) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(
-                axum::http::header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("X-Internal-Token"),
-            )],
-            "missing or invalid internal API token",
-        )
-            .into_response()
+        match peer_ip {
+            Some(ip) if state.allowed_sources.iter().any(|net| net.contains(&ip)) => {}
+            Some(_) => {
+                return (StatusCode::FORBIDDEN, "source IP not allowed").into_response();
+            }
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "missing peer address for internal API request",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(expected_token) = &state.token {
+        let provided = request
+            .headers()
+            .get("x-internal-token")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .unwrap_or("");
+
+        if !crate::auth::constant_time_eq_str(provided, expected_token.as_str()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("X-Internal-Token"),
+                )],
+                "missing or invalid internal API token",
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
+pub fn parse_allowed_node_cidrs(raw: &str) -> anyhow::Result<Vec<IpNet>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if let Ok(net) = s.parse::<IpNet>() {
+                return Ok(net);
+            }
+            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                return Ok(IpNet::from(ip));
+            }
+            Err(anyhow::anyhow!(
+                "invalid AXS_ALLOWED_NODE_CIDRS entry '{s}': expected IP or CIDR"
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, middleware, routing::get};
+    use tower::ServiceExt;
+
+    #[test]
+    fn parse_allowed_node_cidrs_accepts_ip_and_cidr() {
+        let parsed = parse_allowed_node_cidrs("127.0.0.1,10.0.0.0/8").unwrap();
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lab_ip: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].contains(&loopback));
+        assert!(parsed[1].contains(&lab_ip));
+    }
+
+    #[test]
+    fn parse_allowed_node_cidrs_rejects_invalid_entry() {
+        let err = parse_allowed_node_cidrs("127.0.0.1,not-a-cidr").unwrap_err();
+        assert!(err.to_string().contains("not-a-cidr"));
+    }
+
+    #[tokio::test]
+    async fn internal_auth_middleware_rejects_disallowed_source_ip() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                InternalAuthState {
+                    token: Some(Arc::new("secret".to_string())),
+                    allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
+                },
+                internal_auth_middleware,
+            ));
+
+        let mut req = Request::builder()
+            .uri("/ok")
+            .header("x-internal-token", "secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "10.0.0.2:12345".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn internal_auth_middleware_accepts_allowed_source_ip() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                InternalAuthState {
+                    token: Some(Arc::new("secret".to_string())),
+                    allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
+                },
+                internal_auth_middleware,
+            ));
+
+        let mut req = Request::builder()
+            .uri("/ok")
+            .header("x-internal-token", "secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_auth_middleware_allows_allowlist_only_mode() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                InternalAuthState {
+                    token: None,
+                    allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
+                },
+                internal_auth_middleware,
+            ));
+
+        let mut req = Request::builder()
+            .uri("/ok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
 

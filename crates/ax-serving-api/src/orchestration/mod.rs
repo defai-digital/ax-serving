@@ -51,16 +51,57 @@ use tracing::info;
 
 use self::direct::DirectDispatcher;
 use self::health_ticker::HealthTicker;
-use self::internal_routes::{InternalState, internal_auth_middleware, router as internal_router};
+use self::internal_routes::{
+    InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
+    router as internal_router,
+};
 use self::policy::DispatchPolicy;
 use self::queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy};
-use self::registry::WorkerRegistry;
+use self::registry::{RequestKind, WorkerRegistry};
 use crate::audit::AuditLog;
 use crate::auth::RequestId;
 use crate::license::LicenseState;
 use crate::project_policy;
+use crate::rest::schema::InputMessage;
 
 pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    matches!(host, "localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn estimated_tokens_from_text(text: &str) -> u32 {
+    let chars = text.chars().count() as u32;
+    chars.saturating_add(3) / 4
+}
+
+fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u32 {
+    messages
+        .iter()
+        .map(|msg| {
+            let role_tokens = estimated_tokens_from_text(&msg.role);
+            let name_tokens = msg
+                .name
+                .as_deref()
+                .map(estimated_tokens_from_text)
+                .unwrap_or(0);
+            let content_tokens = estimated_tokens_from_text(&msg.content.as_text());
+            role_tokens
+                .saturating_add(name_tokens)
+                .saturating_add(content_tokens)
+                .saturating_add(4)
+        })
+        .sum::<u32>()
+        .max(1)
+}
+
+fn estimate_text_prompt_tokens(prompt: &str) -> u32 {
+    estimated_tokens_from_text(prompt).max(1)
+}
 
 // ── OrchestratorLayer ─────────────────────────────────────────────────────────
 
@@ -125,6 +166,8 @@ impl OrchestratorLayer {
             Some(serde_json::json!({
                 "dispatch_policy": layer.config.dispatch_policy,
                 "public_port": layer.config.port,
+                "internal_bind_addr": layer.config.internal_bind_addr,
+                "allowed_node_cidrs": layer.config.allowed_node_cidrs,
                 "internal_port": layer.config.internal_port,
             })),
         );
@@ -195,9 +238,15 @@ async fn proxy_inference(
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
         stream: bool,
         #[serde(default)]
         max_tokens: Option<u32>,
+        #[serde(default)]
+        messages: Vec<InputMessage>,
+        #[serde(default)]
+        prompt: Option<String>,
     }
 
     let auth_header = req_headers.get(header::AUTHORIZATION);
@@ -207,11 +256,18 @@ async fn proxy_inference(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (model_id, stream, max_tokens) = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
+    let (model_id, backend_hint, stream, max_tokens, min_context) =
+        match serde_json::from_slice::<ProxyRequestMeta>(&body) {
         Ok(v) => (
             v.model.unwrap_or_else(|| "default".to_string()),
+            v.backend,
             v.stream,
             v.max_tokens,
+            if !v.messages.is_empty() {
+                Some(estimate_chat_prompt_tokens(&v.messages))
+            } else {
+                v.prompt.as_deref().map(estimate_text_prompt_tokens)
+            },
         ),
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
@@ -277,10 +333,16 @@ async fn proxy_inference(
 
     let mut resp = layer
         .dispatcher
-        .forward(
+        .forward_kind(
             &layer.registry,
             layer.policy.as_ref(),
             &model_id,
+            match worker_path {
+                "/v1/embeddings" => RequestKind::Embedding,
+                _ => RequestKind::Llm,
+            },
+            backend_hint.as_deref(),
+            min_context,
             stream,
             preferred_pool,
             worker_path,
@@ -386,6 +448,8 @@ fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_js
         "runtime": {
             "host": layer.config.host,
             "port": layer.config.port,
+            "internal_bind_addr": layer.config.internal_bind_addr,
+            "allowed_node_cidrs": layer.config.allowed_node_cidrs,
             "internal_port": layer.config.internal_port,
             "dispatch_policy": layer.config.dispatch_policy,
             "worker_heartbeat_ms": layer.config.worker_heartbeat_ms,
@@ -969,10 +1033,15 @@ pub async fn start_orchestrator(
     )?);
 
     let public_addr = format!("{}:{}", config.host, config.port);
-    let internal_addr = format!("127.0.0.1:{}", config.internal_port);
+    let internal_addr = format!("{}:{}", config.internal_bind_addr, config.internal_port);
+    let internal_is_loopback = is_loopback_bind_host(&config.internal_bind_addr);
 
     info!(%public_addr, "orchestrator public proxy starting");
-    info!(%internal_addr, "orchestrator internal API starting (loopback only)");
+    if internal_is_loopback {
+        info!(%internal_addr, "orchestrator internal API starting (loopback)");
+    } else {
+        info!(%internal_addr, "orchestrator internal API starting (remote-capable)");
+    }
     info!(
         policy = %config.dispatch_policy,
         heartbeat_ms = config.worker_heartbeat_ms,
@@ -1002,14 +1071,33 @@ pub async fn start_orchestrator(
     };
     let internal_app = {
         let app = internal_router(internal_state);
+        let allowed_sources = parse_allowed_node_cidrs(&config.allowed_node_cidrs)?;
         let maybe_token = std::env::var("AXS_INTERNAL_API_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        if let Some(token) = maybe_token {
-            info!("orchestrator internal API token auth enabled");
+        if !internal_is_loopback && maybe_token.is_none() {
+            anyhow::bail!(
+                "AXS_INTERNAL_API_TOKEN is required when the orchestrator internal API is bound \
+                 to a non-loopback address ({}).",
+                config.internal_bind_addr
+            );
+        }
+        if maybe_token.is_some() || !allowed_sources.is_empty() {
+            if maybe_token.is_some() {
+                info!("orchestrator internal API token auth enabled");
+            }
+            if !allowed_sources.is_empty() {
+                info!(
+                    entries = allowed_sources.len(),
+                    "orchestrator internal API source allowlist enabled"
+                );
+            }
             app.route_layer(middleware::from_fn_with_state(
-                Arc::new(token),
+                InternalAuthState {
+                    token: maybe_token.map(Arc::new),
+                    allowed_sources: Arc::new(allowed_sources),
+                },
                 internal_auth_middleware,
             ))
         } else {
@@ -1087,7 +1175,10 @@ pub async fn start_orchestrator(
     let public_shutdown = shutdown_rx;
     tokio::try_join!(
         async {
-            axum::serve(internal_listener, internal_app)
+            axum::serve(
+                internal_listener,
+                internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
                 .with_graceful_shutdown(async move {
                     let mut rx = internal_shutdown;
                     while !*rx.borrow() {
