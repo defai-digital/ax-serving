@@ -1,9 +1,9 @@
-name: Release
+"name": Release
 
 # Triggered by pushing a version tag:
 #   Stable: git tag v1.2.3 && git push origin v1.2.3
 #   Beta:   git tag v2.0.0-beta.1 && git push origin v2.0.0-beta.1
-on:
+"on":
   push:
     tags: ['v*']
 
@@ -130,12 +130,25 @@ jobs:
     if: ${{ needs.build-macos.outputs.prerelease != 'true' }}
 
     steps:
+      - name: Check tap token configuration
+        id: tap-token
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [[ -n "$GH_TOKEN" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download release metadata
+        if: ${{ steps.tap-token.outputs.present == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: release-meta
 
       - name: Update formula in homebrew-ax-serving tap
+        if: ${{ steps.tap-token.outputs.present == 'true' }}
         env:
           # Set this secret in your repo: Settings → Secrets → TAP_GITHUB_TOKEN
           # The token needs push access to the homebrew-ax-serving tap repo.
@@ -146,12 +159,12 @@ jobs:
           TARBALL=$(cat tarball.txt)
 
           # Clone the tap repo
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/automatosx/homebrew-ax-serving.git" tap
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/defai-digital/homebrew-ax-serving.git" tap
           cd tap
 
           # Rewrite the version, url, and sha256 in the formula
           sed -i "s|version \".*\"|version \"${VERSION}\"|" Formula/ax-serving.rb
-          sed -i "s|url \".*aarch64-apple-darwin.*\"|url \"https://github.com/automatosx/ax-serving/releases/download/v${VERSION}/${TARBALL}\"|" Formula/ax-serving.rb
+          sed -i "s|url \".*aarch64-apple-darwin.*\"|url \"https://github.com/defai-digital/ax-serving/releases/download/v${VERSION}/${TARBALL}\"|" Formula/ax-serving.rb
           sed -i "s|sha256 \".*\"|sha256 \"${SHA256}\"|" Formula/ax-serving.rb
 
           git config user.email "ci@automatosx.com"
@@ -160,15 +173,31 @@ jobs:
           git diff --cached --quiet || \
             git commit -m "ax-serving ${VERSION}" && git push
 
+      - name: Skip tap update
+        if: ${{ steps.tap-token.outputs.present != 'true' }}
+        run: echo "TAP_GITHUB_TOKEN is not configured; skipping Homebrew tap update."
+
   publish-js-sdk:
     name: Publish JS SDK to npm
     runs-on: ubuntu-latest
     needs: build-macos
-    if: ${{ secrets.NPM_TOKEN != '' }}
     steps:
+      - name: Check npm token configuration
+        id: npm-token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "$NPM_TOKEN" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
 
       - uses: actions/setup-node@v4
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -176,14 +205,17 @@ jobs:
           cache-dependency-path: sdk/javascript/package-lock.json
 
       - name: Install JS SDK dependencies
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
         working-directory: sdk/javascript
         run: npm ci
 
       - name: Build JS SDK
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
         working-directory: sdk/javascript
         run: npm run build
 
       - name: Validate JS SDK version matches tag
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
         working-directory: sdk/javascript
         env:
           VERSION: ${{ needs.build-macos.outputs.version }}
@@ -196,6 +228,7 @@ jobs:
           fi
 
       - name: Publish package
+        if: ${{ steps.npm-token.outputs.present == 'true' }}
         working-directory: sdk/javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -206,3 +239,7 @@ jobs:
           else
             npm publish --access public
           fi
+
+      - name: Skip npm publish
+        if: ${{ steps.npm-token.outputs.present != 'true' }}
+        run: echo "NPM_TOKEN is not configured; skipping JS SDK publish."
