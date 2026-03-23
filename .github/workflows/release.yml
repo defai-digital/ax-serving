@@ -30,7 +30,7 @@ jobs:
 
       # ── Build release binaries ────────────────────────────────────────────
       - name: cargo build --release
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --exclude ax-serving-py
 
       # ── Determine version from tag ────────────────────────────────────────
       - name: Extract version
