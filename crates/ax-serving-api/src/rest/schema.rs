@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_MESSAGES: usize = 100;
 pub const MAX_CONTENT_BYTES: usize = 32 * 1024; // 32 KB per message
 pub const MAX_MAX_TOKENS: u32 = 32_768;
-pub const MAX_MODEL_ID_BYTES: usize = 256;
+pub const MAX_MODEL_ID_BYTES: usize = 128;
 
 // ── Content size estimation ────────────────────────────────────────────────────
 
@@ -350,7 +350,7 @@ pub struct LoadModelRequest {
     #[serde(default)]
     pub context_length: Option<u32>,
     /// Explicit backend: `"llama_cpp"` | `"lib_llama"` | `"native"` | `"auto"`.
-    /// Omit to use the routing config (`backends.yaml`).
+    /// Omit to use `llama_cpp` by default.
     #[serde(default)]
     pub backend: Option<String>,
     /// Path to a multimodal projector (`.gguf`) for vision models (LLaVA etc.).

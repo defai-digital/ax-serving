@@ -1,10 +1,10 @@
 # AX Serving backend routing configuration
 #
-# CURRENT POLICY: ax-engine (native) is the primary backend for supported families.
-# llama.cpp is the fallback for unsupported architectures and explicit llama_cpp families.
+# CURRENT POLICY: route all models through llama.cpp by default.
+# ax-engine remains available only as an explicit per-load override (`native`).
 #
 # Backends:
-#   native    — ax-engine (primary; requires Xcode Metal toolchain)
+#   native    — ax-engine (explicit opt-in; requires Xcode Metal toolchain)
 #   llama_cpp — llama-server subprocess (requires llama-server on PATH via brew install llama.cpp)
 #   lib_llama — direct libllama C API, no subprocess (requires `libllama` feature; Phase 2)
 #   auto      — try native first; fall back to llama_cpp on unsupported arch
@@ -21,27 +21,23 @@
 # Loading order for this config file:
 #   1. $AXS_ROUTING_CONFIG env var path
 #   2. ./backends.yaml in CWD
-#   3. Built-in defaults (default_backend: auto)
+#   3. Built-in defaults (default_backend: llama_cpp)
 
-# Unknown families: try native first, fall back to llama.cpp on unsupported arch.
-default_backend: auto
+# Unknown families: route to llama.cpp.
+default_backend: llama_cpp
 
 families:
-  # ── ax-engine native (primary) ─────────────────────────────────────────────
-  llama:     native   # LLaMA / LLaMA 3 / CodeLlama
-  qwen:      native   # Qwen 2/3
-  gemma:     native   # Gemma 2/3
-  mistral:   native   # Mistral / Mistral 3
-
-  # ── auto (native where supported, llama.cpp fallback) ─────────────────────
-  deepseek:  auto     # Distills may identify as llama/qwen; keep fallback enabled.
-  phi:       auto     # phi3 is supported natively; older Phi variants still fall back safely.
-  falcon:    auto     # Falcon native support depends on architecture variant.
-  glm:       auto     # GLM/chatglm can use native when GGUF arch matches; fallback otherwise.
-  mixtral:   auto     # Mixtral has native support but remains safer behind fallback.
-  starcoder: auto     # StarCoder2 can use native; older StarCoder variants still fall back.
-
-  # ── llama.cpp only (no ax-engine support today) ───────────────────────────
-  gptj:     llama_cpp  # GPT-J
-  gpt_neox: llama_cpp  # GPT-NeoX / Pythia / RedPajama
-  minimax:  llama_cpp  # MiniMax
+  # ── explicit routing (llama.cpp) ─────────────────────────────────────────
+  llama:     llama_cpp   # LLaMA / LLaMA 3 / CodeLlama
+  qwen:      llama_cpp   # Qwen 2/3
+  gemma:     llama_cpp   # Gemma 2/3
+  mistral:   llama_cpp   # Mistral / Mistral 3
+  deepseek:  llama_cpp   # Distilled models.
+  phi:       llama_cpp   # phi2 / phi3
+  falcon:    llama_cpp   # Falcon
+  glm:       llama_cpp   # GLM / ChatGLM
+  mixtral:   llama_cpp   # Mixtral
+  starcoder: llama_cpp   # StarCoder2
+  gptj:      llama_cpp   # GPT-J
+  gpt_neox:  llama_cpp   # GPT-NeoX / Pythia / RedPajama
+  minimax:   llama_cpp   # MiniMax

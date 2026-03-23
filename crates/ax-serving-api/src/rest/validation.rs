@@ -5,7 +5,62 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use super::schema::{MAX_MAX_TOKENS, ResponseFormat};
+use super::schema::{MAX_MAX_TOKENS, MAX_MODEL_ID_BYTES, ResponseFormat};
+
+/// Validate a model identifier field (e.g., `model` or `model_id`).
+///
+/// Returns `Some(Response)` when the ID is empty/whitespace-only, exceeds
+/// the API limit, or contains unsupported characters.
+pub fn validate_model_identifier(model: &str, field_name: &str) -> Option<Response> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{field_name} must not be empty")})),
+            )
+                .into_response(),
+        );
+    }
+
+    if model != trimmed {
+        return Some(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("{field_name} contains unsupported whitespace")
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if model.chars().count() > MAX_MODEL_ID_BYTES {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("{field_name} exceeds max length of {MAX_MODEL_ID_BYTES}")
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Some(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("{field_name} must be alphanumeric with '-', '_', or '.'")
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
 
 /// Validate sampling parameters common to chat and text completion requests.
 ///
@@ -38,7 +93,7 @@ pub fn validate_sampling_params(
     if !(0.0..=2.0).contains(&temperature) {
         reject!("temperature must be in [0, 2]");
     }
-    if !(f32::EPSILON..=1.0).contains(&top_p) {
+    if !(top_p > 0.0 && top_p <= 1.0) {
         reject!("top_p must be in (0, 1]");
     }
     if let Some(mp) = min_p
@@ -49,7 +104,7 @@ pub fn validate_sampling_params(
     if matches!(top_k, Some(0)) {
         reject!("top_k must be > 0");
     }
-    if !(f32::EPSILON..=10.0).contains(&repeat_penalty) {
+    if !(repeat_penalty > 0.0 && repeat_penalty <= 10.0) {
         reject!("repeat_penalty must be in (0, 10]");
     }
     if let Some(fp) = frequency_penalty
@@ -215,5 +270,36 @@ pub fn validate_response_format(response_format: Option<&ResponseFormat>) -> Opt
             )
                 .into_response(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::validate_model_identifier;
+
+    #[test]
+    fn validate_model_identifier_rejects_empty_or_whitespace() {
+        let resp = validate_model_identifier("   ", "model").unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_model_identifier_rejects_disallowed_characters() {
+        let resp = validate_model_identifier("bad model", "model").unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validate_model_identifier_rejects_trailing_whitespace() {
+        let resp = validate_model_identifier("model ", "model").unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validate_model_identifier_rejects_too_long() {
+        let resp = validate_model_identifier(&"a".repeat(129), "model").unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

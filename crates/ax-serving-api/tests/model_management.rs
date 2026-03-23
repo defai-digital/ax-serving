@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -481,6 +482,77 @@ impl InferenceBackend for BlockingEchoBackend {
     }
 }
 
+// ── CaptureBackend ──────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct CaptureBackend {
+    observed_backend_hint: Arc<Mutex<Option<String>>>,
+}
+
+impl InferenceBackend for CaptureBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        *self.observed_backend_hint.lock().unwrap() = config.backend_hint;
+        Ok((
+            ModelHandle(1),
+            ModelMetadata {
+                architecture: "captured".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
+    }
+}
+
 fn make_blocking_cache_layer(
     started: Arc<AtomicUsize>,
     released: Arc<AtomicBool>,
@@ -728,6 +800,38 @@ async fn embeddings_project_policy_requires_header_before_model_lookup() {
 }
 
 #[tokio::test]
+async fn load_model_defaults_to_llama_cpp_backend_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capture.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let observed = Arc::new(Mutex::new(None::<String>));
+    let backend: Arc<CaptureBackend> = Arc::new(CaptureBackend {
+        observed_backend_hint: Arc::clone(&observed),
+    });
+    let layer = make_layer_with_backend(backend);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "capture", "path": path.to_string_lossy()}).to_string();
+
+    let resp = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("llama_cpp"));
+}
+
+#[tokio::test]
 async fn auth_models_wrong_key_401() {
     let app = make_app_with_key("secret");
     let resp = app
@@ -835,6 +939,116 @@ async fn load_path_not_found_422() {
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn load_empty_model_id_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": " ",
+        "path": path.to_string_lossy(),
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn load_invalid_model_id_422() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": "bad model",
+        "path": path.to_string_lossy(),
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn load_model_id_too_long_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": "a".repeat(129),
+        "path": path.to_string_lossy(),
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn load_invalid_backend_422() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": "test",
+        "path": path.to_string_lossy(),
+        "backend": "not_a_backend",
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
@@ -1288,9 +1502,53 @@ fn make_echo_layer() -> Arc<ServingLayer> {
 #[tokio::test]
 async fn chat_completions_model_id_too_long_400() {
     let app = make_app_no_auth();
-    let long_id = "a".repeat(257);
+    let long_id = "a".repeat(129);
     let body = serde_json::json!({
         "model": long_id,
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn chat_completions_invalid_model_id_422() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model": "bad model",
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn chat_completions_empty_model_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model": " ",
         "messages": [{"role": "user", "content": "hi"}]
     })
     .to_string();
@@ -1638,12 +1896,49 @@ async fn text_completions_model_not_found_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn text_completions_empty_model_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({"model": " ", "prompt": "hello"}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn text_completions_model_id_too_long_400() {
+    let app = make_app_no_auth();
+    let long_id = "a".repeat(129);
+    let body = serde_json::json!({"model": long_id, "prompt": "hello"}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Embeddings input-validation tests ────────────────────────────────────────
 
 #[tokio::test]
 async fn embeddings_model_id_too_long_400() {
     let app = make_app_no_auth();
-    let long_id = "a".repeat(257);
+    let long_id = "a".repeat(129);
     let body = serde_json::json!({"model": long_id, "input": "hello"}).to_string();
     let resp = app
         .oneshot(
@@ -1657,6 +1952,24 @@ async fn embeddings_model_id_too_long_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_invalid_model_id_422() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({"model": "bad model", "input": "hello"}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -1675,6 +1988,24 @@ async fn embeddings_model_not_found_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn embeddings_empty_model_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({"model": " ", "input": "hello"}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::schema::*;
 use super::validation::{
     build_generation_params, cache_ttl_err, resolve_grammar, resolve_logprobs, validate_max_tokens,
-    validate_response_format, validate_sampling_params,
+    validate_model_identifier, validate_response_format, validate_sampling_params,
 };
 use crate::ServingLayer;
 use crate::auth::RequestId;
@@ -199,12 +199,8 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Input validation.
-    if req.model.len() > MAX_MODEL_ID_BYTES {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "model id too long"})),
-        )
-            .into_response();
+    if let Some(response) = validate_model_identifier(&req.model, "model") {
+        return response;
     }
     if req.messages.is_empty() {
         return (
@@ -1068,12 +1064,8 @@ pub async fn text_completions(
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     // Input validation.
-    if req.model.len() > MAX_MODEL_ID_BYTES {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "model id too long"})),
-        )
-            .into_response();
+    if let Some(response) = validate_model_identifier(&req.model, "model") {
+        return response;
     }
     if req.prompt.is_empty() {
         return (
@@ -2301,6 +2293,10 @@ pub async fn rest_load_model(
     req_id: Option<Extension<RequestId>>,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
+    if let Some(response) = validate_model_identifier(&req.model_id, "model_id") {
+        return response;
+    }
+
     let pooling_type = match req.pooling_type.as_deref() {
         Some(raw) => match normalize_pooling_type(raw) {
             Some(v) => Some(v),
@@ -2318,12 +2314,29 @@ pub async fn rest_load_model(
     };
 
     let path = std::path::PathBuf::from(&req.path);
+    let backend_hint = req
+        .backend
+        .clone()
+        .unwrap_or_else(|| "llama_cpp".to_string())
+        .to_ascii_lowercase();
+    let backend_hint = match backend_hint.as_str() {
+        "native" | "llama_cpp" | "lib_llama" | "auto" => backend_hint,
+        other => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("invalid backend; expected native, llama_cpp, lib_llama, or auto but got {other}")
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = LoadConfig {
         context_length: req.context_length.unwrap_or(0),
         backend_type: BackendType::Auto,
         llama_cpp_n_gpu_layers: req.n_gpu_layers,
         mmproj_path: req.mmproj_path.clone(),
-        backend_hint: req.backend.clone(),
+        backend_hint: Some(backend_hint),
         enable_embeddings: req.enable_embeddings,
         pooling_type,
     };
@@ -2431,6 +2444,10 @@ pub async fn rest_unload_model(
     req_id: Option<Extension<RequestId>>,
     Path(model_id): Path<String>,
 ) -> Response {
+    if let Some(response) = validate_model_identifier(&model_id, "model_id") {
+        return response;
+    }
+
     let id_for_response = model_id.clone();
     let layer_for_unload = Arc::clone(&layer);
     let result = tokio::task::spawn_blocking(move || {
@@ -2492,6 +2509,10 @@ pub async fn rest_reload_model(
     req_id: Option<Extension<RequestId>>,
     Path(model_id): Path<String>,
 ) -> Response {
+    if let Some(response) = validate_model_identifier(&model_id, "model_id") {
+        return response;
+    }
+
     let layer_for_reload = Arc::clone(&layer);
     let reload_id = model_id.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -2757,12 +2778,8 @@ pub async fn embeddings(
     use ax_serving_engine::{EmbedConfig, EmbedInput};
     use base64::{Engine as _, engine::general_purpose};
 
-    if req.model.len() > MAX_MODEL_ID_BYTES {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "model id too long"})),
-        )
-            .into_response();
+    if let Some(response) = validate_model_identifier(&req.model, "model") {
+        return response;
     }
     match req.encoding_format.as_deref() {
         None | Some("float" | "base64") => {}

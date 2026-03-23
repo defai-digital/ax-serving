@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{Context as _, Result};
 use ax_serving_api::ServingLayer;
-use ax_serving_engine::{BackendType, LoadConfig, RouterBackend, RoutingConfig};
+use ax_serving_engine::{BackendType, GenerateInput, LoadConfig, RouterBackend, RoutingConfig};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -392,9 +392,7 @@ fn main() -> Result<()> {
 }
 
 fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
-    use ax_serving_engine::{
-        GenerateEvent, GenerateInput, GenerationParams, InferenceBackend as _,
-    };
+    use ax_serving_engine::{GenerateEvent, GenerationParams, InferenceBackend as _};
 
     // Inference mode uses RouterBackend (same as serve mode).
     let backend = RouterBackend::from_env();
@@ -407,7 +405,8 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
         },
         llama_cpp_n_gpu_layers: Some(cli.n_gpu_layers),
         mmproj_path: None,
-        backend_hint: None,
+        // Favor llama.cpp by default for single-shot inference.
+        backend_hint: Some("llama_cpp".to_string()),
         enable_embeddings: None,
         pooling_type: None,
     };
@@ -445,7 +444,7 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<GenerateEvent>(512);
 
     // generate() spawns on the backend's internal runtime and returns immediately.
-    backend.generate(handle, GenerateInput::Text(prompt), params, tx)?;
+    backend.generate(handle, build_inference_input(prompt, cli.chat), params, tx)?;
 
     // Drain the event channel with a small single-thread runtime — entirely
     // separate from the backend's runtime, so no nesting.
@@ -496,6 +495,56 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
 
     // backend dropped here — safe, we're in sync context.
     Ok(())
+}
+
+fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{field} URL is empty");
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() {
+        anyhow::bail!("{field} URL is empty after trimming trailing slashes");
+    }
+
+    let mut rest = trimmed;
+    let has_scheme = if let Some(scheme_end) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_end];
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            rest = &trimmed[scheme_end + 3..];
+            true
+        } else {
+            anyhow::bail!("{field} has unsupported URL scheme: {trimmed}");
+        }
+    } else {
+        false
+    };
+
+    if rest.is_empty() {
+        anyhow::bail!("{field} URL is incomplete: {trimmed}");
+    }
+    if rest.contains('/') {
+        anyhow::bail!("{field} URL must not include a path: {trimmed}");
+    }
+
+    let normalized = if has_scheme {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    Ok(normalized.trim_end_matches('/').to_string())
+}
+
+fn build_inference_input(prompt: String, use_chat_template: bool) -> GenerateInput {
+    if use_chat_template {
+        GenerateInput::Chat(vec![ax_serving_engine::ChatMessage {
+            role: "user".into(),
+            content: serde_json::Value::String(prompt),
+        }])
+    } else {
+        GenerateInput::Text(prompt)
+    }
 }
 
 // ── System identity helpers ───────────────────────────────────────────────────
@@ -645,8 +694,20 @@ async fn heartbeat_loop(
         let thermal_state = format!("{:?}", layer.backend.thermal_state()).to_lowercase();
         let model_ids = layer.registry.list_ids();
         let rss_bytes = ax_serving_api::metrics::current_rss_bytes();
-        // WS4: richer telemetry for TokenCostPolicy scoring
-        let active_sequences = inflight; // active_sequences == inflight for single-stream model
+        // WS4: richer telemetry for TokenCostPolicy scoring.
+        // When split scheduler is enabled, use decode_sequences_active (requests past
+        // prefill) rather than the total inflight count, which includes prefill-phase
+        // requests that haven't yet consumed KV capacity.
+        let active_sequences = if layer.scheduler.split_enabled {
+            layer
+                .scheduler
+                .metrics
+                .decode_sequences_active
+                .load(Ordering::Relaxed)
+                .max(0) as usize
+        } else {
+            inflight
+        };
         let ttft_p95_ms = layer.scheduler.metrics.ttft_p95_us() / 1000;
         let decode_tok_per_sec = layer.metrics.recent_decode_tok_per_sec();
 
@@ -819,7 +880,10 @@ fn run_serve(
     };
 
     // Orchestrator address from --orchestrator flag or AXS_ORCHESTRATOR_ADDR env var.
-    let orchestrator_addr = orchestrator.or_else(|| std::env::var("AXS_ORCHESTRATOR_ADDR").ok());
+    let orchestrator_addr = orchestrator
+        .or_else(|| std::env::var("AXS_ORCHESTRATOR_ADDR").ok())
+        .map(|addr| normalize_http_base_url(&addr, "orchestrator"))
+        .transpose()?;
     let internal_api_token = std::env::var("AXS_INTERNAL_API_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
@@ -954,7 +1018,14 @@ fn run_serve(
 }
 
 fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
-    let addr = addr.trim();
+    let addr = addr.trim().trim_end_matches('/');
+    let lowered = addr.to_ascii_lowercase();
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        anyhow::bail!("invalid rest_addr (URL scheme is not supported): {addr}");
+    }
+    if addr.contains('/') {
+        anyhow::bail!("invalid rest_addr (path is not supported): {addr}");
+    }
     let (host, port) = addr
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("invalid rest_addr (missing ':'): {addr}"))?;
@@ -971,7 +1042,10 @@ fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rest_addr;
+    use super::{build_inference_input, normalize_http_base_url, parse_rest_addr};
+    use anyhow::Result;
+    use ax_serving_engine::{ChatMessage, GenerateInput};
+    use serde_json::json;
 
     #[test]
     fn parse_rest_addr_accepts_ipv4() {
@@ -991,5 +1065,91 @@ mod tests {
     fn parse_rest_addr_rejects_empty_host() {
         let err = parse_rest_addr(":18080").expect_err("empty host should fail");
         assert!(err.to_string().contains("empty host"));
+    }
+
+    #[test]
+    fn parse_rest_addr_rejects_url_scheme() {
+        let err = parse_rest_addr("http://127.0.0.1:18080")
+            .expect_err("rest_addr with URL scheme should fail");
+        assert!(err.to_string().contains("URL scheme"));
+    }
+
+    #[test]
+    fn parse_rest_addr_rejects_uppercase_url_scheme() {
+        let err = parse_rest_addr("HTTPS://127.0.0.1:18080")
+            .expect_err("rest_addr with uppercase URL scheme should fail");
+        assert!(err.to_string().contains("URL scheme"));
+    }
+
+    #[test]
+    fn parse_rest_addr_rejects_path() {
+        let err =
+            parse_rest_addr("127.0.0.1:18080/path").expect_err("rest_addr with path should fail");
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn inference_input_without_chat_uses_text_prompt() {
+        let input = build_inference_input("hello world".to_string(), false);
+        assert!(matches!(input, GenerateInput::Text(_)));
+    }
+
+    #[test]
+    fn inference_input_with_chat_uses_chat_payload() {
+        let input = build_inference_input("hello world".to_string(), true);
+        match input {
+            GenerateInput::Chat(messages) => {
+                let expected = ChatMessage {
+                    role: "user".into(),
+                    content: json!("hello world"),
+                };
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, expected.role);
+                assert_eq!(messages[0].content, expected.content);
+            }
+            _ => panic!("expected chat input"),
+        }
+    }
+
+    #[test]
+    fn normalize_http_base_url_adds_http_scheme_if_missing() -> Result<()> {
+        let normalized = normalize_http_base_url("127.0.0.1:19090", "orchestrator")?;
+        assert_eq!(normalized, "http://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_http_base_url_keeps_http_and_trims_slash() -> Result<()> {
+        let normalized = normalize_http_base_url("http://127.0.0.1:19090//", "orchestrator")?;
+        assert_eq!(normalized, "http://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_unsupported_scheme() {
+        let err = normalize_http_base_url("ftp://127.0.0.1:19090", "orchestrator")
+            .expect_err("unsupported scheme should be rejected");
+        assert!(err.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn normalize_http_base_url_accepts_uppercase_scheme() -> Result<()> {
+        let normalized = normalize_http_base_url("HTTP://127.0.0.1:19090//", "orchestrator")?;
+        assert_eq!(normalized, "HTTP://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_path_suffix() {
+        let err = normalize_http_base_url("http://127.0.0.1:19090/api", "orchestrator")
+            .expect_err("path suffix should be rejected");
+        assert!(err.to_string().contains("URL must not include a path"));
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_trailing_space_only() {
+        let err = normalize_http_base_url("   ", "orchestrator")
+            .expect_err("blank url should be rejected");
+        assert!(err.to_string().contains("URL is empty"));
     }
 }

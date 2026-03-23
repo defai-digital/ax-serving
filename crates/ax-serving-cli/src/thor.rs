@@ -30,6 +30,45 @@ const THOR_ENV_KEYS: &[&str] = &[
 
 const THOR_NOT_READY_EXIT_CODE: i32 = 24;
 
+fn normalize_control_plane_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("control plane URL is empty");
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() {
+        anyhow::bail!("control plane URL is empty");
+    }
+
+    let mut rest = trimmed;
+    let has_scheme = if let Some(scheme_end) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_end];
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            rest = &trimmed[scheme_end + 3..];
+            true
+        } else {
+            anyhow::bail!("unsupported control plane URL scheme: {trimmed}");
+        }
+    } else {
+        false
+    };
+
+    if rest.is_empty() {
+        anyhow::bail!("control plane URL is incomplete: {trimmed}");
+    }
+    if rest.contains('/') {
+        anyhow::bail!("control plane URL must not include a path: {trimmed}");
+    }
+
+    let normalized = if has_scheme {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    Ok(normalized.trim_end_matches('/').to_string())
+}
+
 pub struct InstallArgs {
     pub control_plane: Option<String>,
     pub listen_addr: String,
@@ -153,10 +192,14 @@ pub fn install(args: InstallArgs) -> Result<()> {
         ThorEnvFile::default()
     };
 
-    env_file.set(
-        "AXS_CONTROL_PLANE_URL",
-        args.control_plane.map(trim_trailing_slash),
-    );
+    if let Some(control_plane) = args
+        .control_plane
+        .as_deref()
+        .map(normalize_control_plane_url)
+        .transpose()?
+    {
+        env_file.set("AXS_CONTROL_PLANE_URL", Some(control_plane));
+    }
     env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
     env_file.set("AXS_SGLANG_URL", Some(trim_trailing_slash(args.sglang_url)));
     env_file.set(
@@ -193,7 +236,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
 
     env_file.set(
         "AXS_CONTROL_PLANE_URL",
-        Some(trim_trailing_slash(args.control_plane)),
+        Some(normalize_control_plane_url(&args.control_plane)?),
     );
     env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
     env_file.set_if_some("AXS_WORKER_TOKEN", args.worker_token);
@@ -223,9 +266,11 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     env_file.set_if_some("AXS_THOR_FRIENDLY_NAME", args.friendly_name);
     env_file.set_if_some("AXS_THOR_CHIP_MODEL", args.chip_model);
 
-    let control_plane = env_file
-        .get("AXS_CONTROL_PLANE_URL")
-        .context("AXS_CONTROL_PLANE_URL is required")?;
+    let control_plane = normalize_control_plane_url(
+        env_file
+            .get("AXS_CONTROL_PLANE_URL")
+            .context("AXS_CONTROL_PLANE_URL is required")?,
+    )?;
     let worker_token = env_file.get("AXS_WORKER_TOKEN").map(str::to_string);
     let listen_addr = env_file
         .get("AXS_THOR_LISTEN_ADDR")
@@ -241,7 +286,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("failed to build HTTP client for join check")?;
-    let check = control_plane_readiness(&client, control_plane, worker_token.as_deref()).await?;
+    let check = control_plane_readiness(&client, &control_plane, worker_token.as_deref()).await?;
 
     env_file.write(&path)?;
     println!("thor config updated: {}", path.display());
@@ -335,9 +380,11 @@ pub fn wait_ready_fast_path(config: Option<PathBuf>, timeout_secs: u64) -> Resul
 pub async fn drain(args: DrainArgs) -> Result<()> {
     let path = args.config.unwrap_or_else(default_thor_env_path);
     let env_file = ThorEnvFile::read(&path)?;
-    let control_plane = env_file
-        .get("AXS_CONTROL_PLANE_URL")
-        .context("AXS_CONTROL_PLANE_URL missing from thor config")?;
+    let control_plane = normalize_control_plane_url(
+        env_file
+            .get("AXS_CONTROL_PLANE_URL")
+            .context("AXS_CONTROL_PLANE_URL missing from thor config")?,
+    )?;
     let worker_id = resolve_worker_id(&env_file).context("thor worker_id is not available")?;
     let runtime_url = runtime_base_url(&env_file);
     let client = reqwest::Client::builder()
@@ -348,7 +395,7 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
 
     post_control_plane_action(
         &client,
-        control_plane,
+        &control_plane,
         env_file.get("AXS_WORKER_TOKEN"),
         &worker_id,
         "drain",
@@ -367,7 +414,7 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
         if health.is_idle() {
             post_control_plane_action(
                 &client,
-                control_plane,
+                &control_plane,
                 env_file.get("AXS_WORKER_TOKEN"),
                 &worker_id,
                 "drain-complete",
@@ -400,7 +447,8 @@ fn trim_trailing_slash(input: String) -> String {
 }
 
 fn parse_socket_addr(raw: &str, label: &str) -> Result<SocketAddr> {
-    raw.parse()
+    raw.trim()
+        .parse()
         .with_context(|| format!("invalid {label}: '{raw}'"))
 }
 
@@ -664,10 +712,11 @@ async fn collect_status_report(
     request_timeout: std::time::Duration,
 ) -> Result<ThorStatusReport> {
     let env_file = ThorEnvFile::read(path)?;
-    let control_plane = env_file
-        .get("AXS_CONTROL_PLANE_URL")
-        .context("AXS_CONTROL_PLANE_URL missing from thor config")?
-        .to_string();
+    let control_plane = normalize_control_plane_url(
+        env_file
+            .get("AXS_CONTROL_PLANE_URL")
+            .context("AXS_CONTROL_PLANE_URL missing from thor config")?,
+    )?;
     let listen_addr_raw = env_file
         .get("AXS_THOR_LISTEN_ADDR")
         .unwrap_or(DEFAULT_THOR_LISTEN_ADDR);
@@ -852,12 +901,20 @@ async fn post_control_plane_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{ThorEnvFile, local_probe_base, parse_socket_addr};
+    use super::{InstallArgs, ThorEnvFile, local_probe_base, parse_socket_addr};
+    use anyhow::Result;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn local_probe_base_rewrites_unspecified_ipv4() {
         let addr = parse_socket_addr("0.0.0.0:18081", "listen").unwrap();
         assert_eq!(local_probe_base(addr), "http://127.0.0.1:18081");
+    }
+
+    #[test]
+    fn parse_socket_addr_trims_whitespace() {
+        let addr = parse_socket_addr(" 0.0.0.0:18081 ", "listen").unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:18081");
     }
 
     #[test]
@@ -877,5 +934,74 @@ mod tests {
         env_file.set("AXS_WORKER_TOKEN", Some("secret".into()));
         env_file.set_if_some("AXS_WORKER_TOKEN", None);
         assert_eq!(env_file.get("AXS_WORKER_TOKEN"), Some("secret"));
+    }
+
+    #[test]
+    fn install_without_control_plane_preserves_existing_control_plane() -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
+        let path = std::env::temp_dir().join(format!("ax-serving-thor-install-{now}.env"));
+
+        let existing = "AXS_CONTROL_PLANE_URL=http://existing-control-plane:19090\n";
+        std::fs::write(&path, existing)?;
+
+        super::install(InstallArgs {
+            control_plane: None,
+            listen_addr: "127.0.0.1:18081".into(),
+            advertised_addr: None,
+            sglang_url: "http://127.0.0.1:30000".into(),
+            worker_token: None,
+            max_inflight: 8,
+            worker_pool: None,
+            node_class: "thor".into(),
+            friendly_name: None,
+            chip_model: None,
+            output: Some(path.clone()),
+        })?;
+
+        let contents = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        assert!(contents.contains("AXS_CONTROL_PLANE_URL=http://existing-control-plane:19090"));
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_control_plane_url_adds_http_scheme_if_missing() -> Result<()> {
+        let normalized = super::normalize_control_plane_url("127.0.0.1:19090")?;
+        assert_eq!(normalized, "http://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_control_plane_url_keeps_https_and_trims_slash() -> Result<()> {
+        let normalized = super::normalize_control_plane_url("https://127.0.0.1:19090//")?;
+        assert_eq!(normalized, "https://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_control_plane_url_rejects_unsupported_scheme() {
+        let err = super::normalize_control_plane_url("ftp://127.0.0.1:19090")
+            .expect_err("unsupported scheme should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported control plane URL scheme")
+        );
+    }
+
+    #[test]
+    fn normalize_control_plane_url_accepts_uppercase_scheme() -> Result<()> {
+        let normalized = super::normalize_control_plane_url("HTTPS://127.0.0.1:19090//")?;
+        assert_eq!(normalized, "HTTPS://127.0.0.1:19090");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_control_plane_url_rejects_path_suffix() {
+        let err = super::normalize_control_plane_url("http://127.0.0.1:19090/v1/models")
+            .expect_err("path suffix should be rejected");
+        assert!(
+            err.to_string()
+                .contains("control plane URL must not include a path")
+        );
     }
 }

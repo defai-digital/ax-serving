@@ -26,9 +26,9 @@ which llama-server
 ```
 
 Backend model:
-- `native` = `ax-engine`
+- `native` = explicit `ax-engine`
 - `llama_cpp` = `llama-server` from `llama.cpp`
-- `auto` = prefer native `ax-engine`, fall back to `llama.cpp` when needed
+- `auto` = try `native` first, then fallback to `llama.cpp` on unsupported architectures
 
 ---
 
@@ -42,7 +42,9 @@ One process handles:
 - scheduler/admission control
 - metrics, dashboard, and admin endpoints
 
-By default, AX Serving routes supported native families through `ax-engine` and uses `llama.cpp` only when routing or model capability requires it.
+By default, AX Serving routes all model loads through `llama.cpp`.
+Use `backend: "native"` in `POST /v1/models` (or equivalent internal controls)
+to force `ax-engine` for a specific model.
 
 Best for:
 - OSS usage
