@@ -79,12 +79,20 @@ pub struct ServeConfig {
     pub project_policy: ProjectPolicyConfig,
 }
 
+// ── Default addresses (overridable via AXS_* env vars) ────────────────────────
+
+/// Default loopback host used across REST, gRPC and orchestrator bindings.
+const DEFAULT_BIND_HOST: &str = "127.0.0.1";
+const DEFAULT_REST_ADDR: &str = "127.0.0.1:18080";
+const DEFAULT_GRPC_SOCKET: &str = "/tmp/ax-serving.sock";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
+
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
-            rest_addr: "127.0.0.1:18080".into(),
-            grpc_socket: "/tmp/ax-serving.sock".into(),
-            grpc_host: "127.0.0.1".into(),
+            rest_addr: DEFAULT_REST_ADDR.into(),
+            grpc_socket: DEFAULT_GRPC_SOCKET.into(),
+            grpc_host: DEFAULT_BIND_HOST.into(),
             grpc_port: None,
             sched_max_inflight: 16,
             sched_max_queue: 128,
@@ -178,7 +186,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            url: "redis://127.0.0.1:6379".into(),
+            url: DEFAULT_REDIS_URL.into(),
             key_prefix: "axs:chat:v1".into(),
             default_ttl: "1h".into(),
             max_ttl: "30d".into(),
@@ -244,10 +252,10 @@ pub struct OrchestratorConfig {
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            host: DEFAULT_BIND_HOST.into(),
             port: 18080,
             internal_port: 19090,
-            internal_bind_addr: "127.0.0.1".into(),
+            internal_bind_addr: DEFAULT_BIND_HOST.into(),
             allowed_node_cidrs: String::new(),
             worker_heartbeat_ms: 5_000,
             worker_ttl_ms: 15_000,
@@ -484,7 +492,7 @@ impl ServeConfig {
         if let Ok(v) = std::env::var("AXS_REST_PORT")
             && let Ok(port) = v.parse::<u16>()
         {
-            self.rest_addr = format!("127.0.0.1:{port}");
+            self.rest_addr = format!("{DEFAULT_BIND_HOST}:{port}");
         }
         if let Ok(v) = std::env::var("AXS_REST_HOST") {
             let port = self.rest_addr.rsplit(':').next().unwrap_or("18080");
@@ -962,7 +970,10 @@ mod tests {
         assert_eq!(cfg.orchestrator.port, 9000);
         assert_eq!(cfg.orchestrator.internal_port, 9001);
         assert_eq!(cfg.orchestrator.internal_bind_addr, "0.0.0.0");
-        assert_eq!(cfg.orchestrator.allowed_node_cidrs, "127.0.0.1/32,10.0.0.0/8");
+        assert_eq!(
+            cfg.orchestrator.allowed_node_cidrs,
+            "127.0.0.1/32,10.0.0.0/8"
+        );
     }
 
     #[test]
@@ -1004,17 +1015,16 @@ mod tests {
         // Write a minimal valid YAML config to a temp file.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_serving.yaml");
-        std::fs::write(
-            &path,
-            "sched_max_inflight: 7\nsched_max_queue: 128\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "sched_max_inflight: 7\nsched_max_queue: 128\n").unwrap();
 
         unsafe { std::env::set_var("AXS_CONFIG", path.to_str().unwrap()) };
         let cfg = ServeConfig::load_default();
         unsafe { std::env::remove_var("AXS_CONFIG") };
 
-        assert_eq!(cfg.sched_max_inflight, 7, "sched_max_inflight must be read from the YAML file");
+        assert_eq!(
+            cfg.sched_max_inflight, 7,
+            "sched_max_inflight must be read from the YAML file"
+        );
     }
 
     #[test]
@@ -1139,7 +1149,10 @@ mod tests {
             worker_pool: None,
         }];
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("project") && err.contains("empty"), "got: {err}");
+        assert!(
+            err.contains("project") && err.contains("empty"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -40,6 +40,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{info, warn};
 
+/// Loopback host used for all llama-server subprocess communication.
+/// llama-server is always spawned locally, so this never needs to be changed.
+const LLAMACPP_LOCAL_HOST: &str = "127.0.0.1";
+
 // ── LlamaCppConfig ────────────────────────────────────────────────────────────
 
 /// Configuration for the llama.cpp subprocess backend.
@@ -103,29 +107,61 @@ pub struct LlamaCppConfig {
     pub mmproj_path: Option<String>,
 }
 
+// ── LlamaCppConfig defaults ────────────────────────────────────────────────────
+// All of these are exposed in serving.example.yaml and overridable via AXS_* env vars.
+
+/// SSE tokens are batched before flushing to reduce syscalls; 4 is a low-latency default.
+const DEFAULT_TOKEN_BATCH_SIZE: usize = 4;
+/// Hard ceiling on token_batch_size — large batches increase TTFT noticeably.
+const DEFAULT_TOKEN_BATCH_MAX: usize = 32;
+/// Consecutive inference failures before the circuit breaker opens.
+const DEFAULT_CB_TRIP_THRESHOLD: u32 = 3;
+/// How long (ms) the circuit breaker stays open before allowing a retry.
+const DEFAULT_CB_RECOVERY_MS: u64 = 10_000;
+/// Timeout (secs) for a single llama-server inference HTTP request.
+const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Time (secs) to wait for llama-server to become ready on first spawn.
+const DEFAULT_SERVER_STARTUP_TIMEOUT_SECS: u64 = 120;
+/// Time (secs) to wait for llama-server to become ready after a restart.
+const DEFAULT_SERVER_RESTART_TIMEOUT_SECS: u64 = 60;
+/// Sleep (ms) between readiness poll attempts in `wait_ready()`.
+const DEFAULT_WAIT_READY_POLL_INTERVAL_MS: u64 = 500;
+/// Per-attempt timeout (secs) for each readiness probe in `wait_ready()`.
+const DEFAULT_WAIT_READY_CHECK_TIMEOUT_SECS: u64 = 1;
+/// How often (secs) the background health poller ticks.
+const DEFAULT_HEALTH_POLLER_INTERVAL_SECS: u64 = 5;
+/// Per-request timeout (secs) for background health poll requests.
+const DEFAULT_HEALTH_POLLER_CHECK_TIMEOUT_SECS: u64 = 2;
+/// Consecutive health failures before attempting a restart.
+const DEFAULT_HEALTH_POLLER_RESTART_THRESHOLD: u32 = 3;
+/// Maximum restart attempts before marking the model Dead.
+const DEFAULT_HEALTH_POLLER_MAX_RESTARTS: u32 = 3;
+/// Default parallel slots — 1 means no concurrent requests share a KV cache.
+const DEFAULT_N_PARALLEL: u32 = 1;
+
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self {
-            token_batch_size: 4,
-            token_batch_max: 32,
-            circuit_breaker_trip_threshold: 3,
-            circuit_breaker_recovery_ms: 10_000,
-            http_request_timeout_secs: 300,
-            server_startup_timeout_secs: 120,
-            server_restart_timeout_secs: 60,
-            wait_ready_poll_interval_ms: 500,
-            wait_ready_check_timeout_secs: 1,
-            health_poller_interval_secs: 5,
-            health_poller_check_timeout_secs: 2,
-            health_poller_restart_threshold: 3,
-            health_poller_max_restarts: 3,
+            token_batch_size: DEFAULT_TOKEN_BATCH_SIZE,
+            token_batch_max: DEFAULT_TOKEN_BATCH_MAX,
+            circuit_breaker_trip_threshold: DEFAULT_CB_TRIP_THRESHOLD,
+            circuit_breaker_recovery_ms: DEFAULT_CB_RECOVERY_MS,
+            http_request_timeout_secs: DEFAULT_HTTP_REQUEST_TIMEOUT_SECS,
+            server_startup_timeout_secs: DEFAULT_SERVER_STARTUP_TIMEOUT_SECS,
+            server_restart_timeout_secs: DEFAULT_SERVER_RESTART_TIMEOUT_SECS,
+            wait_ready_poll_interval_ms: DEFAULT_WAIT_READY_POLL_INTERVAL_MS,
+            wait_ready_check_timeout_secs: DEFAULT_WAIT_READY_CHECK_TIMEOUT_SECS,
+            health_poller_interval_secs: DEFAULT_HEALTH_POLLER_INTERVAL_SECS,
+            health_poller_check_timeout_secs: DEFAULT_HEALTH_POLLER_CHECK_TIMEOUT_SECS,
+            health_poller_restart_threshold: DEFAULT_HEALTH_POLLER_RESTART_THRESHOLD,
+            health_poller_max_restarts: DEFAULT_HEALTH_POLLER_MAX_RESTARTS,
             cache_prompt: true,
             n_threads: None,
             flash_attn: true,
             kv_cache_type: None,
             n_batch: None,
             n_ubatch: None,
-            n_parallel: 1,
+            n_parallel: DEFAULT_N_PARALLEL,
             mmproj_path: None,
         }
     }
@@ -411,7 +447,7 @@ impl LlamaCppBackend {
         cmd.arg("--model")
             .arg(path)
             .arg("--host")
-            .arg("127.0.0.1")
+            .arg(LLAMACPP_LOCAL_HOST)
             .arg("--port")
             .arg(port.to_string())
             .arg("--n-gpu-layers")
@@ -487,7 +523,7 @@ impl LlamaCppBackend {
         poll_interval: Duration,
         check_timeout: Duration,
     ) -> Result<()> {
-        let url = format!("http://127.0.0.1:{port}/health");
+        let url = format!("http://{LLAMACPP_LOCAL_HOST}:{port}/health");
         let deadline = Instant::now() + startup_timeout;
         loop {
             match http.get(&url).timeout(check_timeout).send() {
@@ -574,7 +610,14 @@ impl InferenceBackend for LlamaCppBackend {
         } else {
             crate::BackendType::Metal
         };
-        let meta = fetch_model_meta(&self.http, port, config.context_length, load_ms, gguf_meta, resolved_backend);
+        let meta = fetch_model_meta(
+            &self.http,
+            port,
+            config.context_length,
+            load_ms,
+            gguf_meta,
+            resolved_backend,
+        );
         let handle = next_llamacpp_handle();
 
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
@@ -779,7 +822,7 @@ impl InferenceBackend for LlamaCppBackend {
         });
         let resp: serde_json::Value = self
             .http
-            .post(format!("http://127.0.0.1:{port}/tokenize"))
+            .post(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/tokenize"))
             .json(&body)
             .send()
             .context("POST /tokenize")?
@@ -815,7 +858,7 @@ impl InferenceBackend for LlamaCppBackend {
         let body = serde_json::json!({ "tokens": token_values });
         let resp: serde_json::Value = self
             .http
-            .post(format!("http://127.0.0.1:{port}/detokenize"))
+            .post(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/detokenize"))
             .json(&body)
             .send()
             .context("POST /detokenize")?
@@ -862,7 +905,7 @@ impl InferenceBackend for LlamaCppBackend {
 
         let resp: serde_json::Value = self
             .http
-            .post(format!("http://127.0.0.1:{port}/v1/embeddings"))
+            .post(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/v1/embeddings"))
             .json(&body)
             .send()
             .context("POST /v1/embeddings")?
@@ -970,7 +1013,7 @@ fn run_health_poller(args: PollerArgs) {
         wait_ready_check_timeout,
     } = args;
 
-    let url = format!("http://127.0.0.1:{port}/health");
+    let url = format!("http://{LLAMACPP_LOCAL_HOST}:{port}/health");
     let mut consecutive_failures = 0u32;
     let mut restart_count = 0u32;
 
@@ -1074,7 +1117,7 @@ fn run_health_poller(args: PollerArgs) {
 
 /// Find a free TCP port by binding to :0.
 fn find_free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let listener = std::net::TcpListener::bind(format!("{LLAMACPP_LOCAL_HOST}:0"))?;
     Ok(listener.local_addr()?.port())
     // listener drops here, releasing the port.
     // TOCTOU: negligible for local use.
@@ -1394,7 +1437,9 @@ fn complete_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = http
-        .post(format!("http://127.0.0.1:{port}/v1/completions"))
+        .post(format!(
+            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/completions"
+        ))
         .json(body)
         .send()
         .context("POST /v1/completions")?;
@@ -1456,7 +1501,9 @@ fn complete_chat_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = http
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .post(format!(
+            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/chat/completions"
+        ))
         .json(body)
         .send()
         .context("POST /v1/chat/completions")?;
@@ -1544,7 +1591,9 @@ fn stream_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = http
-        .post(format!("http://127.0.0.1:{port}/v1/completions"))
+        .post(format!(
+            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/completions"
+        ))
         .json(body)
         .send()
         .context("POST /v1/completions")?;
@@ -1704,7 +1753,9 @@ fn stream_chat_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = http
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .post(format!(
+            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/chat/completions"
+        ))
         .json(body)
         .send()
         .context("POST /v1/chat/completions")?;
@@ -1896,7 +1947,7 @@ fn fetch_model_meta(
     } else {
         // Try GET /props (llama-server ≥ b3xxx)
         let from_server = http
-            .get(format!("http://127.0.0.1:{port}/props"))
+            .get(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/props"))
             .timeout(Duration::from_secs(5))
             .send()
             .ok()

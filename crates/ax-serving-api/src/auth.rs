@@ -311,9 +311,7 @@ mod tests {
     fn headers_app() -> axum::Router {
         axum::Router::new()
             .route("/test", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(
-                request_id_and_headers_middleware,
-            ))
+            .layer(axum::middleware::from_fn(request_id_and_headers_middleware))
     }
 
     #[tokio::test]

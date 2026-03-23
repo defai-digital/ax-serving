@@ -240,7 +240,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        // bench::run is sync — MistralrsBackend owns its runtime, drain uses a
+        // bench::run is sync — the selected backend owns its execution path, and drain uses a
         // small separate current_thread runtime. No #[tokio::main] needed.
         Command::Bench {
             model,

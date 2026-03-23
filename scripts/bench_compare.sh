@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# bench_compare.sh — fair comparison: raw-mistralrs vs ax-serving vs llama.cpp
+# bench_compare.sh — fair comparison: ax-serving native vs llama.cpp
 #
 # Methodology (apples-to-apples):
 #   - All tools use **release builds**
 #   - All tools send **exact token-ID sequences** (no chat template overhead)
 #   - All tools use **greedy decoding** (top-k=1, temperature=None)
-#   - Same prompt lengths and decode token count for all three
+#   - Same prompt lengths and decode token count for both tools
 #   - llama-bench is the ground truth reference (runs -r 3 warmup+measure)
 #
 # Usage:
@@ -14,7 +14,6 @@ set -euo pipefail
 
 MODEL="models/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"
 AX_BENCH="./target/release/ax-serving-bench"
-RAW_BENCH="./target/release/raw-mistralrs-bench"
 LLAMA_BENCH="llama-bench"
 
 PP_SIZES="64,256,512"   # prompt token counts (exact, matches llama-bench -p N)
@@ -23,7 +22,7 @@ WARMUP=1
 ITERS=3
 
 echo "================================================================"
-echo "  Benchmark: raw-mistralrs vs ax-serving vs llama.cpp"
+echo "  Benchmark: ax-serving native vs llama.cpp"
 echo "  Model:  $MODEL"
 echo "  Config: greedy, pp={$PP_SIZES} tokens, tg=$TG_TOKENS tokens"
 echo "  Runs:   warmup=$WARMUP, iters=$ITERS"
@@ -31,25 +30,13 @@ echo "  Date:   $(date '+%Y-%m-%d %H:%M')"
 echo "================================================================"
 echo ""
 
-for bin in "$AX_BENCH" "$RAW_BENCH"; do
-    if [ ! -f "$bin" ]; then
-        echo "ERROR: release binary not found: $bin"
-        echo "Run: TOOLCHAINS=... cargo build -p ax-serving-bench --release"
-        exit 1
-    fi
-done
+if [ ! -f "$AX_BENCH" ]; then
+    echo "ERROR: release binary not found: $AX_BENCH"
+    echo "Run: TOOLCHAINS=... cargo build -p ax-serving-bench --release"
+    exit 1
+fi
 
-# ── raw mistralrs (GgufModelBuilder direct, no ax-serving wrapping) ────────
-echo "── raw-mistralrs-bench (release, CompletionTokens, greedy) ─────"
-TOOLCHAINS="${TOOLCHAINS:-}" "$RAW_BENCH" \
-    -m "$MODEL" \
-    --prompt-lengths "$PP_SIZES" \
-    --decode-tokens "$TG_TOKENS" \
-    --warmup "$WARMUP" \
-    --iters "$ITERS"
-echo ""
-
-# ── ax-serving-bench (MistralrsBackend wrapper, CompletionTokens, greedy) ─
+# ── ax-serving-bench (native ax-engine path, CompletionTokens, greedy) ─────
 echo "── ax-serving-bench (release, CompletionTokens, greedy) ────────"
 TOOLCHAINS="${TOOLCHAINS:-}" "$AX_BENCH" bench \
     -m "$MODEL" \
@@ -71,7 +58,6 @@ echo ""
 echo "================================================================"
 echo "Notes:"
 echo "  All tools: exact token IDs, greedy, release builds"
-echo "  raw-mistralrs: GgufModelBuilder direct, is_streaming=false"
-echo "  ax-serving:    MistralrsBackend wrapper, GenerateInput::Tokens"
+echo "  ax-serving:    AxEngineBackend via RouterBackend, GenerateInput::Tokens"
 echo "  llama.cpp:     ggml Metal Q8_0 on-the-fly dequant"
 echo "================================================================"

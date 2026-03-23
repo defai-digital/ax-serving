@@ -255,7 +255,8 @@ impl AxServingServiceTrait for AxServingService {
             .generate(handle, input, params, engine_tx)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let (out_tx, out_rx) = mpsc::channel::<Result<proto::InferResponse, Status>>(INFER_CHANNEL_CAPACITY);
+        let (out_tx, out_rx) =
+            mpsc::channel::<Result<proto::InferResponse, Status>>(INFER_CHANNEL_CAPACITY);
 
         // Start timing before spawning so total_time_ms covers the full
         // generation window, not just task-scheduled-to-done.

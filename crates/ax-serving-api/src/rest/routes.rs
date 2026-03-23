@@ -6,8 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ax_serving_engine::{
-    BackendType, ChatMessage, GenerateEvent, GenerateInput, GenerationParams, LoadConfig,
-    current_rss_bytes,
+    BackendType, ChatMessage, GenerateEvent, GenerateInput, LoadConfig, current_rss_bytes,
 };
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
@@ -20,6 +19,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::schema::*;
+use super::validation::{
+    build_generation_params, cache_ttl_err, resolve_grammar, resolve_logprobs, validate_max_tokens,
+    validate_response_format, validate_sampling_params,
+};
 use crate::ServingLayer;
 use crate::auth::RequestId;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
@@ -145,88 +148,22 @@ fn sse_json_event<T: Serialize>(value: &T) -> Event {
     }
 }
 
-/// Validate sampling parameters common to chat and text completion requests.
-///
-/// Returns `Some(Response)` with 422 Unprocessable Entity if any parameter is out of range.
-/// Returns `None` when all parameters are within acceptable bounds.
-#[allow(clippy::too_many_arguments)]
-fn validate_sampling_params(
-    temperature: f32,
-    top_p: f32,
-    top_k: Option<u32>,
-    repeat_penalty: f32,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    logprobs: Option<bool>,
-    top_logprobs: Option<u32>,
-    mirostat: Option<u8>,
-) -> Option<Response> {
-    macro_rules! reject {
-        ($msg:expr) => {
-            return Some(
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({"error": $msg})),
-                )
-                    .into_response(),
-            )
-        };
-    }
-    if !(0.0..=2.0).contains(&temperature) {
-        reject!("temperature must be in [0, 2]");
-    }
-    if !(f32::EPSILON..=1.0).contains(&top_p) {
-        reject!("top_p must be in (0, 1]");
-    }
-    if matches!(top_k, Some(0)) {
-        reject!("top_k must be > 0");
-    }
-    if !(f32::EPSILON..=10.0).contains(&repeat_penalty) {
-        reject!("repeat_penalty must be in (0, 10]");
-    }
-    if let Some(fp) = frequency_penalty
-        && !(-2.0..=2.0).contains(&fp)
-    {
-        reject!("frequency_penalty must be in [-2, 2]");
-    }
-    if let Some(pp) = presence_penalty
-        && !(-2.0..=2.0).contains(&pp)
-    {
-        reject!("presence_penalty must be in [-2, 2]");
-    }
-    if matches!(top_logprobs, Some(n) if n > 20) {
-        reject!("top_logprobs must be <= 20");
-    }
-    if top_logprobs.is_some() && logprobs != Some(true) {
-        reject!("top_logprobs requires logprobs=true");
-    }
-    if matches!(mirostat, Some(m) if m > 2) {
-        reject!("mirostat must be 0, 1, or 2");
-    }
-    None
-}
+/// Capacity of the mpsc channel used to stream `GenerateEvent` tokens from the
+/// backend to the HTTP response handler.  Large enough to buffer a full short
+/// response without back-pressure on the inference thread.
+const GENERATE_CHANNEL_CAPACITY: usize = 512;
 
-fn validate_response_format(response_format: Option<&ResponseFormat>) -> Option<Response> {
-    let response_format = response_format?;
-    match response_format.format_type.as_str() {
-        "text" | "json_object" => None,
-        other => Some(
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "invalid response_format.type '{other}'; expected 'text' or 'json_object'"
-                    )
-                })),
-            )
-                .into_response(),
-        ),
-    }
-}
+/// Characters per token for the heuristic fallback estimator (4 chars ≈ 1 token,
+/// matching the GPT-3/4 rule-of-thumb for English text).
+const CHARS_PER_TOKEN: u64 = 4;
+
+/// Token overhead added per chat message to account for role/separator framing.
+/// Matches the +4 tokens per message used by the OpenAI tiktoken cookbook.
+const MESSAGE_FRAMING_TOKENS: u64 = 4;
 
 fn estimated_tokens_from_text(text: &str) -> u64 {
     let chars = text.chars().count() as u64;
-    chars.saturating_add(3) / 4
+    chars.saturating_add(CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
 }
 
 fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u64 {
@@ -243,7 +180,7 @@ fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u64 {
             role_tokens
                 .saturating_add(name_tokens)
                 .saturating_add(content_tokens)
-                .saturating_add(4)
+                .saturating_add(MESSAGE_FRAMING_TOKENS)
         })
         .sum::<u64>()
         .max(1)
@@ -292,16 +229,13 @@ pub async fn chat_completions(
                 .into_response();
         }
     }
-    if matches!(req.max_tokens, Some(n) if n > MAX_MAX_TOKENS) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})")})),
-        )
-            .into_response();
+    if let Some(r) = validate_max_tokens(req.max_tokens) {
+        return r;
     }
     if let Some(r) = validate_sampling_params(
         req.temperature,
         req.top_p,
+        req.min_p,
         req.top_k,
         req.repeat_penalty,
         req.frequency_penalty,
@@ -322,9 +256,12 @@ pub async fn chat_completions(
         let d = layer.default_max_tokens;
         if d > 0 { Some(d) } else { None }
     });
-    if let Err(resp) =
-        project_policy::enforce(&headers, &req.model, effective_max_tokens, &layer.config.project_policy)
-    {
+    if let Err(resp) = project_policy::enforce(
+        &headers,
+        &req.model,
+        effective_max_tokens,
+        &layer.config.project_policy,
+    ) {
         return resp.into_response();
     }
 
@@ -400,11 +337,7 @@ pub async fn chat_completions(
                                 cache_leader_guard = Some(leader);
                             }
                             Err(e) => {
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({"error": format!("invalid cache_ttl: {e}")})),
-                                )
-                                    .into_response();
+                                return cache_ttl_err(e);
                             }
                         }
                     }
@@ -489,13 +422,7 @@ pub async fn chat_completions(
                                 .metrics
                                 .cache_follower_waiting
                                 .fetch_sub(1, Ordering::Relaxed);
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(
-                                    serde_json::json!({"error": format!("invalid cache_ttl: {e}")}),
-                                ),
-                            )
-                                .into_response();
+                            return cache_ttl_err(e);
                         }
                     }
                     break false; // Proceed to inference as new leader.
@@ -567,60 +494,36 @@ pub async fn chat_completions(
         .collect();
 
     let stop_seqs = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
+    let grammar = resolve_grammar(req.grammar.clone(), req.response_format.as_ref());
+    let (req_logprobs, req_top_logprobs) = resolve_logprobs(req.logprobs, req.top_logprobs);
 
-    // Resolve grammar: explicit grammar string wins; response_format json_object
-    // maps to the JSON grammar which the backend (llama-server or libllama) applies.
-    let grammar = req.grammar.clone().or_else(|| {
-        req.response_format
-            .as_ref()
-            .filter(|rf| rf.format_type == "json_object")
-            .map(|_| "__json__".to_string())
-    });
-
-    let req_logprobs = req.logprobs.unwrap_or(false);
-    let req_top_logprobs = if req_logprobs {
-        req.top_logprobs.unwrap_or(0)
-    } else {
-        0
-    };
-
-    let params = GenerationParams {
-        stream: req.stream,
-        temperature: if req.temperature == 0.0 {
-            None
-        } else {
-            Some(req.temperature as f64)
-        },
-        top_p: Some(req.top_p as f64),
-        top_k: req.top_k.map(|k| k as usize),
-        max_tokens: effective_max_tokens.map(|n| n as usize),
+    let mut params = build_generation_params(
+        req.stream,
+        req.temperature,
+        req.top_p,
+        req.min_p,
+        req.top_k,
+        effective_max_tokens,
         stop_seqs,
-        seed: req.seed,
-        repeat_penalty: Some(req.repeat_penalty as f64),
-        frequency_penalty: req.frequency_penalty.map(|v| v as f64),
-        presence_penalty: req.presence_penalty.map(|v| v as f64),
+        req.seed,
+        req.repeat_penalty,
+        req.frequency_penalty,
+        req.presence_penalty,
         grammar,
-        response_format: req
-            .response_format
-            .as_ref()
-            .map(|rf| rf.format_type.clone()),
-        mirostat: req.mirostat,
-        mirostat_tau: req.mirostat_tau.map(|v| v as f64),
-        mirostat_eta: req.mirostat_eta.map(|v| v as f64),
-        logprobs: if req_logprobs { Some(true) } else { None },
-        top_logprobs: if req_top_logprobs > 0 {
-            Some(req_top_logprobs)
-        } else {
-            None
-        },
-        tools: req
-            .tools
-            .as_ref()
-            .map(|t| serde_json::to_value(t).unwrap_or_default()),
-        tool_choice: req.tool_choice.clone(),
-    };
+        req.response_format.as_ref(),
+        req.mirostat,
+        req.mirostat_tau,
+        req.mirostat_eta,
+        req_logprobs,
+        req_top_logprobs,
+    );
+    params.tools = req
+        .tools
+        .as_ref()
+        .map(|t| serde_json::to_value(t).unwrap_or_default());
+    params.tool_choice = req.tool_choice.clone();
 
-    let (tx, rx) = mpsc::channel::<GenerateEvent>(512);
+    let (tx, rx) = mpsc::channel::<GenerateEvent>(GENERATE_CHANNEL_CAPACITY);
 
     if let Err(e) = layer
         .backend
@@ -1186,16 +1089,13 @@ pub async fn text_completions(
         )
             .into_response();
     }
-    if matches!(req.max_tokens, Some(n) if n > MAX_MAX_TOKENS) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})")})),
-        )
-            .into_response();
+    if let Some(r) = validate_max_tokens(req.max_tokens) {
+        return r;
     }
     if let Some(r) = validate_sampling_params(
         req.temperature,
         req.top_p,
+        req.min_p,
         req.top_k,
         req.repeat_penalty,
         req.frequency_penalty,
@@ -1214,9 +1114,12 @@ pub async fn text_completions(
         let d = layer.default_max_tokens;
         if d > 0 { Some(d) } else { None }
     });
-    if let Err(resp) =
-        project_policy::enforce(&headers, &req.model, effective_max_tokens, &layer.config.project_policy)
-    {
+    if let Err(resp) = project_policy::enforce(
+        &headers,
+        &req.model,
+        effective_max_tokens,
+        &layer.config.project_policy,
+    ) {
         return resp.into_response();
     }
 
@@ -1281,11 +1184,7 @@ pub async fn text_completions(
                                 cache_leader_guard = Some(leader);
                             }
                             Err(e) => {
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({"error": format!("invalid cache_ttl: {e}")})),
-                                )
-                                    .into_response();
+                                return cache_ttl_err(e);
                             }
                         }
                     }
@@ -1359,13 +1258,7 @@ pub async fn text_completions(
                                 .metrics
                                 .cache_follower_waiting
                                 .fetch_sub(1, Ordering::Relaxed);
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(
-                                    serde_json::json!({"error": format!("invalid cache_ttl: {e}")}),
-                                ),
-                            )
-                                .into_response();
+                            return cache_ttl_err(e);
                         }
                     }
                     break false;
@@ -1421,54 +1314,31 @@ pub async fn text_completions(
     };
 
     let stop_seqs = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
-    let grammar = req.grammar.clone().or_else(|| {
-        req.response_format
-            .as_ref()
-            .filter(|rf| rf.format_type == "json_object")
-            .map(|_| "__json__".to_string())
-    });
+    let grammar = resolve_grammar(req.grammar.clone(), req.response_format.as_ref());
+    let (req_logprobs, req_top_logprobs) = resolve_logprobs(req.logprobs, req.top_logprobs);
 
-    let req_logprobs = req.logprobs.unwrap_or(false);
-    let req_top_logprobs = if req_logprobs {
-        req.top_logprobs.unwrap_or(0)
-    } else {
-        0
-    };
-
-    let params = GenerationParams {
-        stream: req.stream,
-        temperature: if req.temperature == 0.0 {
-            None
-        } else {
-            Some(req.temperature as f64)
-        },
-        top_p: Some(req.top_p as f64),
-        top_k: req.top_k.map(|k| k as usize),
-        max_tokens: effective_max_tokens.map(|n| n as usize),
+    let params = build_generation_params(
+        req.stream,
+        req.temperature,
+        req.top_p,
+        req.min_p,
+        req.top_k,
+        effective_max_tokens,
         stop_seqs,
-        seed: req.seed,
-        repeat_penalty: Some(req.repeat_penalty as f64),
-        frequency_penalty: req.frequency_penalty.map(|v| v as f64),
-        presence_penalty: req.presence_penalty.map(|v| v as f64),
+        req.seed,
+        req.repeat_penalty,
+        req.frequency_penalty,
+        req.presence_penalty,
         grammar,
-        response_format: req
-            .response_format
-            .as_ref()
-            .map(|rf| rf.format_type.clone()),
-        mirostat: req.mirostat,
-        mirostat_tau: req.mirostat_tau.map(|v| v as f64),
-        mirostat_eta: req.mirostat_eta.map(|v| v as f64),
-        logprobs: if req_logprobs { Some(true) } else { None },
-        top_logprobs: if req_top_logprobs > 0 {
-            Some(req_top_logprobs)
-        } else {
-            None
-        },
-        tools: None,
-        tool_choice: None,
-    };
+        req.response_format.as_ref(),
+        req.mirostat,
+        req.mirostat_tau,
+        req.mirostat_eta,
+        req_logprobs,
+        req_top_logprobs,
+    );
 
-    let (tx, rx) = mpsc::channel::<GenerateEvent>(512);
+    let (tx, rx) = mpsc::channel::<GenerateEvent>(GENERATE_CHANNEL_CAPACITY);
 
     if let Err(e) = layer
         .backend
@@ -2085,7 +1955,9 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
     let models_meta = layer.registry.loaded_models_with_meta();
     let loaded_count = models_meta.len();
 
-    let mut buf = String::with_capacity(2048);
+    // Pre-allocate enough for all metric lines; avoids re-allocations on the hot path.
+    const PROMETHEUS_BUF_CAPACITY: usize = 2048;
+    let mut buf = String::with_capacity(PROMETHEUS_BUF_CAPACITY);
 
     // ── Scheduler ──────────────────────────────────────────────────────────
     buf.push_str("# HELP axs_scheduler_queue_depth Current request queue depth\n");
@@ -2705,6 +2577,7 @@ struct CacheKeyPayload<'a> {
     messages: Vec<NormalizedMessage>,
     temperature: String,
     top_p: String,
+    min_p: Option<String>,
     top_k: Option<u32>,
     max_tokens: Option<u32>,
     seed: Option<u64>,
@@ -2738,6 +2611,7 @@ fn build_cache_key(
         messages,
         temperature: format!("{:.4}", req.temperature),
         top_p: format!("{:.4}", req.top_p),
+        min_p: req.min_p.map(|v| format!("{v:.4}")),
         top_k: req.top_k,
         max_tokens: effective_max_tokens,
         seed: req.seed,
@@ -2758,6 +2632,7 @@ struct TextCacheKeyPayload<'a> {
     prompt: &'a str,
     temperature: String,
     top_p: String,
+    min_p: Option<String>,
     top_k: Option<u32>,
     max_tokens: Option<u32>,
     seed: Option<u64>,
@@ -2779,6 +2654,7 @@ fn build_text_cache_key(
         prompt: req.prompt.trim(),
         temperature: format!("{:.4}", req.temperature),
         top_p: format!("{:.4}", req.top_p),
+        min_p: req.min_p.map(|v| format!("{v:.4}")),
         top_k: req.top_k,
         max_tokens: effective_max_tokens,
         seed: req.seed,
@@ -2872,7 +2748,7 @@ fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value 
 ///
 /// Supports the `llama_cpp` subprocess backend (batched POST to llama-server's
 /// `/v1/embeddings`) and the `LibLlamaBackend`. Returns 501 if the backend does
-/// not implement embeddings (e.g. native mistralrs backend).
+/// not implement embeddings (e.g. the native ax-engine backend).
 pub async fn embeddings(
     State(layer): State<Arc<ServingLayer>>,
     headers: HeaderMap,
@@ -3093,6 +2969,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: Some(16),
             top_p: 1.0,
+            min_p: None,
             top_k: Some(1),
             seed: None,
             repeat_penalty: 1.1,
@@ -3199,6 +3076,7 @@ mod tests {
             validate_sampling_params(
                 0.0,
                 1.0,
+                None,
                 Some(1),
                 0.1,
                 None,
@@ -3214,6 +3092,7 @@ mod tests {
                 2.0,
                 0.01,
                 None,
+                None,
                 10.0,
                 Some(-2.0),
                 Some(2.0),
@@ -3228,31 +3107,35 @@ mod tests {
     #[test]
     fn sampling_params_temperature_out_of_range() {
         assert!(
-            validate_sampling_params(-0.1, 1.0, None, 1.1, None, None, None, None, None).is_some()
+            validate_sampling_params(-0.1, 1.0, None, None, 1.1, None, None, None, None, None)
+                .is_some()
         );
         assert!(
-            validate_sampling_params(2.01, 1.0, None, 1.1, None, None, None, None, None).is_some()
+            validate_sampling_params(2.01, 1.0, None, None, 1.1, None, None, None, None, None)
+                .is_some()
         );
     }
 
     #[test]
     fn sampling_params_top_p_out_of_range() {
         assert!(
-            validate_sampling_params(1.0, 0.0, None, 1.1, None, None, None, None, None).is_some()
+            validate_sampling_params(1.0, 0.0, None, None, 1.1, None, None, None, None, None)
+                .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.01, None, 1.1, None, None, None, None, None).is_some()
+            validate_sampling_params(1.0, 1.01, None, None, 1.1, None, None, None, None, None)
+                .is_some()
         );
     }
 
     #[test]
     fn sampling_params_top_k_zero_rejected() {
         assert!(
-            validate_sampling_params(1.0, 1.0, Some(0), 1.1, None, None, None, None, None)
+            validate_sampling_params(1.0, 1.0, None, Some(0), 1.1, None, None, None, None, None)
                 .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, Some(1), 1.1, None, None, None, None, None)
+            validate_sampling_params(1.0, 1.0, None, Some(1), 1.1, None, None, None, None, None)
                 .is_none()
         );
     }
@@ -3260,51 +3143,117 @@ mod tests {
     #[test]
     fn sampling_params_penalties_out_of_range() {
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, Some(2.01), None, None, None, None)
-                .is_some()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                Some(2.01),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, Some(-2.01), None, None, None)
-                .is_some()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                None,
+                Some(-2.01),
+                None,
+                None,
+                None,
+            )
+            .is_some()
         );
     }
 
     #[test]
     fn sampling_params_top_logprobs_over_limit() {
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, Some(true), Some(21), None)
-                .is_some()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                None,
+                None,
+                Some(true),
+                Some(21),
+                None,
+            )
+            .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, Some(true), Some(20), None)
-                .is_none()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                None,
+                None,
+                Some(true),
+                Some(20),
+                None,
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn sampling_params_top_logprobs_requires_logprobs() {
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, None, Some(1), None)
+            validate_sampling_params(1.0, 1.0, None, None, 1.1, None, None, None, Some(1), None)
                 .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, Some(false), Some(1), None)
-                .is_some()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                None,
+                None,
+                Some(false),
+                Some(1),
+                None,
+            )
+            .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, Some(true), Some(1), None)
-                .is_none()
+            validate_sampling_params(
+                1.0,
+                1.0,
+                None,
+                None,
+                1.1,
+                None,
+                None,
+                Some(true),
+                Some(1),
+                None,
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn sampling_params_mirostat_invalid() {
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, None, None, Some(3))
+            validate_sampling_params(1.0, 1.0, None, None, 1.1, None, None, None, None, Some(3))
                 .is_some()
         );
         assert!(
-            validate_sampling_params(1.0, 1.0, None, 1.1, None, None, None, None, Some(2))
+            validate_sampling_params(1.0, 1.0, None, None, 1.1, None, None, None, None, Some(2))
                 .is_none()
         );
     }
@@ -3323,6 +3272,13 @@ mod tests {
             format_type: "json_object".into(),
         };
         assert!(validate_response_format(Some(&json)).is_none());
+    }
+
+    #[test]
+    fn max_tokens_validation_rejects_zero_and_schema_limit() {
+        assert!(validate_max_tokens(Some(0)).is_some());
+        assert!(validate_max_tokens(Some(MAX_MAX_TOKENS)).is_none());
+        assert!(validate_max_tokens(Some(MAX_MAX_TOKENS + 1)).is_some());
     }
 
     #[test]
@@ -3360,8 +3316,7 @@ mod tests {
 
     #[test]
     fn scheduler_error_status_throttled_is_503() {
-        let e: anyhow::Error =
-            crate::scheduler::SchedulerError::Throttled { cap: 8 }.into();
+        let e: anyhow::Error = crate::scheduler::SchedulerError::Throttled { cap: 8 }.into();
         assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 

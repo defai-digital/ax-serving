@@ -16,8 +16,8 @@
 //! Unhealthy within 10 s and is evicted at 15 s.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -418,11 +418,12 @@ impl WorkerRegistry {
             .and_then(WorkerId::parse)
             .unwrap_or_default();
 
+        // Sentinel: loopback on the reserved port 1 so the registry isn't
+        // poisoned but the worker will never receive real traffic.
+        const SENTINEL_ADDR: &str = "127.0.0.1:1";
         let addr: SocketAddr = raw_addr.parse().unwrap_or_else(|e| {
-            // Fallback: loopback on a non-routable port so the registry isn't
-            // poisoned but the worker will never receive traffic.
             warn!(raw_addr = %raw_addr, err = %e, "worker registered with unparseable address; it will never receive traffic");
-            "127.0.0.1:1".parse().unwrap()
+            SENTINEL_ADDR.parse().unwrap()
         });
         let backend = BackendKind::parse(&backend);
         let (capabilities, capability_source) = capabilities.into_parts();
@@ -547,7 +548,11 @@ impl WorkerRegistry {
 
     /// Returns workers eligible to receive a request for `model_id` and request kind:
     /// healthy, not draining, advertises the model, and supports the request kind.
-    pub fn eligible_workers_for(&self, model_id: &str, request_kind: RequestKind) -> Vec<WorkerStatus> {
+    pub fn eligible_workers_for(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+    ) -> Vec<WorkerStatus> {
         self.eligible_workers_filtered(model_id, request_kind, None, None)
     }
 
@@ -567,7 +572,9 @@ impl WorkerRegistry {
                     && matches!(e.health, WorkerHealth::Healthy)
                     && e.capabilities.models.iter().any(|c| c == model_id)
                     && supports_request_kind(e, request_kind)
-                    && backend_filter.as_ref().is_none_or(|kind| &e.backend == kind)
+                    && backend_filter
+                        .as_ref()
+                        .is_none_or(|kind| &e.backend == kind)
                     && min_context.is_none_or(|required| {
                         e.capabilities
                             .max_context
@@ -853,7 +860,8 @@ mod tests {
 
         assert!(r.eligible_workers("embed-1").is_empty());
         assert_eq!(
-            r.eligible_workers_for("embed-1", RequestKind::Embedding).len(),
+            r.eligible_workers_for("embed-1", RequestKind::Embedding)
+                .len(),
             1
         );
     }
@@ -1199,7 +1207,10 @@ mod tests {
         let _ = id4;
 
         let (h, u, d) = r.counts();
-        assert_eq!(h, 3, "id1 is still Healthy (just draining), id2+id4 healthy");
+        assert_eq!(
+            h, 3,
+            "id1 is still Healthy (just draining), id2+id4 healthy"
+        );
         assert_eq!(u, 1, "id3 is unhealthy");
         assert_eq!(d, 1, "id1 is draining");
     }
@@ -1302,9 +1313,15 @@ mod tests {
 
         assert_eq!(evicted.len(), 1, "only the dead worker should be evicted");
         assert!(evicted.contains(&id_dead));
-        assert!(r.inner.get(&id_dead).is_none(), "dead worker must be removed");
+        assert!(
+            r.inner.get(&id_dead).is_none(),
+            "dead worker must be removed"
+        );
 
-        assert_eq!(r.inner.get(&id_healthy).unwrap().health, WorkerHealth::Healthy);
+        assert_eq!(
+            r.inner.get(&id_healthy).unwrap().health,
+            WorkerHealth::Healthy
+        );
         assert_eq!(
             r.inner.get(&id_miss1).unwrap().health,
             WorkerHealth::Unhealthy { missed: 1 }
@@ -1338,8 +1355,14 @@ mod tests {
 
         let evicted = r.tick(ttl_ms);
 
-        assert!(evicted.contains(&id_stale), "stale draining worker must be evicted");
-        assert!(!evicted.contains(&id_fresh), "fresh draining worker must not be evicted yet");
+        assert!(
+            evicted.contains(&id_stale),
+            "stale draining worker must be evicted"
+        );
+        assert!(
+            !evicted.contains(&id_fresh),
+            "fresh draining worker must not be evicted yet"
+        );
         assert!(r.inner.get(&id_fresh).is_some());
     }
 
@@ -1370,7 +1393,11 @@ mod tests {
         // Worker has "llama3-8b" — must NOT be returned for "llama3" or "llama3-8b-v2".
         r.register(reg_req("127.0.0.1:8081", &["llama3-8b"], 4), 5000);
 
-        assert_eq!(r.eligible_workers("llama3-8b").len(), 1, "exact match must work");
+        assert_eq!(
+            r.eligible_workers("llama3-8b").len(),
+            1,
+            "exact match must work"
+        );
         assert!(
             r.eligible_workers("llama3").is_empty(),
             "substring 'llama3' must not match 'llama3-8b'"

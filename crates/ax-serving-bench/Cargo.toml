@@ -8,16 +8,9 @@ edition.workspace = true
 name = "ax-serving-bench"
 path = "src/main.rs"
 
-[[bin]]
-name = "raw-mistralrs-bench"
-path = "src/raw_mistralrs_bench.rs"
-
 [dependencies]
 ax-serving-engine = { path = "../ax-serving-engine" }
 ax-serving-api = { path = "../ax-serving-api" }
-mistralrs = { workspace = true }
-either = "1"
-indexmap = "2"
 
 tokio = { workspace = true }
 clap = { workspace = true }

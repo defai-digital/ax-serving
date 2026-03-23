@@ -12,6 +12,12 @@ pub const MAX_CONTENT_BYTES: usize = 32 * 1024; // 32 KB per message
 pub const MAX_MAX_TOKENS: u32 = 32_768;
 pub const MAX_MODEL_ID_BYTES: usize = 256;
 
+// ── Content size estimation ────────────────────────────────────────────────────
+
+/// Estimated byte cost of a single image_url part for content-size validation.
+/// Image payloads are not inlined in the JSON, so a fixed placeholder is used.
+pub const IMAGE_PART_BYTE_COST: usize = 256;
+
 use crate::cache::CachePreference;
 
 // ── Message content (string or multipart for vision) ──────────────────────────
@@ -48,7 +54,7 @@ impl MessageContent {
                 .iter()
                 .map(|p| match p {
                     ContentPart::Text { text } => text.len(),
-                    ContentPart::ImageUrl { .. } => 256,
+                    ContentPart::ImageUrl { .. } => IMAGE_PART_BYTE_COST,
                 })
                 .sum(),
         }
@@ -157,6 +163,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
+    #[serde(default)]
+    pub min_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
     #[serde(default)]
@@ -412,6 +420,8 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
+    #[serde(default)]
+    pub min_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
     #[serde(default)]

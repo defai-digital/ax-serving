@@ -3,8 +3,8 @@
 //! Ported from ax-engine's metrics module. No external dependencies.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ax_serving_engine::GenerationStats;
@@ -133,6 +133,11 @@ impl BurnRateWindow {
     }
 }
 
+/// Sliding window duration for the fast SLO burn-rate alert (1 hour).
+const BURN_RATE_1H_MS: u64 = 60 * 60 * 1_000;
+/// Sliding window duration for the slow SLO burn-rate alert (6 hours).
+const BURN_RATE_6H_MS: u64 = 6 * 60 * 60 * 1_000;
+
 /// Global metrics store.
 pub struct MetricsStore {
     pub uptime_start: Instant,
@@ -158,8 +163,8 @@ impl MetricsStore {
     pub fn new() -> Self {
         Self {
             uptime_start: Instant::now(),
-            burn_1h: Mutex::new(BurnRateWindow::new(3_600_000)),
-            burn_6h: Mutex::new(BurnRateWindow::new(21_600_000)),
+            burn_1h: Mutex::new(BurnRateWindow::new(BURN_RATE_1H_MS)),
+            burn_6h: Mutex::new(BurnRateWindow::new(BURN_RATE_6H_MS)),
             recent_decode_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
             recent_prefill_tok_per_sec_bits: AtomicU64::new(0.0_f64.to_bits()),
             cold_requests_total: AtomicU64::new(0),
@@ -175,7 +180,7 @@ impl MetricsStore {
 
     pub fn record_generation_stats(&self, stats: &GenerationStats) {
         // Guard against NaN / infinity before storing.  Non-finite values arise
-        // when mistralrs reports throughput for a request that completes in near-
+        // when the backend reports throughput for a request that completes in near-
         // zero time (decode_time ≈ 0 → tokens/time = +∞ or NaN).  Storing them
         // as-is is safe here, but `recent_decode_tok_per_sec()` is serialized by
         // the heartbeat loop via `serde_json::json!`, which panics on non-finite
@@ -263,7 +268,7 @@ impl OpTimer {
 
 /// Query current RSS from macOS task info.
 pub fn current_rss_bytes() -> u64 {
-    ax_serving_engine::backend::current_rss_bytes()
+    ax_serving_engine::current_rss_bytes()
 }
 
 #[cfg(test)]

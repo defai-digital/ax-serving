@@ -85,10 +85,14 @@ impl HealthTicker {
     }
 }
 
+/// Timeout for each TCP liveness probe. Short enough that a dead worker is
+/// detected within one heartbeat interval; long enough for a loaded host to accept.
+const TCP_PROBE_TIMEOUT_SECS: u64 = 1;
+
 /// Attempt TCP connects to `candidates` concurrently (1 s timeout each).
 /// Any worker whose probe fails is evicted from the registry immediately.
 async fn probe_and_evict(registry: &WorkerRegistry, candidates: Vec<(WorkerId, SocketAddr)>) {
-    let probe_timeout = Duration::from_secs(1);
+    let probe_timeout = Duration::from_secs(TCP_PROBE_TIMEOUT_SECS);
 
     let tasks: Vec<_> = candidates
         .into_iter()

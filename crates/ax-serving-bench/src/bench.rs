@@ -1,9 +1,9 @@
 //! Throughput benchmark: prefill tok/s + decode tok/s across prompt lengths.
 //!
-//! Threading model: `run()` is plain sync. MistralrsBackend owns its internal
-//! runtime for model loading and generation. A small separate `current_thread`
-//! runtime is created only to `.await` the channel drain — it never calls into
-//! the backend (no nested block_on / blocking_read panics).
+//! Threading model: `run()` is plain sync. The selected backend owns its own
+//! execution path for model loading and generation. A small separate
+//! `current_thread` runtime is created only to `.await` the channel drain — it
+//! never calls into the backend.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -23,8 +23,7 @@ pub fn run(
     iters: usize,
     json_out: Option<PathBuf>,
 ) -> Result<()> {
-    // load_model: sync, calls block_on on backend's internal runtime.
-    // Called here from a plain non-tokio thread — safe.
+    // load_model is called here from a plain non-tokio thread.
     let backend = RouterBackend::from_env();
     let (handle, meta) = backend.load_model(&model, LoadConfig::default())?;
 

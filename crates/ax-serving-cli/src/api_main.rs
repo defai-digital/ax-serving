@@ -21,6 +21,8 @@
 //!   AXS_GLOBAL_QUEUE_WAIT_MS — max queue wait before 503 (default: 10000)
 //!   AXS_LOG                 — tracing filter, e.g. "debug" or "ax_serving_api=trace"
 
+mod logging;
+
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 compile_error!("ax-serving-api only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
@@ -66,13 +68,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("AXS_LOG")
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .init();
+    logging::init_logging(false);
 
     use ax_serving_api::config::ServeConfig;
     use ax_serving_api::orchestration::start_orchestrator;
@@ -98,8 +94,12 @@ fn main() -> Result<()> {
     let project_policy = serve_config.project_policy;
 
     eprintln!(
-        "[ax-serving-api] starting: mode=direct public={}:{} internal=127.0.0.1:{} policy={}",
-        config.host, config.port, config.internal_port, config.dispatch_policy,
+        "[ax-serving-api] starting: mode=direct public={}:{} internal={}:{} policy={}",
+        config.host,
+        config.port,
+        config.internal_bind_addr,
+        config.internal_port,
+        config.dispatch_policy,
     );
 
     tokio::runtime::Builder::new_multi_thread()

@@ -1,7 +1,8 @@
 //! ax-serving-engine: Inference backend adapter.
 //!
-//! Wraps mistralrs behind the [`InferenceBackend`] trait.
-//! All other crates depend on this trait, not on mistralrs directly.
+//! Wraps the native ax-engine backend and llama.cpp behind the
+//! [`InferenceBackend`] trait.
+//! All other crates depend on this trait, not on a concrete inference engine.
 //!
 //! # Architecture
 //!
@@ -9,13 +10,13 @@
 //! ax-serving-api / ax-serving-shim
 //!      │  InferenceBackend trait
 //!      ▼
-//! MistralrsBackend  ──→  mistralrs  ──→  Candle Metal kernels
+//! AxEngineBackend / LlamaCppBackend / LibLlamaBackend
 //! ```
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 compile_error!("ax-serving-engine only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
-pub mod backend;
+pub mod ax_engine;
 pub mod gguf_meta;
 #[cfg(feature = "libllama")]
 pub mod libllama;
@@ -26,7 +27,8 @@ pub mod thermal;
 
 use std::path::Path;
 
-pub use backend::{MistralrsBackend, current_rss_bytes};
+pub use ax_core::metrics::current_rss_bytes;
+pub use ax_engine::AxEngineBackend;
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
@@ -115,7 +117,7 @@ pub struct ModelMetadata {
     pub peak_rss_bytes: u64,
     /// The backend hardware type that was actually used to load the model.
     ///
-    /// Set by each backend implementation (`MistralrsBackend` → `Metal`,
+    /// Set by each backend implementation (`AxEngineBackend` → `Metal`/`Cpu`,
     /// `LlamaCppBackend` → `Metal` when GPU layers > 0 else `Cpu`,
     /// `LibLlamaBackend` → `Metal`).  Allows callers to report the resolved
     /// backend rather than echoing the client-supplied `Auto` hint.
@@ -176,6 +178,8 @@ pub struct GenerationParams {
     pub temperature: Option<f64>,
     /// Top-p nucleus sampling (None = disabled).
     pub top_p: Option<f64>,
+    /// Min-p sampling threshold relative to the most likely token (None = disabled).
+    pub min_p: Option<f64>,
     /// Top-k sampling (None = disabled).
     pub top_k: Option<usize>,
     /// Maximum number of tokens to generate.
@@ -216,6 +220,7 @@ impl Default for GenerationParams {
             stream: false,
             temperature: Some(0.7),
             top_p: None,
+            min_p: None,
             top_k: None,
             max_tokens: None,
             stop_seqs: Vec::new(),
@@ -319,10 +324,10 @@ pub struct EmbedResult {
 
 // ── InferenceBackend trait ────────────────────────────────────────────────────
 
-/// Core inference interface implemented by [`MistralrsBackend`].
+/// Core inference interface implemented by concrete backend adapters.
 ///
 /// All serving-layer logic (gRPC, REST, C API) depends only on this trait.
-/// mistralrs is not visible outside `ax-serving-engine`.
+/// The underlying inference engine is not visible outside `ax-serving-engine`.
 pub trait InferenceBackend: Send + Sync {
     /// Load a GGUF model and return an opaque handle.
     fn load_model(
@@ -381,7 +386,7 @@ pub trait InferenceBackend: Send + Sync {
     /// shim to implement `llama_eval`. The returned ID drives synthetic logits
     /// in `llama_get_logits` (greedy-compatible near-degenerate distribution).
     ///
-    /// Default implementation returns an error — only `MistralrsBackend` supports this.
+    /// Default implementation returns an error — only selected backends support this.
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> anyhow::Result<u32> {
         let _ = (handle, tokens);
         Err(anyhow::anyhow!("eval_tokens not supported by this backend"))

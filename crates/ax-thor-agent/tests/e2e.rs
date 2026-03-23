@@ -35,7 +35,8 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     let control_state = Arc::new(ControlPlaneState::default());
     let sglang_state = Arc::new(SgLangState::default());
 
-    let (control_base, _control_task) = spawn_server(control_plane_router(control_state.clone())).await?;
+    let (control_base, _control_task) =
+        spawn_server(control_plane_router(control_state.clone())).await?;
     let (sglang_base, _sglang_task) = spawn_server(sglang_router(sglang_state.clone())).await?;
 
     let config = ThorConfig {
@@ -67,7 +68,10 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert_eq!(registrations.len(), 1);
     assert_eq!(registrations[0]["backend"], "sglang");
     assert_eq!(registrations[0]["addr"], "127.0.0.1:18081");
-    assert_eq!(registrations[0]["capabilities"]["models"], json!(["qwen2-72b"]));
+    assert_eq!(
+        registrations[0]["capabilities"]["models"],
+        json!(["qwen2-72b"])
+    );
     drop(registrations);
 
     let heartbeat_task = tokio::spawn(agent::heartbeat_loop(
@@ -116,7 +120,10 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         .await
         .context("failed to parse thor proxy response")?;
     assert_eq!(response["model"], "qwen2-72b");
-    assert_eq!(response["choices"][0]["message"]["content"], "hello from sglang");
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "hello from sglang"
+    );
 
     let chats = sglang_state.chats.lock().await;
     assert_eq!(chats.len(), 1);
@@ -226,7 +233,9 @@ async fn spawn_server(app: Router) -> Result<(String, tokio::task::JoinHandle<()
         .context("failed to bind test listener")?;
     let addr = listener.local_addr().context("missing listener addr")?;
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("test server failed");
+        axum::serve(listener, app)
+            .await
+            .expect("test server failed");
     });
     Ok((format!("http://{}", display_addr(addr)), handle))
 }

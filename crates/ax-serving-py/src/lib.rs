@@ -1,7 +1,7 @@
 //! ax-serving-py: PyO3 Python bindings for ax-serving.
 //!
 //! Exposes a minimal Python API for loading models and running inference
-//! against the mistralrs/llama.cpp backend chain via `InferenceBackend`.
+//! against the native/llama.cpp backend chain via `InferenceBackend`.
 //!
 //! # Usage (Python)
 //!
@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 /// A loaded inference model.
 ///
 /// Created via `AxModel.load(path)`. Internally wraps the `RouterBackend`
-/// (which auto-selects mistralrs or llama.cpp based on model architecture).
+/// (which auto-selects the native backend or llama.cpp based on model architecture).
 #[pyclass]
 pub struct AxModel {
     backend: Arc<dyn InferenceBackend>,

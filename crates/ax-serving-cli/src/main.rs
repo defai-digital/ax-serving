@@ -6,6 +6,7 @@
 //!
 //! To start the multi-worker API gateway, use `ax-serving-api` instead.
 
+mod logging;
 mod thor;
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
@@ -216,27 +217,39 @@ enum ThorCommand {
         /// Env-file path. Defaults to ~/.config/ax-serving/thor.env
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Exit with a Thor-specific readiness code when the node is not ready.
+        #[arg(long)]
+        require_ready: bool,
+    },
+    /// Poll Thor status until the node is ready or timeout expires.
+    WaitReady {
+        /// Env-file path. Defaults to ~/.config/ax-serving/thor.env
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Overall timeout before returning a readiness-mismatch exit code.
+        #[arg(long, default_value_t = 60)]
+        timeout_secs: u64,
+        /// Poll interval between status checks.
+        #[arg(long, default_value_t = 1000)]
+        poll_interval_ms: u64,
+    },
+    /// Mark a registered Thor worker draining and optionally complete drain when idle.
+    Drain {
+        /// Env-file path. Defaults to ~/.config/ax-serving/thor.env
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// After requesting drain, wait for the local agent to become idle and
+        /// then send drain-complete.
+        #[arg(long)]
+        complete_when_idle: bool,
+        /// Maximum time to wait for idle before failing drain completion.
+        #[arg(long, default_value_t = 30)]
+        idle_timeout_secs: u64,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let log_filter =
-        tracing_subscriber::EnvFilter::from_env("AXS_LOG").add_directive(if cli.verbose {
-            tracing::Level::DEBUG.into()
-        } else {
-            tracing::Level::WARN.into()
-        });
-    let log_format = std::env::var("AXS_LOG_FORMAT").unwrap_or_else(|_| "text".into());
-    if log_format == "json" {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(log_filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(log_filter).init();
-    }
 
     match cli.command {
         Some(Command::Serve {
@@ -247,16 +260,27 @@ fn main() -> Result<()> {
             config,
             routing_config,
             orchestrator,
-        }) => run_serve(
-            model,
-            model_id,
-            host,
-            port,
-            config,
-            routing_config,
-            orchestrator,
-        ),
+        }) => {
+            logging::init_logging(cli.verbose);
+            run_serve(
+                model,
+                model_id,
+                host,
+                port,
+                config,
+                routing_config,
+                orchestrator,
+            )
+        }
         Some(Command::Thor { command }) => {
+            if let ThorCommand::WaitReady {
+                config,
+                timeout_secs,
+                ..
+            } = &command
+            {
+                thor::wait_ready_fast_path(config.clone(), *timeout_secs)?;
+            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -315,14 +339,46 @@ fn main() -> Result<()> {
                         })
                         .await
                     }
-                    ThorCommand::Status { config } => {
-                        thor::status(thor::StatusArgs { config }).await
+                    ThorCommand::Status {
+                        config,
+                        require_ready,
+                    } => {
+                        thor::status(thor::StatusArgs {
+                            config,
+                            require_ready,
+                        })
+                        .await
+                    }
+                    ThorCommand::WaitReady {
+                        config,
+                        timeout_secs,
+                        poll_interval_ms,
+                    } => {
+                        thor::wait_ready(thor::WaitReadyArgs {
+                            config,
+                            timeout_secs,
+                            poll_interval_ms,
+                        })
+                        .await
+                    }
+                    ThorCommand::Drain {
+                        config,
+                        complete_when_idle,
+                        idle_timeout_secs,
+                    } => {
+                        thor::drain(thor::DrainArgs {
+                            config,
+                            complete_when_idle,
+                            idle_timeout_secs,
+                        })
+                        .await
                     }
                 }
             })
         }
         None => {
-            // Inference mode: MistralrsBackend owns its own runtime internally.
+            logging::init_logging(cli.verbose);
+            // Inference mode: the selected backend owns its own execution path.
             // Run everything synchronously to avoid nested-runtime panics.
             let model = cli
                 .model
@@ -381,8 +437,8 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
         },
         max_tokens: Some(cli.n_predict as usize),
         stop_seqs: Vec::new(),
-        seed: None,
-        repeat_penalty: None,
+        seed: if cli.seed == 0 { None } else { Some(cli.seed) },
+        repeat_penalty: Some(cli.repeat_penalty as f64),
         ..Default::default()
     };
 

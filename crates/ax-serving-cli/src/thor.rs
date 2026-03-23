@@ -6,18 +6,29 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+/// Default listen/advertised address for the Thor agent proxy.
+const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
+/// Default SGLang (or vLLM) runtime URL on the same host.
+const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
+
 const THOR_ENV_KEYS: &[&str] = &[
     "AXS_CONTROL_PLANE_URL",
     "AXS_WORKER_TOKEN",
     "AXS_SGLANG_URL",
+    "AXS_THOR_BACKEND",
+    "AXS_THOR_RUNTIME_URL",
     "AXS_THOR_LISTEN_ADDR",
     "AXS_THOR_ADVERTISED_ADDR",
     "AXS_THOR_MAX_INFLIGHT",
+    "AXS_THOR_MAX_CONTEXT",
     "AXS_THOR_WORKER_POOL",
     "AXS_THOR_NODE_CLASS",
     "AXS_THOR_FRIENDLY_NAME",
     "AXS_THOR_CHIP_MODEL",
+    "AXS_THOR_WORKER_ID_PATH",
 ];
+
+const THOR_NOT_READY_EXIT_CODE: i32 = 24;
 
 pub struct InstallArgs {
     pub control_plane: Option<String>,
@@ -49,6 +60,19 @@ pub struct JoinArgs {
 
 pub struct StatusArgs {
     pub config: Option<PathBuf>,
+    pub require_ready: bool,
+}
+
+pub struct WaitReadyArgs {
+    pub config: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub poll_interval_ms: u64,
+}
+
+pub struct DrainArgs {
+    pub config: Option<PathBuf>,
+    pub complete_when_idle: bool,
+    pub idle_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,7 +119,8 @@ impl ThorEnvFile {
     fn set(&mut self, key: &str, value: Option<String>) {
         match value {
             Some(value) if !value.trim().is_empty() => {
-                self.values.insert(key.to_string(), value.trim().to_string());
+                self.values
+                    .insert(key.to_string(), value.trim().to_string());
             }
             _ => {
                 self.values.remove(key);
@@ -132,11 +157,22 @@ pub fn install(args: InstallArgs) -> Result<()> {
         "AXS_CONTROL_PLANE_URL",
         args.control_plane.map(trim_trailing_slash),
     );
+    env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
     env_file.set("AXS_SGLANG_URL", Some(trim_trailing_slash(args.sglang_url)));
+    env_file.set(
+        "AXS_THOR_RUNTIME_URL",
+        env_file.get("AXS_SGLANG_URL").map(str::to_string),
+    );
     env_file.set("AXS_WORKER_TOKEN", args.worker_token);
     env_file.set("AXS_THOR_LISTEN_ADDR", Some(listen_addr.to_string()));
-    env_file.set("AXS_THOR_ADVERTISED_ADDR", Some(advertised_addr.to_string()));
-    env_file.set("AXS_THOR_MAX_INFLIGHT", Some(args.max_inflight.max(1).to_string()));
+    env_file.set(
+        "AXS_THOR_ADVERTISED_ADDR",
+        Some(advertised_addr.to_string()),
+    );
+    env_file.set(
+        "AXS_THOR_MAX_INFLIGHT",
+        Some(args.max_inflight.max(1).to_string()),
+    );
     env_file.set("AXS_THOR_WORKER_POOL", args.worker_pool);
     env_file.set("AXS_THOR_NODE_CLASS", Some(args.node_class));
     env_file.set("AXS_THOR_FRIENDLY_NAME", args.friendly_name);
@@ -159,18 +195,28 @@ pub async fn join(args: JoinArgs) -> Result<()> {
         "AXS_CONTROL_PLANE_URL",
         Some(trim_trailing_slash(args.control_plane)),
     );
+    env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
     env_file.set_if_some("AXS_WORKER_TOKEN", args.worker_token);
     env_file.set_if_some("AXS_SGLANG_URL", args.sglang_url.map(trim_trailing_slash));
+    if let Some(runtime_url) = env_file.get("AXS_SGLANG_URL") {
+        env_file.set("AXS_THOR_RUNTIME_URL", Some(runtime_url.to_string()));
+    }
     if let Some(listen_addr) = args.listen_addr {
         let listen_addr = parse_socket_addr(&listen_addr, "listen address")?;
         env_file.set("AXS_THOR_LISTEN_ADDR", Some(listen_addr.to_string()));
     }
     if let Some(advertised_addr) = args.advertised_addr {
         let advertised_addr = parse_socket_addr(&advertised_addr, "advertised address")?;
-        env_file.set("AXS_THOR_ADVERTISED_ADDR", Some(advertised_addr.to_string()));
+        env_file.set(
+            "AXS_THOR_ADVERTISED_ADDR",
+            Some(advertised_addr.to_string()),
+        );
     }
     if let Some(max_inflight) = args.max_inflight {
-        env_file.set("AXS_THOR_MAX_INFLIGHT", Some(max_inflight.max(1).to_string()));
+        env_file.set(
+            "AXS_THOR_MAX_INFLIGHT",
+            Some(max_inflight.max(1).to_string()),
+        );
     }
     env_file.set_if_some("AXS_THOR_WORKER_POOL", args.worker_pool);
     env_file.set_if_some("AXS_THOR_NODE_CLASS", args.node_class);
@@ -183,7 +229,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     let worker_token = env_file.get("AXS_WORKER_TOKEN").map(str::to_string);
     let listen_addr = env_file
         .get("AXS_THOR_LISTEN_ADDR")
-        .unwrap_or("0.0.0.0:18081");
+        .unwrap_or(DEFAULT_THOR_LISTEN_ADDR);
     parse_socket_addr(listen_addr, "listen address")?;
     let advertised_addr = env_file
         .get("AXS_THOR_ADVERTISED_ADDR")
@@ -201,78 +247,145 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     println!("thor config updated: {}", path.display());
     println!("control plane: {}", control_plane);
     println!("readiness: {}", check.summary());
-    println!(
-        "next: run `ax-thor-agent` with env from {}",
-        path.display()
-    );
+    println!("next: run `ax-thor-agent` with env from {}", path.display());
     Ok(())
 }
 
 pub async fn status(args: StatusArgs) -> Result<()> {
     let path = args.config.unwrap_or_else(default_thor_env_path);
-    let env_file = ThorEnvFile::read(&path)?;
+    let report = collect_status_report(
+        &path,
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    print_status_report(&report);
+    if args.require_ready && !report.ready {
+        eprintln!("thor status overall_state={}", report.overall_state);
+        std::process::exit(THOR_NOT_READY_EXIT_CODE);
+    }
+    Ok(())
+}
 
+pub async fn wait_ready(args: WaitReadyArgs) -> Result<()> {
+    let path = args.config.unwrap_or_else(default_thor_env_path);
+    let timeout_secs = args.timeout_secs.max(1);
+    let poll_interval_ms = args.poll_interval_ms.max(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let connect_timeout = std::time::Duration::from_millis(200);
+    let request_timeout = std::time::Duration::from_millis(500);
+    let env_file = ThorEnvFile::read(&path)?;
+    if resolve_worker_id(&env_file).is_none() {
+        let report = fallback_status_report_from_env(path.clone(), &env_file)?;
+        print_status_report(&report);
+        eprintln!("thor wait-ready timed out after {timeout_secs}s");
+        std::process::exit(THOR_NOT_READY_EXIT_CODE);
+    }
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let report = match tokio::time::timeout(
+            remaining,
+            collect_status_report(&path, connect_timeout, request_timeout),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let report = fallback_status_report(&path)?;
+                print_status_report(&report);
+                eprintln!("thor wait-ready timed out after {timeout_secs}s");
+                std::process::exit(THOR_NOT_READY_EXIT_CODE);
+            }
+        };
+        if report.ready {
+            print_status_report(&report);
+            return Ok(());
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            print_status_report(&report);
+            eprintln!("thor wait-ready timed out after {timeout_secs}s");
+            std::process::exit(THOR_NOT_READY_EXIT_CODE);
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(poll_interval_ms))).await;
+        if tokio::time::Instant::now() >= deadline {
+            print_status_report(&report);
+            eprintln!("thor wait-ready timed out after {timeout_secs}s");
+            std::process::exit(THOR_NOT_READY_EXIT_CODE);
+        }
+    }
+}
+
+pub fn wait_ready_fast_path(config: Option<PathBuf>, timeout_secs: u64) -> Result<()> {
+    let path = config.unwrap_or_else(default_thor_env_path);
+    let env_file = ThorEnvFile::read(&path)?;
+    if resolve_worker_id(&env_file).is_none() {
+        let report = fallback_status_report_from_env(path, &env_file)?;
+        print_status_report(&report);
+        eprintln!("thor wait-ready timed out after {}s", timeout_secs.max(1));
+        std::process::exit(THOR_NOT_READY_EXIT_CODE);
+    }
+    Ok(())
+}
+
+pub async fn drain(args: DrainArgs) -> Result<()> {
+    let path = args.config.unwrap_or_else(default_thor_env_path);
+    let env_file = ThorEnvFile::read(&path)?;
     let control_plane = env_file
         .get("AXS_CONTROL_PLANE_URL")
         .context("AXS_CONTROL_PLANE_URL missing from thor config")?;
-    let sglang_url = env_file
-        .get("AXS_SGLANG_URL")
-        .unwrap_or("http://127.0.0.1:30000");
-    let listen_addr = env_file
-        .get("AXS_THOR_LISTEN_ADDR")
-        .unwrap_or("0.0.0.0:18081");
-    let advertised_addr = env_file
-        .get("AXS_THOR_ADVERTISED_ADDR")
-        .unwrap_or(listen_addr);
-    let listen_addr = parse_socket_addr(listen_addr, "listen address")?;
-    let advertised_addr = parse_socket_addr(advertised_addr, "advertised address")?;
-    let local_agent_base = local_probe_base(listen_addr);
-
+    let worker_id = resolve_worker_id(&env_file).context("thor worker_id is not available")?;
+    let runtime_url = runtime_base_url(&env_file);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .context("failed to build HTTP client for thor status")?;
+        .context("failed to build HTTP client for thor drain")?;
 
-    let control = control_plane_readiness(
+    post_control_plane_action(
         &client,
         control_plane,
         env_file.get("AXS_WORKER_TOKEN"),
+        &worker_id,
+        "drain",
     )
     .await?;
-    let sglang = probe_sglang(&client, sglang_url).await;
-    let thor = probe_health(&client, &format!("{local_agent_base}/health")).await;
-    let worker = probe_registered_worker(
-        &client,
-        control_plane,
-        env_file.get("AXS_WORKER_TOKEN"),
-        advertised_addr,
-    )
-    .await;
+    println!("thor drain requested for worker_id={worker_id}");
 
-    println!("config: {}", path.display());
-    println!("control plane: {} ({})", control_plane, control.summary());
-    println!("thor agent: {} ({})", local_agent_base, thor.summary());
-    println!("sglang: {} ({})", sglang_url, sglang.summary());
-    match worker {
-        Ok(Some(worker)) => {
-            println!(
-                "registry: registered as {} backend={} health={} drain={}",
-                worker.id, worker.backend, worker.health, worker.drain
-            );
-        }
-        Ok(None) => {
-            println!(
-                "registry: no worker currently registered for {}",
-                advertised_addr
-            );
-        }
-        Err(err) => {
-            println!("registry: unavailable ({err})");
-        }
+    if !args.complete_when_idle {
+        return Ok(());
     }
 
-    Ok(())
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(args.idle_timeout_secs.max(1));
+    loop {
+        let health = probe_agent_health(&client, &format!("{runtime_url}/health")).await;
+        if health.is_idle() {
+            post_control_plane_action(
+                &client,
+                control_plane,
+                env_file.get("AXS_WORKER_TOKEN"),
+                &worker_id,
+                "drain-complete",
+            )
+            .await?;
+            println!("thor drain-complete sent for worker_id={worker_id}");
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "thor agent did not become idle within {}s",
+                args.idle_timeout_secs.max(1)
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 fn default_thor_env_path() -> PathBuf {
@@ -310,13 +423,13 @@ fn print_preflight(path: &Path, env_file: &ThorEnvFile) {
         "listen addr: {}",
         env_file
             .get("AXS_THOR_LISTEN_ADDR")
-            .unwrap_or("0.0.0.0:18081")
+            .unwrap_or(DEFAULT_THOR_LISTEN_ADDR)
     );
     println!(
         "advertised addr: {}",
         env_file
             .get("AXS_THOR_ADVERTISED_ADDR")
-            .unwrap_or("0.0.0.0:18081")
+            .unwrap_or(DEFAULT_THOR_LISTEN_ADDR)
     );
 
     let docker = check_command("docker", &["--version"]);
@@ -400,7 +513,11 @@ async fn probe_health(client: &reqwest::Client, url: &str) -> EndpointStatus {
 }
 
 async fn probe_sglang(client: &reqwest::Client, sglang_url: &str) -> EndpointStatus {
-    let health = probe_health(client, &format!("{}/health", sglang_url.trim_end_matches('/'))).await;
+    let health = probe_health(
+        client,
+        &format!("{}/health", sglang_url.trim_end_matches('/')),
+    )
+    .await;
     if !health.ok {
         return health;
     }
@@ -421,6 +538,46 @@ async fn probe_sglang(client: &reqwest::Client, sglang_url: &str) -> EndpointSta
             ok: false,
             detail: err.to_string(),
         },
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct AgentCapabilities {
+    llm: bool,
+    embedding: bool,
+    vision: bool,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct AgentHealth {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    capabilities: AgentCapabilities,
+    #[serde(default)]
+    max_context: Option<u32>,
+    #[serde(default)]
+    inflight: usize,
+    #[serde(default)]
+    queue_depth: usize,
+}
+
+impl AgentHealth {
+    fn is_ok(&self) -> bool {
+        self.status.eq_ignore_ascii_case("ok")
+    }
+
+    fn is_idle(&self) -> bool {
+        self.is_ok() && self.inflight == 0 && self.queue_depth == 0
+    }
+}
+
+async fn probe_agent_health(client: &reqwest::Client, url: &str) -> AgentHealth {
+    match client.get(url).send().await {
+        Ok(response) => response.json().await.unwrap_or_default(),
+        Err(_) => AgentHealth::default(),
     }
 }
 
@@ -459,6 +616,240 @@ async fn probe_registered_worker(
         .find(|worker| worker.addr == advertised_addr.to_string()))
 }
 
+fn runtime_base_url(env_file: &ThorEnvFile) -> String {
+    env_file
+        .get("AXS_THOR_RUNTIME_URL")
+        .or_else(|| env_file.get("AXS_SGLANG_URL"))
+        .unwrap_or(DEFAULT_SGLANG_URL)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn resolve_worker_id(env_file: &ThorEnvFile) -> Option<String> {
+    let path = env_file.get("AXS_THOR_WORKER_ID_PATH")?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn expected_capabilities(backend: &str) -> AgentCapabilities {
+    match backend {
+        "sglang" => AgentCapabilities {
+            llm: true,
+            embedding: true,
+            vision: false,
+        },
+        _ => AgentCapabilities::default(),
+    }
+}
+
+struct ThorStatusReport {
+    config_path: PathBuf,
+    control_plane: String,
+    control: ReadinessCheck,
+    local_agent_base: String,
+    thor: EndpointStatus,
+    runtime_url: String,
+    sglang: EndpointStatus,
+    worker: Option<WorkerSnapshot>,
+    config_mismatch: Option<&'static str>,
+    overall_state: &'static str,
+    ready: bool,
+}
+
+async fn collect_status_report(
+    path: &Path,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> Result<ThorStatusReport> {
+    let env_file = ThorEnvFile::read(path)?;
+    let control_plane = env_file
+        .get("AXS_CONTROL_PLANE_URL")
+        .context("AXS_CONTROL_PLANE_URL missing from thor config")?
+        .to_string();
+    let listen_addr_raw = env_file
+        .get("AXS_THOR_LISTEN_ADDR")
+        .unwrap_or(DEFAULT_THOR_LISTEN_ADDR);
+    let advertised_addr_raw = env_file
+        .get("AXS_THOR_ADVERTISED_ADDR")
+        .unwrap_or(listen_addr_raw);
+    let listen_addr = parse_socket_addr(listen_addr_raw, "listen address")?;
+    let advertised_addr = parse_socket_addr(advertised_addr_raw, "advertised address")?;
+    let local_agent_base = local_probe_base(listen_addr);
+    let runtime_url = runtime_base_url(&env_file);
+    let expected_backend = env_file.get("AXS_THOR_BACKEND").unwrap_or("sglang");
+    let expected_max_context = env_file
+        .get("AXS_THOR_MAX_CONTEXT")
+        .and_then(|v| v.parse::<u32>().ok());
+    let expected_worker_id = resolve_worker_id(&env_file);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .context("failed to build HTTP client for thor status")?;
+
+    let token = env_file.get("AXS_WORKER_TOKEN");
+    let thor_health_url = format!("{local_agent_base}/health");
+    let (control, sglang, thor, agent_health, worker) = tokio::join!(
+        control_plane_readiness(&client, &control_plane, token),
+        probe_sglang(&client, &runtime_url),
+        probe_health(&client, &thor_health_url),
+        probe_agent_health(&client, &thor_health_url),
+        probe_registered_worker(&client, &control_plane, token, advertised_addr),
+    );
+    let control = control?;
+    let worker = worker?;
+
+    let config_mismatch = if !agent_health.backend.is_empty()
+        && agent_health.backend != expected_backend
+    {
+        Some("backend_mismatch")
+    } else if agent_health.capabilities.llm != expected_capabilities(expected_backend).llm
+        || agent_health.capabilities.embedding != expected_capabilities(expected_backend).embedding
+        || agent_health.capabilities.vision != expected_capabilities(expected_backend).vision
+    {
+        Some("capability_mismatch")
+    } else if expected_max_context.is_some() && agent_health.max_context != expected_max_context {
+        Some("max_context_mismatch")
+    } else {
+        None
+    };
+
+    let registration_ok = match (&worker, expected_worker_id.as_deref()) {
+        (Some(worker), Some(expected_id)) => worker.id == expected_id,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    let ready = control.status == reqwest::StatusCode::OK
+        && thor.ok
+        && sglang.ok
+        && registration_ok
+        && config_mismatch.is_none()
+        && worker
+            .as_ref()
+            .is_some_and(|worker| worker.health == "healthy" && !worker.drain);
+
+    let overall_state = if ready {
+        "ready"
+    } else if !registration_ok || config_mismatch.is_some() {
+        "registration_mismatch"
+    } else if !thor.ok || !sglang.ok {
+        "local_unhealthy"
+    } else {
+        "not_ready"
+    };
+
+    Ok(ThorStatusReport {
+        config_path: path.to_path_buf(),
+        control_plane,
+        control,
+        local_agent_base,
+        thor,
+        runtime_url,
+        sglang,
+        worker,
+        config_mismatch,
+        overall_state,
+        ready,
+    })
+}
+
+fn print_status_report(report: &ThorStatusReport) {
+    println!("config: {}", report.config_path.display());
+    println!(
+        "control plane: {} ({})",
+        report.control_plane,
+        report.control.summary()
+    );
+    println!(
+        "thor agent: {} ({})",
+        report.local_agent_base,
+        report.thor.summary()
+    );
+    println!(
+        "sglang: {} ({})",
+        report.runtime_url,
+        report.sglang.summary()
+    );
+    match &report.worker {
+        Some(worker) => println!(
+            "registry: registered as {} backend={} health={} drain={}",
+            worker.id, worker.backend, worker.health, worker.drain
+        ),
+        None => println!("registry: no worker currently registered"),
+    }
+    if let Some(reason) = report.config_mismatch {
+        println!("thor agent config: {reason}");
+    }
+    println!("overall_state={}", report.overall_state);
+}
+
+fn fallback_status_report(path: &Path) -> Result<ThorStatusReport> {
+    let env_file = ThorEnvFile::read(path)?;
+    fallback_status_report_from_env(path.to_path_buf(), &env_file)
+}
+
+fn fallback_status_report_from_env(
+    path: PathBuf,
+    env_file: &ThorEnvFile,
+) -> Result<ThorStatusReport> {
+    let control_plane = env_file
+        .get("AXS_CONTROL_PLANE_URL")
+        .unwrap_or("<missing>")
+        .to_string();
+    let listen_addr = env_file
+        .get("AXS_THOR_LISTEN_ADDR")
+        .unwrap_or(DEFAULT_THOR_LISTEN_ADDR);
+    let local_agent_base = local_probe_base(parse_socket_addr(listen_addr, "listen address")?);
+    Ok(ThorStatusReport {
+        config_path: path,
+        control_plane,
+        control: ReadinessCheck {
+            status: reqwest::StatusCode::REQUEST_TIMEOUT,
+        },
+        local_agent_base,
+        thor: EndpointStatus {
+            ok: false,
+            detail: "timeout".to_string(),
+        },
+        runtime_url: runtime_base_url(env_file),
+        sglang: EndpointStatus {
+            ok: false,
+            detail: "timeout".to_string(),
+        },
+        worker: None,
+        config_mismatch: None,
+        overall_state: "registration_mismatch",
+        ready: false,
+    })
+}
+
+async fn post_control_plane_action(
+    client: &reqwest::Client,
+    control_plane: &str,
+    token: Option<&str>,
+    worker_id: &str,
+    action: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/internal/workers/{worker_id}/{action}",
+        control_plane.trim_end_matches('/')
+    );
+    let mut req = client.post(url);
+    if let Some(token) = token {
+        req = req.header("X-Internal-Token", token);
+    }
+    req.send()
+        .await
+        .with_context(|| format!("thor {action} request failed"))?
+        .error_for_status()
+        .with_context(|| format!("thor {action} request rejected"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ThorEnvFile, local_probe_base, parse_socket_addr};
@@ -472,7 +863,10 @@ mod tests {
     #[test]
     fn env_file_set_removes_empty_values() {
         let mut env_file = ThorEnvFile::default();
-        env_file.set("AXS_CONTROL_PLANE_URL", Some("http://127.0.0.1:19090".into()));
+        env_file.set(
+            "AXS_CONTROL_PLANE_URL",
+            Some("http://127.0.0.1:19090".into()),
+        );
         env_file.set("AXS_CONTROL_PLANE_URL", Some(String::new()));
         assert!(env_file.get("AXS_CONTROL_PLANE_URL").is_none());
     }

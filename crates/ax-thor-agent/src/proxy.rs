@@ -97,12 +97,14 @@ async fn proxy_to(state: &ProxyState, path: &str, body: Bytes) -> axum::response
                     (Box::pin(byte_stream), Some(_guard)),
                     |(mut stream, guard)| async move {
                         match stream.next().await {
-                            Some(Ok(chunk)) => Some((Ok::<Bytes, axum::Error>(chunk), (stream, guard))),
-                            Some(Err(err)) => Some((
-                                Err(axum::Error::new(err)),
-                                (stream, None),
-                            )),
-                            None => None,
+                            Some(item) => {
+                                let mapped = item.map_err(axum::Error::new);
+                                Some((mapped, (stream, guard)))
+                            }
+                            None => {
+                                drop(guard);
+                                None
+                            }
                         }
                     },
                 );
@@ -131,6 +133,10 @@ async fn proxy_to(state: &ProxyState, path: &str, body: Bytes) -> axum::response
                     .into_response(),
             }
         }
-        Err(err) => (StatusCode::BAD_GATEWAY, format!("sglang proxy error: {err}")).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("sglang proxy error: {err}"),
+        )
+            .into_response(),
     }
 }

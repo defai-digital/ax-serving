@@ -258,31 +258,27 @@ async fn proxy_inference(
 
     let (model_id, backend_hint, stream, max_tokens, min_context) =
         match serde_json::from_slice::<ProxyRequestMeta>(&body) {
-        Ok(v) => (
-            v.model.unwrap_or_else(|| "default".to_string()),
-            v.backend,
-            v.stream,
-            v.max_tokens,
-            if !v.messages.is_empty() {
-                Some(estimate_chat_prompt_tokens(&v.messages))
-            } else {
-                v.prompt.as_deref().map(estimate_text_prompt_tokens)
-            },
-        ),
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
-        }
-    };
+            Ok(v) => (
+                v.model.unwrap_or_else(|| "default".to_string()),
+                v.backend,
+                v.stream,
+                v.max_tokens,
+                if !v.messages.is_empty() {
+                    Some(estimate_chat_prompt_tokens(&v.messages))
+                } else {
+                    v.prompt.as_deref().map(estimate_text_prompt_tokens)
+                },
+            ),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
+            }
+        };
 
-    let resolved_policy = match project_policy::enforce(
-        &req_headers,
-        &model_id,
-        max_tokens,
-        &layer.project_policy,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp.into_response(),
-    };
+    let resolved_policy =
+        match project_policy::enforce(&req_headers, &model_id, max_tokens, &layer.project_policy) {
+            Ok(v) => v,
+            Err(resp) => return resp.into_response(),
+        };
     let preferred_pool = resolved_policy
         .as_ref()
         .and_then(|v| v.worker_pool.as_deref())
@@ -720,7 +716,11 @@ async fn proxy_admin_fleet(State(layer): State<Arc<OrchestratorLayer>>) -> impl 
     let mut backends = serde_json::Map::new();
 
     for worker in &workers {
-        accumulate_fleet_bucket(&mut pools, worker.worker_pool.as_deref().unwrap_or("default"), worker);
+        accumulate_fleet_bucket(
+            &mut pools,
+            worker.worker_pool.as_deref().unwrap_or("default"),
+            worker,
+        );
         accumulate_fleet_bucket(
             &mut node_classes,
             worker.node_class.as_deref().unwrap_or("unknown"),
@@ -744,20 +744,18 @@ fn accumulate_fleet_bucket(
     key: &str,
     worker: &self::registry::WorkerSnapshot,
 ) {
-    let entry = buckets
-        .entry(key.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "workers": 0usize,
-                "healthy": 0usize,
-                "draining": 0usize,
-                "eligible": 0usize,
-                "total_inflight": 0usize,
-                "total_active_sequences": 0usize,
-                "total_queue_depth": 0usize,
-                "max_error_rate": 0.0_f64,
-            })
-        });
+    let entry = buckets.entry(key.to_string()).or_insert_with(|| {
+        serde_json::json!({
+            "workers": 0usize,
+            "healthy": 0usize,
+            "draining": 0usize,
+            "eligible": 0usize,
+            "total_inflight": 0usize,
+            "total_active_sequences": 0usize,
+            "total_queue_depth": 0usize,
+            "max_error_rate": 0.0_f64,
+        })
+    });
     let obj = entry.as_object_mut().expect("fleet bucket must be object");
     increment_bucket(obj, "workers", 1_u64);
     if worker.health == "healthy" {
@@ -770,7 +768,11 @@ fn accumulate_fleet_bucket(
         increment_bucket(obj, "eligible", 1_u64);
     }
     increment_bucket(obj, "total_inflight", worker.inflight as u64);
-    increment_bucket(obj, "total_active_sequences", worker.active_sequences as u64);
+    increment_bucket(
+        obj,
+        "total_active_sequences",
+        worker.active_sequences as u64,
+    );
     increment_bucket(obj, "total_queue_depth", worker.queue_depth as u64);
     let current_max = obj
         .get("max_error_rate")
@@ -1192,14 +1194,14 @@ pub async fn start_orchestrator(
                 internal_listener,
                 internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-                .with_graceful_shutdown(async move {
-                    let mut rx = internal_shutdown;
-                    while !*rx.borrow() {
-                        rx.changed().await.ok();
-                    }
-                })
-                .await
-                .map_err(anyhow::Error::from)
+            .with_graceful_shutdown(async move {
+                let mut rx = internal_shutdown;
+                while !*rx.borrow() {
+                    rx.changed().await.ok();
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)
         },
         async {
             axum::serve(public_listener, public_app)

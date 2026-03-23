@@ -12,10 +12,9 @@ metal = []
 libllama = []
 
 [dependencies]
-# mistralrs high-level SDK for GgufModelBuilder + Model
-mistralrs = { workspace = true }
-# mistralrs-core for TokenizationRequest/DetokenizationRequest not re-exported by mistralrs
-mistralrs-core = { workspace = true }
+# ax-engine native backend
+ax-core = { git = "https://github.com/defai-digital/ax-engine.git", rev = "ee50ca5bc1f8557ce712d6a6385288b433ecd15e" }
+ax-metal = { git = "https://github.com/defai-digital/ax-engine.git", rev = "ee50ca5bc1f8557ce712d6a6385288b433ecd15e" }
 # Async runtime
 tokio = { workspace = true }
 # Error handling
@@ -27,11 +26,7 @@ tracing = { workspace = true }
 rustc-hash = { workspace = true }
 # Serialization
 serde = { workspace = true }
-# either crate for mistralrs tokenize API
-either = "1"
 libc = "0.2"
-# IndexMap for building mistralrs Chat messages
-indexmap = "2"
 # Serialization
 serde_json = { workspace = true }
 # YAML config for backends.yaml

@@ -148,6 +148,130 @@ pub fn parse_allowed_node_cidrs(raw: &str) -> anyhow::Result<Vec<IpNet>> {
         .collect()
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn parse_worker_id(id_str: &str) -> Result<WorkerId, StatusCode> {
+    WorkerId::parse(id_str).ok_or(StatusCode::BAD_REQUEST)
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+/// `POST /internal/workers/register`
+async fn handle_register(
+    State(s): State<InternalState>,
+    Json(req): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    // Validate addr before registering — a malformed addr would silently route
+    // to 127.0.0.1:1 in the registry, accepting the worker but never sending it traffic.
+    let Ok(addr) = req.addr.parse::<SocketAddr>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid worker addr '{}': must be a valid host:port",
+                req.addr
+            ),
+        )
+            .into_response();
+    };
+
+    // Detect remote (non-loopback) workers for the license reminder.
+    if !addr.ip().is_loopback() {
+        s.license.mark_remote_worker_seen();
+    }
+    let resp = s.registry.register(req, s.config.worker_heartbeat_ms);
+    info!(worker_id = %resp.worker_id, "worker registered");
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// `POST /internal/workers/{id}/heartbeat`
+async fn handle_heartbeat(
+    State(s): State<InternalState>,
+    Path(id_str): Path<String>,
+    Json(req): Json<HeartbeatRequest>,
+) -> impl IntoResponse {
+    let id = match parse_worker_id(&id_str) {
+        Ok(id) => id,
+        Err(status) => return (status, "invalid worker id").into_response(),
+    };
+    if s.registry.heartbeat(id, req) {
+        StatusCode::OK.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "worker not found").into_response()
+    }
+}
+
+/// `POST /internal/workers/{id}/drain`
+async fn handle_drain(
+    State(s): State<InternalState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let id = match parse_worker_id(&id_str) {
+        Ok(id) => id,
+        Err(status) => return (status, "invalid worker id").into_response(),
+    };
+    if s.registry.mark_drain(id) {
+        info!(%id, "worker marked for drain");
+        StatusCode::OK.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "worker not found").into_response()
+    }
+}
+
+/// `POST /internal/workers/{id}/drain-complete`
+async fn handle_drain_complete(
+    State(s): State<InternalState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let id = match parse_worker_id(&id_str) {
+        Ok(id) => id,
+        Err(status) => return (status, "invalid worker id").into_response(),
+    };
+    s.registry.evict(id);
+    info!(%id, "worker drain complete, evicted");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /internal/workers`
+async fn handle_list(State(s): State<InternalState>) -> impl IntoResponse {
+    let workers = s.registry.list_all();
+    Json(serde_json::json!({ "workers": workers }))
+}
+
+/// `GET /internal/workers/{id}`
+async fn handle_get(
+    State(s): State<InternalState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let id = match parse_worker_id(&id_str) {
+        Ok(id) => id,
+        Err(status) => return (status, "invalid worker id").into_response(),
+    };
+    match s.registry.get_snapshot(id) {
+        Some(snap) => Json(snap).into_response(),
+        None => (StatusCode::NOT_FOUND, "worker not found").into_response(),
+    }
+}
+
+/// `DELETE /internal/workers/{id}` — remove a worker immediately (drain + evict in one step).
+///
+/// Use this to undo an accidental registration or force-remove a stuck worker.
+/// For graceful shutdown of a live worker use the two-step drain → drain-complete flow instead.
+async fn handle_delete(
+    State(s): State<InternalState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let id = match parse_worker_id(&id_str) {
+        Ok(id) => id,
+        Err(status) => return (status, "invalid worker id").into_response(),
+    };
+    if !s.registry.mark_drain(id) {
+        return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
+    s.registry.evict(id);
+    info!(%id, "worker force-removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,9 +311,8 @@ mod tests {
             .header("x-internal-token", "secret")
             .body(axum::body::Body::empty())
             .unwrap();
-        req.extensions_mut().insert(ConnectInfo(
-            "10.0.0.2:12345".parse::<SocketAddr>().unwrap(),
-        ));
+        req.extensions_mut()
+            .insert(ConnectInfo("10.0.0.2:12345".parse::<SocketAddr>().unwrap()));
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -243,117 +366,4 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-}
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
-/// `POST /internal/workers/register`
-async fn handle_register(
-    State(s): State<InternalState>,
-    Json(req): Json<RegisterRequest>,
-) -> impl IntoResponse {
-    // Validate addr before registering — a malformed addr would silently route
-    // to 127.0.0.1:1 in the registry, accepting the worker but never sending it traffic.
-    let Ok(addr) = req.addr.parse::<SocketAddr>() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "invalid worker addr '{}': must be a valid host:port",
-                req.addr
-            ),
-        )
-            .into_response();
-    };
-
-    // Detect remote (non-loopback) workers for the license reminder.
-    if !addr.ip().is_loopback() {
-        s.license.mark_remote_worker_seen();
-    }
-    let resp = s.registry.register(req, s.config.worker_heartbeat_ms);
-    info!(worker_id = %resp.worker_id, "worker registered");
-    (StatusCode::OK, Json(resp)).into_response()
-}
-
-/// `POST /internal/workers/{id}/heartbeat`
-async fn handle_heartbeat(
-    State(s): State<InternalState>,
-    Path(id_str): Path<String>,
-    Json(req): Json<HeartbeatRequest>,
-) -> impl IntoResponse {
-    let Some(id) = WorkerId::parse(&id_str) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
-    };
-    if s.registry.heartbeat(id, req) {
-        StatusCode::OK.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "worker not found").into_response()
-    }
-}
-
-/// `POST /internal/workers/{id}/drain`
-async fn handle_drain(
-    State(s): State<InternalState>,
-    Path(id_str): Path<String>,
-) -> impl IntoResponse {
-    let Some(id) = WorkerId::parse(&id_str) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
-    };
-    if s.registry.mark_drain(id) {
-        info!(%id, "worker marked for drain");
-        StatusCode::OK.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "worker not found").into_response()
-    }
-}
-
-/// `POST /internal/workers/{id}/drain-complete`
-async fn handle_drain_complete(
-    State(s): State<InternalState>,
-    Path(id_str): Path<String>,
-) -> impl IntoResponse {
-    let Some(id) = WorkerId::parse(&id_str) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
-    };
-    s.registry.evict(id);
-    info!(%id, "worker drain complete, evicted");
-    StatusCode::NO_CONTENT.into_response()
-}
-
-/// `GET /internal/workers`
-async fn handle_list(State(s): State<InternalState>) -> impl IntoResponse {
-    let workers = s.registry.list_all();
-    Json(serde_json::json!({ "workers": workers }))
-}
-
-/// `GET /internal/workers/{id}`
-async fn handle_get(
-    State(s): State<InternalState>,
-    Path(id_str): Path<String>,
-) -> impl IntoResponse {
-    let Some(id) = WorkerId::parse(&id_str) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
-    };
-    match s.registry.get_snapshot(id) {
-        Some(snap) => Json(snap).into_response(),
-        None => (StatusCode::NOT_FOUND, "worker not found").into_response(),
-    }
-}
-
-/// `DELETE /internal/workers/{id}` — remove a worker immediately (drain + evict in one step).
-///
-/// Use this to undo an accidental registration or force-remove a stuck worker.
-/// For graceful shutdown of a live worker use the two-step drain → drain-complete flow instead.
-async fn handle_delete(
-    State(s): State<InternalState>,
-    Path(id_str): Path<String>,
-) -> impl IntoResponse {
-    let Some(id) = WorkerId::parse(&id_str) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker id").into_response();
-    };
-    if !s.registry.mark_drain(id) {
-        return (StatusCode::NOT_FOUND, "worker not found").into_response();
-    }
-    s.registry.evict(id);
-    info!(%id, "worker force-removed");
-    StatusCode::NO_CONTENT.into_response()
 }

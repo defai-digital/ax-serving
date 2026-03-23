@@ -16,6 +16,8 @@ use anyhow::{Context, Result};
 use ax_serving_engine::{InferenceBackend, LoadConfig, ModelHandle, ModelMetadata};
 use tracing::{info, warn};
 
+use crate::utils::time::unix_now_ms;
+
 /// Typed errors returned by registry operations.
 ///
 /// Wraps into `anyhow::Error` via the `?` operator so existing callers that
@@ -57,11 +59,8 @@ pub struct LoadedModel {
 impl LoadedModel {
     /// Record the current time as the last-accessed timestamp.
     pub fn touch(&self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_accessed_ms.store(now_ms, Ordering::Relaxed);
+        self.last_accessed_ms
+            .store(unix_now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -219,7 +218,9 @@ impl ModelRegistry {
             match backend.unload_model(evicted.handle) {
                 Ok(()) => info!("warm pool: evicted '{evict_id}' (oldest) to load '{model_id}'"),
                 Err(e) => {
-                    warn!("warm pool: failed to evict '{evict_id}' to make room for '{model_id}': {e}");
+                    warn!(
+                        "warm pool: failed to evict '{evict_id}' to make room for '{model_id}': {e}"
+                    );
                     failed_evictions.push(evicted);
                 }
             }
@@ -237,10 +238,6 @@ impl ModelRegistry {
             .load_model(&canonical_path, config.clone())
             .with_context(|| format!("failed to load model from {}", canonical_path.display()))?;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let entry = Arc::new(LoadedModel {
             id: model_id.to_string(),
             path: canonical_path,
@@ -248,15 +245,24 @@ impl ModelRegistry {
             metadata,
             load_config: config,
             loaded_at: Instant::now(),
-            last_accessed_ms: Arc::new(AtomicU64::new(now_ms)),
+            last_accessed_ms: Arc::new(AtomicU64::new(unix_now_ms())),
         });
 
         // Commit: insert under write lock. The LoadingGuard ensures no other
         // load() for this model_id is concurrently in progress.
-        self.inner
-            .write()
-            .unwrap()
-            .insert(model_id.to_string(), Arc::clone(&entry));
+        {
+            let mut guard = self.inner.write().unwrap();
+            if guard.len() >= self.max_loaded_models {
+                drop(guard);
+                backend.unload_model(handle).with_context(|| {
+                    format!(
+                        "capacity exceeded while finalizing load for '{model_id}'; cleanup failed"
+                    )
+                })?;
+                return Err(RegistryError::CapacityExceeded(self.max_loaded_models).into());
+            }
+            guard.insert(model_id.to_string(), Arc::clone(&entry));
+        }
 
         // _loading_guard drops here, removing model_id from the loading set.
         info!("registered model '{model_id}' (handle={handle:?})");
@@ -338,10 +344,6 @@ impl ModelRegistry {
                 }
             };
 
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
             let new_entry = Arc::new(LoadedModel {
                 id: model_id.to_string(),
                 path,
@@ -349,7 +351,7 @@ impl ModelRegistry {
                 metadata: new_metadata,
                 load_config,
                 loaded_at: Instant::now(),
-                last_accessed_ms: Arc::new(AtomicU64::new(now_ms)),
+                last_accessed_ms: Arc::new(AtomicU64::new(unix_now_ms())),
             });
             guard.insert(model_id.to_string(), Arc::clone(&new_entry));
             (new_entry, old_handle)
@@ -380,10 +382,7 @@ impl ModelRegistry {
         backend: &dyn InferenceBackend,
         idle_timeout_ms: u64,
     ) -> Vec<String> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
 
         // Collect candidate IDs under read lock (IDs only, not handles).
         // We re-read the handle under write lock below to avoid TOCTOU.
@@ -795,6 +794,144 @@ mod tests {
         );
     }
 
+    struct BlockingLoadBackend {
+        started: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        next_handle: AtomicU64,
+        unloads: Arc<AtomicU64>,
+    }
+
+    impl InferenceBackend for BlockingLoadBackend {
+        fn load_model(
+            &self,
+            _path: &std::path::Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            self.started.wait();
+            self.release.wait();
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok((
+                ModelHandle(handle),
+                ModelMetadata {
+                    architecture: "blocking".into(),
+                    n_layers: 1,
+                    n_heads: 1,
+                    n_kv_heads: 1,
+                    embedding_dim: 1,
+                    vocab_size: 1,
+                    context_length: 1,
+                    load_time_ms: 0,
+                    peak_rss_bytes: 0,
+                    resolved_backend: ax_serving_engine::BackendType::Cpu,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            self.unloads.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: ModelHandle,
+            _: GenerateInput,
+            _: GenerationParams,
+            _: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn tokenize(&self, _: ModelHandle, _: &str, _: bool) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn decode_tokens(&self, _: ModelHandle, _: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn concurrent_loads_do_not_exceed_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("m1.gguf");
+        let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&path1, b"dummy").unwrap();
+        std::fs::write(&path2, b"dummy").unwrap();
+
+        let backend = Arc::new(BlockingLoadBackend {
+            started: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+            next_handle: AtomicU64::new(0),
+            unloads: Arc::new(AtomicU64::new(0)),
+        });
+        let reg = ModelRegistry::new(1);
+
+        let reg1 = reg.clone();
+        let backend1 = Arc::clone(&backend);
+        let path1_clone = path1.clone();
+        let t1 = std::thread::spawn(move || {
+            reg1.load(
+                "first",
+                &path1_clone,
+                LoadConfig::default(),
+                backend1.as_ref(),
+            )
+        });
+
+        let reg2 = reg.clone();
+        let backend2 = Arc::clone(&backend);
+        let path2_clone = path2.clone();
+        let t2 = std::thread::spawn(move || {
+            reg2.load(
+                "second",
+                &path2_clone,
+                LoadConfig::default(),
+                backend2.as_ref(),
+            )
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let successes = [r1.is_ok(), r2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(successes, 1, "exactly one load must succeed at capacity 1");
+
+        let capacity_errors = [r1.as_ref().err(), r2.as_ref().err()]
+            .into_iter()
+            .flatten()
+            .filter(|err| {
+                err.downcast_ref::<RegistryError>()
+                    .is_some_and(|e| matches!(e, RegistryError::CapacityExceeded(_)))
+            })
+            .count();
+        assert_eq!(
+            capacity_errors, 1,
+            "one concurrent load must fail with CapacityExceeded"
+        );
+        assert_eq!(reg.len(), 1, "registry must not exceed max_loaded_models");
+        assert_eq!(
+            backend.unloads.load(Ordering::Relaxed),
+            1,
+            "the losing concurrent load must clean up its backend handle"
+        );
+    }
+
     #[test]
     fn load_invalid_model_id_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1016,7 +1153,10 @@ mod tests {
 
         // idle_timeout is very large — recent access must not be evicted.
         let evicted = reg.idle_evict_pass(&backend, 10_000_000 /* 10 000 s */);
-        assert!(evicted.is_empty(), "recently accessed model must not be evicted");
+        assert!(
+            evicted.is_empty(),
+            "recently accessed model must not be evicted"
+        );
         assert!(!reg.is_empty());
     }
 
@@ -1035,7 +1175,10 @@ mod tests {
         // Even though the backend fails, idle_evict_pass must re-insert the
         // entry rather than leaking the handle.
         let evicted = reg.idle_evict_pass(&backend, 1);
-        assert!(evicted.is_empty(), "failed eviction must not appear in return list");
+        assert!(
+            evicted.is_empty(),
+            "failed eviction must not appear in return list"
+        );
         assert!(
             reg.get("old").is_some(),
             "entry must be re-inserted after failed idle eviction"

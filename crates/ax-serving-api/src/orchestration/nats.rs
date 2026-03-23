@@ -68,11 +68,14 @@ pub struct NatsConfig {
     pub wait_ms: u64,
 }
 
+const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
+const DEFAULT_NATS_STREAM: &str = "ax-serving";
+
 impl Default for NatsConfig {
     fn default() -> Self {
         Self {
-            nats_url: "nats://127.0.0.1:4222".into(),
-            stream_name: "ax-serving".into(),
+            nats_url: DEFAULT_NATS_URL.into(),
+            stream_name: DEFAULT_NATS_STREAM.into(),
             max_deliver: 3,
             wait_ms: 10_000,
         }
@@ -132,6 +135,61 @@ pub struct NatsResponse {
     /// Error message from the worker (non-retryable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl NatsResponse {
+    /// A complete (non-streaming) successful response.
+    pub fn complete(request_id: String, status: u16, content_type: String, body: &[u8]) -> Self {
+        Self {
+            request_id,
+            status,
+            content_type,
+            done: true,
+            data_hex: Some(hex::encode(body)),
+            error: None,
+        }
+    }
+
+    /// A single streaming chunk (not the final message).
+    pub fn streaming_chunk(request_id: String, status: u16, chunk: &[u8]) -> Self {
+        Self {
+            request_id,
+            status,
+            content_type: "text/event-stream".into(),
+            done: false,
+            data_hex: Some(hex::encode(chunk)),
+            error: None,
+        }
+    }
+
+    /// The done sentinel that closes a streaming response.
+    pub fn streaming_done(request_id: String, status: u16) -> Self {
+        Self {
+            request_id,
+            status,
+            content_type: "text/event-stream".into(),
+            done: true,
+            data_hex: None,
+            error: None,
+        }
+    }
+
+    /// An error response (status 503 by default; pass a specific status if available).
+    pub fn error_response(request_id: String, status: u16, message: String) -> Self {
+        Self {
+            request_id,
+            status,
+            content_type: "application/json".into(),
+            done: true,
+            data_hex: None,
+            error: Some(message),
+        }
+    }
+
+    /// Serialize to a NATS payload, falling back to an empty vec on encode failure.
+    pub fn to_payload(&self) -> Bytes {
+        serde_json::to_vec(self).unwrap_or_default().into()
+    }
 }
 
 // ── NatsDispatcher ────────────────────────────────────────────────────────────

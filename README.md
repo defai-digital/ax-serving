@@ -135,7 +135,7 @@ Most local runtimes focus on single-process inference. AX Serving focuses on the
 Positioning:
 - AX Fabric is the product layer
 - AX Serving is the serving and orchestration layer underneath it
-- inference runtimes such as `llama.cpp` or `mistralrs` remain lower-level execution backends
+- inference runtimes such as `ax-engine` and `llama.cpp` remain lower-level execution backends
 
 ### Best With AX Fabric
 
@@ -272,8 +272,6 @@ Admin/control-plane notes:
 
 - `AXS_SPLIT_SCHEDULER=true`
   - enables prefill/decode activity tracking in scheduler metrics
-- `AXS_MISTRALRS_MAX_SEQS=<n>`
-  - controls `mistralrs` continuous-batching sequence depth
 - `AXS_MAX_BATCH_SIZE` / `AXS_BATCH_WINDOW_MS`
   - currently advisory scheduler hints only
   - they are exposed for future scheduler work and do not drive a batching loop today

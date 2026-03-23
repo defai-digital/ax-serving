@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "description": "Phase 1 inference baselines for mistralrs (native) backend models. BMS-AX-SERVING-v1.0 §4.",
+    "description": "Phase 1 inference baselines for the native backend models. BMS-AX-SERVING-v1.0 §4.",
     "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
     "os": "macOS 14.x (Sonoma)",
     "build": "cargo build --workspace --release",

@@ -2,15 +2,15 @@
 //
 // The ax-engine design used block-level KV export/import for cross-request
 // prefix reuse (key = (model_fingerprint, token_hash), LRU eviction).
-// This is blocked on a public KV block export/import API in mistralrs-core.
-// As of 2026-03-02, mistralrs manages KV cache internally and provides no
-// stable API for exporting or importing KV blocks across requests.
+// This is blocked on a public KV block export/import API in the active native
+// backend path. As of 2026-03-23, ax-serving does not expose a stable backend-
+// agnostic API for exporting or importing KV blocks across requests.
 //
 // Current alternative: `ResponseCache` (below) provides exact-match caching
 // at the full-response level via Redis/Valkey. This covers the most common
-// use case (repeated identical prompts) with no mistralrs-core dependency.
+// use case (repeated identical prompts) with no backend-specific dependency.
 //
-// When mistralrs exposes KV block export:
+// When a native backend exposes KV block export:
 //   1. Add `KvPrefixCache` struct with block allocator (port from ax-engine).
 //   2. Wire into `ServingLayer::generate()` pre/post hooks.
 //   3. Expose block stats in `/metrics` and `/v1/metrics`.
@@ -185,12 +185,7 @@ impl ResponseCache {
         Ok(Some(raw))
     }
 
-    pub async fn set<T: Serialize>(
-        &self,
-        key: &str,
-        value: &T,
-        ttl: Duration,
-    ) -> Result<()> {
+    pub async fn set<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<()> {
         let mut conn = self.connection().await?;
         let raw = serde_json::to_string(value).with_context(|| "serializing response for cache")?;
         if conn
@@ -209,8 +204,14 @@ impl ResponseCache {
     }
 }
 
+const SECS_PER_MIN: u64 = 60;
+const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
+const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
+const SECS_PER_MONTH: u64 = 30 * SECS_PER_DAY;
+
 /// Hard cap: any TTL above this is a configuration error, not a valid cache lifetime.
-const MAX_TTL_SECS: u64 = 90 * 24 * 3600; // 90 days
+const MAX_TTL_SECS: u64 = 90 * SECS_PER_DAY;
 
 pub fn parse_ttl(input: &str) -> Result<Duration> {
     let s = input.trim().to_ascii_lowercase();
@@ -221,19 +222,19 @@ pub fn parse_ttl(input: &str) -> Result<Duration> {
     };
 
     let secs = if let Some(n) = s.strip_suffix("months") {
-        checked_mul(checked_mul(parse(n.trim())?, 30 * 24 * 60)?, 60)?
+        checked_mul(parse(n.trim())?, SECS_PER_MONTH)?
     } else if let Some(n) = s.strip_suffix("month") {
-        checked_mul(checked_mul(parse(n.trim())?, 30 * 24 * 60)?, 60)?
+        checked_mul(parse(n.trim())?, SECS_PER_MONTH)?
     } else if let Some(n) = s.strip_suffix("mo") {
-        checked_mul(checked_mul(parse(n.trim())?, 30 * 24 * 60)?, 60)?
+        checked_mul(parse(n.trim())?, SECS_PER_MONTH)?
     } else if let Some(n) = s.strip_suffix('w') {
-        checked_mul(checked_mul(parse(n)?, 7 * 24 * 60)?, 60)?
+        checked_mul(parse(n)?, SECS_PER_WEEK)?
     } else if let Some(n) = s.strip_suffix('d') {
-        checked_mul(checked_mul(parse(n)?, 24 * 60)?, 60)?
+        checked_mul(parse(n)?, SECS_PER_DAY)?
     } else if let Some(n) = s.strip_suffix('h') {
-        checked_mul(parse(n)?, 3600)?
+        checked_mul(parse(n)?, SECS_PER_HOUR)?
     } else if let Some(n) = s.strip_suffix('m') {
-        checked_mul(parse(n)?, 60)?
+        checked_mul(parse(n)?, SECS_PER_MIN)?
     } else if let Some(n) = s.strip_suffix('s') {
         parse(n)?
     } else {

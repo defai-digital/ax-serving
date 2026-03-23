@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ax_serving_api::orchestration::{
+    LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     direct::DirectDispatcher,
     internal_routes::{
         InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
@@ -21,7 +22,6 @@ use ax_serving_api::orchestration::{
         HeartbeatRequest, RegisterCapabilities, RegisterRequest, RequestKind, WorkerCapabilities,
         WorkerId, WorkerRegistry, WorkerStatus,
     },
-    LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     start_orchestrator,
 };
 use axum::{Router, middleware, routing::post};
@@ -149,10 +149,7 @@ async fn spawn_mock_worker(status: u16, body: &'static str) -> Option<SocketAddr
     Some(addr)
 }
 
-fn proxy_router_with_key(
-    layer: Arc<OrchestratorLayer>,
-    key: &str,
-) -> Router {
+fn proxy_router_with_key(layer: Arc<OrchestratorLayer>, key: &str) -> Router {
     layer.set_public_auth_required(true);
     let mut keys = HashSet::new();
     keys.insert(key.to_string());
@@ -657,14 +654,16 @@ async fn test_internal_router_real_server_enforces_token_and_allowlist() {
         config: Arc::clone(&layer.config),
         license: Arc::clone(&layer.license),
     };
-    let addr = skip_if_no_socket!(spawn_internal_router_with_auth(
-        state,
-        Some(InternalAuthState {
-            token: Some(Arc::new("secret".to_string())),
-            allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
-        }),
-    )
-    .await);
+    let addr = skip_if_no_socket!(
+        spawn_internal_router_with_auth(
+            state,
+            Some(InternalAuthState {
+                token: Some(Arc::new("secret".to_string())),
+                allowed_sources: Arc::new(parse_allowed_node_cidrs("127.0.0.1/32").unwrap()),
+            }),
+        )
+        .await
+    );
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -1190,7 +1189,9 @@ async fn test_admin_status_requires_auth_and_returns_operational_summary() {
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     assert_eq!(
-        resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
         Some("req-admin-123")
     );
     let json: serde_json::Value = serde_json::from_slice(
@@ -1296,8 +1297,14 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
     .unwrap();
     assert_eq!(startup_json["service"], "orchestrator");
     assert_eq!(startup_json["auth_required"], true);
-    assert_eq!(startup_json["dispatch_runtime"]["scheduler_managed_batching"], false);
-    assert_eq!(startup_json["dispatch_runtime"]["batch_hints_advisory_only"], true);
+    assert_eq!(
+        startup_json["dispatch_runtime"]["scheduler_managed_batching"],
+        false
+    );
+    assert_eq!(
+        startup_json["dispatch_runtime"]["batch_hints_advisory_only"],
+        true
+    );
 
     let license_set = app
         .clone()
@@ -1349,9 +1356,13 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
     );
     let diag_json: serde_json::Value = serde_json::from_slice(&diag_body).unwrap();
     assert_eq!(diag_json["request_id"], "req-orch-diag");
-    assert!(diag_json["audit_tail"].as_array().unwrap().iter().any(
-        |e| e["action"] == "license_set" && e["actor"] == "request:req-orch-license"
-    ));
+    assert!(
+        diag_json["audit_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "license_set" && e["actor"] == "request:req-orch-license")
+    );
 
     let audit = app
         .oneshot(
@@ -1371,9 +1382,13 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
             .unwrap(),
     )
     .unwrap();
-    assert!(audit_json["events"].as_array().unwrap().iter().any(
-        |e| e["action"] == "startup" && e["target_type"] == "orchestrator_layer"
-    ));
+    assert!(
+        audit_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "startup" && e["target_type"] == "orchestrator_layer")
+    );
 }
 
 #[tokio::test]
@@ -1751,10 +1766,13 @@ async fn test_project_policy_proxy_requires_header() {
         )
         .unwrap(),
     );
-    let worker = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#).await);
-    layer
-        .registry
-        .register(reg_req_with_pool(worker, &["ops-model"], Some("green"), Some("m3-pro")), 5000);
+    let worker = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(worker, &["ops-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
     let app = proxy_router_with_key(Arc::clone(&layer), "secret");
 
     let resp = app
@@ -1846,12 +1864,18 @@ async fn test_proxy_embeddings_route_and_project_policy() {
         .unwrap(),
     );
     let blue = skip_if_no_socket!(
-        spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1],"index":0}],"model":"embed-main"}"#)
-            .await
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.1],"index":0}],"model":"embed-main"}"#
+        )
+        .await
     );
     let green = skip_if_no_socket!(
-        spawn_mock_worker(200, r#"{"data":[{"embedding":[0.9],"index":0}],"model":"embed-main"}"#)
-            .await
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.9],"index":0}],"model":"embed-main"}"#
+        )
+        .await
     );
     layer.registry.register(
         reg_req_with_pool(blue, &["embed-main"], Some("blue"), Some("m3-max")),
@@ -1932,7 +1956,10 @@ async fn test_structured_embedding_worker_is_not_used_for_chat() {
             None,
         )
         .await;
-    assert_eq!(chat_resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        chat_resp.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 
     let embedding_resp = dispatcher
         .forward_kind(
@@ -2240,7 +2267,9 @@ async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     let app = proxy_router_with_key(Arc::clone(&layer), "secret");
 
     let worker_addr = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[]}"#).await);
-    let register = layer.registry.register(reg_req(worker_addr, &["ops-model"]), 5000);
+    let register = layer
+        .registry
+        .register(reg_req(worker_addr, &["ops-model"]), 5000);
     let worker_id = register.worker_id;
 
     let list_resp = app

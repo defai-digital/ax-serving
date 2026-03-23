@@ -26,10 +26,12 @@
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 compile_error!("ax-serving-api only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
-pub mod auth;
 pub mod audit;
+pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod embedding_batcher;
+pub mod generation_batcher;
 pub mod grpc;
 pub mod license;
 pub mod metrics;
@@ -38,6 +40,7 @@ pub mod project_policy;
 pub mod registry;
 pub mod rest;
 pub mod scheduler;
+pub mod utils;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,13 +49,13 @@ use anyhow::Result;
 use ax_serving_engine::{InferenceBackend, ThermalMonitor};
 use tracing::{info, warn};
 
+use crate::audit::AuditLog;
 use crate::cache::{CacheInflight, CacheMetrics, ResponseCache};
 use crate::config::ServeConfig;
 use crate::license::LicenseState;
 use crate::metrics::MetricsStore;
 use crate::registry::ModelRegistry;
 use crate::scheduler::{PerModelScheduler, Scheduler};
-use crate::audit::AuditLog;
 
 /// Shared serving state — held by both the gRPC and REST servers.
 pub struct ServingLayer {

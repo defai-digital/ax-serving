@@ -67,6 +67,6 @@ pub extern "C" fn llama_time_us() -> i64 {
 /// The returned pointer is static — never free it.
 #[unsafe(no_mangle)]
 pub extern "C" fn llama_system_info() -> *const libc::c_char {
-    static INFO: &std::ffi::CStr = c"ax-serving (mistralrs-core + Candle Metal / Apple Silicon)";
+    static INFO: &std::ffi::CStr = c"ax-serving (ax-engine native + llama.cpp / Apple Silicon)";
     INFO.as_ptr()
 }

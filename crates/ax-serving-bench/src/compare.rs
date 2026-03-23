@@ -11,7 +11,7 @@
 //!     --url-a http://127.0.0.1:18080 \
 //!     --url-b http://127.0.0.1:18081 \
 //!     --label-a llamacpp \
-//!     --label-b mistralrs \
+//!     --label-b native \
 //!     --model default
 //! ```
 

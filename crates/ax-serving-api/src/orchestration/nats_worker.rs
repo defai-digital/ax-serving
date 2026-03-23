@@ -301,6 +301,20 @@ async fn dispatch_to_local(
     }
 }
 
+/// POST JSON to a local HTTP endpoint and return the response.
+async fn http_post_json(
+    client: &Client,
+    url: &str,
+    body: Vec<u8>,
+) -> reqwest::Result<reqwest::Response> {
+    client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+}
+
 async fn dispatch_non_streaming(
     http_client: &Client,
     nats_client: &async_nats::Client,
@@ -308,12 +322,7 @@ async fn dispatch_non_streaming(
     req: &NatsRequest,
     body_bytes: Vec<u8>,
 ) -> bool {
-    let result = http_client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await;
+    let result = http_post_json(http_client, url, body_bytes).await;
 
     match result {
         Err(e) => {
@@ -337,17 +346,11 @@ async fn dispatch_non_streaming(
                     false
                 }
                 Ok(body) => {
-                    let resp_msg = NatsResponse {
-                        request_id: req.request_id.clone(),
-                        status,
-                        content_type,
-                        done: true,
-                        data_hex: Some(hex::encode(&body)),
-                        error: None,
-                    };
-                    let payload = serde_json::to_vec(&resp_msg).unwrap_or_default();
+                    let payload =
+                        NatsResponse::complete(req.request_id.clone(), status, content_type, &body)
+                            .to_payload();
                     if let Err(e) = nats_client
-                        .publish(req.reply_subject.clone(), payload.into())
+                        .publish(req.reply_subject.clone(), payload)
                         .await
                     {
                         error!(request_id = %req.request_id, %e, "NatsWorker: reply publish failed");
@@ -366,14 +369,7 @@ async fn dispatch_streaming(
     req: &NatsRequest,
     body_bytes: Vec<u8>,
 ) -> bool {
-    let result = http_client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await;
-
-    let resp = match result {
+    let resp = match http_post_json(http_client, url, body_bytes).await {
         Err(e) => {
             warn!(request_id = %req.request_id, %e, "NatsWorker: streaming local HTTP failed");
             publish_error(nats_client, req, &e.to_string()).await;
@@ -383,21 +379,47 @@ async fn dispatch_streaming(
     };
 
     let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
     if status >= 500 {
         // Publish a 5xx response and nack so JetStream retries.
-        let resp_msg = NatsResponse {
-            request_id: req.request_id.clone(),
+        let payload = NatsResponse::error_response(
+            req.request_id.clone(),
             status,
-            content_type: "application/json".into(),
-            done: true,
-            data_hex: None,
-            error: Some(format!("worker returned {status}")),
-        };
-        let payload = serde_json::to_vec(&resp_msg).unwrap_or_default();
+            format!("worker returned {status}"),
+        )
+        .to_payload();
         let _ = nats_client
-            .publish(req.reply_subject.clone(), payload.into())
+            .publish(req.reply_subject.clone(), payload)
             .await;
         return false;
+    }
+
+    if !resp.status().is_success() {
+        match resp.bytes().await {
+            Err(e) => {
+                warn!(request_id = %req.request_id, %e, "NatsWorker: reading error response body failed");
+                publish_error(nats_client, req, &e.to_string()).await;
+                return false;
+            }
+            Ok(body) => {
+                let payload =
+                    NatsResponse::complete(req.request_id.clone(), status, content_type, &body)
+                        .to_payload();
+                if let Err(e) = nats_client
+                    .publish(req.reply_subject.clone(), payload)
+                    .await
+                {
+                    error!(request_id = %req.request_id, %e, "NatsWorker: reply publish failed");
+                }
+                return true;
+            }
+        }
     }
 
     // Stream chunks to the reply subject.
@@ -409,17 +431,10 @@ async fn dispatch_streaming(
                 break;
             }
             Ok(chunk) => {
-                let resp_msg = NatsResponse {
-                    request_id: req.request_id.clone(),
-                    status,
-                    content_type: "text/event-stream".into(),
-                    done: false,
-                    data_hex: Some(hex::encode(&chunk)),
-                    error: None,
-                };
-                let payload = serde_json::to_vec(&resp_msg).unwrap_or_default();
+                let payload = NatsResponse::streaming_chunk(req.request_id.clone(), status, &chunk)
+                    .to_payload();
                 if let Err(e) = nats_client
-                    .publish(req.reply_subject.clone(), payload.into())
+                    .publish(req.reply_subject.clone(), payload)
                     .await
                 {
                     error!(request_id = %req.request_id, %e, "NatsWorker: chunk publish failed");
@@ -430,33 +445,18 @@ async fn dispatch_streaming(
     }
 
     // Send the done sentinel.
-    let done_msg = NatsResponse {
-        request_id: req.request_id.clone(),
-        status,
-        content_type: "text/event-stream".into(),
-        done: true,
-        data_hex: None,
-        error: None,
-    };
-    let payload = serde_json::to_vec(&done_msg).unwrap_or_default();
+    let payload = NatsResponse::streaming_done(req.request_id.clone(), status).to_payload();
     let _ = nats_client
-        .publish(req.reply_subject.clone(), payload.into())
+        .publish(req.reply_subject.clone(), payload)
         .await;
 
     true // ack — streaming completed
 }
 
 async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, message: &str) {
-    let resp_msg = NatsResponse {
-        request_id: req.request_id.clone(),
-        status: 503,
-        content_type: "application/json".into(),
-        done: true,
-        data_hex: None,
-        error: Some(message.to_string()),
-    };
-    let payload = serde_json::to_vec(&resp_msg).unwrap_or_default();
+    let payload =
+        NatsResponse::error_response(req.request_id.clone(), 503, message.to_string()).to_payload();
     let _ = nats_client
-        .publish(req.reply_subject.clone(), payload.into())
+        .publish(req.reply_subject.clone(), payload)
         .await;
 }

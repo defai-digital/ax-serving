@@ -11,6 +11,7 @@
 
 pub mod routes;
 pub mod schema;
+pub mod validation;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -63,7 +64,10 @@ pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
         .route("/health", get(routes::health))
         .route("/v1/metrics", get(routes::metrics))
         .route("/v1/admin/status", get(routes::admin_status))
-        .route("/v1/admin/startup-report", get(routes::admin_startup_report))
+        .route(
+            "/v1/admin/startup-report",
+            get(routes::admin_startup_report),
+        )
         .route("/v1/admin/diagnostics", get(routes::admin_diagnostics))
         .route("/v1/admin/audit", get(routes::admin_audit))
         .route("/v1/admin/policy", get(routes::admin_policy))

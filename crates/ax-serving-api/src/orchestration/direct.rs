@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::StreamExt as _;
+use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use reqwest::Client;
 use tracing::{error, warn};
 
@@ -56,12 +56,32 @@ pub struct DirectDispatcher {
     reroute_total: Arc<AtomicU64>,
 }
 
+/// Attach an `Authorization` header to a request builder when one is provided.
+fn attach_auth(
+    builder: reqwest::RequestBuilder,
+    auth: Option<&HeaderValue>,
+) -> reqwest::RequestBuilder {
+    match auth.and_then(|v| v.to_str().ok()) {
+        Some(v) => builder.header("authorization", v),
+        None => builder,
+    }
+}
+
+/// TCP connect timeout for the dispatcher's reqwest client.
+/// Short enough to fail fast on unreachable workers without blocking the queue.
+const DISPATCHER_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Default pool size and request timeout matching serving.example.yaml defaults.
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 impl DirectDispatcher {
     pub fn new(pool_max_idle_per_host: usize, request_timeout_secs: u64) -> Self {
         Self {
             client: Client::builder()
                 .pool_max_idle_per_host(pool_max_idle_per_host)
-                .connect_timeout(std::time::Duration::from_secs(5))
+                .connect_timeout(std::time::Duration::from_secs(
+                    DISPATCHER_CONNECT_TIMEOUT_SECS,
+                ))
                 .timeout(std::time::Duration::from_secs(request_timeout_secs))
                 .build()
                 .expect("failed to build reqwest client"),
@@ -133,9 +153,9 @@ impl DirectDispatcher {
         if workers.is_empty() {
             return trace_response(
                 (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("no eligible workers for model '{model_id}'"),
-            )
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no eligible workers for model '{model_id}'"),
+                )
                     .into_response(),
                 0,
                 None,
@@ -154,9 +174,9 @@ impl DirectDispatcher {
             None => {
                 return trace_response(
                     (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("all workers for '{model_id}' are at capacity"),
-                )
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("all workers for '{model_id}' are at capacity"),
+                    )
                         .into_response(),
                     candidate_count,
                     None,
@@ -176,17 +196,15 @@ impl DirectDispatcher {
             None
         };
 
-        let mut req_builder = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body);
-        if let Some(auth) = auth_header
-            && let Ok(v) = auth.to_str()
-        {
-            req_builder = req_builder.header("authorization", v);
-        }
-        let result = req_builder.send().await;
+        let result = attach_auth(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body),
+            auth_header,
+        )
+        .send()
+        .await;
 
         // Reroute on network error or 5xx.
         let is_err = result.is_err();
@@ -245,6 +263,7 @@ impl DirectDispatcher {
     }
 
     /// Try once more with a different worker (excluding `excluded_id`).
+    #[allow(clippy::too_many_arguments)]
     async fn reroute(
         &self,
         registry: &WorkerRegistry,
@@ -258,8 +277,12 @@ impl DirectDispatcher {
         excluded_id: WorkerId,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers2 =
-            registry.eligible_workers_filtered(ctx.model_id, request_kind, backend_hint, min_context);
+        let workers2 = registry.eligible_workers_filtered(
+            ctx.model_id,
+            request_kind,
+            backend_hint,
+            min_context,
+        );
         let candidates: Vec<_> = preferred_pool_workers(workers2, ctx.preferred_pool)
             .into_iter()
             .filter(|w| w.id != excluded_id)
@@ -270,9 +293,9 @@ impl DirectDispatcher {
             None => {
                 return trace_response(
                     (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("no alternative worker for '{}' after reroute", ctx.model_id),
-                )
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("no alternative worker for '{}' after reroute", ctx.model_id),
+                    )
                         .into_response(),
                     candidates.len(),
                     None,
@@ -285,17 +308,15 @@ impl DirectDispatcher {
         let url2 = worker_url(selected2.addr, path);
         let guard2 = InflightGuard::acquire(&selected2.inflight_counter);
 
-        let mut req_builder2 = self
-            .client
-            .post(&url2)
-            .header("content-type", "application/json")
-            .body(body);
-        if let Some(auth) = auth_header
-            && let Ok(v) = auth.to_str()
-        {
-            req_builder2 = req_builder2.header("authorization", v);
-        }
-        let result2 = req_builder2.send().await;
+        let result2 = attach_auth(
+            self.client
+                .post(&url2)
+                .header("content-type", "application/json")
+                .body(body),
+            auth_header,
+        )
+        .send()
+        .await;
 
         // If the reroute also failed, return 503 rather than passing the worker's
         // internal error status through — the orchestrator owns the failure signal.
@@ -359,15 +380,15 @@ impl DirectDispatcher {
                     .to_string();
 
                 if stream {
-                    let byte_stream = resp.bytes_stream();
+                    type GuardedResponseStream =
+                        std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+                    let byte_stream: GuardedResponseStream =
+                        Box::pin(resp.bytes_stream().map_err(std::io::Error::other));
                     let guarded = futures::stream::unfold(
-                        (Box::pin(byte_stream), Some(guard)),
-                        |(mut inner, guard)| async move {
+                        (byte_stream, Some(guard)),
+                        |(mut inner, guard): (GuardedResponseStream, Option<InflightGuard>)| async move {
                             match inner.next().await {
-                                Some(item) => {
-                                    let mapped = item.map_err(std::io::Error::other);
-                                    Some((mapped, (inner, guard)))
-                                }
+                                Some(item) => Some((item, (inner, guard))),
                                 None => {
                                     drop(guard);
                                     None
@@ -401,7 +422,7 @@ impl DirectDispatcher {
 
 impl Default for DirectDispatcher {
     fn default() -> Self {
-        Self::new(8, 300)
+        Self::new(DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT_SECS)
     }
 }
 
@@ -507,7 +528,11 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
 
         let guard = InflightGuard::acquire(&counter);
-        assert_eq!(counter.load(Ordering::Relaxed), 1, "must increment on acquire");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "must increment on acquire"
+        );
 
         drop(guard);
         assert_eq!(counter.load(Ordering::Relaxed), 0, "must decrement on drop");

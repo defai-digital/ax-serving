@@ -2,6 +2,18 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 
+const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
+const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
+const DEFAULT_MAX_INFLIGHT: usize = 8;
+const DEFAULT_NODE_CLASS: &str = "thor";
+
+fn load_optional_string_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct ThorConfig {
     pub control_plane_url: String,
@@ -18,16 +30,13 @@ pub struct ThorConfig {
 
 impl ThorConfig {
     pub fn from_env() -> Result<Self> {
-        let control_plane_url = std::env::var("AXS_CONTROL_PLANE_URL")
-            .context("AXS_CONTROL_PLANE_URL is required")?;
-        let worker_token = std::env::var("AXS_WORKER_TOKEN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let control_plane_url =
+            std::env::var("AXS_CONTROL_PLANE_URL").context("AXS_CONTROL_PLANE_URL is required")?;
+        let worker_token = load_optional_string_env("AXS_WORKER_TOKEN");
         let sglang_url =
-            std::env::var("AXS_SGLANG_URL").unwrap_or_else(|_| "http://127.0.0.1:30000".into());
+            std::env::var("AXS_SGLANG_URL").unwrap_or_else(|_| DEFAULT_SGLANG_URL.into());
         let listen_addr: SocketAddr = std::env::var("AXS_THOR_LISTEN_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:18081".into())
+            .unwrap_or_else(|_| DEFAULT_THOR_LISTEN_ADDR.into())
             .parse()
             .context("invalid AXS_THOR_LISTEN_ADDR")?;
         let advertised_addr: SocketAddr = std::env::var("AXS_THOR_ADVERTISED_ADDR")
@@ -37,21 +46,13 @@ impl ThorConfig {
         let max_inflight = std::env::var("AXS_THOR_MAX_INFLIGHT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT)
             .max(1);
-        let worker_pool = std::env::var("AXS_THOR_WORKER_POOL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let node_class = std::env::var("AXS_THOR_NODE_CLASS").unwrap_or_else(|_| "thor".into());
-        let friendly_name = std::env::var("AXS_THOR_FRIENDLY_NAME")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let chip_model = std::env::var("AXS_THOR_CHIP_MODEL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let worker_pool = load_optional_string_env("AXS_THOR_WORKER_POOL");
+        let node_class =
+            std::env::var("AXS_THOR_NODE_CLASS").unwrap_or_else(|_| DEFAULT_NODE_CLASS.into());
+        let friendly_name = load_optional_string_env("AXS_THOR_FRIENDLY_NAME");
+        let chip_model = load_optional_string_env("AXS_THOR_CHIP_MODEL");
 
         Ok(Self {
             control_plane_url: control_plane_url.trim_end_matches('/').to_string(),

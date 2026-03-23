@@ -4,18 +4,13 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "1.1.0"
+version = "2.0.1"
 authors = ["AutomatosX Team (DEFAI Private Limited)"]
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-# Inference backend
-mistralrs = { version = "0.7.0", features = ["metal", "accelerate"] }
-mistralrs-core = { version = "0.7.0", features = ["metal", "accelerate"] }
-mistralrs-quant = { version = "0.7.0", features = ["accelerate"] }
-
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # gRPC
@@ -58,11 +53,11 @@ rstest = "0.24"
 
 # Utilities
 futures = "0.3"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 ipnet = "2"
 
 # HTTP client (llama.cpp backend subprocess proxy)
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 
 # YAML config parsing (backends.yaml)
 serde_yaml = "0.9"

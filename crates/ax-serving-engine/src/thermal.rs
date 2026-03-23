@@ -260,7 +260,9 @@ mod tests {
         let monitor = ThermalMonitor::with_poll(60);
         let nominal = monitor.recommended_concurrency();
         // Fair maps to the same full-CPU path as Nominal.
-        monitor.state.store(ThermalState::Fair as u8, Ordering::Relaxed);
+        monitor
+            .state
+            .store(ThermalState::Fair as u8, Ordering::Relaxed);
         assert_eq!(monitor.recommended_concurrency(), nominal);
     }
 
@@ -268,7 +270,9 @@ mod tests {
     fn recommended_concurrency_serious_is_half_of_nominal() {
         let monitor = ThermalMonitor::with_poll(60);
         let nominal = monitor.recommended_concurrency();
-        monitor.state.store(ThermalState::Serious as u8, Ordering::Relaxed);
+        monitor
+            .state
+            .store(ThermalState::Serious as u8, Ordering::Relaxed);
         let expected = (nominal / 2).max(1);
         assert_eq!(monitor.recommended_concurrency(), expected);
     }
@@ -276,7 +280,9 @@ mod tests {
     #[test]
     fn recommended_concurrency_critical_is_one() {
         let monitor = ThermalMonitor::with_poll(60);
-        monitor.state.store(ThermalState::Critical as u8, Ordering::Relaxed);
+        monitor
+            .state
+            .store(ThermalState::Critical as u8, Ordering::Relaxed);
         assert_eq!(monitor.recommended_concurrency(), 1);
     }
 }

@@ -75,7 +75,10 @@ pub fn enforce(
         .find(|rule| rule.project == project_name)
         .ok_or_else(|| ProjectPolicyError {
             status: StatusCode::FORBIDDEN,
-            message: format!("project '{}' is not allowed by runtime policy", project_name),
+            message: format!(
+                "project '{}' is not allowed by runtime policy",
+                project_name
+            ),
         })?;
 
     if !model_allowed(&rule.allowed_models, model) {
@@ -108,7 +111,9 @@ pub fn enforce(
 }
 
 fn model_allowed(allowed_models: &[String], model: &str) -> bool {
-    allowed_models.iter().any(|pattern| model_matches(pattern, model))
+    allowed_models
+        .iter()
+        .any(|pattern| model_matches(pattern, model))
 }
 
 fn model_matches(pattern: &str, model: &str) -> bool {
@@ -124,8 +129,8 @@ fn model_matches(pattern: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
     use crate::config::ProjectRuleConfig;
+    use axum::http::HeaderValue;
 
     fn sample_config() -> ProjectPolicyConfig {
         ProjectPolicyConfig {
@@ -275,7 +280,10 @@ mod tests {
     fn model_matches_no_suffix_star_is_exact_match() {
         // "embed-" (no trailing *) is a literal exact match, not a glob.
         assert!(model_matches("embed-", "embed-"));
-        assert!(!model_matches("embed-", "embed-small"), "no star → not a prefix glob");
+        assert!(
+            !model_matches("embed-", "embed-small"),
+            "no star → not a prefix glob"
+        );
         assert!(!model_matches("embed-", "embed-large"));
     }
 }

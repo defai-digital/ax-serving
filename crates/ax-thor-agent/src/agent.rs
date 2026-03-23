@@ -10,6 +10,16 @@ use tokio::sync::RwLock;
 use crate::config::ThorConfig;
 use crate::sglang;
 
+fn with_internal_token(
+    req: reqwest::RequestBuilder,
+    token: Option<&String>,
+) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.header("X-Internal-Token", t),
+        None => req,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerSession {
     pub worker_id: String,
@@ -39,10 +49,13 @@ impl SharedRuntime {
     }
 }
 
-pub async fn register(
-    client: &reqwest::Client,
-    config: &ThorConfig,
-) -> Result<RegistrationState> {
+impl Default for SharedRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
     let models = sglang::get_loaded_models(client, &config.sglang_url).await?;
     let body = json!({
         "addr": config.advertised_addr.to_string(),
@@ -61,15 +74,15 @@ pub async fn register(
         "node_class": config.node_class,
     });
 
-    let mut req = client
-        .post(format!(
-            "{}/internal/workers/register",
-            config.control_plane_url
-        ))
-        .json(&body);
-    if let Some(token) = &config.worker_token {
-        req = req.header("X-Internal-Token", token);
-    }
+    let req = with_internal_token(
+        client
+            .post(format!(
+                "{}/internal/workers/register",
+                config.control_plane_url
+            ))
+            .json(&body),
+        config.worker_token.as_ref(),
+    );
 
     let response: serde_json::Value = req
         .send()
@@ -95,11 +108,7 @@ pub async fn register(
     })
 }
 
-pub async fn heartbeat_loop(
-    client: reqwest::Client,
-    config: ThorConfig,
-    runtime: SharedRuntime,
-) {
+pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime: SharedRuntime) {
     loop {
         let session = {
             let guard = runtime.session.read().await;
@@ -111,7 +120,10 @@ pub async fn heartbeat_loop(
             continue;
         };
 
-        tokio::time::sleep(std::time::Duration::from_millis(session.heartbeat_interval_ms)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            session.heartbeat_interval_ms,
+        ))
+        .await;
 
         let models = match sglang::get_loaded_models(&client, &config.sglang_url).await {
             Ok(models) => {
@@ -124,27 +136,28 @@ pub async fn heartbeat_loop(
             }
         };
 
+        let current_inflight = runtime.inflight.load(Ordering::Relaxed);
         let body = json!({
-            "inflight": runtime.inflight.load(Ordering::Relaxed),
+            "inflight": current_inflight,
             "thermal_state": "nominal",
             "model_ids": models,
             "rss_bytes": 0_u64,
-            "active_sequences": runtime.inflight.load(Ordering::Relaxed),
+            "active_sequences": current_inflight,
             "decode_tok_per_sec": 0.0_f64,
             "ttft_p95_ms": 0_u64,
             "queue_depth": 0_usize,
             "error_rate": 0.0_f64,
         });
 
-        let mut req = client
-            .post(format!(
-                "{}/internal/workers/{}/heartbeat",
-                config.control_plane_url, session.worker_id
-            ))
-            .json(&body);
-        if let Some(token) = &config.worker_token {
-            req = req.header("X-Internal-Token", token);
-        }
+        let req = with_internal_token(
+            client
+                .post(format!(
+                    "{}/internal/workers/{}/heartbeat",
+                    config.control_plane_url, session.worker_id
+                ))
+                .json(&body),
+            config.worker_token.as_ref(),
+        );
 
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {}
@@ -164,36 +177,29 @@ pub async fn heartbeat_loop(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SharedRuntime;
-
-    #[tokio::test]
-    async fn shared_runtime_starts_with_empty_model_cache() {
-        let runtime = SharedRuntime::new();
-        assert!(runtime.models.read().await.is_empty());
-    }
-}
-
-pub async fn drain(client: &reqwest::Client, config: &ThorConfig, runtime: &SharedRuntime) -> Result<()> {
+pub async fn drain(
+    client: &reqwest::Client,
+    config: &ThorConfig,
+    runtime: &SharedRuntime,
+) -> Result<()> {
     let session = runtime
         .session
         .read()
         .await
         .clone()
         .context("thor agent has no active worker session")?;
-    let mut req = client.post(format!(
-        "{}/internal/workers/{}/drain",
-        config.control_plane_url, session.worker_id
-    ));
-    if let Some(token) = &config.worker_token {
-        req = req.header("X-Internal-Token", token);
-    }
-    req.send()
-        .await
-        .context("thor drain request failed")?
-        .error_for_status()
-        .context("thor drain request rejected")?;
+    with_internal_token(
+        client.post(format!(
+            "{}/internal/workers/{}/drain",
+            config.control_plane_url, session.worker_id
+        )),
+        config.worker_token.as_ref(),
+    )
+    .send()
+    .await
+    .context("thor drain request failed")?
+    .error_for_status()
+    .context("thor drain request rejected")?;
     Ok(())
 }
 
@@ -208,17 +214,28 @@ pub async fn drain_complete(
         .await
         .clone()
         .context("thor agent has no active worker session")?;
-    let mut req = client.post(format!(
-        "{}/internal/workers/{}/drain-complete",
-        config.control_plane_url, session.worker_id
-    ));
-    if let Some(token) = &config.worker_token {
-        req = req.header("X-Internal-Token", token);
-    }
-    req.send()
-        .await
-        .context("thor drain-complete request failed")?
-        .error_for_status()
-        .context("thor drain-complete request rejected")?;
+    with_internal_token(
+        client.post(format!(
+            "{}/internal/workers/{}/drain-complete",
+            config.control_plane_url, session.worker_id
+        )),
+        config.worker_token.as_ref(),
+    )
+    .send()
+    .await
+    .context("thor drain-complete request failed")?
+    .error_for_status()
+    .context("thor drain-complete request rejected")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedRuntime;
+
+    #[tokio::test]
+    async fn shared_runtime_starts_with_empty_model_cache() {
+        let runtime = SharedRuntime::new();
+        assert!(runtime.models.read().await.is_empty());
+    }
 }

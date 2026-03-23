@@ -280,18 +280,23 @@ impl DispatchPolicy for ModelAffinityPolicy {
 /// Workers at full capacity (`active_sequences >= max_inflight`) are excluded
 /// before scoring regardless of score value.  Tie-breaking is by `WorkerId`
 /// bytes for determinism.
+/// TTFT is weighted more heavily than sequence load because tail latency is
+/// the dominant user-visible signal (60/40 split from empirical tuning).
+const TOKEN_COST_TTFT_WEIGHT: f64 = 0.6;
+const TOKEN_COST_SEQ_WEIGHT: f64 = 0.4;
+
 pub struct TokenCostPolicy {
-    /// Weight for the TTFT component (default 0.6 — TTFT is the primary signal).
+    /// Weight for the TTFT component.
     ttft_weight: f64,
-    /// Weight for the active-sequence component (default 0.4).
+    /// Weight for the active-sequence component.
     seq_weight: f64,
 }
 
 impl TokenCostPolicy {
     pub fn new() -> Self {
         Self {
-            ttft_weight: 0.6,
-            seq_weight: 0.4,
+            ttft_weight: TOKEN_COST_TTFT_WEIGHT,
+            seq_weight: TOKEN_COST_SEQ_WEIGHT,
         }
     }
 }
@@ -339,25 +344,22 @@ impl DispatchPolicy for TokenCostPolicy {
 
         // Select the worker with the minimum composite score.  Ties broken by
         // WorkerId bytes so dispatch is deterministic under equal load.
-        eligible
-            .iter()
-            .copied()
-            .min_by(|a, b| {
-                let score = |w: &&WorkerStatus| {
-                    let seqs = if w.active_sequences > 0 || w.inflight == 0 {
-                        w.active_sequences
-                    } else {
-                        w.inflight
-                    } as f64;
-                    let ttft_norm = w.ttft_p95_ms as f64 / ref_ttft_ms;
-                    let seq_norm = seqs / w.max_inflight.max(1) as f64;
-                    self.ttft_weight * ttft_norm + self.seq_weight * seq_norm
-                };
-                score(a)
-                    .partial_cmp(&score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.0.as_bytes().cmp(b.id.0.as_bytes()))
-            })
+        eligible.iter().copied().min_by(|a, b| {
+            let score = |w: &&WorkerStatus| {
+                let seqs = if w.active_sequences > 0 || w.inflight == 0 {
+                    w.active_sequences
+                } else {
+                    w.inflight
+                } as f64;
+                let ttft_norm = w.ttft_p95_ms as f64 / ref_ttft_ms;
+                let seq_norm = seqs / w.max_inflight.max(1) as f64;
+                self.ttft_weight * ttft_norm + self.seq_weight * seq_norm
+            };
+            score(a)
+                .partial_cmp(&score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.0.as_bytes().cmp(b.id.0.as_bytes()))
+        })
     }
 }
 
@@ -485,36 +487,8 @@ mod tests {
         // w_high: capacity 4, w_low: capacity 1.
         // Over 5 calls we expect w_high 4 times and w_low 1 time.
         let policy = WeightedRoundRobinPolicy::new();
-        let w_high = WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8081".parse().unwrap(),
-            inflight: 0,
-            max_inflight: 4, // capacity 4
-            inflight_counter: Arc::new(AtomicUsize::new(0)),
-            active_sequences: 0,
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        };
-        let w_low = WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8082".parse().unwrap(),
-            inflight: 0,
-            max_inflight: 1, // capacity 1
-            inflight_counter: Arc::new(AtomicUsize::new(0)),
-            active_sequences: 0,
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        };
+        let w_high = make_worker(0, 4); // capacity 4
+        let w_low = make_worker(0, 1); // capacity 1
         let workers = vec![w_high.clone(), w_low.clone()];
 
         let mut high_count = 0usize;
@@ -667,19 +641,17 @@ mod tests {
         ttft_p95_ms: u64,
     ) -> WorkerStatus {
         WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8081".parse().unwrap(),
-            inflight,
-            max_inflight,
-            inflight_counter: Arc::new(AtomicUsize::new(inflight)),
-            active_sequences: inflight,
-            decode_tok_per_sec: 0.0,
             ttft_p95_ms,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
+            ..make_worker(inflight, max_inflight)
+        }
+    }
+
+    /// Like `make_worker` but with `active_sequences: 0` to simulate a legacy
+    /// worker that hasn't started reporting the new field yet.
+    fn make_legacy_worker(inflight: usize, max_inflight: usize) -> WorkerStatus {
+        WorkerStatus {
+            active_sequences: 0,
+            ..make_worker(inflight, max_inflight)
         }
     }
 
@@ -736,36 +708,8 @@ mod tests {
     fn token_cost_legacy_worker_uses_inflight_as_seqs() {
         // Legacy worker: active_sequences == 0 && inflight != 0.
         // The policy must use `inflight` as the sequence count in that case.
-        let legacy_busy = WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8081".parse().unwrap(),
-            inflight: 3,
-            max_inflight: 4,
-            inflight_counter: Arc::new(AtomicUsize::new(3)),
-            active_sequences: 0, // legacy worker — not yet sending the new field
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        };
-        let modern_idle = WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8082".parse().unwrap(),
-            inflight: 1,
-            max_inflight: 4,
-            inflight_counter: Arc::new(AtomicUsize::new(1)),
-            active_sequences: 1,
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        };
+        let legacy_busy = make_legacy_worker(3, 4); // active_sequences: 0 — not yet sending the new field
+        let modern_idle = make_worker(1, 4);
         let workers = vec![legacy_busy.clone(), modern_idle.clone()];
         let sel = TokenCostPolicy::new().select(&workers, &ctx()).unwrap();
         // modern_idle has lower effective seqs (1) vs legacy (inflight=3) → should win.
@@ -775,23 +719,11 @@ mod tests {
     #[test]
     fn token_cost_legacy_worker_at_capacity_excluded() {
         // Legacy worker where inflight == max_inflight must be treated as full.
-        let legacy_full = WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8081".parse().unwrap(),
-            inflight: 4,
-            max_inflight: 4,
-            inflight_counter: Arc::new(AtomicUsize::new(4)),
-            active_sequences: 0,
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: None,
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        };
+        let legacy_full = make_legacy_worker(4, 4);
         assert!(
-            TokenCostPolicy::new().select(&[legacy_full], &ctx()).is_none(),
+            TokenCostPolicy::new()
+                .select(&[legacy_full], &ctx())
+                .is_none(),
             "legacy worker at inflight==max_inflight must be excluded"
         );
     }

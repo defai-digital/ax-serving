@@ -118,14 +118,15 @@ impl Drop for QueuePermit {
         // Hint priority: (1) last_served_client (set on previous handoffs),
         // (2) this permit's own client_key (first handoff — permit was obtained
         //     on the fast path without updating last_served_client).
-        let hint: Option<&str> = last_served
-            .as_deref()
-            .and_then(|v| v.as_deref())
-            .or(if self.client_key.is_empty() {
-                None
-            } else {
-                Some(self.client_key.as_str())
-            });
+        let hint: Option<&str> =
+            last_served
+                .as_deref()
+                .and_then(|v| v.as_deref())
+                .or(if self.client_key.is_empty() {
+                    None
+                } else {
+                    Some(self.client_key.as_str())
+                });
         loop {
             let next = select_next_waiter(&mut waiters, hint);
             match next {
@@ -228,10 +229,12 @@ impl GlobalQueue {
             if current >= max {
                 break; // At capacity — fall to slow path.
             }
-            match self
-                .active
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => {
                     // Fast path: no mutex acquired — last_served_client is not
                     // updated here.  The client key is stored in the permit so
@@ -300,7 +303,10 @@ impl GlobalQueue {
             let (tx, rx) = oneshot::channel::<bool>();
             // Clone key into the waiter entry (for fairness tracking during
             // handoff); the original moves into the permit when we wake up.
-            waiters.push_back(WaiterEntry { client_key: client_key.clone(), tx });
+            waiters.push_back(WaiterEntry {
+                client_key: client_key.clone(),
+                tx,
+            });
             rx
         }; // ← waiters mutex released here
 
@@ -571,7 +577,10 @@ mod tests {
 
         let permit = match q.acquire(key("client-a")).await {
             AcquireResult::Permit(p) => p,
-            other => panic!("expected initial permit, got {:?}", core::mem::discriminant(&other)),
+            other => panic!(
+                "expected initial permit, got {:?}",
+                core::mem::discriminant(&other)
+            ),
         };
 
         let q2 = Arc::clone(&q);
@@ -586,7 +595,9 @@ mod tests {
 
         let permit_b = waiter_b.await.unwrap();
         assert!(matches!(permit_b, AcquireResult::Permit(_)));
-        let AcquireResult::Permit(permit_b) = permit_b else { unreachable!() };
+        let AcquireResult::Permit(permit_b) = permit_b else {
+            unreachable!()
+        };
         drop(permit_b);
 
         let permit_a2 = waiter_a2.await.unwrap();

@@ -1,10 +1,9 @@
-//! Backend routing: dispatches inference to mistralrs (native) or llama.cpp
+//! Backend routing: dispatches inference to ax-engine (native) or llama.cpp
 //! based on a YAML config file.
 //!
-//! **Current policy** (ADR-013): mistralrs v0.7.0 is the primary backend for
-//! supported families (llama, qwen, gemma, mistral, phi, starcoder, deepseek,
-//! glm). llama.cpp is used for unsupported architectures (gptj, gpt_neox,
-//! falcon, minimax) and as the `auto`-mode fallback for unknown families.
+//! **Current policy**: ax-engine is the primary native backend for supported
+//! families (llama, qwen, gemma, mistral). llama.cpp is used for unsupported
+//! architectures and as the `auto`-mode fallback for unknown families.
 //! See `config/backends.yaml` for the full routing table.
 //!
 //! # Config file (`backends.yaml`)
@@ -12,7 +11,7 @@
 //! ```yaml
 //! # Default backend for families not listed below.
 //! # Options: native | llama_cpp | auto
-//! #   native    — use mistralrs only (fail if not supported)
+//! #   native    — use ax-engine only (fail if not supported)
 //! #   llama_cpp — use llama.cpp only (requires llama-server on PATH)
 //! #   auto      — try native first, fall back to llama.cpp on unsupported arch
 //! default_backend: llama_cpp
@@ -67,7 +66,7 @@ use crate::libllama::LibLlamaBackend;
 use crate::{
     EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
     InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
-    backend::MistralrsBackend,
+    ax_engine::AxEngineBackend,
     llamacpp::{LlamaCppBackend, LlamaCppConfig},
 };
 
@@ -77,7 +76,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendChoice {
-    /// Use mistralrs (native ax-serving backend).
+    /// Use the native ax-engine backend.
     Native,
     /// Use llama.cpp via a spawned `llama-server` subprocess.
     LlamaCpp,
@@ -281,7 +280,7 @@ fn is_unsupported_model_error(e: &anyhow::Error) -> bool {
         .join(" ")
         .to_lowercase();
 
-    // Positive signals: mistralrs cannot handle this architecture/quantization.
+    // Positive signals: native backend cannot handle this architecture/capability.
     let unsupported = full.contains("unsupported architecture")
         || full.contains("unknown gguf architecture")
         || full.contains("unsupported model architecture")
@@ -290,7 +289,8 @@ fn is_unsupported_model_error(e: &anyhow::Error) -> bool {
         || full.contains("quantization not supported")
         || full.contains("unsupported gguf type")
         || full.contains("unsupported ggml type")
-        || (full.contains("tokenizer") && full.contains("not supported"));
+        || (full.contains("tokenizer") && full.contains("not supported"))
+        || (full.contains("embeddings") && full.contains("not supported"));
 
     // Negative signals: real infrastructure failures — do NOT fall back.
     let real_failure = full.contains("insufficient memory")
@@ -313,7 +313,7 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn try_native_load_model(
-    native: &MistralrsBackend,
+    native: &AxEngineBackend,
     path: &Path,
     config: LoadConfig,
 ) -> Result<(ModelHandle, ModelMetadata)> {
@@ -353,11 +353,11 @@ struct RouterEntry {
     inner: ModelHandle,
 }
 
-/// `InferenceBackend` that routes to native mistralrs, llama.cpp, or libllama
+/// `InferenceBackend` that routes to ax-engine native, llama.cpp, or libllama
 /// based on `RoutingConfig`.
 pub struct RouterBackend {
     config: RoutingConfig,
-    native: Arc<MistralrsBackend>,
+    native: Arc<AxEngineBackend>,
     llamacpp: Arc<LlamaCppBackend>,
     #[cfg(feature = "libllama")]
     libllama: Arc<LibLlamaBackend>,
@@ -368,7 +368,7 @@ impl RouterBackend {
     pub fn new(routing: RoutingConfig, llamacpp: LlamaCppConfig) -> Self {
         Self {
             config: routing,
-            native: Arc::new(MistralrsBackend::new()),
+            native: Arc::new(AxEngineBackend::new()),
             llamacpp: Arc::new(LlamaCppBackend::new(llamacpp)),
             #[cfg(feature = "libllama")]
             libllama: Arc::new(LibLlamaBackend::new()),
@@ -403,7 +403,7 @@ impl InferenceBackend for RouterBackend {
 
         let (tag, inner, meta) = match choice {
             BackendChoice::Native => {
-                info!("routing {} → native (mistralrs)", path.display());
+                info!("routing {} → native (ax-engine)", path.display());
                 let (inner, meta) = try_native_load_model(&self.native, path, config)?;
                 (BackendTag::Native, inner, meta)
             }

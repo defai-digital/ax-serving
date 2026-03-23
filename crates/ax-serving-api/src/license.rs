@@ -259,7 +259,10 @@ mod tests {
         // Restore HOME so later tests work.
         unsafe { std::env::set_var("HOME", "/tmp") };
         let result = ls.set_key("my-license-key".to_string());
-        assert!(result.is_ok(), "set_key must succeed even without a file path");
+        assert!(
+            result.is_ok(),
+            "set_key must succeed even without a file path"
+        );
         assert!(ls.has_key(), "key must be stored in memory");
         assert_eq!(ls.edition(), "business");
     }
@@ -281,7 +284,8 @@ mod tests {
             key_file: "license.key".into(),
             dashboard_poll_ms: 2000,
         };
-        ls.set_key("prod-key-abc".to_string()).expect("set_key must succeed");
+        ls.set_key("prod-key-abc".to_string())
+            .expect("set_key must succeed");
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
 
