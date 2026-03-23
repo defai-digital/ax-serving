@@ -816,7 +816,10 @@ mod tests {
         let batcher = EmbeddingBatcher::new(backend, sched, pm, 1, 0); // disabled
 
         let first = batcher.submit(make_request(vec!["boom"])).await;
-        assert!(first.is_err(), "first request should surface the task panic");
+        assert!(
+            first.is_err(),
+            "first request should surface the task panic"
+        );
 
         let second = batcher.submit(make_request(vec!["ok"])).await;
         assert!(

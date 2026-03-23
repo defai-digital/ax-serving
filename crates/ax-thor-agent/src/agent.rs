@@ -120,11 +120,6 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             continue;
         };
 
-        tokio::time::sleep(std::time::Duration::from_millis(
-            session.heartbeat_interval_ms,
-        ))
-        .await;
-
         let models = match sglang::get_loaded_models(&client, &config.sglang_url).await {
             Ok(models) => {
                 *runtime.models.write().await = models.clone();
@@ -174,6 +169,11 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             Ok(resp) => tracing::warn!(status = %resp.status(), "thor heartbeat rejected"),
             Err(err) => tracing::warn!(%err, "thor heartbeat failed"),
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            session.heartbeat_interval_ms,
+        ))
+        .await;
     }
 }
 

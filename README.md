@@ -10,6 +10,10 @@ The Offline Serving And Orchestration Plane For AX Fabric
 
 AX Serving is the offline serving and orchestration layer behind [AX Fabric](https://github.com/defai-digital/ax-fabric). It provides OpenAI-compatible APIs, runtime model lifecycle control, scheduling, metrics, and multi-worker routing on Apple Silicon.
 
+For inference execution, AX Serving uses:
+- `ax-engine` for the native backend on supported model families
+- `llama.cpp` for compatibility, embeddings, and fallback paths
+
 AX Fabric is the product-facing layer for retrieval, knowledge, and grounded agent workflows. AX Serving is the infrastructure layer that makes that stack deployable and operable.
 
 Status: production-ready Rust workspace for Apple Silicon (`aarch64-apple-darwin`) with OpenAI-compatible REST, gRPC, runtime model management, and optional multi-worker orchestration.
@@ -70,7 +74,7 @@ Private enterprise work is handled in a separate private project. This public re
 Prerequisites:
 - Apple Silicon macOS
 - Rust toolchain
-- `llama-server` on `PATH`
+- `llama-server` on `PATH` for `llama.cpp` fallback and explicit `llama_cpp` loads
 - a GGUF model file
 
 Validate your environment:
@@ -79,6 +83,11 @@ Validate your environment:
 cargo check --workspace
 which llama-server
 ```
+
+Backend model:
+- `native` = `ax-engine`
+- `llama_cpp` = `llama-server`
+- `auto` = prefer `ax-engine` native, fall back to `llama.cpp` when needed
 
 Start the simplest local runtime:
 
@@ -136,6 +145,16 @@ Positioning:
 - AX Fabric is the product layer
 - AX Serving is the serving and orchestration layer underneath it
 - inference runtimes such as `ax-engine` and `llama.cpp` remain lower-level execution backends
+
+### Backend Architecture
+
+AX Serving is not itself the token-generation engine. It is the serving layer that routes requests into lower-level runtimes.
+
+- `ax-engine` is the native backend used by AX Serving for supported GGUF architectures on Apple Silicon
+- `llama.cpp` remains the subprocess backend for compatibility, fallback, and embedding-oriented paths
+- routing between those backends is controlled through [`config/backends.yaml`](config/backends.yaml)
+
+In practice, this means AX Serving owns the APIs, scheduling, orchestration, health, metrics, and model lifecycle, while `ax-engine` owns the native inference path.
 
 ### Best With AX Fabric
 

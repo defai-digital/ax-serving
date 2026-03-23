@@ -15,7 +15,7 @@ Use this guide for:
 
 - Apple Silicon macOS 14+
 - Rust toolchain (`cargo`)
-- `llama-server` available on `PATH` (from [llama.cpp](https://github.com/ggerganov/llama.cpp))
+- `llama-server` available on `PATH` for `llama.cpp` fallback, embeddings, and explicit `llama_cpp` loads
 - A GGUF model file at `./models/<model>.gguf`
 
 Validate your environment:
@@ -24,6 +24,11 @@ Validate your environment:
 cargo check --workspace
 which llama-server
 ```
+
+Backend model:
+- `native` = `ax-engine`
+- `llama_cpp` = `llama-server` from `llama.cpp`
+- `auto` = prefer native `ax-engine`, fall back to `llama.cpp` when needed
 
 ---
 
@@ -36,6 +41,8 @@ One process handles:
 - OpenAI-compatible serving
 - scheduler/admission control
 - metrics, dashboard, and admin endpoints
+
+By default, AX Serving routes supported native families through `ax-engine` and uses `llama.cpp` only when routing or model capability requires it.
 
 Best for:
 - OSS usage
@@ -313,7 +320,7 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
 
 ## Embeddings
 
-Load a dedicated embedding model, or start a chat-capable model with embeddings enabled in the backend.
+Load a dedicated embedding model, or start a chat-capable model with embeddings enabled in the backend. In practice, embeddings remain a `llama.cpp`-oriented path today, even when native text generation uses `ax-engine`.
 
 Basic embedding:
 
@@ -377,7 +384,7 @@ AXS_LLAMACPP_N_BATCH=4096 AXS_LLAMACPP_N_UBATCH=4096 \
 cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/embed-model.gguf ...
 ```
 
-Without this, long document chunks will produce HTTP 500 errors from the llama-server subprocess.
+Without this, long document chunks will produce HTTP 500 errors from the `llama.cpp` / `llama-server` subprocess path.
 
 ---
 
@@ -410,7 +417,7 @@ curl -sS -X POST http://127.0.0.1:18080/v1/models \
 |-------|------|-------------|
 | `model_id` | string | Identifier (1–128 chars, alphanumeric + `-_./:`) |
 | `path` | string | Absolute path to the `.gguf` file |
-| `backend` | string? | `"llama_cpp"`, `"lib_llama"`, `"native"`, or `"auto"` |
+| `backend` | string? | `"llama_cpp"`, `"lib_llama"`, `"native"` (`ax-engine`), or `"auto"` |
 | `mmproj_path` | string? | Multimodal projector `.gguf` for vision models |
 | `n_gpu_layers` | int? | GPU layer count override (`-1` = all) |
 | `context_length` | int? | Context window override (0 = model default) |
@@ -592,7 +599,7 @@ Recommended profiles:
 | Symptom | Fix |
 |---------|-----|
 | `model file not found` | Verify the model path is correct |
-| `failed to spawn llama-server` | Ensure `llama-server` is installed and on `PATH` |
+| `failed to spawn llama-server` | Ensure `llama-server` is installed and on `PATH` for `llama_cpp` / fallback routes |
 | `401` / `403` | Check `AXS_API_KEY` matches the `Authorization: Bearer` token |
 | `503` from gateway | Check `GET http://127.0.0.1:19090/internal/workers` — no healthy workers |
 | Model missing from `GET /v1/models` | Worker is unhealthy or draining; check worker logs |
@@ -607,7 +614,7 @@ Recommended profiles:
 - [README.md](README.md)
 - `docs/contracts/ax-fabric-runtime-contract.md` — supported AX Fabric integration contract
 - `config/serving.example.yaml` — full configuration reference
-- `config/backends.yaml` — backend routing rules
+- `config/backends.yaml` — backend routing rules (`ax-engine` native + `llama.cpp` fallback)
 - `docs/runbooks/multi-worker.md` — multi-worker deployment guide
 - `docs/perf/service-tuning.md` — throughput and latency tuning
 - [LICENSE](LICENSE) — full AGPL-3.0-only text
