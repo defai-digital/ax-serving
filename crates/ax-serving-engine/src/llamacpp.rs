@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -328,12 +328,18 @@ impl BlockingExecutor {
         let mut workers = Vec::with_capacity(n);
         for i in 0..n {
             let rx = Arc::clone(&rx);
-            let handle = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name(format!("ax-llamacpp-gen-{i}"))
                 .spawn(move || {
                     loop {
                         let recv_result = {
-                            let guard = rx.lock().expect("blocking executor receiver poisoned");
+                            let guard = match rx.lock() {
+                                Ok(guard) => guard,
+                                Err(err) => {
+                                    warn!("blocking executor receiver lock poisoned; continuing with poisoned state");
+                                    err.into_inner()
+                                }
+                            };
                             guard.recv()
                         };
                         match recv_result {
@@ -341,9 +347,12 @@ impl BlockingExecutor {
                             Err(_) => break,
                         }
                     }
-                })
-                .expect("failed to spawn blocking executor worker");
-            workers.push(handle);
+                }) {
+                Ok(handle) => workers.push(handle),
+                Err(err) => {
+                    warn!(%err, thread_idx = i, "failed to spawn blocking executor worker");
+                }
+            }
         }
         Self {
             tx,
@@ -382,9 +391,17 @@ impl Drop for LlamaCppProcess {
         // Signal poller to stop before killing the child so it doesn't
         // attempt a restart.
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.child.lock()
-            && let Some(mut child) = guard.take()
-        {
+        let mut guard = match self.child.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "llama.cpp child lock poisoned during drop; continuing with poisoned state"
+                );
+                err.into_inner()
+            }
+        };
+        if let Some(mut child) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -403,6 +420,36 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+    fn models_read(
+        &self,
+    ) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
+        match self.models.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "llama.cpp model registry read lock poisoned; continuing with poisoned state"
+                );
+                err.into_inner()
+            }
+        }
+    }
+
+    fn models_write(
+        &self,
+    ) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
+        match self.models.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "llama.cpp model registry write lock poisoned; continuing with poisoned state"
+                );
+                err.into_inner()
+            }
+        }
+    }
+
     fn effective_n_gpu_layers(config: &LoadConfig) -> i32 {
         if config.backend_type == crate::BackendType::Cpu {
             0
@@ -412,10 +459,19 @@ impl LlamaCppBackend {
     }
 
     pub fn new(config: LlamaCppConfig) -> Self {
-        let http = reqwest::blocking::Client::builder()
+        let http = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(config.http_request_timeout_secs))
             .build()
-            .expect("failed to build reqwest blocking client");
+        {
+            Ok(http) => http,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "failed to build blocking reqwest client with configured timeout; falling back to default"
+                );
+                reqwest::blocking::Client::new()
+            }
+        };
         let executor_threads = std::env::var("AXS_LLAMACPP_EXECUTOR_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -650,10 +706,39 @@ impl InferenceBackend for LlamaCppBackend {
                     self.config.wait_ready_check_timeout_secs,
                 ),
             };
-            std::thread::spawn(move || run_health_poller(args))
+            match std::thread::Builder::new()
+                .name(format!("ax-llamacpp-health-{port}"))
+                .spawn(move || run_health_poller(args))
+            {
+                Ok(poller) => poller,
+                Err(err) => {
+                    warn!(
+                        %err,
+                        port,
+                        "failed to spawn llama-server health poller; cleaning up model process"
+                    );
+                    {
+                        let mut guard = match child_arc.lock() {
+                            Ok(guard) => guard,
+                            Err(lock_err) => {
+                                warn!(
+                                    %lock_err,
+                                    "llama.cpp child lock poisoned during load cleanup; continuing with poisoned state"
+                                );
+                                lock_err.into_inner()
+                            }
+                        };
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                    return Err(anyhow::anyhow!("failed to spawn llama-server health poller: {err}"));
+                }
+            }
         };
 
-        self.models.lock().unwrap().insert(
+        self.models_write().insert(
             handle,
             LlamaCppProcess {
                 port,
@@ -669,7 +754,7 @@ impl InferenceBackend for LlamaCppBackend {
     }
 
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
-        let entry = self.models.lock().unwrap().remove(&handle);
+        let entry = self.models_write().remove(&handle);
         anyhow::ensure!(
             entry.is_some(),
             "no llama.cpp model loaded with handle {:?}",
@@ -690,7 +775,7 @@ impl InferenceBackend for LlamaCppBackend {
         tx: tokio::sync::mpsc::Sender<GenerateEvent>,
     ) -> Result<()> {
         let (port, health, breaker) = {
-            let guard = self.models.lock().unwrap();
+            let guard = self.models_read();
             let proc = guard
                 .get(&handle)
                 .ok_or_else(|| anyhow::anyhow!("invalid llama.cpp model handle {:?}", handle))?;
@@ -760,14 +845,10 @@ impl InferenceBackend for LlamaCppBackend {
                     let body = build_chat_completions_body(msgs, &params, cache_prompt);
                     complete_chat_completions(&http, port, &body, &tx, emit_logprobs)
                 }
-                (_, true) => {
-                    let body = build_completions_body(&input, &params, cache_prompt);
-                    stream_completions(&http, port, &body, &tx, batch_size, emit_logprobs)
-                }
-                (_, false) => {
-                    let body = build_completions_body(&input, &params, cache_prompt);
-                    complete_completions(&http, port, &body, &tx, emit_logprobs)
-                }
+                (_, true) => build_completions_body(&input, &params, cache_prompt)
+                    .and_then(|body| stream_completions(&http, port, &body, &tx, batch_size, emit_logprobs)),
+                (_, false) => build_completions_body(&input, &params, cache_prompt)
+                    .and_then(|body| complete_completions(&http, port, &body, &tx, emit_logprobs)),
             };
 
             match result {
@@ -803,14 +884,15 @@ impl InferenceBackend for LlamaCppBackend {
                     let _ = tx.blocking_send(GenerateEvent::Error(e.to_string()));
                 }
             }
-        })
+        })?;
+        Ok(())
     }
 
     // ── Tokenization ──────────────────────────────────────────────────────────
 
     fn tokenize(&self, handle: ModelHandle, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         let port = {
-            let guard = self.models.lock().unwrap();
+            let guard = self.models_read();
             guard
                 .get(&handle)
                 .map(|p| p.port)
@@ -845,7 +927,7 @@ impl InferenceBackend for LlamaCppBackend {
 
     fn decode_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<String> {
         let port = {
-            let guard = self.models.lock().unwrap();
+            let guard = self.models_read();
             guard
                 .get(&handle)
                 .map(|p| p.port)
@@ -884,7 +966,7 @@ impl InferenceBackend for LlamaCppBackend {
         config: &EmbedConfig,
     ) -> Result<EmbedResult> {
         let port = {
-            let guard = self.models.lock().unwrap();
+            let guard = self.models_read();
             guard
                 .get(&handle)
                 .map(|p| p.port)
@@ -1073,7 +1155,17 @@ fn run_health_poller(args: PollerArgs) {
 
         // Kill old child and spawn a fresh server on the same port.
         {
-            let mut guard = child.lock().unwrap();
+            let mut guard = match child.lock() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    warn!(
+                        %err,
+                        port,
+                        "llama.cpp child lock poisoned during health poller restart; continuing with poisoned state"
+                    );
+                    err.into_inner()
+                }
+            };
             if let Some(mut old) = guard.take() {
                 let _ = old.kill();
                 let _ = old.wait();
@@ -1131,7 +1223,7 @@ fn build_completions_body(
     input: &GenerateInput,
     params: &GenerationParams,
     cache_prompt: bool,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let mut body = serde_json::json!({
         "stream": params.stream,
         "cache_prompt": cache_prompt,
@@ -1155,13 +1247,14 @@ fn build_completions_body(
             body["prompt"] = token_array;
         }
         GenerateInput::Chat(_) => {
-            // Handled by build_chat_completions_body; should not reach here.
-            unreachable!("Chat input must use build_chat_completions_body");
+            // If this path is reached, request dispatching already violated the expected
+            // input protocol for this endpoint.
+            anyhow::bail!("chat inputs must use build_chat_completions_body");
         }
     };
 
     apply_generation_params(&mut body, params);
-    body
+    Ok(body)
 }
 
 /// Build a `/v1/chat/completions` JSON body for Chat inputs.
@@ -2046,7 +2139,8 @@ mod tests {
             stream: false,
             ..Default::default()
         };
-        let body = build_completions_body(&GenerateInput::Text("hello".into()), &params, true);
+        let body = build_completions_body(&GenerateInput::Text("hello".into()), &params, true)
+            .expect("build_completions_body should handle text input");
         assert_eq!(body["stream"].as_bool(), Some(false));
     }
 
