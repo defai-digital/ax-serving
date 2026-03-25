@@ -166,8 +166,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "ax-core"
-version = "2.0.0"
-source = "git+https://github.com/defai-digital/ax-engine.git?rev=0959a65a269e4f517d42300d1f3b9eebabdad0ab#0959a65a269e4f517d42300d1f3b9eebabdad0ab"
+version = "2.0.4"
+source = "git+https://github.com/defai-digital/ax-engine.git?rev=ac25264bf15491021e51d6dc56def308b4e29b35#ac25264bf15491021e51d6dc56def308b4e29b35"
 dependencies = [
  "anyhow",
  "ax-metal",
@@ -182,8 +182,8 @@ dependencies = [
 
 [[package]]
 name = "ax-metal"
-version = "2.0.0"
-source = "git+https://github.com/defai-digital/ax-engine.git?rev=0959a65a269e4f517d42300d1f3b9eebabdad0ab#0959a65a269e4f517d42300d1f3b9eebabdad0ab"
+version = "2.0.4"
+source = "git+https://github.com/defai-digital/ax-engine.git?rev=ac25264bf15491021e51d6dc56def308b4e29b35#ac25264bf15491021e51d6dc56def308b4e29b35"
 dependencies = [
  "anyhow",
  "objc2",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-api"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-bench"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "ax-serving-api",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-cli"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "ax-serving-api",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-engine"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "ax-core",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-py"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-shim"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "ax-thor-agent"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "axum 0.8.8",

@@ -12,9 +12,9 @@ metal = []
 libllama = []
 
 [dependencies]
-# ax-engine native backend
-ax-core = { git = "https://github.com/defai-digital/ax-engine.git", rev = "0959a65a269e4f517d42300d1f3b9eebabdad0ab" }
-ax-metal = { git = "https://github.com/defai-digital/ax-engine.git", rev = "0959a65a269e4f517d42300d1f3b9eebabdad0ab" }
+# ax-engine native backend.
+ax-core = { git = "https://github.com/defai-digital/ax-engine.git", rev = "ac25264bf15491021e51d6dc56def308b4e29b35" }
+ax-metal = { git = "https://github.com/defai-digital/ax-engine.git", rev = "ac25264bf15491021e51d6dc56def308b4e29b35" }
 # Async runtime
 tokio = { workspace = true }
 # Error handling

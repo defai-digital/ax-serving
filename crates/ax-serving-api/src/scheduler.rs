@@ -314,12 +314,14 @@ impl HistogramShards {
 
     fn snapshot(&self) -> Option<LatencyWindow> {
         let mut merged = LatencyWindow::new();
+        let merged_hist = merged.hist.as_mut()?;
         let mut saw_data = false;
         for shard in &self.shards {
             if let Ok(guard) = shard.try_lock()
-                && !guard.hist.is_empty()
+                && let Some(hist) = guard.hist.as_ref()
+                && !hist.is_empty()
             {
-                let _ = merged.hist.add(&guard.hist);
+                let _ = merged_hist.add(hist);
                 saw_data = true;
             }
         }
@@ -824,7 +826,7 @@ impl PerModelScheduler {
 ///
 /// Range: 1 µs – 1 hour.  Values outside this range are clamped.
 pub struct LatencyWindow {
-    hist: Histogram<u64>,
+    hist: Option<Histogram<u64>>,
 }
 
 impl Default for LatencyWindow {
@@ -836,35 +838,57 @@ impl Default for LatencyWindow {
 impl LatencyWindow {
     pub fn new() -> Self {
         // 1 µs min, 3 600 s max (1 hour), 3 significant figures (~0.1% error).
-        let hist =
-            Histogram::new_with_bounds(1, 3_600_000_000, 3).expect("hdrhistogram bounds are valid");
+        let hist = match Histogram::new_with_bounds(1, 3_600_000_000, 3) {
+            Ok(hist) => Some(hist),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to initialize latency histogram; disabling latency tracking"
+                );
+                None
+            }
+        };
         Self { hist }
     }
 
     pub fn record_us(&mut self, us: u64) {
         // Clamp to [1 µs, 1 hour] to stay within histogram bounds.
-        let _ = self.hist.record(us.clamp(1, 3_600_000_000));
+        if let Some(hist) = self.hist.as_mut() {
+            let _ = hist.record(us.clamp(1, 3_600_000_000));
+        }
     }
 
     pub fn p50(&self) -> Duration {
-        if self.hist.is_empty() {
+        let Some(hist) = self.hist.as_ref() else {
+            return Duration::ZERO;
+        };
+
+        if hist.is_empty() {
             return Duration::ZERO;
         }
-        Duration::from_micros(self.hist.value_at_quantile(0.50))
+        Duration::from_micros(hist.value_at_quantile(0.50))
     }
 
     pub fn p95(&self) -> Duration {
-        if self.hist.is_empty() {
+        let Some(hist) = self.hist.as_ref() else {
+            return Duration::ZERO;
+        };
+
+        if hist.is_empty() {
             return Duration::ZERO;
         }
-        Duration::from_micros(self.hist.value_at_quantile(0.95))
+        Duration::from_micros(hist.value_at_quantile(0.95))
     }
 
     pub fn p99(&self) -> Duration {
-        if self.hist.is_empty() {
+        let Some(hist) = self.hist.as_ref() else {
+            return Duration::ZERO;
+        };
+
+        if hist.is_empty() {
             return Duration::ZERO;
         }
-        Duration::from_micros(self.hist.value_at_quantile(0.99))
+        Duration::from_micros(hist.value_at_quantile(0.99))
     }
 }
 
