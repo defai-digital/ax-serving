@@ -2,12 +2,13 @@
 
 use std::path::Path;
 use std::sync::{
-    Arc, RwLock,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tracing::warn;
 use ax_core::backend::{self, BackendConfig};
 use ax_core::chat::{self, ChatRenderOptions, ChatRole};
 use ax_core::gguf::MappedModel;
@@ -144,6 +145,51 @@ fn infer_render_architecture(model_architecture: &str, chat_template: Option<&st
         }
     }
     model_architecture.to_string()
+}
+
+fn render_chat_messages_with_compat(
+    messages: &[chat::ChatMessage<'_>],
+    architecture: &str,
+    options: ChatRenderOptions,
+) -> String {
+    if matches!(architecture, "mistral" | "mixtral") {
+        return render_mistral_chat_messages(messages);
+    }
+    chat::render_chat_messages(messages, architecture, options)
+}
+
+fn render_mistral_chat_messages(messages: &[chat::ChatMessage<'_>]) -> String {
+    let mut rendered = String::new();
+    let mut pending_system = None;
+
+    for message in messages {
+        match message.role {
+            chat::ChatRole::System => {
+                pending_system = Some(message.content);
+            }
+            chat::ChatRole::User => {
+                if !rendered.is_empty() {
+                    rendered.push(' ');
+                }
+                rendered.push_str("[INST] ");
+                if let Some(system) = pending_system.take() {
+                    rendered.push_str("<<SYS>>\n");
+                    rendered.push_str(system);
+                    rendered.push_str("\n<</SYS>>\n\n");
+                }
+                rendered.push_str(message.content);
+                rendered.push_str(" [/INST]");
+            }
+            chat::ChatRole::Assistant => {
+                if !rendered.is_empty() {
+                    rendered.push(' ');
+                }
+                rendered.push_str(message.content);
+            }
+        }
+    }
+
+    rendered
 }
 
 fn build_sampling_config(params: &GenerationParams) -> SamplingConfig {
@@ -327,7 +373,7 @@ fn run_generate(
                 .map(|(role, content)| chat::ChatMessage::new(*role, content.as_str()))
                 .collect();
             loaded.tokenizer.encode(
-                &chat::render_chat_messages(
+                &render_chat_messages_with_compat(
                     &chat_messages,
                     &loaded.render_architecture,
                     ChatRenderOptions::default(),
@@ -529,10 +575,30 @@ impl AxEngineBackend {
         }
     }
 
-    fn get_model(&self, handle: ModelHandle) -> Result<Arc<LoadedModel>> {
+    fn models_read(
+        &self,
+    ) -> RwLockReadGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
         self.models
             .read()
-            .unwrap()
+            .unwrap_or_else(|err| {
+                warn!("ax-engine models rwlock poisoned; recovering from poisoned read lock");
+                err.into_inner()
+            })
+    }
+
+    fn models_write(
+        &self,
+    ) -> RwLockWriteGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
+        self.models
+            .write()
+            .unwrap_or_else(|err| {
+                warn!("ax-engine models rwlock poisoned; recovering from poisoned write lock");
+                err.into_inner()
+            })
+    }
+
+    fn get_model(&self, handle: ModelHandle) -> Result<Arc<LoadedModel>> {
+        self.models_read()
             .get(&handle)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid ax-engine model handle {:?}", handle))
@@ -608,14 +674,14 @@ impl InferenceBackend for AxEngineBackend {
             metadata: metadata.clone(),
             render_architecture,
         });
-        self.models.write().unwrap().insert(handle, loaded);
+        self.models_write().insert(handle, loaded);
 
         Ok((handle, metadata))
     }
 
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
         anyhow::ensure!(
-            self.models.write().unwrap().remove(&handle).is_some(),
+            self.models_write().remove(&handle).is_some(),
             "no model loaded with handle {:?}",
             handle
         );
@@ -823,7 +889,7 @@ mod tests {
 
     #[test]
     fn ax_core_mistral_template_uses_inst_format() {
-        let prompt = chat::render_chat_messages(
+        let prompt = super::render_chat_messages_with_compat(
             &[
                 chat::ChatMessage::system("be concise"),
                 chat::ChatMessage::user("hello"),
