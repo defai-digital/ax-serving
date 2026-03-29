@@ -1,71 +1,99 @@
 # AX Serving
 
-The Offline Serving And Orchestration Plane For AX Fabric
+**Category:** Department-Scale Private AI Fleet Control Plane
+
+**Product:** The serving and orchestration layer for multi-model private AI fleets operated by SMEs and enterprise departments.
 
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/defai-digital/ax-serving)
 [![rust-1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
 [![Tests: 384 passing](https://img.shields.io/badge/tests-384%20passing-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
-[![license-AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![license-AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-AX Serving is the offline serving and orchestration layer behind [AX Fabric](https://github.com/defai-digital/ax-fabric). It provides OpenAI-compatible APIs, runtime model lifecycle control, scheduling, metrics, and multi-worker routing on Apple Silicon.
+AX Serving is the serving and orchestration control plane behind
+[AX Fabric](https://github.com/defai-digital/ax-fabric). It is designed for
+department-scale private AI fleets that need OpenAI-compatible APIs, runtime
+model lifecycle control, scheduling, metrics, audit surfaces, and multi-worker
+routing across heterogeneous workers.
 
 For inference execution, AX Serving uses:
 - `llama.cpp` by default for all model loads
 - `ax-engine` when explicitly requested via `native` backend override
 
-AX Fabric is the product-facing layer for retrieval, knowledge, and grounded agent workflows. AX Serving is the infrastructure layer that makes that stack deployable and operable.
+AX Fabric is the product-facing layer for retrieval, knowledge, and grounded
+agent workflows. AX Serving is the infrastructure layer that makes that stack
+deployable and operable across Mac-led and mixed-worker environments.
 
-Status: production-ready Rust workspace for Apple Silicon (`aarch64-apple-darwin`) with OpenAI-compatible REST, gRPC, runtime model management, and optional multi-worker orchestration.
+Status: production-ready Rust workspace for Apple Silicon
+(`aarch64-apple-darwin`) with OpenAI-compatible REST, gRPC, runtime model
+management, and multi-worker orchestration oriented around department-scale
+private AI serving.
 
-What AX Serving is:
-- the serving/control-plane subsystem behind AX Fabric
-- not the end-user product surface
-- not the low-level inference engine itself
+## Market Focus
 
-What AX Serving is for:
-- single-node offline serving
-- multi-worker model routing and health-aware dispatch
-- operator-facing runtime control, diagnostics, metrics, and audit surfaces
-- OSS and Business deployments of the public repo
+AX Serving is built to win in three adjacent niches:
+
+- department-scale private AI fleet control planes
+- mixed-worker orchestration across Thor-class, Mac Studio-class, and future workers
+- serving infrastructure for governed private AI stacks such as AX Fabric
+
+Who it is for:
+
+- SMEs and enterprise departments with fewer than ~100 users or operators
+- platform and infra teams running private AI fleets
+- operators who need more than a single local runtime process
+- teams that care about model lifecycle, routing, metrics, health, audit, and fleet operations
+- private deployments that need an OpenAI-compatible serving layer without a cloud-first dependency
+
+What it is not:
+
+- not an end-user desktop chat app
+- not a generic CUDA hyperscale serving stack
+- not the low-level token-generation engine itself
+
+Deployment fit:
+
+- `Thor grid`: a strong fit for standard operations and high-parallel inference on `<=70B` models
+- `Mac Studio grid`: a strong fit for larger-memory tiers, including `>70B` models and memory-heavy workloads
+- `Mac` control plane: coordinates mixed worker fleets and turns heterogeneous hardware into one operable serving system
+
+For market positioning, competitive analysis, and ICP details, see:
+
+- [docs/market-positioning.md](docs/market-positioning.md)
+- [docs/competitive-landscape.md](docs/competitive-landscape.md)
+- [docs/icp-and-demand.md](docs/icp-and-demand.md)
+- [docs/prd/PRD-AX-SERVING-v3.0.md](docs/prd/PRD-AX-SERVING-v3.0.md)
+- [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
 
 * * *
 
-## Editions
+## Licensing And Commercial Use
 
-Jump to: [OSS](#oss) | [Business](#business)
+AX Serving is dual-licensed:
 
-| Capability | OSS | Business |
-| --- | --- | --- |
-| OpenAI-compatible REST + gRPC serving | Yes | Yes |
-| Runtime model load/unload/reload APIs | Yes | Yes |
-| Scheduler controls, metrics, dashboard, and admin APIs | Yes | Yes |
-| Benchmark/soak tooling (`ax-serving-bench`) | Yes | Yes |
-| Single-node offline runtime | Yes | Yes |
-| Multi-worker Mac Grid orchestration | No | Yes |
-| Commercial licensing terms | No | Included |
-| Optional support arrangements | No | By agreement |
+- Open-source use: `AGPL-3.0-or-later`
+- Commercial use: available under separate written license
 
-<details>
-<summary><strong id="oss">OSS</strong></summary>
+Commercial licensing is intended for organizations that want to use AX Serving
+as a proprietary serving backend, private inference/control plane, embedded
+runtime, OEM component, managed fleet, or enterprise integration layer without
+AGPL obligations.
 
-- License: AGPL-3.0-only
-- Best for local builders, evaluation, and teams operating under OSS terms
-- Single-node serving surface in the public repo
+Commercial engagements may include:
 
-</details>
+- commercial runtime licensing
+- private deployment rights
+- OEM / embedded redistribution rights
+- enterprise fleet and mixed-node integration work
+- support, service, and deployment terms
 
-<details>
-<summary><strong id="business">Business</strong></summary>
+The public repository contains the public source distribution, including
+single-node and multi-worker serving/orchestration capabilities. Commercial
+agreements govern usage outside AGPL obligations, private packaging, and
+enterprise delivery terms.
 
-- Includes everything in OSS
-- Available under [commercial terms](LICENSE-COMMERCIAL.md) as an alternative to AGPL obligations
-- Adds multi-worker Mac Grid deployment in the public repo
-- License key activation via `AXS_LICENSE_KEY` or `POST /v1/license`
-
-</details>
-
-Private enterprise work is handled in a separate private project. This public repository covers OSS and Business.
+See [LICENSING.md](LICENSING.md) and
+[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
 
 * * *
 
@@ -138,7 +166,7 @@ Most local runtimes focus on single-process inference. AX Serving focuses on the
 - runtime model load/unload/reload
 - admission queueing and concurrency control
 - metrics, dashboard, diagnostics, and audit surfaces
-- multi-worker orchestration for Business deployments
+- multi-worker orchestration in the public repo
 - benchmark and soak tooling in the same repo
 
 Positioning:
@@ -153,6 +181,7 @@ AX Serving is not itself the token-generation engine. It is the serving layer th
 - `llama.cpp` is the default backend for model loading across families.
 - `ax-engine` remains an explicit opt-in path for environments that can benefit from native execution.
 - routing between those backends is controlled through [`config/backends.yaml`](config/backends.yaml)
+- `ax-engine` is pinned to v1.2.2-compatible `0959a65` because `v1.3.1` regressed the shipped `gdn.metal` file and the `v1.3.2` commit path does not currently compile cleanly in this workspace snapshot.
 
 In practice, this means AX Serving owns the APIs, scheduling, orchestration, health, metrics, and model lifecycle, while model execution defaults to `llama.cpp` with `ax-engine` as an explicit override.
 
@@ -203,7 +232,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
   --port 18080
 ```
 
-### 3. Gateway + Workers (`ax-serving-api` + workers, Business)
+### 3. Gateway + Workers (`ax-serving-api` + workers)
 
 Gateway:
 
@@ -251,7 +280,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
 - `GET /v1/admin/audit`
 - `GET /v1/admin/policy`
 
-### Orchestrator (`ax-serving-api`, Business)
+### Orchestrator (`ax-serving-api`)
 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
@@ -291,9 +320,6 @@ Admin/control-plane notes:
 
 - `AXS_SPLIT_SCHEDULER=true`
   - enables prefill/decode activity tracking in scheduler metrics
-- `AXS_MAX_BATCH_SIZE` / `AXS_BATCH_WINDOW_MS`
-  - currently advisory scheduler hints only
-  - they are exposed for future scheduler work and do not drive a batching loop today
 
 Relevant scheduler metrics:
 - `prefill_tokens_active`
@@ -406,6 +432,12 @@ Other benchmark modes:
 ## Documentation
 
 - [QUICKSTART.md](QUICKSTART.md)
+- [docs/market-positioning.md](docs/market-positioning.md)
+- [docs/competitive-landscape.md](docs/competitive-landscape.md)
+- [docs/icp-and-demand.md](docs/icp-and-demand.md)
+- [docs/prd/PRD-AX-SERVING-v3.0.md](docs/prd/PRD-AX-SERVING-v3.0.md)
+- [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
+- [docs/adr/README.md](docs/adr/README.md)
 - `docs/contracts/ax-fabric-runtime-contract.md`
 - `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
 - `sdk/python/` (Python SDK)
@@ -417,5 +449,5 @@ Other benchmark modes:
 ## Licensing
 
 - Open-source terms: [AGPL v3 text](LICENSE) and [licensing guide](LICENSING.md)
-- Commercial terms: [commercial license](LICENSE-COMMERCIAL.md)
+- Commercial terms: [commercial licensing summary](LICENSE-COMMERCIAL.md)
 - Issue reporting policy: [CONTRIBUTING.md](CONTRIBUTING.md)
