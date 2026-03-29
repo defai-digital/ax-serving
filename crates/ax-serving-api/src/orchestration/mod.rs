@@ -32,6 +32,7 @@ pub mod policy;
 pub mod queue;
 pub mod registry;
 
+use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,7 +48,7 @@ use axum::{
 };
 use serde::Deserialize;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use self::direct::DirectDispatcher;
 use self::health_ticker::HealthTicker;
@@ -63,6 +64,10 @@ use crate::auth::RequestId;
 use crate::license::LicenseState;
 use crate::project_policy;
 use crate::rest::schema::InputMessage;
+use crate::utils::request_meta::{
+    audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u32,
+    estimate_text_prompt_tokens_u32,
+};
 
 pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
 
@@ -72,35 +77,6 @@ fn is_loopback_bind_host(host: &str) -> bool {
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false)
-}
-
-fn estimated_tokens_from_text(text: &str) -> u32 {
-    let chars = text.chars().count() as u32;
-    chars.saturating_add(3) / 4
-}
-
-fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u32 {
-    messages
-        .iter()
-        .map(|msg| {
-            let role_tokens = estimated_tokens_from_text(&msg.role);
-            let name_tokens = msg
-                .name
-                .as_deref()
-                .map(estimated_tokens_from_text)
-                .unwrap_or(0);
-            let content_tokens = estimated_tokens_from_text(&msg.content.as_text());
-            role_tokens
-                .saturating_add(name_tokens)
-                .saturating_add(content_tokens)
-                .saturating_add(4)
-        })
-        .sum::<u32>()
-        .max(1)
-}
-
-fn estimate_text_prompt_tokens(prompt: &str) -> u32 {
-    estimated_tokens_from_text(prompt).max(1)
 }
 
 // ── OrchestratorLayer ─────────────────────────────────────────────────────────
@@ -264,9 +240,9 @@ async fn proxy_inference(
                 v.stream,
                 v.max_tokens,
                 if !v.messages.is_empty() {
-                    Some(estimate_chat_prompt_tokens(&v.messages))
+                    Some(estimate_chat_prompt_tokens_u32(&v.messages))
                 } else {
-                    v.prompt.as_deref().map(estimate_text_prompt_tokens)
+                    v.prompt.as_deref().map(estimate_text_prompt_tokens_u32)
                 },
             ),
             Err(_) => {
@@ -425,16 +401,6 @@ struct AuditQuery {
     limit: usize,
 }
 
-fn default_audit_limit() -> usize {
-    50
-}
-
-fn audit_actor(req_id: Option<Extension<RequestId>>) -> String {
-    req_id
-        .map(|id| format!("request:{}", id.0.0))
-        .unwrap_or_else(|| "request:unknown".to_string())
-}
-
 fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_json::Value {
     serde_json::json!({
         "service": "orchestrator",
@@ -455,10 +421,7 @@ fn orchestrator_startup_report_value(layer: &Arc<OrchestratorLayer>) -> serde_js
             "global_queue_depth": layer.config.global_queue_depth,
             "global_queue_wait_ms": layer.config.global_queue_wait_ms,
         },
-        "dispatch_runtime": {
-            "scheduler_managed_batching": false,
-            "batch_hints_advisory_only": true,
-        },
+        "dispatch_runtime": {},
         "project_policy": project_policy::summary_json(&layer.project_policy),
         "governance": {
             "project_policy_enabled": layer.project_policy.enabled,
@@ -756,33 +719,36 @@ fn accumulate_fleet_bucket(
             "max_error_rate": 0.0_f64,
         })
     });
-    let obj = entry.as_object_mut().expect("fleet bucket must be object");
-    increment_bucket(obj, "workers", 1_u64);
-    if worker.health == "healthy" {
-        increment_bucket(obj, "healthy", 1_u64);
-    }
-    if worker.drain {
-        increment_bucket(obj, "draining", 1_u64);
-    }
-    if worker.health == "healthy" && !worker.drain {
-        increment_bucket(obj, "eligible", 1_u64);
-    }
-    increment_bucket(obj, "total_inflight", worker.inflight as u64);
-    increment_bucket(
-        obj,
-        "total_active_sequences",
-        worker.active_sequences as u64,
-    );
-    increment_bucket(obj, "total_queue_depth", worker.queue_depth as u64);
-    let current_max = obj
-        .get("max_error_rate")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    if worker.error_rate > current_max {
-        obj.insert(
-            "max_error_rate".to_string(),
-            serde_json::Value::from(worker.error_rate),
+    if let Some(obj) = entry.as_object_mut() {
+        increment_bucket(obj, "workers", 1_u64);
+        if worker.health == "healthy" {
+            increment_bucket(obj, "healthy", 1_u64);
+        }
+        if worker.drain {
+            increment_bucket(obj, "draining", 1_u64);
+        }
+        if worker.health == "healthy" && !worker.drain {
+            increment_bucket(obj, "eligible", 1_u64);
+        }
+        increment_bucket(obj, "total_inflight", worker.inflight as u64);
+        increment_bucket(
+            obj,
+            "total_active_sequences",
+            worker.active_sequences as u64,
         );
+        increment_bucket(obj, "total_queue_depth", worker.queue_depth as u64);
+        let current_max = obj
+            .get("max_error_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if worker.error_rate > current_max {
+            obj.insert(
+                "max_error_rate".to_string(),
+                serde_json::Value::from(worker.error_rate),
+            );
+        }
+    } else {
+        warn!(key = %key, "unexpected non-object fleet bucket encountered");
     }
 }
 
@@ -1171,10 +1137,17 @@ pub async fn start_orchestrator(
 
         let ctrl_c = async { tokio::signal::ctrl_c().await.ok() };
         let sigterm = async {
-            signal(SignalKind::terminate())
-                .expect("failed to install SIGTERM handler")
-                .recv()
-                .await
+            match signal(SignalKind::terminate()) {
+                Ok(mut stream) => stream.recv().await,
+                Err(err) => {
+                    warn!(
+                        %err,
+                        "failed to install SIGTERM handler; continuing with SIGINT only"
+                    );
+                    pending::<()>().await;
+                    None
+                }
+            }
         };
         tokio::select! {
             _ = ctrl_c => {}

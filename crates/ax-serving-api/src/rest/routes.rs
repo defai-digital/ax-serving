@@ -20,8 +20,9 @@ use uuid::Uuid;
 
 use super::schema::*;
 use super::validation::{
-    build_generation_params, cache_ttl_err, resolve_grammar, resolve_logprobs, validate_max_tokens,
-    validate_model_identifier, validate_response_format, validate_sampling_params,
+    build_generation_params, cache_ttl_err, effective_max_tokens, map_stop_reason, resolve_grammar,
+    resolve_logprobs, validate_max_tokens, validate_model_identifier,
+    validate_multimodal_backend_support, validate_response_format, validate_sampling_params,
 };
 use crate::ServingLayer;
 use crate::auth::RequestId;
@@ -29,6 +30,10 @@ use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference
 use crate::project_policy;
 use crate::registry::RegistryError;
 use crate::scheduler::{SchedulerError, SchedulerPermit};
+use crate::utils::request_meta::{
+    audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u64,
+    estimate_text_prompt_tokens_u64,
+};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// Map a scheduler error to the correct HTTP status code.
@@ -153,41 +158,75 @@ fn sse_json_event<T: Serialize>(value: &T) -> Event {
 /// response without back-pressure on the inference thread.
 const GENERATE_CHANNEL_CAPACITY: usize = 512;
 
-/// Characters per token for the heuristic fallback estimator (4 chars ≈ 1 token,
-/// matching the GPT-3/4 rule-of-thumb for English text).
-const CHARS_PER_TOKEN: u64 = 4;
+// ── Shared cache helpers ─────────────────────────────────────────────────────
 
-/// Token overhead added per chat message to account for role/separator framing.
-/// Matches the +4 tokens per message used by the OpenAI tiktoken cookbook.
-const MESSAGE_FRAMING_TOKENS: u64 = 4;
-
-fn estimated_tokens_from_text(text: &str) -> u64 {
-    let chars = text.chars().count() as u64;
-    chars.saturating_add(CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+fn record_cache_error(metrics: &crate::cache::CacheMetrics, msg: impl std::fmt::Display) {
+    metrics.errors.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!("cache error: {msg}");
 }
 
-fn estimate_chat_prompt_tokens(messages: &[InputMessage]) -> u64 {
-    messages
-        .iter()
-        .map(|msg| {
-            let role_tokens = estimated_tokens_from_text(&msg.role);
-            let name_tokens = msg
-                .name
-                .as_deref()
-                .map(estimated_tokens_from_text)
-                .unwrap_or(0);
-            let content_tokens = estimated_tokens_from_text(&msg.content.as_text());
-            role_tokens
-                .saturating_add(name_tokens)
-                .saturating_add(content_tokens)
-                .saturating_add(MESSAGE_FRAMING_TOKENS)
-        })
-        .sum::<u64>()
-        .max(1)
+fn cache_hit_response(hit_json: String) -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        hit_json,
+    )
+        .into_response()
 }
 
-fn estimate_text_prompt_tokens(prompt: &str) -> u64 {
-    estimated_tokens_from_text(prompt).max(1)
+async fn write_cache_and_record<T: Serialize>(
+    cache: &crate::cache::ResponseCache,
+    key: &str,
+    value: &T,
+    ttl: std::time::Duration,
+    cache_metrics: &crate::cache::CacheMetrics,
+    serving_metrics: &crate::metrics::MetricsStore,
+) {
+    if let Err(e) = cache.set(key, value, ttl).await {
+        record_cache_error(cache_metrics, format_args!("write: {e}"));
+    } else {
+        serving_metrics.record_cache_fill();
+    }
+}
+
+/// Build a logprobs payload from token-level probability data.
+fn build_logprobs_payload(
+    logprobs_enabled: bool,
+    lp_data: Option<(f32, Vec<(String, f32)>)>,
+    token_text: &str,
+) -> Option<StreamLogprobs> {
+    if !logprobs_enabled {
+        return None;
+    }
+    let content = if let Some((lp, top)) = lp_data {
+        let top_logprobs = top
+            .iter()
+            .map(|(t, l)| StreamTopLogprob {
+                token: t.clone(),
+                logprob: *l,
+                bytes: t.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        vec![StreamTokenLogprob {
+            token: token_text.to_string(),
+            logprob: lp,
+            bytes: token_text.as_bytes().to_vec(),
+            top_logprobs,
+        }]
+    } else {
+        Vec::new()
+    };
+    Some(StreamLogprobs { content })
+}
+
+/// Emit a Prometheus metric (HELP + TYPE + value) into a buffer.
+macro_rules! prom {
+    ($buf:expr, $name:expr, $ty:expr, $help:expr, $val:expr) => {{
+        $buf.push_str(concat!("# HELP ", $name, " "));
+        $buf.push_str($help);
+        $buf.push_str(concat!("\n# TYPE ", $name, " ", $ty, "\n"));
+        $buf.push_str(&format!(concat!($name, " {}\n"), $val));
+    }};
 }
 
 /// POST /v1/chat/completions
@@ -248,10 +287,7 @@ pub async fn chat_completions(
 
     // Apply the server-side default when the client omits max_tokens.
     // A configured default of 0 means "no cap" (pass None to the backend).
-    let effective_max_tokens: Option<u32> = req.max_tokens.or_else(|| {
-        let d = layer.default_max_tokens;
-        if d > 0 { Some(d) } else { None }
-    });
+    let effective_max_tokens = effective_max_tokens(req.max_tokens, layer.default_max_tokens);
     if let Err(resp) = project_policy::enforce(
         &headers,
         &req.model,
@@ -272,6 +308,14 @@ pub async fn chat_completions(
                 .into_response();
         }
     };
+
+    let has_image_input = req.messages.iter().any(|msg| msg.content.has_images());
+    if let Some(resp) = validate_multimodal_backend_support(
+        has_image_input,
+        layer.backend.backend_name_for_handle(entry.handle),
+    ) {
+        return resp;
+    }
 
     let handle = entry.handle;
     let model_name = req.model.clone();
@@ -309,20 +353,16 @@ pub async fn chat_completions(
                                 if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                                     // Immediate cache hit — bypass admission entirely.
                                     layer.metrics.record_exact_cache_hit();
-                                    return (
-                                        StatusCode::OK,
-                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                        hit_json,
-                                    )
-                                        .into_response();
+                                    return cache_hit_response(hit_json);
                                 }
-                                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("cache read error: invalid cached JSON payload");
+                                record_cache_error(
+                                    &layer.cache_metrics,
+                                    "invalid cached JSON payload",
+                                );
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("cache read error: {e}");
+                                record_cache_error(&layer.cache_metrics, format_args!("read: {e}"));
                             }
                         }
                         // Leader, no immediate hit — set up for inference + caching.
@@ -344,8 +384,7 @@ pub async fn chat_completions(
                 }
             }
             Err(e) => {
-                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("cache key generation error: {e}");
+                record_cache_error(&layer.cache_metrics, format_args!("key generation: {e}"));
             }
         }
     }
@@ -383,20 +422,13 @@ pub async fn chat_completions(
                             .metrics
                             .cache_follower_waiting
                             .fetch_sub(1, Ordering::Relaxed);
-                        return (
-                            StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            hit_json,
-                        )
-                            .into_response();
+                        return cache_hit_response(hit_json);
                     }
-                    layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("cache read error: invalid cached JSON payload");
+                    record_cache_error(&layer.cache_metrics, "invalid cached JSON payload");
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("cache read error: {e}");
+                    record_cache_error(&layer.cache_metrics, &e);
                 }
             }
             if attempts >= layer.cache_inflight_max_retries {
@@ -457,7 +489,7 @@ pub async fn chat_completions(
 
     // Split-scheduler prompt estimation is only needed when the feature is enabled.
     let estimated_prompt_tokens = if layer.scheduler.split_enabled {
-        estimate_chat_prompt_tokens(&req.messages)
+        estimate_chat_prompt_tokens_u64(&req.messages)
     } else {
         0
     };
@@ -664,29 +696,7 @@ fn stream_response(
                                 (None, None)
                             };
 
-                            let logprobs_payload = if logprobs {
-                                let content = if let Some((lp, top)) = lp_data {
-                                    let top_logprobs = top
-                                        .iter()
-                                        .map(|(t, l)| StreamTopLogprob {
-                                            token: t.clone(),
-                                            logprob: *l,
-                                            bytes: t.as_bytes().to_vec(),
-                                        })
-                                        .collect::<Vec<_>>();
-                                    vec![StreamTokenLogprob {
-                                        token: text.clone(),
-                                        logprob: lp,
-                                        bytes: text.as_bytes().to_vec(),
-                                        top_logprobs,
-                                    }]
-                                } else {
-                                    Vec::new()
-                                };
-                                Some(StreamLogprobs { content })
-                            } else {
-                                None
-                            };
+                            let logprobs_payload = build_logprobs_payload(logprobs, lp_data, &text);
 
                             let delta = StreamChatDelta {
                                 role: if first_token { Some("assistant") } else { None },
@@ -777,11 +787,7 @@ fn stream_response(
                                         content: None,
                                         tool_calls: None,
                                     },
-                                    finish_reason: Some(match stats.stop_reason.as_str() {
-                                        "length" => "length",
-                                        "content_filter" => "content_filter",
-                                        _ => "stop",
-                                    }),
+                                    finish_reason: Some(map_stop_reason(&stats.stop_reason)),
                                     logprobs: None,
                                 }],
                                 usage: Some(StreamUsage {
@@ -815,8 +821,26 @@ fn stream_response(
                                 ),
                             ))
                         }
-                        // TokenLogprob is handled above; this arm is unreachable.
-                        GenerateEvent::TokenLogprob { .. } => unreachable!(),
+                        GenerateEvent::TokenLogprob { .. } => {
+                            tracing::warn!(
+                                "rest/routes: unexpected TokenLogprob event in chat stream"
+                            );
+                            let env = ErrorEnvelope {
+                                error: "unexpected token logprob event",
+                            };
+                            let ev = Event::default().event("error").data(
+                                serde_json::to_string(&env).unwrap_or_else(|_| {
+                                    "{\"error\":\"serialization failure\"}".to_string()
+                                }),
+                            );
+                            Some((
+                                Ok(ev),
+                                (
+                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
+                            ))
+                        }
                     }
                 }
             }
@@ -837,6 +861,31 @@ fn with_timing(mut resp: Response, queue_wait_us: u64) -> Response {
         resp.headers_mut().insert("x-ax-stage-timing", val);
     }
     resp
+}
+
+fn slo_pass_gauges(
+    total_requests: u64,
+    rejected_requests: u64,
+    e2e_p99_us: u64,
+    queue_p99_us: u64,
+    slo_e2e_p99_ms: u64,
+    slo_queue_p99_ms: u64,
+    slo_max_error_rate: f64,
+) -> (u8, u8, u8) {
+    let error_rate = if total_requests > 0 {
+        rejected_requests as f64 / total_requests as f64
+    } else {
+        0.0
+    };
+
+    // Require at least one completed request before reporting pass.
+    // Without this guard all three gauges would be 1 at startup / idle,
+    // which is a false positive that masks misconfigured alerting rules.
+    let have_data = total_requests > 0;
+    let e2e_pass = u8::from(have_data && e2e_p99_us <= slo_e2e_p99_ms * 1_000);
+    let queue_pass = u8::from(have_data && queue_p99_us <= slo_queue_p99_ms * 1_000);
+    let error_pass = u8::from(have_data && error_rate <= slo_max_error_rate);
+    (e2e_pass, queue_pass, error_pass)
 }
 
 fn record_generation_stats(
@@ -1039,12 +1088,7 @@ async fn blocking_response(
     drop(permit);
 
     if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl) {
-        if let Err(e) = cache.set(&key, &response, ttl).await {
-            cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("cache write error: {e}");
-        } else {
-            metrics.record_cache_fill();
-        }
+        write_cache_and_record(cache, &key, &response, ttl, cache_metrics, metrics).await;
     }
 
     with_timing(
@@ -1102,10 +1146,7 @@ pub async fn text_completions(
         return r;
     }
 
-    let effective_max_tokens: Option<u32> = req.max_tokens.or_else(|| {
-        let d = layer.default_max_tokens;
-        if d > 0 { Some(d) } else { None }
-    });
+    let effective_max_tokens = effective_max_tokens(req.max_tokens, layer.default_max_tokens);
     if let Err(resp) = project_policy::enforce(
         &headers,
         &req.model,
@@ -1153,20 +1194,16 @@ pub async fn text_completions(
                             Ok(Some(hit_json)) => {
                                 if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                                     layer.metrics.record_exact_cache_hit();
-                                    return (
-                                        StatusCode::OK,
-                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                        hit_json,
-                                    )
-                                        .into_response();
+                                    return cache_hit_response(hit_json);
                                 }
-                                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("cache read error: invalid cached JSON payload");
+                                record_cache_error(
+                                    &layer.cache_metrics,
+                                    "invalid cached JSON payload",
+                                );
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("cache read error: {e}");
+                                record_cache_error(&layer.cache_metrics, format_args!("read: {e}"));
                             }
                         }
                         match cache.ttl_for_request(req.cache_ttl.as_deref()) {
@@ -1186,8 +1223,7 @@ pub async fn text_completions(
                 }
             }
             Err(e) => {
-                layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("cache key generation error: {e}");
+                record_cache_error(&layer.cache_metrics, format_args!("key generation: {e}"));
             }
         }
     }
@@ -1217,20 +1253,13 @@ pub async fn text_completions(
                             .metrics
                             .cache_follower_waiting
                             .fetch_sub(1, Ordering::Relaxed);
-                        return (
-                            StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            hit_json,
-                        )
-                            .into_response();
+                        return cache_hit_response(hit_json);
                     }
-                    layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("cache read error: invalid cached JSON payload");
+                    record_cache_error(&layer.cache_metrics, "invalid cached JSON payload");
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    layer.cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("cache read error: {e}");
+                    record_cache_error(&layer.cache_metrics, &e);
                 }
             }
             if attempts >= layer.cache_inflight_max_retries {
@@ -1286,7 +1315,7 @@ pub async fn text_completions(
     };
 
     let estimated_prompt_tokens = if layer.scheduler.split_enabled {
-        estimate_text_prompt_tokens(&req.prompt)
+        estimate_text_prompt_tokens_u64(&req.prompt)
     } else {
         0
     };
@@ -1458,29 +1487,7 @@ fn text_stream_response(
                                 (None, None)
                             };
 
-                            let logprobs_payload = if logprobs {
-                                let content = if let Some((lp, top)) = lp_data {
-                                    let top_logprobs = top
-                                        .iter()
-                                        .map(|(t, l)| StreamTopLogprob {
-                                            token: t.clone(),
-                                            logprob: *l,
-                                            bytes: t.as_bytes().to_vec(),
-                                        })
-                                        .collect::<Vec<_>>();
-                                    vec![StreamTokenLogprob {
-                                        token: text.clone(),
-                                        logprob: lp,
-                                        bytes: text.as_bytes().to_vec(),
-                                        top_logprobs,
-                                    }]
-                                } else {
-                                    Vec::new()
-                                };
-                                Some(StreamLogprobs { content })
-                            } else {
-                                None
-                            };
+                            let logprobs_payload = build_logprobs_payload(logprobs, lp_data, &text);
 
                             let chunk = StreamTextChunk {
                                 id: &id,
@@ -1523,11 +1530,7 @@ fn text_stream_response(
                                 choices: vec![StreamTextChoice {
                                     text: "",
                                     index: 0,
-                                    finish_reason: Some(match stats.stop_reason.as_str() {
-                                        "length" => "length",
-                                        "content_filter" => "content_filter",
-                                        _ => "stop",
-                                    }),
+                                    finish_reason: Some(map_stop_reason(&stats.stop_reason)),
                                     logprobs: None,
                                 }],
                                 usage: Some(StreamUsage {
@@ -1577,8 +1580,26 @@ fn text_stream_response(
                                 metrics,
                             ),
                         )),
-                        // TokenLogprob was resolved above; this arm is unreachable.
-                        GenerateEvent::TokenLogprob { .. } => unreachable!(),
+                        GenerateEvent::TokenLogprob { .. } => {
+                            tracing::warn!(
+                                "rest/routes: unexpected TokenLogprob event in text stream"
+                            );
+                            let env = ErrorEnvelope {
+                                error: "unexpected token logprob event",
+                            };
+                            let ev = Event::default().event("error").data(
+                                serde_json::to_string(&env).unwrap_or_else(|_| {
+                                    "{\"error\":\"serialization failure\"}".to_string()
+                                }),
+                            );
+                            Some((
+                                Ok(ev),
+                                (
+                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    metrics,
+                                ),
+                            ))
+                        }
                     }
                 }
             }
@@ -1711,12 +1732,7 @@ async fn text_blocking_response(
     drop(permit);
 
     if let (Some(cache), Some(key), Some(ttl)) = (cache, cache_key, cache_ttl) {
-        if let Err(e) = cache.set(&key, &response, ttl).await {
-            cache_metrics.errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("cache write error: {e}");
-        } else {
-            metrics.record_cache_fill();
-        }
+        write_cache_and_record(cache, &key, &response, ttl, cache_metrics, metrics).await;
     }
 
     with_timing(
@@ -1952,217 +1968,206 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
     let mut buf = String::with_capacity(PROMETHEUS_BUF_CAPACITY);
 
     // ── Scheduler ──────────────────────────────────────────────────────────
-    buf.push_str("# HELP axs_scheduler_queue_depth Current request queue depth\n");
-    buf.push_str("# TYPE axs_scheduler_queue_depth gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_queue_depth {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_queue_depth",
+        "gauge",
+        "Current request queue depth",
         m.queue_depth.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str("# HELP axs_scheduler_inflight_count Active inference requests\n");
-    buf.push_str("# TYPE axs_scheduler_inflight_count gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_inflight_count {}\n",
+    );
+    prom!(
+        buf,
+        "axs_scheduler_inflight_count",
+        "gauge",
+        "Active inference requests",
         m.inflight_count.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str("# HELP axs_scheduler_total_requests_total Total requests received\n");
-    buf.push_str("# TYPE axs_scheduler_total_requests_total counter\n");
-    buf.push_str(&format!(
-        "axs_scheduler_total_requests_total {}\n",
+    );
+    prom!(
+        buf,
+        "axs_scheduler_total_requests_total",
+        "counter",
+        "Total requests received",
         m.total_requests.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_rejected_requests_total Total requests rejected (queue full)\n",
     );
-    buf.push_str("# TYPE axs_scheduler_rejected_requests_total counter\n");
-    buf.push_str(&format!(
-        "axs_scheduler_rejected_requests_total {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_rejected_requests_total",
+        "counter",
+        "Total requests rejected (queue full)",
         m.rejected_requests.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_queued_requests_total Requests that entered the slow-path wait queue\n",
     );
-    buf.push_str("# TYPE axs_scheduler_queued_requests_total counter\n");
-    buf.push_str(&format!(
-        "axs_scheduler_queued_requests_total {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_queued_requests_total",
+        "counter",
+        "Requests that entered the slow-path wait queue",
         m.queued_requests.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_avg_queue_wait_us Average queue wait time in microseconds\n",
     );
-    buf.push_str("# TYPE axs_scheduler_avg_queue_wait_us gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_avg_queue_wait_us {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_avg_queue_wait_us",
+        "gauge",
+        "Average queue wait time in microseconds",
         m.avg_queue_wait_us()
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_queue_wait_p50_us Rolling P50 queue wait in microseconds (slow-path only)\n",
     );
-    buf.push_str("# TYPE axs_scheduler_queue_wait_p50_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_queue_wait_p50_us {qw_p50}\n"));
-
-    buf.push_str(
-        "# HELP axs_scheduler_queue_wait_p95_us Rolling P95 queue wait in microseconds (slow-path only)\n",
+    prom!(
+        buf,
+        "axs_scheduler_queue_wait_p50_us",
+        "gauge",
+        "Rolling P50 queue wait in microseconds (slow-path only)",
+        qw_p50
     );
-    buf.push_str("# TYPE axs_scheduler_queue_wait_p95_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_queue_wait_p95_us {qw_p95}\n"));
-
-    buf.push_str(
-        "# HELP axs_scheduler_queue_wait_p99_us Rolling P99 queue wait in microseconds (slow-path only)\n",
+    prom!(
+        buf,
+        "axs_scheduler_queue_wait_p95_us",
+        "gauge",
+        "Rolling P95 queue wait in microseconds (slow-path only)",
+        qw_p95
     );
-    buf.push_str("# TYPE axs_scheduler_queue_wait_p99_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_queue_wait_p99_us {qw_p99}\n"));
-
-    buf.push_str(
-        "# HELP axs_scheduler_e2e_p50_us Rolling P50 end-to-end latency in microseconds\n",
+    prom!(
+        buf,
+        "axs_scheduler_queue_wait_p99_us",
+        "gauge",
+        "Rolling P99 queue wait in microseconds (slow-path only)",
+        qw_p99
     );
-    buf.push_str("# TYPE axs_scheduler_e2e_p50_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p50_us {e2e_p50}\n"));
-
-    buf.push_str(
-        "# HELP axs_scheduler_e2e_p95_us Rolling P95 end-to-end latency in microseconds\n",
+    prom!(
+        buf,
+        "axs_scheduler_e2e_p50_us",
+        "gauge",
+        "Rolling P50 end-to-end latency in microseconds",
+        e2e_p50
     );
-    buf.push_str("# TYPE axs_scheduler_e2e_p95_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p95_us {e2e_p95}\n"));
-
-    buf.push_str(
-        "# HELP axs_scheduler_e2e_p99_us Rolling P99 end-to-end latency in microseconds\n",
+    prom!(
+        buf,
+        "axs_scheduler_e2e_p95_us",
+        "gauge",
+        "Rolling P95 end-to-end latency in microseconds",
+        e2e_p95
     );
-    buf.push_str("# TYPE axs_scheduler_e2e_p99_us gauge\n");
-    buf.push_str(&format!("axs_scheduler_e2e_p99_us {e2e_p99}\n"));
-
-    buf.push_str(
-        "# HELP axs_cache_follower_waiting Cache followers currently waiting pre-permit (WS3)\n",
+    prom!(
+        buf,
+        "axs_scheduler_e2e_p99_us",
+        "gauge",
+        "Rolling P99 end-to-end latency in microseconds",
+        e2e_p99
     );
-    buf.push_str("# TYPE axs_cache_follower_waiting gauge\n");
-    buf.push_str(&format!(
-        "axs_cache_follower_waiting {}\n",
+    prom!(
+        buf,
+        "axs_cache_follower_waiting",
+        "gauge",
+        "Cache followers currently waiting pre-permit (WS3)",
         m.cache_follower_waiting.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_prefill_tokens_active Estimated prompt tokens currently in prefill\n",
     );
-    buf.push_str("# TYPE axs_scheduler_prefill_tokens_active gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_prefill_tokens_active {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_prefill_tokens_active",
+        "gauge",
+        "Estimated prompt tokens currently in prefill",
         m.prefill_tokens_active.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_scheduler_decode_sequences_active Active sequences currently in decode\n",
     );
-    buf.push_str("# TYPE axs_scheduler_decode_sequences_active gauge\n");
-    buf.push_str(&format!(
-        "axs_scheduler_decode_sequences_active {}\n",
+    prom!(
+        buf,
+        "axs_scheduler_decode_sequences_active",
+        "gauge",
+        "Active sequences currently in decode",
         m.decode_sequences_active.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str(
-        "# HELP axs_ttft_p50_us Rolling P50 time-to-first-token in microseconds (streaming only)\n",
     );
-    buf.push_str("# TYPE axs_ttft_p50_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p50_us {ttft_p50}\n"));
-
-    buf.push_str(
-        "# HELP axs_ttft_p95_us Rolling P95 time-to-first-token in microseconds (streaming only)\n",
+    prom!(
+        buf,
+        "axs_ttft_p50_us",
+        "gauge",
+        "Rolling P50 time-to-first-token in microseconds (streaming only)",
+        ttft_p50
     );
-    buf.push_str("# TYPE axs_ttft_p95_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p95_us {ttft_p95}\n"));
-
-    buf.push_str(
-        "# HELP axs_ttft_p99_us Rolling P99 time-to-first-token in microseconds (streaming only)\n",
+    prom!(
+        buf,
+        "axs_ttft_p95_us",
+        "gauge",
+        "Rolling P95 time-to-first-token in microseconds (streaming only)",
+        ttft_p95
     );
-    buf.push_str("# TYPE axs_ttft_p99_us gauge\n");
-    buf.push_str(&format!("axs_ttft_p99_us {ttft_p99}\n"));
-
-    buf.push_str(
-        "# HELP axs_adaptive_inflight_limit Effective inflight limit (adaptive or static)\n",
+    prom!(
+        buf,
+        "axs_ttft_p99_us",
+        "gauge",
+        "Rolling P99 time-to-first-token in microseconds (streaming only)",
+        ttft_p99
     );
-    buf.push_str("# TYPE axs_adaptive_inflight_limit gauge\n");
-    buf.push_str(&format!(
-        "axs_adaptive_inflight_limit {}\n",
+    prom!(
+        buf,
+        "axs_adaptive_inflight_limit",
+        "gauge",
+        "Effective inflight limit (adaptive or static)",
         layer.scheduler.effective_inflight_limit()
-    ));
-
-    buf.push_str(
-        "# HELP axs_adaptive_target_p99_ms AIMD target P99 latency in milliseconds (0 = disabled)\n",
     );
-    buf.push_str("# TYPE axs_adaptive_target_p99_ms gauge\n");
-    buf.push_str(&format!(
-        "axs_adaptive_target_p99_ms {}\n",
+    prom!(
+        buf,
+        "axs_adaptive_target_p99_ms",
+        "gauge",
+        "AIMD target P99 latency in milliseconds (0 = disabled)",
         layer.scheduler.adaptive_target_p99_ms().unwrap_or(0)
-    ));
-
-    buf.push_str(
-        "# HELP axs_request_class_cold_requests_total Requests that executed inference without a cache result\n",
     );
-    buf.push_str("# TYPE axs_request_class_cold_requests_total counter\n");
-    buf.push_str(&format!(
-        "axs_request_class_cold_requests_total {}\n",
+    prom!(
+        buf,
+        "axs_request_class_cold_requests_total",
+        "counter",
+        "Requests that executed inference without a cache result",
         layer.metrics.cold_requests_total()
-    ));
-
-    buf.push_str(
-        "# HELP axs_request_class_exact_cache_hits_total Requests served immediately from exact response-cache hits\n",
     );
-    buf.push_str("# TYPE axs_request_class_exact_cache_hits_total counter\n");
-    buf.push_str(&format!(
-        "axs_request_class_exact_cache_hits_total {}\n",
+    prom!(
+        buf,
+        "axs_request_class_exact_cache_hits_total",
+        "counter",
+        "Requests served immediately from exact response-cache hits",
         layer.metrics.exact_cache_hits_total()
-    ));
-
-    buf.push_str(
-        "# HELP axs_request_class_cache_follower_hits_total Requests served from follower waits after a leader cache fill\n",
     );
-    buf.push_str("# TYPE axs_request_class_cache_follower_hits_total counter\n");
-    buf.push_str(&format!(
-        "axs_request_class_cache_follower_hits_total {}\n",
+    prom!(
+        buf,
+        "axs_request_class_cache_follower_hits_total",
+        "counter",
+        "Requests served from follower waits after a leader cache fill",
         layer.metrics.cache_follower_hits_total()
-    ));
-
-    buf.push_str(
-        "# HELP axs_request_class_cache_fills_total Successful exact response-cache writes after inference\n",
     );
-    buf.push_str("# TYPE axs_request_class_cache_fills_total counter\n");
-    buf.push_str(&format!(
-        "axs_request_class_cache_fills_total {}\n",
+    prom!(
+        buf,
+        "axs_request_class_cache_fills_total",
+        "counter",
+        "Successful exact response-cache writes after inference",
         layer.metrics.cache_fills_total()
-    ));
+    );
 
     // ── Thermal ────────────────────────────────────────────────────────────
-    buf.push_str(
-        "# HELP axs_thermal_state Thermal pressure state (0=Nominal 1=Fair 2=Serious 3=Critical)\n",
+    prom!(
+        buf,
+        "axs_thermal_state",
+        "gauge",
+        "Thermal pressure state (0=Nominal 1=Fair 2=Serious 3=Critical)",
+        thermal_val
     );
-    buf.push_str("# TYPE axs_thermal_state gauge\n");
-    buf.push_str(&format!("axs_thermal_state {thermal_val}\n"));
 
     // ── Cache ──────────────────────────────────────────────────────────────
-    buf.push_str("# HELP axs_cache_hits_total Response cache hits\n");
-    buf.push_str("# TYPE axs_cache_hits_total counter\n");
-    buf.push_str(&format!(
-        "axs_cache_hits_total {}\n",
+    prom!(
+        buf,
+        "axs_cache_hits_total",
+        "counter",
+        "Response cache hits",
         layer.cache_metrics.hits.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str("# HELP axs_cache_misses_total Response cache misses\n");
-    buf.push_str("# TYPE axs_cache_misses_total counter\n");
-    buf.push_str(&format!(
-        "axs_cache_misses_total {}\n",
+    );
+    prom!(
+        buf,
+        "axs_cache_misses_total",
+        "counter",
+        "Response cache misses",
         layer.cache_metrics.misses.load(Ordering::Relaxed)
-    ));
-
-    buf.push_str("# HELP axs_cache_writes_total Response cache writes\n");
-    buf.push_str("# TYPE axs_cache_writes_total counter\n");
-    buf.push_str(&format!(
-        "axs_cache_writes_total {}\n",
+    );
+    prom!(
+        buf,
+        "axs_cache_writes_total",
+        "counter",
+        "Response cache writes",
         layer.cache_metrics.writes.load(Ordering::Relaxed)
-    ));
+    );
 
     {
         let hits = layer.cache_metrics.hits.load(Ordering::Relaxed);
@@ -2181,21 +2186,29 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
     }
 
     // ── System ────────────────────────────────────────────────────────────
-    buf.push_str("# HELP axs_uptime_seconds Seconds since server start\n");
-    buf.push_str("# TYPE axs_uptime_seconds counter\n");
-    buf.push_str(&format!(
-        "axs_uptime_seconds {}\n",
+    prom!(
+        buf,
+        "axs_uptime_seconds",
+        "counter",
+        "Seconds since server start",
         layer.metrics.uptime_secs()
-    ));
-
-    buf.push_str("# HELP axs_rss_bytes Process resident set size in bytes\n");
-    buf.push_str("# TYPE axs_rss_bytes gauge\n");
-    buf.push_str(&format!("axs_rss_bytes {}\n", current_rss_bytes()));
+    );
+    prom!(
+        buf,
+        "axs_rss_bytes",
+        "gauge",
+        "Process resident set size in bytes",
+        current_rss_bytes()
+    );
 
     // ── Models ────────────────────────────────────────────────────────────
-    buf.push_str("# HELP axs_loaded_models_total Number of currently loaded models\n");
-    buf.push_str("# TYPE axs_loaded_models_total gauge\n");
-    buf.push_str(&format!("axs_loaded_models_total {loaded_count}\n"));
+    prom!(
+        buf,
+        "axs_loaded_models_total",
+        "gauge",
+        "Number of currently loaded models",
+        loaded_count
+    );
 
     buf.push_str("# HELP axs_model_kv_bytes_estimated Estimated KV cache bytes for full context\n");
     buf.push_str("# TYPE axs_model_kv_bytes_estimated gauge\n");
@@ -2223,57 +2236,81 @@ pub async fn prometheus_metrics(State(layer): State<Arc<ServingLayer>>) -> impl 
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.05);
 
-    let e2e_p99_us = m.e2e_p99_us();
-    let queue_p99_us = m.queue_wait_p99_us();
     let total = m.total_requests.load(Ordering::Relaxed);
     let rejected = m.rejected_requests.load(Ordering::Relaxed);
-    let error_rate = if total > 0 {
-        rejected as f64 / total as f64
-    } else {
-        0.0
-    };
+    let (e2e_pass, queue_pass, error_pass) = slo_pass_gauges(
+        total,
+        rejected,
+        e2e_p99,
+        qw_p99,
+        slo_e2e_p99_ms,
+        slo_queue_p99_ms,
+        slo_max_error_rate,
+    );
 
-    // Require at least one completed request before reporting pass.
-    // Without this guard all three gauges would be 1 at startup / idle,
-    // which is a false positive that masks misconfigured alerting rules.
-    let have_data = total > 0;
-    let e2e_pass = u8::from(have_data && e2e_p99_us <= slo_e2e_p99_ms * 1_000);
-    let queue_pass = u8::from(have_data && queue_p99_us <= slo_queue_p99_ms * 1_000);
-    let error_pass = u8::from(have_data && error_rate <= slo_max_error_rate);
-
-    buf.push_str("# HELP axs_slo_e2e_p99_pass 1 if e2e P99 latency is within SLO, 0 otherwise\n");
-    buf.push_str("# TYPE axs_slo_e2e_p99_pass gauge\n");
-    buf.push_str(&format!("axs_slo_e2e_p99_pass {e2e_pass}\n"));
-
-    buf.push_str("# HELP axs_slo_queue_p99_pass 1 if queue-wait P99 is within SLO, 0 otherwise\n");
-    buf.push_str("# TYPE axs_slo_queue_p99_pass gauge\n");
-    buf.push_str(&format!("axs_slo_queue_p99_pass {queue_pass}\n"));
-
-    buf.push_str("# HELP axs_slo_error_rate_pass 1 if rejection rate is within SLO, 0 otherwise\n");
-    buf.push_str("# TYPE axs_slo_error_rate_pass gauge\n");
-    buf.push_str(&format!("axs_slo_error_rate_pass {error_pass}\n"));
+    prom!(
+        buf,
+        "axs_slo_e2e_p99_pass",
+        "gauge",
+        "1 if e2e P99 latency is within SLO, 0 otherwise",
+        e2e_pass
+    );
+    prom!(
+        buf,
+        "axs_slo_queue_p99_pass",
+        "gauge",
+        "1 if queue-wait P99 is within SLO, 0 otherwise",
+        queue_pass
+    );
+    prom!(
+        buf,
+        "axs_slo_error_rate_pass",
+        "gauge",
+        "1 if rejection rate is within SLO, 0 otherwise",
+        error_pass
+    );
 
     // ── Burn-rate alerting ────────────────────────────────────────────────────
     // Multi-window SLO burn rate.  error_budget = 0.001 (99.9% availability).
     // Fast burn: 1h window > 14.4× → 2% budget in 1h   (Google SRE chapter 5).
     // Slow burn: 6h window >  6.0× → 5% budget in 6h.
-    let burn_1h = layer.metrics.burn_1h.lock().unwrap().burn_rate(0.001);
-    let burn_6h = layer.metrics.burn_6h.lock().unwrap().burn_rate(0.001);
+    let burn_1h = match layer.metrics.burn_1h.lock() {
+        Ok(metric) => metric.burn_rate(0.001),
+        Err(err) => {
+            tracing::warn!(%err, "burn-1h metric lock poisoned; continuing with poisoned state");
+            err.into_inner().burn_rate(0.001)
+        }
+    };
+    let burn_6h = match layer.metrics.burn_6h.lock() {
+        Ok(metric) => metric.burn_rate(0.001),
+        Err(err) => {
+            tracing::warn!(%err, "burn-6h metric lock poisoned; continuing with poisoned state");
+            err.into_inner().burn_rate(0.001)
+        }
+    };
     let burn_alert = u8::from((burn_1h > 14.4) || (burn_6h > 6.0));
 
-    buf.push_str("# HELP axs_slo_burn_rate_1h SLO error burn rate over 1-hour sliding window\n");
-    buf.push_str("# TYPE axs_slo_burn_rate_1h gauge\n");
-    buf.push_str(&format!("axs_slo_burn_rate_1h {burn_1h}\n"));
-
-    buf.push_str("# HELP axs_slo_burn_rate_6h SLO error burn rate over 6-hour sliding window\n");
-    buf.push_str("# TYPE axs_slo_burn_rate_6h gauge\n");
-    buf.push_str(&format!("axs_slo_burn_rate_6h {burn_6h}\n"));
-
-    buf.push_str(
-        "# HELP axs_slo_burn_rate_alert 1 if multi-window burn-rate alert is firing, 0 otherwise\n",
+    prom!(
+        buf,
+        "axs_slo_burn_rate_1h",
+        "gauge",
+        "SLO error burn rate over 1-hour sliding window",
+        burn_1h
     );
-    buf.push_str("# TYPE axs_slo_burn_rate_alert gauge\n");
-    buf.push_str(&format!("axs_slo_burn_rate_alert {burn_alert}\n"));
+    prom!(
+        buf,
+        "axs_slo_burn_rate_6h",
+        "gauge",
+        "SLO error burn rate over 6-hour sliding window",
+        burn_6h
+    );
+    prom!(
+        buf,
+        "axs_slo_burn_rate_alert",
+        "gauge",
+        "1 if multi-window burn-rate alert is firing, 0 otherwise",
+        burn_alert
+    );
 
     (
         StatusCode::OK,
@@ -2459,6 +2496,7 @@ pub async fn rest_unload_model(
 
     match result {
         Ok(Ok(())) => {
+            layer.per_model_scheduler.remove(&id_for_response);
             layer.audit.record(
                 audit_actor(req_id),
                 "model_unload",
@@ -2603,6 +2641,18 @@ struct CacheKeyPayload<'a> {
     max_tokens: Option<u32>,
     seed: Option<u64>,
     repeat_penalty: String,
+    stop: Option<Vec<String>>,
+    frequency_penalty: Option<String>,
+    presence_penalty: Option<String>,
+    grammar: Option<&'a str>,
+    response_format: Option<&'a ResponseFormat>,
+    mirostat: Option<u8>,
+    mirostat_tau: Option<String>,
+    mirostat_eta: Option<String>,
+    tools: Option<&'a Vec<Tool>>,
+    tool_choice: Option<&'a serde_json::Value>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u32>,
 }
 
 /// Build the raw bytes that are fed into the SHA-256 cache key.
@@ -2626,7 +2676,7 @@ fn build_cache_key(
         .collect();
 
     let payload = CacheKeyPayload {
-        version: "v2",
+        version: "v3",
         resolved_model_path,
         resolved_model_arch,
         messages,
@@ -2637,6 +2687,22 @@ fn build_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
+        stop: req.stop.as_ref().map(|s| {
+            let mut v = s.clone().into_vec();
+            v.sort();
+            v
+        }),
+        frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
+        presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
+        grammar: req.grammar.as_deref(),
+        response_format: req.response_format.as_ref(),
+        mirostat: req.mirostat,
+        mirostat_tau: req.mirostat_tau.map(|v| format!("{v:.4}")),
+        mirostat_eta: req.mirostat_eta.map(|v| format!("{v:.4}")),
+        tools: req.tools.as_ref(),
+        tool_choice: req.tool_choice.as_ref(),
+        logprobs: req.logprobs,
+        top_logprobs: req.top_logprobs,
     };
     serde_json::to_vec(&payload).map_err(anyhow::Error::from)
 }
@@ -2658,6 +2724,16 @@ struct TextCacheKeyPayload<'a> {
     max_tokens: Option<u32>,
     seed: Option<u64>,
     repeat_penalty: String,
+    stop: Option<Vec<String>>,
+    frequency_penalty: Option<String>,
+    presence_penalty: Option<String>,
+    grammar: Option<&'a str>,
+    response_format: Option<&'a ResponseFormat>,
+    mirostat: Option<u8>,
+    mirostat_tau: Option<String>,
+    mirostat_eta: Option<String>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u32>,
 }
 
 /// Build the raw bytes for the SHA-256 text-completion cache key.
@@ -2668,7 +2744,7 @@ fn build_text_cache_key(
     effective_max_tokens: Option<u32>,
 ) -> anyhow::Result<Vec<u8>> {
     let payload = TextCacheKeyPayload {
-        version: "v1",
+        version: "v2",
         kind: "text_completion",
         resolved_model_path,
         resolved_model_arch,
@@ -2680,6 +2756,20 @@ fn build_text_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
+        stop: req.stop.as_ref().map(|s| {
+            let mut v = s.clone().into_vec();
+            v.sort();
+            v
+        }),
+        frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
+        presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
+        grammar: req.grammar.as_deref(),
+        response_format: req.response_format.as_ref(),
+        mirostat: req.mirostat,
+        mirostat_tau: req.mirostat_tau.map(|v| format!("{v:.4}")),
+        mirostat_eta: req.mirostat_eta.map(|v| format!("{v:.4}")),
+        logprobs: req.logprobs,
+        top_logprobs: req.top_logprobs,
     };
     serde_json::to_vec(&payload).map_err(anyhow::Error::from)
 }
@@ -2695,16 +2785,6 @@ fn unix_now() -> u64 {
 pub struct AuditQuery {
     #[serde(default = "default_audit_limit")]
     limit: usize,
-}
-
-fn default_audit_limit() -> usize {
-    50
-}
-
-fn audit_actor(req_id: Option<Extension<RequestId>>) -> String {
-    req_id
-        .map(|id| format!("request:{}", id.0.0))
-        .unwrap_or_else(|| "request:unknown".to_string())
 }
 
 fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value {
@@ -2743,10 +2823,6 @@ fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_json::Value 
         "scheduler": {
             "effective_inflight_limit": layer.scheduler.effective_inflight_limit(),
             "split_scheduler_enabled": layer.scheduler.split_enabled,
-            "scheduler_managed_batching": false,
-            "batch_hints_advisory_only": true,
-            "max_batch_size_hint": layer.config.sched_max_batch_size,
-            "batch_window_ms_hint": layer.config.sched_batch_window_ms,
         },
         "cache": {
             "enabled": layer.cache.is_some(),
@@ -2827,17 +2903,16 @@ pub async fn embeddings(
         EmbeddingsInput::ManyTokens(t) => (None, Some(t)),
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        if let Some(texts) = strings_owned {
-            layer
-                .backend
-                .embed(handle, &EmbedInput::Strings(&texts), &config)
-        } else {
-            let seqs = tokens_owned.unwrap();
-            layer
-                .backend
-                .embed(handle, &EmbedInput::Tokens(&seqs), &config)
-        }
+    let result = tokio::task::spawn_blocking(move || match (strings_owned, tokens_owned) {
+        (Some(texts), None) => layer
+            .backend
+            .embed(handle, &EmbedInput::Strings(&texts), &config),
+        (None, Some(seqs)) => layer
+            .backend
+            .embed(handle, &EmbedInput::Tokens(&seqs), &config),
+        _ => Err(anyhow::anyhow!(
+            "embedding request payload had unsupported input state"
+        )),
     })
     .await;
 
@@ -3347,5 +3422,23 @@ mod tests {
     fn scheduler_error_status_generic_error_is_503() {
         let e: anyhow::Error = anyhow::anyhow!("some unexpected error");
         assert_eq!(scheduler_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn slo_pass_gauges_fail_closed_without_data() {
+        let (e2e_pass, queue_pass, error_pass) =
+            slo_pass_gauges(0, 0, 100, 100, 1_000, 1_000, 0.05);
+        assert_eq!((e2e_pass, queue_pass, error_pass), (0, 0, 0));
+    }
+
+    #[test]
+    fn slo_pass_gauges_apply_thresholds() {
+        let (e2e_pass, queue_pass, error_pass) =
+            slo_pass_gauges(100, 4, 900_000, 800_000, 1_000, 1_000, 0.05);
+        assert_eq!((e2e_pass, queue_pass, error_pass), (1, 1, 1));
+
+        let (e2e_pass, queue_pass, error_pass) =
+            slo_pass_gauges(100, 6, 1_100_000, 1_200_000, 1_000, 1_000, 0.05);
+        assert_eq!((e2e_pass, queue_pass, error_pass), (0, 0, 0));
     }
 }
