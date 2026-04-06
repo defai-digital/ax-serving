@@ -339,22 +339,34 @@ pub struct ModelEntry {
 
 // ── Model management ──────────────────────────────────────────────────────────
 
-/// POST /v1/models — load a model from a GGUF file.
+/// POST /v1/models — load a model.
+///
+/// Supports GGUF files (llama.cpp / native) and MLX model directories
+/// (SafeTensors format, `mlx_lm.server` backend).
 #[derive(Debug, Deserialize)]
 pub struct LoadModelRequest {
     /// Model ID to register (1–128 chars, alphanumeric/dash/underscore/dot).
     pub model_id: String,
-    /// Absolute or relative path to the `.gguf` file.
+    /// Path to the model.
+    ///
+    /// - GGUF backends: path to a `.gguf` file.
+    /// - MLX backend: path to an MLX model directory (`config.json` + `*.safetensors`).
     pub path: String,
     /// Override context length (0 / omit = use model default).
     #[serde(default)]
     pub context_length: Option<u32>,
-    /// Explicit backend: `"llama_cpp"` | `"lib_llama"` | `"native"` | `"auto"`.
-    /// Omit to use `llama_cpp` by default.
+    /// Explicit backend: `"llama_cpp"` | `"mlx"` | `"lib_llama"` | `"native"` | `"auto"`.
+    /// When set, takes precedence over the `mlx` flag.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Enable MLX backend (`mlx_lm.server`).
+    ///
+    /// When `true`, ax-serving routes to `mlx_lm.server` if the path is an MLX
+    /// model directory; otherwise falls back to llama.cpp automatically.
+    /// Ignored when `backend` is explicitly set.
+    #[serde(default)]
+    pub mlx: Option<bool>,
     /// Path to a multimodal projector (`.gguf`) for vision models (LLaVA etc.).
-    /// Passed as `--mmproj` to llama-server when using the llama_cpp backend.
     #[serde(default)]
     pub mmproj_path: Option<String>,
     /// Override GPU layer count (`--n-gpu-layers`).  `None` = backend default.

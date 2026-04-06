@@ -41,3 +41,4 @@ bindgen = "0.70"
 
 [dev-dependencies]
 rstest = { workspace = true }
+tempfile = "3"

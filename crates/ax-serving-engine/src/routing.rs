@@ -70,6 +70,7 @@ use crate::{
     GenerationParams, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
     ax_engine::AxEngineBackend,
     llamacpp::{LlamaCppBackend, LlamaCppConfig},
+    mlx::{MlxBackend, MlxConfig, is_mlx_model},
 };
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -89,6 +90,10 @@ pub enum BackendChoice {
     /// No speculative probing — the decision is made before any load attempt.
     #[default]
     Auto,
+    /// Use the MLX backend (`mlx_lm.server`).
+    /// Only valid via `backend_hint = "mlx"` in `LoadConfig`.
+    /// If the model path is not an MLX directory, falls back to llama.cpp.
+    Mlx,
 }
 
 /// Top-level routing configuration, loaded from `backends.yaml`.
@@ -351,6 +356,7 @@ fn next_router_handle() -> ModelHandle {
 enum BackendTag {
     Native,
     LlamaCpp,
+    Mlx,
     /// Direct C API backend — only usable when `libllama` feature is compiled.
     #[cfg_attr(not(feature = "libllama"), allow(dead_code))]
     LibLlama,
@@ -361,12 +367,13 @@ struct RouterEntry {
     inner: ModelHandle,
 }
 
-/// `InferenceBackend` that routes to ax-engine native, llama.cpp, or libllama
-/// based on `RoutingConfig`.
+/// `InferenceBackend` that routes to ax-engine native, llama.cpp, mlx-lm, or
+/// libllama based on `RoutingConfig` and per-load `backend_hint`.
 pub struct RouterBackend {
     config: RoutingConfig,
     native: Arc<AxEngineBackend>,
     llamacpp: Arc<LlamaCppBackend>,
+    mlx: Arc<MlxBackend>,
     #[cfg(feature = "libllama")]
     libllama: Arc<LibLlamaBackend>,
     entries: RwLock<HashMap<ModelHandle, RouterEntry>>,
@@ -391,11 +398,12 @@ impl RouterBackend {
         })
     }
 
-    pub fn new(routing: RoutingConfig, llamacpp: LlamaCppConfig) -> Self {
+    pub fn new(routing: RoutingConfig, llamacpp: LlamaCppConfig, mlx: MlxConfig) -> Self {
         Self {
             config: routing,
             native: Arc::new(AxEngineBackend::new()),
             llamacpp: Arc::new(LlamaCppBackend::new(llamacpp)),
+            mlx: Arc::new(MlxBackend::new(mlx)),
             #[cfg(feature = "libllama")]
             libllama: Arc::new(LibLlamaBackend::new()),
             entries: RwLock::new(HashMap::new()),
@@ -412,24 +420,30 @@ impl RouterBackend {
     }
 
     /// Scan loaded entries and return which backend kinds have active models.
-    fn active_backend_tags(&self) -> (bool, bool, bool) {
+    fn active_backend_tags(&self) -> (bool, bool, bool, bool) {
         let entries = self.entries_read();
         let mut has_native = false;
         let mut has_llamacpp = false;
+        let mut has_mlx = false;
         let mut has_libllama = false;
         for entry in entries.values() {
             match entry.tag {
                 BackendTag::Native => has_native = true,
                 BackendTag::LlamaCpp => has_llamacpp = true,
+                BackendTag::Mlx => has_mlx = true,
                 BackendTag::LibLlama => has_libllama = true,
             }
         }
-        (has_native, has_llamacpp, has_libllama)
+        (has_native, has_llamacpp, has_mlx, has_libllama)
     }
 
     /// Convenience: create with defaults loaded from environment.
     pub fn from_env() -> Self {
-        Self::new(RoutingConfig::load_default(), LlamaCppConfig::from_env())
+        Self::new(
+            RoutingConfig::load_default(),
+            LlamaCppConfig::from_env(),
+            MlxConfig::from_env(),
+        )
     }
 }
 
@@ -439,6 +453,7 @@ macro_rules! dispatch {
         match $tag {
             BackendTag::Native => $self.native.$method($inner, $($arg),*),
             BackendTag::LlamaCpp => $self.llamacpp.$method($inner, $($arg),*),
+            BackendTag::Mlx => $self.mlx.$method($inner, $($arg),*),
             BackendTag::LibLlama => {
                 #[cfg(feature = "libllama")]
                 { $self.libllama.$method($inner, $($arg),*) }
@@ -460,8 +475,21 @@ impl InferenceBackend for RouterBackend {
                 // "auto" hint: use standard routing table (same as no hint).
                 // resolve() expands Auto via native_families, never returns Auto.
                 "auto" => self.config.resolve(path),
+                // "mlx" hint: detect MLX model directory; fall back to llama.cpp.
+                "mlx" => {
+                    if is_mlx_model(path) {
+                        BackendChoice::Mlx
+                    } else {
+                        warn!(
+                            "mlx backend requested but {} is not an MLX model directory \
+                             (needs config.json + *.safetensors); routing to llama.cpp",
+                            path.display()
+                        );
+                        BackendChoice::LlamaCpp
+                    }
+                }
                 other => anyhow::bail!(
-                    "unknown backend hint '{}'; valid values: llama_cpp, native, lib_llama, auto",
+                    "unknown backend hint '{}'; valid values: llama_cpp, native, mlx, lib_llama, auto",
                     other
                 ),
             }
@@ -480,6 +508,11 @@ impl InferenceBackend for RouterBackend {
                 info!("routing {} → llama.cpp", path.display());
                 let (inner, meta) = self.llamacpp.load_model(path, config)?;
                 (BackendTag::LlamaCpp, inner, meta)
+            }
+            BackendChoice::Mlx => {
+                info!("routing {} → mlx-lm", path.display());
+                let (inner, meta) = self.mlx.load_model(path, config)?;
+                (BackendTag::Mlx, inner, meta)
             }
             BackendChoice::LibLlama => {
                 #[cfg(feature = "libllama")]
@@ -519,6 +552,7 @@ impl InferenceBackend for RouterBackend {
             .map(|entry| match entry.tag {
                 BackendTag::Native => "native",
                 BackendTag::LlamaCpp => "llama_cpp",
+                BackendTag::Mlx => "mlx",
                 BackendTag::LibLlama => "lib_llama",
             })
     }
@@ -589,82 +623,52 @@ impl InferenceBackend for RouterBackend {
     }
 
     fn thermal_state(&self) -> ThermalState {
-        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
+        let (has_native, has_llamacpp, has_mlx, has_libllama) = self.active_backend_tags();
 
-        // Collect thermal states from active backends and return the worst.
         let mut worst = self.llamacpp.thermal_state(); // default for empty router
-        if has_native {
-            let t = self.native.thermal_state();
+        let mut update = |t: ThermalState| {
             if (t as u8) > (worst as u8) {
                 worst = t;
             }
-        }
-        if has_llamacpp {
-            let t = self.llamacpp.thermal_state();
-            if (t as u8) > (worst as u8) {
-                worst = t;
-            }
-        }
+        };
+        if has_native { update(self.native.thermal_state()); }
+        if has_llamacpp { update(self.llamacpp.thermal_state()); }
+        if has_mlx { update(self.mlx.thermal_state()); }
         #[cfg(feature = "libllama")]
-        if has_libllama {
-            let t = self.libllama.thermal_state();
-            if (t as u8) > (worst as u8) {
-                worst = t;
-            }
-        }
+        if has_libllama { update(self.libllama.thermal_state()); }
         let _ = has_libllama;
         worst
     }
 
     fn recommended_concurrency(&self) -> usize {
-        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
+        let (has_native, has_llamacpp, has_mlx, has_libllama) = self.active_backend_tags();
 
-        // Report the minimum concurrency across active backends (conservative).
         let mut min = self.llamacpp.recommended_concurrency(); // default
-        if has_native {
-            min = min.min(self.native.recommended_concurrency());
-        }
-        if has_llamacpp {
-            min = min.min(self.llamacpp.recommended_concurrency());
-        }
+        if has_native { min = min.min(self.native.recommended_concurrency()); }
+        if has_llamacpp { min = min.min(self.llamacpp.recommended_concurrency()); }
+        if has_mlx { min = min.min(self.mlx.recommended_concurrency()); }
         #[cfg(feature = "libllama")]
-        if has_libllama {
-            min = min.min(self.libllama.recommended_concurrency());
-        }
+        if has_libllama { min = min.min(self.libllama.recommended_concurrency()); }
         let _ = has_libllama;
         min
     }
 
     fn cache_telemetry(&self) -> CacheTelemetry {
-        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
+        let (has_native, has_llamacpp, has_mlx, has_libllama) = self.active_backend_tags();
 
-        // Sum telemetry across all active backends.
         let mut agg = CacheTelemetry::default();
-        if has_native {
-            let t = self.native.cache_telemetry();
+        let mut merge = |t: CacheTelemetry| {
             agg.kv_pages_used += t.kv_pages_used;
             agg.kv_pages_total += t.kv_pages_total;
             agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
             agg.active_batch_size += t.active_batch_size;
             agg.max_batch_size += t.max_batch_size;
-        }
-        if has_llamacpp {
-            let t = self.llamacpp.cache_telemetry();
-            agg.kv_pages_used += t.kv_pages_used;
-            agg.kv_pages_total += t.kv_pages_total;
-            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
-            agg.active_batch_size += t.active_batch_size;
-            agg.max_batch_size += t.max_batch_size;
-        }
+        };
+        if has_native { merge(self.native.cache_telemetry()); }
+        if has_llamacpp { merge(self.llamacpp.cache_telemetry()); }
+        if has_mlx { merge(self.mlx.cache_telemetry()); }
         #[cfg(feature = "libllama")]
-        if has_libllama {
-            let t = self.libllama.cache_telemetry();
-            agg.kv_pages_used += t.kv_pages_used;
-            agg.kv_pages_total += t.kv_pages_total;
-            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
-            agg.active_batch_size += t.active_batch_size;
-            agg.max_batch_size += t.max_batch_size;
-        }
+        if has_libllama { merge(self.libllama.cache_telemetry()); }
         let _ = has_libllama;
         agg
     }
@@ -707,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_backend_name_for_handle() {
-        let backend = RouterBackend::new(RoutingConfig::default(), LlamaCppConfig::from_env());
+        let backend = RouterBackend::new(RoutingConfig::default(), LlamaCppConfig::from_env(), crate::mlx::MlxConfig::from_env());
         {
             let mut entries = backend.entries.write().unwrap();
             entries.insert(

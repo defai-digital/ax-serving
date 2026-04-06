@@ -2351,18 +2351,25 @@ pub async fn rest_load_model(
     };
 
     let path = std::path::PathBuf::from(&req.path);
-    let backend_hint = req
-        .backend
-        .clone()
-        .unwrap_or_else(|| "llama_cpp".to_string())
-        .to_ascii_lowercase();
-    let backend_hint = match backend_hint.as_str() {
-        "native" | "llama_cpp" | "lib_llama" | "auto" => backend_hint,
+
+    // Resolve backend hint: explicit `backend` field takes priority; then `mlx: true`
+    // flag; then default to "auto" (routing config decides).
+    let raw_hint = if let Some(ref b) = req.backend {
+        b.to_ascii_lowercase()
+    } else if req.mlx == Some(true) {
+        "mlx".to_string()
+    } else {
+        "auto".to_string()
+    };
+    let backend_hint = match raw_hint.as_str() {
+        "native" | "llama_cpp" | "mlx" | "lib_llama" | "auto" => raw_hint,
         other => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
-                    "error": format!("invalid backend; expected native, llama_cpp, lib_llama, or auto but got {other}")
+                    "error": format!(
+                        "invalid backend; expected native, llama_cpp, mlx, lib_llama, or auto but got {other}"
+                    )
                 })),
             )
                 .into_response();

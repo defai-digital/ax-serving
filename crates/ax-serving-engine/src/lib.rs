@@ -1,6 +1,6 @@
 //! ax-serving-engine: Inference backend adapter.
 //!
-//! Wraps the native ax-engine backend and llama.cpp behind the
+//! Wraps the native ax-engine backend, llama.cpp, and mlx-lm behind the
 //! [`InferenceBackend`] trait.
 //! All other crates depend on this trait, not on a concrete inference engine.
 //!
@@ -10,7 +10,7 @@
 //! ax-serving-api / ax-serving-shim
 //!      │  InferenceBackend trait
 //!      ▼
-//! AxEngineBackend / LlamaCppBackend / LibLlamaBackend
+//! AxEngineBackend / LlamaCppBackend / MlxBackend / LibLlamaBackend
 //! ```
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
@@ -22,6 +22,7 @@ pub mod gguf_meta;
 pub mod libllama;
 pub mod llamacpp;
 pub mod memory;
+pub mod mlx;
 pub mod routing;
 pub mod thermal;
 
@@ -32,6 +33,7 @@ pub use ax_engine::AxEngineBackend;
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
+pub use mlx::{MlxBackend, MlxConfig, is_mlx_model};
 pub use routing::{BackendChoice, RouterBackend, RoutingConfig};
 pub use thermal::{ThermalMonitor, ThermalState};
 

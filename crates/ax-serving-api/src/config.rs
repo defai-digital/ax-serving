@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ax_serving_engine::LlamaCppConfig;
+use ax_serving_engine::{LlamaCppConfig, MlxConfig};
 use serde::Deserialize;
 
 /// Top-level serving configuration.
@@ -61,6 +61,8 @@ pub struct ServeConfig {
     pub dispatcher: DispatcherConfig,
     /// llama.cpp subprocess backend settings.
     pub llamacpp: LlamaCppConfig,
+    /// mlx-lm subprocess backend settings.
+    pub mlx: MlxConfig,
     /// Multi-worker orchestrator settings (`ax-llama orchestrate`).
     pub orchestrator: OrchestratorConfig,
     /// License reminder and dashboard settings.
@@ -99,6 +101,7 @@ impl Default for ServeConfig {
             registry: RegistryConfig::default(),
             dispatcher: DispatcherConfig::default(),
             llamacpp: LlamaCppConfig::default(),
+            mlx: MlxConfig::default(),
             orchestrator: OrchestratorConfig::default(),
             license: LicenseConfig::default(),
             project_policy: ProjectPolicyConfig::default(),
@@ -592,6 +595,9 @@ impl ServeConfig {
 
         // ── LlamaCpp ─────────────────────────────────────────────────────────
         self.llamacpp.apply_env_overrides();
+
+        // ── MLX ───────────────────────────────────────────────────────────────
+        self.mlx.apply_env_overrides();
 
         // ── Orchestrator ──────────────────────────────────────────────────────
         if let Some(v) = env_str("AXS_ORCHESTRATOR_HOST") {

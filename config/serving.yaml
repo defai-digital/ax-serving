@@ -59,6 +59,20 @@ llamacpp:
                                # exceeding 512 tokens fails with HTTP 500. For embedding
                                # workloads with real document chunks, set both to 4096.
 
+mlx:
+  bin: "mlx_lm.server"        # env: AXS_MLX_BIN  (path to mlx_lm.server; pip install mlx-lm)
+  token_batch_size: 4          # env: AXS_MLX_TOKEN_BATCH
+  token_batch_max: 32
+  http_request_timeout_secs: 300
+  server_startup_timeout_secs: 120
+  wait_ready_poll_interval_ms: 500
+  wait_ready_check_timeout_secs: 1
+  health_poller_interval_secs: 5
+  health_poller_check_timeout_secs: 2
+  health_poller_restart_threshold: 3
+  health_poller_max_restarts: 3
+  # decode_concurrency: 32     # env: AXS_MLX_DECODE_CONCURRENCY
+
 orchestrator:
   host: "127.0.0.1"
   port: 18080
