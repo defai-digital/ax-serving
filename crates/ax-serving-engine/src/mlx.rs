@@ -262,7 +262,8 @@ struct MlxProcess {
     health: Arc<AtomicU8>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     _poller: std::thread::JoinHandle<()>,
-    model_type: String,
+    /// Model type string from config.json; kept for diagnostics and future use.
+    _model_type: String,
 }
 
 impl Drop for MlxProcess {
@@ -626,7 +627,7 @@ impl InferenceBackend for MlxBackend {
 
         self.models_lock().insert(
             handle,
-            MlxProcess { port, child: child_arc, health, stop, _poller: poller, model_type },
+            MlxProcess { port, child: child_arc, health, stop, _poller: poller, _model_type: model_type },
         );
         Ok((handle, meta))
     }
@@ -750,10 +751,10 @@ impl InferenceBackend for MlxBackend {
 
 fn apply_mlx_generation_params(body: &mut serde_json::Value, params: &GenerationParams) {
     if let Some(t) = params.temperature {
-        body["temperature"] = (t as f64).into();
+        body["temperature"] = t.into();
     }
     if let Some(p) = params.top_p {
-        body["top_p"] = (p as f64).into();
+        body["top_p"] = p.into();
     }
     if let Some(k) = params.top_k {
         body["top_k"] = (k as i64).into();
@@ -918,10 +919,8 @@ fn parse_mlx_sse(
         let Some(choice) = chunk.choices.first() else {
             continue;
         };
-        if let Some(r) = &choice.finish_reason {
-            if !r.is_empty() {
-                stop_reason = r.clone();
-            }
+        if let Some(r) = &choice.finish_reason && !r.is_empty() {
+            stop_reason = r.clone();
         }
 
         let token_text = choice

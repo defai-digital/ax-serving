@@ -286,9 +286,15 @@ fn detect_family_from_filename(path: &Path) -> String {
 
     for (needle, family) in &[
         // Keep explicit family names that may embed base-model names first.
+        // More-specific entries must come before their generic prefixes so that
+        // e.g. "gemma3-4b.gguf" maps to "gemma3", not the broader "gemma".
         ("deepseek", "deepseek"),
         ("llama", "llama"),
+        ("qwen35", "qwen35"),
+        ("qwen3", "qwen3"),
         ("qwen", "qwen"),
+        ("gemma4", "gemma4"),
+        ("gemma3", "gemma3"),
         ("gemma", "gemma"),
         ("mistral", "mistral"),
         // Avoid broad "phi" substring matching (e.g. "graphite" false-positive).
