@@ -201,12 +201,12 @@ fn render_chat_messages_with_compat(
     options: ChatRenderOptions,
 ) -> String {
     if matches!(architecture, "mistral" | "mixtral") {
-        return render_mistral_chat_messages(messages);
+        return render_inst_format_chat_messages(messages);
     }
     chat::render_chat_messages(messages, architecture, options)
 }
 
-fn render_mistral_chat_messages(messages: &[chat::ChatMessage<'_>]) -> String {
+fn render_inst_format_chat_messages(messages: &[chat::ChatMessage<'_>]) -> String {
     let mut rendered = String::new();
     let mut pending_system = None;
 
@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn ax_engine_core_mistral_template_uses_inst_format() {
+    fn ax_engine_core_template_inst_format() {
         let prompt = super::render_chat_messages_with_compat(
             &[
                 chat::ChatMessage::system("be concise"),
