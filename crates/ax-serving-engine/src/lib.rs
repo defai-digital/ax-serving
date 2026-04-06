@@ -27,7 +27,7 @@ pub mod thermal;
 
 use std::path::Path;
 
-pub use ax_core::metrics::current_rss_bytes;
+pub use ax_engine_core::metrics::current_rss_bytes;
 pub use ax_engine::AxEngineBackend;
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;

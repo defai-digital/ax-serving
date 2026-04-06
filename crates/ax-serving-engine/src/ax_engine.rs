@@ -8,15 +8,15 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ax_core::backend::{self, BackendConfig};
-use ax_core::chat::{self, ChatRenderOptions, ChatRole};
-use ax_core::gguf::MappedModel;
-use ax_core::metrics::current_rss_bytes;
-use ax_core::model::{
-    DecodeControl, LlamaModel, ModelConfig, WeightStore, arch_registry, run_decode,
+use ax_engine_core::backend::{self, BackendConfig};
+use ax_engine_core::chat::{self, ChatRenderOptions, ChatRole};
+use ax_engine_core::gguf::MappedModel;
+use ax_engine_core::metrics::current_rss_bytes;
+use ax_engine_core::model::{
+    DecodeControl, InferenceModel, ModelConfig, WeightStore, arch_registry, run_decode,
 };
-use ax_core::sampling::{LogitBias, SampledTokenInfo, Sampler, SamplingConfig};
-use ax_core::tokenizer::Tokenizer;
+use ax_engine_core::sampling::{LogitBias, SampledTokenInfo, Sampler, SamplingConfig};
+use ax_engine_core::tokenizer::Tokenizer;
 use rustc_hash::FxHashMap;
 use tracing::warn;
 
@@ -82,7 +82,7 @@ fn push_stream_token_piece(
 struct LoadedModel {
     mapped: MappedModel,
     tokenizer: Tokenizer,
-    model: LlamaModel,
+    model: InferenceModel,
     metadata: ModelMetadata,
     render_architecture: String,
 }
@@ -90,7 +90,7 @@ struct LoadedModel {
 // SAFETY: LoadedModel is immutable after load. Per-request mutable state lives
 // in fresh KV caches and sampler/history buffers, not in the loaded model.
 // `MappedModel` is read-only mmap-backed data, `Tokenizer` is immutable, and
-// `LlamaModel` methods take `&self` and operate on caller-owned buffers.
+// `InferenceModel` methods take `&self` and operate on caller-owned buffers.
 unsafe impl Send for LoadedModel {}
 unsafe impl Sync for LoadedModel {}
 
@@ -503,8 +503,8 @@ fn run_generate(
             Some(first_sample),
             prompt.len(),
             max_new,
-            ax_core::model::DecodeRunConfig {
-                intent: ax_core::model::DecodeIntent::Throughput,
+            ax_engine_core::model::DecodeRunConfig {
+                intent: ax_engine_core::model::DecodeIntent::Throughput,
                 allow_pipelined: true,
                 top_logprobs: decode_top_logprobs,
             },
@@ -555,8 +555,8 @@ fn run_generate(
             None,
             prompt.len(),
             max_new,
-            ax_core::model::DecodeRunConfig {
-                intent: ax_core::model::DecodeIntent::Throughput,
+            ax_engine_core::model::DecodeRunConfig {
+                intent: ax_engine_core::model::DecodeIntent::Throughput,
                 allow_pipelined: true,
                 top_logprobs: 0,
             },
@@ -625,7 +625,7 @@ fn run_generate(
     Ok(())
 }
 
-/// `InferenceBackend` implementation backed by ax-engine (`ax-core`).
+/// `InferenceBackend` implementation backed by ax-engine (`ax-engine-core`).
 pub struct AxEngineBackend {
     models: Arc<RwLock<FxHashMap<ModelHandle, Arc<LoadedModel>>>>,
     thermal: ThermalMonitor,
@@ -706,7 +706,7 @@ impl InferenceBackend for AxEngineBackend {
         let backend_config = resolve_backend_config(&config);
         let backend = backend::create_backend(backend_config)
             .context("ax-engine failed to create compute backend")?;
-        let model = LlamaModel::with_backend(model_config.clone(), backend);
+        let model = InferenceModel::with_backend(model_config.clone(), backend);
 
         let rss_after = current_rss_bytes();
         let metadata = ModelMetadata {
@@ -804,7 +804,7 @@ impl InferenceBackend for AxEngineBackend {
             .model
             .forward_batch(tokens, &mut kv, &weights, &mut logits)
             .context("ax-engine eval prefill failed")?;
-        Ok(ax_core::sampling::argmax(&logits))
+        Ok(ax_engine_core::sampling::argmax(&logits))
     }
 }
 
@@ -812,7 +812,7 @@ impl InferenceBackend for AxEngineBackend {
 mod tests {
     use std::sync::Mutex;
 
-    use ax_core::chat::{self, ChatRenderOptions, ChatRole};
+    use ax_engine_core::chat::{self, ChatRenderOptions, ChatRole};
     use tokio::sync::mpsc;
 
     use super::{
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_messages_render_with_ax_core_chat() {
+    fn normalized_messages_render_with_ax_engine_core_chat() {
         let normalized = normalize_chat_messages(&[
             ChatMessage {
                 role: "developer".into(),
@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn ax_core_mistral_template_uses_inst_format() {
+    fn ax_engine_core_mistral_template_uses_inst_format() {
         let prompt = super::render_chat_messages_with_compat(
             &[
                 chat::ChatMessage::system("be concise"),
