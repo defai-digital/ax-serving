@@ -6,46 +6,15 @@
 
 ## Overview
 
-120 issues identified across all crates. 21 false positives. 117 fixed. 2 deferred.
+99 real bugs confirmed across all crates. 97 fixed across 5 batches. 2 deferred.
 
 ## Statistics
 
-| Severity | Count | Status |
-|----------|-------|--------|
-| Critical | 1 | Fixed |
-| High | 22 | 22 Fixed |
-| Medium | 45 | 42 Fixed, 3 Deferred |
-| Low | 34 | 31 Fixed, 3 FP |
-| False Positive | 21 | No fix needed |
-| **Total** | **120** | |
-
----
-
-## False Positives (21)
-
-| ID | Issue | Reason |
-|----|-------|--------|
-| BUG-001 | `.unwrap()` on HashMap remove | Write lock invariant |
-| BUG-002 | `.expect()` on runtime build | Startup-only |
-| BUG-003 | `.expect()` on HTTP client | Startup-only |
-| BUG-004 | Silent job deletion | Returns `Option` |
-| BUG-006 | JSON OOB indexing | serde_json null-safe |
-| BUG-020 | eval_tokens fresh KV | Shim works correctly |
-| BUG-032 | Non-atomic reregister | heartbeat_loop is single async task; no concurrent writers |
-| BUG-036 | Arc dup use-after-unload | Caller contract |
-| BUG-058 | Context invalidated handle | Duplicate of 036 |
-| BUG-062 | Float precision memory | Negligible |
-| BUG-063 | Circuit breaker Relaxed | Acceptable for heuristic |
-| BUG-064 | unix_ms pre-epoch | System misconfig |
-| BUG-066 | Executor drops jobs | mpsc workers drain pending before channel closes |
-| BUG-080 | Seed defaults u64::MAX | Design choice |
-| BUG-082 | Registration warning | Design choice |
-| BUG-083 | URL scheme casing | Unreachable |
-| BUG-084 | f32→f64 precision | Negligible |
-| BUG-087 | penalty_last_n==0 | Correct: 0 means disabled in llama.cpp semantics |
-| BUG-088 | n_past ignored | Documented limitation |
-| BUG-108 | RPS dispatch overhead | Standard measurement |
-| BUG-119 | Seed ignored in shim | No RNG in shim sampling |
+| Status | Count |
+|--------|-------|
+| Fixed | 97 |
+| Deferred | 2 |
+| **Total** | **99** |
 
 ---
 
