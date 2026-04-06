@@ -507,6 +507,7 @@ fn run_generate(
                 intent: ax_engine_core::model::DecodeIntent::Throughput,
                 allow_pipelined: true,
                 top_logprobs: decode_top_logprobs,
+                collect_metal_perf: false,
             },
             |token, info| {
                 generated_tokens += 1;
@@ -559,6 +560,7 @@ fn run_generate(
                 intent: ax_engine_core::model::DecodeIntent::Throughput,
                 allow_pipelined: true,
                 top_logprobs: 0,
+                collect_metal_perf: false,
             },
             |token, _info| {
                 generated_tokens += 1;
@@ -706,7 +708,8 @@ impl InferenceBackend for AxEngineBackend {
         let backend_config = resolve_backend_config(&config);
         let backend = backend::create_backend(backend_config)
             .context("ax-engine failed to create compute backend")?;
-        let model = InferenceModel::with_backend(model_config.clone(), backend);
+        let model = InferenceModel::with_backend(model_config.clone(), backend)
+            .context("ax-engine failed to initialize InferenceModel")?;
 
         let rss_after = current_rss_bytes();
         let metadata = ModelMetadata {

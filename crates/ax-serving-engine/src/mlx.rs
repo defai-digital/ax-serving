@@ -725,7 +725,7 @@ impl InferenceBackend for MlxBackend {
     }
 
     fn thermal_state(&self) -> ThermalState {
-        self.thermal.state()
+        self.thermal.current()
     }
 
     fn recommended_concurrency(&self) -> usize {
@@ -761,9 +761,9 @@ fn apply_mlx_generation_params(body: &mut serde_json::Value, params: &Generation
     if let Some(n) = params.max_tokens {
         body["max_tokens"] = (n as i64).into();
     }
-    if let Some(ref stops) = params.stop {
+    if !params.stop_seqs.is_empty() {
         let arr: Vec<serde_json::Value> =
-            stops.iter().map(|s| serde_json::Value::String(s.clone())).collect();
+            params.stop_seqs.iter().map(|s| serde_json::Value::String(s.clone())).collect();
         body["stop"] = serde_json::Value::Array(arr);
     }
     if let Some(seed) = params.seed {
@@ -786,14 +786,19 @@ fn build_mlx_chat_body(msgs: &[crate::ChatMessage], params: &GenerationParams) -
 }
 
 fn build_mlx_completions_body(input: &GenerateInput, params: &GenerationParams) -> serde_json::Value {
-    let prompt = match input {
-        GenerateInput::Text(t) => t.clone(),
+    // Per OpenAI spec, `prompt` may be a string OR an array of token integers.
+    // mlx-lm honours the array form; passing a JSON-serialised string "[1,2,3]"
+    // would be treated as literal text, not tokens.
+    let prompt: serde_json::Value = match input {
+        GenerateInput::Text(t) => serde_json::Value::String(t.clone()),
         GenerateInput::Tokens(toks) => {
-            // mlx-lm /v1/completions accepts a string prompt; serialise token IDs
-            // as JSON so the server can decode them if it supports numeric prompts.
-            serde_json::to_string(toks).unwrap_or_default()
+            serde_json::Value::Array(
+                toks.iter()
+                    .map(|&t| serde_json::Value::Number(t.into()))
+                    .collect(),
+            )
         }
-        GenerateInput::Chat(_) => String::new(),
+        GenerateInput::Chat(_) => serde_json::Value::String(String::new()),
     };
     let mut body = serde_json::json!({ "prompt": prompt });
     apply_mlx_generation_params(&mut body, params);
@@ -946,7 +951,8 @@ fn parse_mlx_sse(
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens: prompt_tokens as usize,
         completion_tokens: completion_tokens as usize,
-        stop_reason: if stop_reason.is_empty() { None } else { Some(stop_reason) },
+        stop_reason,
+        ..Default::default()
     }));
     Ok(())
 }
@@ -992,8 +998,8 @@ fn emit_non_streaming_response(
     let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
     let stop_reason = val["choices"][0]["finish_reason"]
         .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .unwrap_or("")
+        .to_string();
 
     if !text.is_empty() {
         let _ = tx.blocking_send(GenerateEvent::Token(text));
@@ -1002,6 +1008,7 @@ fn emit_non_streaming_response(
         prompt_tokens,
         completion_tokens,
         stop_reason,
+        ..Default::default()
     }));
     Ok(())
 }

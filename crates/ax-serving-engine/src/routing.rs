@@ -214,8 +214,13 @@ impl RoutingConfig {
         };
 
         // 1. Exact match.
-        if let Some(choice) = self.families.get(&arch) {
-            return *choice;
+        if let Some(&choice) = self.families.get(&arch) {
+            // Expand Auto here too — resolve() must never return Auto.
+            return if matches!(choice, BackendChoice::Auto) {
+                self.resolve_auto(&arch)
+            } else {
+                choice
+            };
         }
         // 2. Normalized exact match (e.g. key "gpt_j" matches arch "gptj").
         // If multiple aliases normalize to the same key, choose deterministically
@@ -230,7 +235,13 @@ impl RoutingConfig {
             .collect();
         if !exact_matches.is_empty() {
             exact_matches.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            return exact_matches[0].1;
+            let choice = exact_matches[0].1;
+            // Expand Auto — resolve() must never return Auto.
+            return if matches!(choice, BackendChoice::Auto) {
+                self.resolve_auto(&arch)
+            } else {
+                choice
+            };
         }
         // 3. Prefix match on normalized keys, choosing the longest prefix for
         // deterministic behavior when multiple keys overlap.
@@ -566,6 +577,7 @@ impl InferenceBackend for RouterBackend {
         let result = match entry.tag {
             BackendTag::Native => self.native.unload_model(entry.inner),
             BackendTag::LlamaCpp => self.llamacpp.unload_model(entry.inner),
+            BackendTag::Mlx => self.mlx.unload_model(entry.inner),
             BackendTag::LibLlama => {
                 #[cfg(feature = "libllama")]
                 {
@@ -616,6 +628,9 @@ impl InferenceBackend for RouterBackend {
         match tag {
             BackendTag::Native => self.native.eval_tokens(inner, tokens),
             BackendTag::LlamaCpp => self.llamacpp.eval_tokens(inner, tokens),
+            BackendTag::Mlx => Err(anyhow::anyhow!(
+                "eval_tokens not supported by MlxBackend"
+            )),
             BackendTag::LibLlama => Err(anyhow::anyhow!(
                 "eval_tokens not supported by LibLlamaBackend"
             )),

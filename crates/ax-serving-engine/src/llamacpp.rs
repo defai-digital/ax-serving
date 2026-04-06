@@ -815,25 +815,21 @@ impl InferenceBackend for LlamaCppBackend {
                         handle
                     );
                 }
-                // Recovery window elapsed → allow one probe through.
-                // If the CAS fails, inspect why: if the state is still Open
-                // (health poller re-tripped the breaker between our elapsed-time
-                // check and now), bail out; otherwise (Closed or HalfOpen) proceed.
-                if let Err(current) = proc.breaker.state.compare_exchange(
+                // Recovery window elapsed → attempt to transition Open → HalfOpen
+                // to allow one probe request through.
+                //
+                // CAS semantics: succeeds only if state == Open (returns Ok).
+                // If CAS fails, current != Open (another thread already moved it
+                // to Closed or HalfOpen), so we can safely proceed with the probe.
+                // Note: CAS can never fail with current == Open — if it were still
+                // Open the CAS would have succeeded.  There is no state where we
+                // should reject the probe when CAS fails.
+                let _ = proc.breaker.state.compare_exchange(
                     CircuitState::Open as u8,
                     CircuitState::HalfOpen as u8,
                     Ordering::SeqCst,
                     Ordering::Relaxed,
-                ) && current == CircuitState::Open as u8
-                {
-                    anyhow::bail!(
-                        "circuit open: recovery window was reset for handle {:?}; retry later",
-                        handle
-                    );
-                } else {
-                    // HalfOpen or Closed — another thread already transitioned;
-                    // proceed with the probe.
-                }
+                );
             }
 
             (
