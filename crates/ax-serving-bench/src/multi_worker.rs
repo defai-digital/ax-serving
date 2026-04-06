@@ -178,6 +178,12 @@ async fn bench(cfg: &MultiWorkerConfig) -> Result<MultiWorkerResults> {
         });
         handles.push(h);
         req_index += 1;
+
+        // In duration mode total_requests == usize::MAX; drain finished handles
+        // every 500 spawns to prevent unbounded memory growth (BUG-079).
+        if cfg.duration_secs.is_some() && handles.len() % 500 == 0 {
+            handles.retain(|h| !h.is_finished());
+        }
     }
 
     for h in handles {

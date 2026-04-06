@@ -9,6 +9,8 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
 
+use crate::bench_common::percentile_f64;
+
 const PROMPT_LENGTHS: [usize; 4] = [39, 209, 509, 1024];
 const SHARED_REPLAY_PREFIX: &str = "Shared enterprise support transcript prefix: customer reports intermittent request spikes after deployment, repeated retries, and degraded p95 latency. Summarize root-cause patterns and mitigation actions. ";
 
@@ -121,11 +123,15 @@ pub async fn run(cfg: ServicePerfConfig) -> Result<()> {
     let replay_requests =
         ((cfg.requests as f64) * (cfg.replay_share_pct as f64 / 100.0)).round() as usize;
     let burst_window_ms = cfg.burst_window_ms;
-    let start = Instant::now();
     let mut handles = Vec::with_capacity(cfg.requests);
 
     for i in 0..cfg.requests {
         let permit = Arc::clone(&sem).acquire_owned().await?;
+        // BUG-078: capture start AFTER acquiring the permit so the stagger
+        // offset is computed relative to permit acquisition, not the loop start.
+        // Without this, waiting for a permit pushes deadlines into the past
+        // and the entire burst fires simultaneously.
+        let start = Instant::now();
         let client = Arc::clone(&client);
         let endpoint = endpoint.clone();
         let model = cfg.model.clone();
@@ -222,12 +228,12 @@ pub async fn run(cfg: ServicePerfConfig) -> Result<()> {
         } else {
             0.0
         },
-        latency_p50_ms: percentile(&latencies, 50.0),
-        latency_p95_ms: percentile(&latencies, 95.0),
-        latency_p99_ms: percentile(&latencies, 99.0),
-        queue_wait_p50_ms: percentile(&queue_waits, 50.0),
-        queue_wait_p95_ms: percentile(&queue_waits, 95.0),
-        queue_wait_p99_ms: percentile(&queue_waits, 99.0),
+        latency_p50_ms: percentile_f64(&latencies, 50),
+        latency_p95_ms: percentile_f64(&latencies, 95),
+        latency_p99_ms: percentile_f64(&latencies, 99),
+        queue_wait_p50_ms: percentile_f64(&queue_waits, 50),
+        queue_wait_p95_ms: percentile_f64(&queue_waits, 95),
+        queue_wait_p99_ms: percentile_f64(&queue_waits, 99),
         cache_hits_delta,
         cache_misses_delta,
         exact_cache_hit_rate: if total_cache > 0 {
@@ -358,13 +364,6 @@ fn sanitize(values: &mut Vec<f64>) {
     values.sort_by(|a, b| a.total_cmp(b));
 }
 
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
 
 fn print_report(cfg: &ServicePerfConfig, results: &ServicePerfResults) {
     println!();

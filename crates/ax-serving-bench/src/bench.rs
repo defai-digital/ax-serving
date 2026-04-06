@@ -262,7 +262,15 @@ async fn drain_channel(
                 if s.prefill_tok_per_sec > 0.0 && s.decode_tok_per_sec > 0.0 {
                     stats = s;
                 } else {
+                    // BUG-106: the wall-clock fallback divides both prefill and
+                    // decode throughput by total elapsed time, producing a ~10x
+                    // underestimate when decode dominates.  Emit an explicit
+                    // warning so users know the numbers are approximate.
                     let elapsed = wall.elapsed().as_secs_f64();
+                    tracing::warn!(
+                        "backend did not report split-phase stats; \
+                         throughput numbers are approximate (divided by total wall time)"
+                    );
                     stats.prefill_tok_per_sec = n_prompt as f64 / elapsed;
                     stats.decode_tok_per_sec =
                         params.max_tokens.map(|n| n as f64 / elapsed).unwrap_or(0.0);

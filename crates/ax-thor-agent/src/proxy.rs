@@ -165,7 +165,15 @@ async fn proxy_to(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
 
+            // Limit buffered response bodies to 64 MiB to prevent OOM from a
+            // misbehaving upstream (BUG-033).
+            const MAX_RESPONSE_BODY: usize = 64 * 1024 * 1024;
             match resp.bytes().await {
+                Ok(bytes) if bytes.len() > MAX_RESPONSE_BODY => (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream response body exceeded 64 MiB limit",
+                )
+                    .into_response(),
                 Ok(bytes) => {
                     let mut builder = axum::response::Response::builder().status(status);
                     for (name, value) in &resp_headers {

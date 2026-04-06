@@ -400,6 +400,17 @@ fn stats_from_decode(
     }
 }
 
+/// Typed sentinel for a dropped receiver — avoids fragile string comparison
+/// in the `catch_unwind` handler (BUG-041).
+#[derive(Debug)]
+struct ReceiverDropped;
+impl std::fmt::Display for ReceiverDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("receiver dropped")
+    }
+}
+impl std::error::Error for ReceiverDropped {}
+
 fn run_generate(
     loaded: Arc<LoadedModel>,
     input: GenerateInput,
@@ -513,24 +524,26 @@ fn run_generate(
                 generated_tokens += 1;
                 let piece = render_token_text(&loaded.tokenizer, token);
                 let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
-                if !action.emit.is_empty() {
-                    if tx.blocking_send(GenerateEvent::Token(action.emit)).is_err() {
-                        anyhow::bail!("receiver dropped");
-                    }
-                    if let Some(info) = info
-                        && tx
-                            .blocking_send(GenerateEvent::TokenLogprob {
-                                logprob: info.logprob,
-                                top: sample_top_logprobs_text(
-                                    &loaded.tokenizer,
-                                    info,
-                                    top_logprobs,
-                                ),
-                            })
-                            .is_err()
-                    {
-                        anyhow::bail!("receiver dropped");
-                    }
+                if !action.emit.is_empty()
+                    && tx.blocking_send(GenerateEvent::Token(action.emit)).is_err()
+                {
+                    return Err(anyhow::Error::from(ReceiverDropped));
+                }
+                // Emit logprob for every decoded token regardless of stop-buffer state
+                // to maintain the 1:1 Token→TokenLogprob invariant (BUG-051).
+                if let Some(info) = info
+                    && tx
+                        .blocking_send(GenerateEvent::TokenLogprob {
+                            logprob: info.logprob,
+                            top: sample_top_logprobs_text(
+                                &loaded.tokenizer,
+                                info,
+                                top_logprobs,
+                            ),
+                        })
+                        .is_err()
+                {
+                    return Err(anyhow::Error::from(ReceiverDropped));
                 }
                 if action.matched {
                     stopped_on_stop_sequence = true;
@@ -575,7 +588,7 @@ fn run_generate(
                     &mut stream_token_buffer,
                     &mut buffered_stream_tokens,
                 ) {
-                    anyhow::bail!("receiver dropped");
+                    return Err(anyhow::Error::from(ReceiverDropped));
                 }
                 if action.matched {
                     stopped_on_stop_sequence = true;
@@ -608,7 +621,7 @@ fn run_generate(
             }
             (outcome.completion_tokens, outcome.decode_duration)
         }
-        Err(err) if err.to_string() == "receiver dropped" => return Ok(()),
+        Err(err) if err.downcast_ref::<ReceiverDropped>().is_some() => return Ok(()),
         Err(err) => return Err(err).context("ax-engine decode failed"),
     };
 

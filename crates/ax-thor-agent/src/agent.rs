@@ -7,6 +7,33 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tokio::sync::RwLock;
 
+fn current_rss_bytes() -> u64 {
+    // Read RSS from /proc/self/status on macOS via sysctl (same approach as
+    // ax-serving-engine metrics).  Returns 0 on failure rather than panicking.
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn getpid() -> i32;
+        }
+        // SAFETY: libc call with correct argument structure.
+        let pid = unsafe { getpid() };
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output();
+        if let Ok(out) = output
+            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(kb) = s.trim().parse::<u64>()
+        {
+            return kb * 1024;
+        }
+        0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
 use crate::config::ThorConfig;
 use crate::sglang;
 
@@ -80,6 +107,7 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
                 "{}/internal/workers/register",
                 config.control_plane_url
             ))
+            .timeout(std::time::Duration::from_secs(10))
             .json(&body),
         config.worker_token.as_ref(),
     );
@@ -135,11 +163,13 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
         };
 
         let current_inflight = runtime.inflight.load(Ordering::Relaxed);
+        // BUG-073: use real RSS instead of hardcoded 0.
+        let rss_bytes = current_rss_bytes();
         let body = json!({
             "inflight": current_inflight,
             "thermal_state": "nominal",
             "model_ids": models,
-            "rss_bytes": 0_u64,
+            "rss_bytes": rss_bytes,
             "active_sequences": current_inflight,
             "decode_tok_per_sec": 0.0_f64,
             "ttft_p95_ms": 0_u64,
@@ -147,12 +177,15 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             "error_rate": 0.0_f64,
         });
 
+        // BUG-096: use a short per-request timeout for control-plane calls so a
+        // slow/unresponsive orchestrator doesn't stall the heartbeat loop for 300s.
         let req = with_internal_token(
             client
                 .post(format!(
                     "{}/internal/workers/{}/heartbeat",
                     config.control_plane_url, session.worker_id
                 ))
+                .timeout(std::time::Duration::from_secs(10))
                 .json(&body),
             config.worker_token.as_ref(),
         );

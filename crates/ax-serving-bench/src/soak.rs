@@ -48,7 +48,10 @@ pub async fn run(
         let raw = ax_serving_api::metrics::current_rss_bytes() as f64;
         if raw > 0.0 { raw } else { 1.0 }
     };
+    // BUG-107: delay baseline capture until after the first check interval so
+    // the cold-start latency spike is excluded from the drift denominator.
     let mut baseline_p95: Option<Duration> = None;
+    let mut baseline_set_after_interval = false;
     let mut measurements: Vec<serde_json::Value> = Vec::new();
     let mut last_check = start;
 
@@ -96,13 +99,22 @@ pub async fn run(
         }
 
         let p95 = hist.p95();
-        if baseline_p95.is_none() {
-            baseline_p95 = Some(p95);
-        }
 
         // Check at interval.
         if last_check.elapsed() >= interval {
             last_check = Instant::now();
+
+            // BUG-107: set baseline after the first completed interval (post-warmup)
+            // so the cold-start latency spike doesn't become the reference point.
+            if !baseline_set_after_interval {
+                baseline_p95 = Some(p95);
+                baseline_set_after_interval = true;
+                println!(
+                    "soak: warmup complete; P95 baseline set to {:.1}ms",
+                    p95.as_secs_f64() * 1000.0
+                );
+            }
+
             let elapsed_min = start.elapsed().as_secs() / 60;
             let rss = ax_serving_api::metrics::current_rss_bytes() as f64;
             let rss_drift = (rss - baseline_rss) / baseline_rss;

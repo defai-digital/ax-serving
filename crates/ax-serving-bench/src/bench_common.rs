@@ -43,6 +43,17 @@ pub fn percentile(values: &[u64], p: usize) -> f64 {
     sorted[(sorted.len() * p / 100).min(sorted.len() - 1)] as f64
 }
 
+/// Same nearest-rank percentile formula as [`percentile`] but for `f64` slices.
+/// Deduplicates the ad-hoc implementations in `service_perf.rs` (BUG-090).
+pub fn percentile_f64(values: &[f64], p: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
+}
+
 pub fn mean(values: &[u64]) -> f64 {
     if values.is_empty() {
         return 0.0;

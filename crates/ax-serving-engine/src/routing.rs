@@ -575,19 +575,19 @@ impl InferenceBackend for RouterBackend {
     }
 
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
-        let entry = self
-            .entries_write()
-            .remove(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
+        // BUG-061: peek without removing first so concurrent generate/tokenize
+        // calls don't see "unknown router handle" while unload is in progress.
+        // The entry is only removed after a successful backend unload.
+        let (tag, inner) = self.resolve_entry(handle)?;
 
-        let result = match entry.tag {
-            BackendTag::Native => self.native.unload_model(entry.inner),
-            BackendTag::LlamaCpp => self.llamacpp.unload_model(entry.inner),
-            BackendTag::Mlx => self.mlx.unload_model(entry.inner),
+        let result = match tag {
+            BackendTag::Native => self.native.unload_model(inner),
+            BackendTag::LlamaCpp => self.llamacpp.unload_model(inner),
+            BackendTag::Mlx => self.mlx.unload_model(inner),
             BackendTag::LibLlama => {
                 #[cfg(feature = "libllama")]
                 {
-                    self.libllama.unload_model(entry.inner)
+                    self.libllama.unload_model(inner)
                 }
                 #[cfg(not(feature = "libllama"))]
                 {
@@ -595,10 +595,8 @@ impl InferenceBackend for RouterBackend {
                 }
             }
         };
-        if result.is_err() {
-            // Preserve routing state so callers can retry unload rather than
-            // losing the inner handle mapping permanently.
-            self.entries_write().insert(handle, entry);
+        if result.is_ok() {
+            self.entries_write().remove(&handle);
         }
         result
     }

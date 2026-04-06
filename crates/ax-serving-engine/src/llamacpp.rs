@@ -380,8 +380,9 @@ struct LlamaCppProcess {
     health: Arc<AtomicU8>,
     /// Set to `true` by `Drop` to signal the poller to exit.
     stop: Arc<std::sync::atomic::AtomicBool>,
-    /// Poller thread handle — dropping detaches the thread (does not join).
-    _poller: std::thread::JoinHandle<()>,
+    /// Poller thread handle — joined in `Drop` to prevent detached threads
+    /// from attempting restarts after shutdown (BUG-081).
+    poller: Option<std::thread::JoinHandle<()>>,
     /// Circuit breaker for generate() failures.
     breaker: Arc<CircuitBreaker>,
     /// EOS token ID queried from the model at load time.
@@ -407,7 +408,12 @@ impl Drop for LlamaCppProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // `_poller` JoinHandle drops here — detaches the thread.
+        // BUG-081: join the poller thread so it cannot attempt a restart after
+        // the child has been killed.  A brief timeout avoids hanging forever if
+        // the poller is stuck on a probe.
+        if let Some(handle) = self.poller.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -634,16 +640,36 @@ impl InferenceBackend for LlamaCppBackend {
             config.enable_embeddings = Some(true);
         }
 
-        let port = find_free_port().context("failed to find free TCP port for llama-server")?;
-        info!(
-            "spawning llama-server for {} on port {}",
-            path.display(),
-            port
-        );
-
         let start = Instant::now();
-        let child = Self::spawn_server(path, port, &config, &self.config)
-            .with_context(|| format!("spawning llama-server for {}", path.display()))?;
+        // BUG-049: mitigate TOCTOU port race by retrying up to 3 times with a
+        // freshly allocated port each attempt.  The race window is small on
+        // macOS/Linux but non-zero under high concurrency of model loads.
+        const PORT_RETRY_LIMIT: usize = 3;
+        let mut last_err = None;
+        let (port, child) = 'retry: {
+            for attempt in 0..PORT_RETRY_LIMIT {
+                let port = find_free_port()
+                    .context("failed to find free TCP port for llama-server")?;
+                info!(
+                    "spawning llama-server for {} on port {} (attempt {})",
+                    path.display(),
+                    port,
+                    attempt + 1
+                );
+                match Self::spawn_server(path, port, &config, &self.config) {
+                    Ok(child) => break 'retry (port, child),
+                    Err(err) => {
+                        warn!(%err, "llama-server spawn failed on port {port}; retrying with new port");
+                        last_err = Some(err);
+                    }
+                }
+            }
+            return Err(
+                last_err
+                    .unwrap()
+                    .context(format!("spawning llama-server for {}", path.display())),
+            );
+        };
 
         Self::wait_ready(
             &self.http,
@@ -760,7 +786,7 @@ impl InferenceBackend for LlamaCppBackend {
                 child: child_arc,
                 health,
                 stop,
-                _poller: poller,
+                poller: Some(poller),
                 breaker,
                 eos_token,
             },
@@ -1265,8 +1291,8 @@ fn run_health_poller(args: PollerArgs) {
 fn find_free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind(format!("{LLAMACPP_LOCAL_HOST}:0"))?;
     Ok(listener.local_addr()?.port())
-    // listener drops here, releasing the port.
-    // TOCTOU: negligible for local use.
+    // listener drops here, releasing the port (short TOCTOU window; mitigated
+    // by the caller retrying on spawn failure — see BUG-049).
 }
 
 /// Build a `/v1/completions` JSON body for Text or Tokens inputs.
@@ -1381,12 +1407,15 @@ fn apply_generation_params(body: &mut serde_json::Value, params: &GenerationPara
     }
     // Grammar: "__json__" is ax-serving's sentinel for json_object mode;
     // translate it to llama-server's response_format field.
+    // Also honour params.response_format set directly on GenerationParams (BUG-100).
     if let Some(ref g) = params.grammar {
         if g == "__json__" {
             body["response_format"] = serde_json::json!({"type": "json_object"});
         } else {
             body["grammar"] = g.clone().into();
         }
+    } else if params.response_format.as_deref() == Some("json_object") {
+        body["response_format"] = serde_json::json!({"type": "json_object"});
     }
     // Mirostat sampling (llama-server native fields).
     if let Some(m) = params.mirostat {

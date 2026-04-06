@@ -14,28 +14,36 @@ async fn main() -> Result<()> {
         .init();
 
     let config = ThorConfig::from_env()?;
-    let client = reqwest::Client::builder()
+
+    // BUG-055: use separate clients so streaming proxy connections are never
+    // killed by the global 300s timeout that is appropriate for control-plane calls.
+    let cp_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
+    // Proxy client has no global timeout; per-request timeouts are set explicitly
+    // by control-plane helpers in agent.rs.
+    let proxy_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
 
-    sglang::wait_for_sglang(&client, &config.sglang_url).await?;
+    sglang::wait_for_sglang(&cp_client, &config.sglang_url).await?;
 
     let runtime = SharedRuntime::new();
-    let registration = agent::register(&client, &config).await?;
+    let registration = agent::register(&cp_client, &config).await?;
     {
         *runtime.models.write().await = registration.models;
         *runtime.session.write().await = Some(registration.session);
     }
 
     let heartbeat_runtime = runtime.clone();
-    let heartbeat_client = client.clone();
+    let heartbeat_client = cp_client.clone();
     let heartbeat_config = config.clone();
     let heartbeat_task = tokio::spawn(async move {
         agent::heartbeat_loop(heartbeat_client, heartbeat_config, heartbeat_runtime).await;
     });
 
-    let app = proxy::router(&config, client.clone(), runtime.inflight.clone());
+    let app = proxy::router(&config, proxy_client, runtime.inflight.clone());
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "ax-thor-agent listening");
 
@@ -70,7 +78,7 @@ async fn main() -> Result<()> {
 
     // Abort heartbeat BEFORE drain to prevent re-registration race (BUG-023).
     heartbeat_task.abort();
-    if let Err(e) = agent::drain(&client, &config, &runtime).await {
+    if let Err(e) = agent::drain(&cp_client, &config, &runtime).await {
         tracing::warn!(%e, "drain request failed");
     }
     let shutdown_deadline = tokio::time::Instant::now()
@@ -82,7 +90,7 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    if let Err(e) = agent::drain_complete(&client, &config, &runtime).await {
+    if let Err(e) = agent::drain_complete(&cp_client, &config, &runtime).await {
         tracing::warn!(%e, "drain-complete request failed");
     }
 

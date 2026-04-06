@@ -907,6 +907,23 @@ fn fallback_status_report_from_env(
     })
 }
 
+/// Validate that a worker_id contains only URL-safe characters so it can be
+/// safely interpolated into a path segment (BUG-112).
+fn validate_worker_id(worker_id: &str) -> Result<()> {
+    if worker_id.is_empty() {
+        anyhow::bail!("worker_id is empty");
+    }
+    if !worker_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "worker_id '{worker_id}' contains characters that are not safe for URL path segments"
+        );
+    }
+    Ok(())
+}
+
 async fn post_control_plane_action(
     client: &reqwest::Client,
     control_plane: &str,
@@ -914,6 +931,7 @@ async fn post_control_plane_action(
     worker_id: &str,
     action: &str,
 ) -> Result<()> {
+    validate_worker_id(worker_id)?;
     let url = format!(
         "{}/internal/workers/{worker_id}/{action}",
         control_plane.trim_end_matches('/')
