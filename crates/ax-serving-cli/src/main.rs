@@ -6,8 +6,10 @@
 //!
 //! To start the multi-worker API gateway, use `ax-serving-api` instead.
 
+mod doctor;
 mod logging;
 mod thor;
+mod tune;
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 compile_error!("ax-serving-cli only supports aarch64-apple-darwin (Apple Silicon M3+)");
@@ -94,7 +96,8 @@ enum Command {
     ///
     /// Key env vars:
     ///   AXS_ORCHESTRATOR_ADDR   — orchestrator internal URL for auto-registration
-    ///   AXS_WORKER_MAX_INFLIGHT — max concurrent requests this worker accepts (default: 8)
+    ///   AXS_WORKER_MAX_INFLIGHT — max concurrent requests this worker advertises
+    ///                             to the orchestrator (default: clamped to scheduler limits)
     Serve {
         /// Path to GGUF model file to preload.
         #[arg(short = 'm', long)]
@@ -136,6 +139,17 @@ enum Command {
         #[command(subcommand)]
         command: ThorCommand,
     },
+    /// Detect hardware and emit recommended serving configuration.
+    Tune {
+        /// Output file path (default: serving.toml).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Print recommendation without writing a file.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate serving configuration and environment.
+    Doctor,
 }
 
 #[derive(Subcommand, Debug)]
@@ -272,6 +286,8 @@ fn main() -> Result<()> {
                 orchestrator,
             )
         }
+        Some(Command::Tune { output, dry_run }) => tune::run_tune(output, dry_run),
+        Some(Command::Doctor) => doctor::run_doctor(),
         Some(Command::Thor { command }) => {
             if let ThorCommand::WaitReady {
                 config,
@@ -478,6 +494,11 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
                     GenerateEvent::TokenLogprob { .. } | GenerateEvent::ToolCall { .. } => {}
                 }
             }
+            if final_stats.is_none() {
+                return Err(anyhow::anyhow!(
+                    "generation channel closed without Done or Error event"
+                ));
+            }
             Ok(final_stats)
         })?;
 
@@ -525,6 +546,9 @@ fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
     }
     if rest.contains('/') {
         anyhow::bail!("{field} URL must not include a path: {trimmed}");
+    }
+    if rest.contains('?') || rest.contains('#') {
+        anyhow::bail!("{field} URL must not include query params or fragments: {trimmed}");
     }
 
     let normalized = if has_scheme {
@@ -681,9 +705,16 @@ async fn heartbeat_loop(
     layer: Arc<ServingLayer>,
     mut cfg: HeartbeatConfig,
 ) {
-    let interval = std::time::Duration::from_millis(cfg.interval_ms);
+    let mut rereg_backoff: u32 = 0;
     loop {
-        tokio::time::sleep(interval).await;
+        let sleep_ms = if rereg_backoff > 0 {
+            // Exponential backoff for re-registration retries: 2^n seconds, capped at 30s.
+            let backoff_ms = (1u64 << rereg_backoff.min(5)) * 1000;
+            backoff_ms.min(30_000)
+        } else {
+            cfg.interval_ms
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
         let inflight = layer
             .scheduler
@@ -708,7 +739,7 @@ async fn heartbeat_loop(
         } else {
             inflight
         };
-        let ttft_p95_ms = layer.scheduler.metrics.ttft_p95_us() / 1000;
+        let ttft_p95_ms = (layer.scheduler.metrics.ttft_p95_us() + 500) / 1000;
         let decode_tok_per_sec = layer.metrics.recent_decode_tok_per_sec();
 
         let url = format!(
@@ -761,9 +792,16 @@ async fn heartbeat_loop(
                             "re-registered with orchestrator after eviction"
                         );
                         cfg.worker_id = r.worker_id;
+                        cfg.interval_ms = r.heartbeat_interval_ms;
+                        rereg_backoff = 0;
                     }
                     Err(e) => {
-                        tracing::warn!(%e, "re-registration failed, will retry next heartbeat");
+                        rereg_backoff = rereg_backoff.saturating_add(1);
+                        tracing::warn!(
+                            %e,
+                            backoff_secs = (1u64 << rereg_backoff.min(5)),
+                            "re-registration failed, will retry with backoff"
+                        );
                     }
                 }
             }
@@ -865,7 +903,7 @@ fn run_serve(
     let layer = Arc::new(ServingLayer::new(backend.clone(), config.clone()));
 
     // Print identity info to stderr so operators can identify this worker node.
-    eprintln!("[ax-serving] worker starting on {host}:{port}");
+    tracing::info!(%host, %port, "worker starting");
 
     // Preload model (sync, before starting the async runtime).
     let capabilities: Vec<String> = if let Some(path) = model {
@@ -873,7 +911,7 @@ fn run_serve(
         layer
             .registry
             .load(&model_id, &path, load_config, backend.as_ref())?;
-        eprintln!("[ax-serving] preloaded '{model_id}'");
+        tracing::info!(%model_id, "preloaded model");
         vec![model_id.clone()]
     } else {
         vec![]
@@ -901,15 +939,26 @@ fn run_serve(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Max inflight reported to the orchestrator.  Must be at least 1: zero
-    // would make this worker permanently unselectable by WeightedRoundRobin
-    // (weight = max_inflight - inflight = 0) while LeastInflight would still
-    // route to it, causing inconsistent policy behaviour.
-    let max_inflight: usize = std::env::var("AXS_WORKER_MAX_INFLIGHT")
+    // Max inflight reported to the orchestrator.  This must not overstate the
+    // serving layer's own admission limits or the orchestrator will route
+    // requests that the worker immediately rejects with 503.  Clamp the
+    // advertised value to the effective scheduler capacity.
+    let requested_max_inflight: usize = std::env::var("AXS_WORKER_MAX_INFLIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
-        .max(1);
+        .unwrap_or_else(|| default_advertised_max_inflight(&config));
+    let max_inflight = clamp_advertised_max_inflight(
+        requested_max_inflight,
+        config.sched_max_inflight,
+        config.sched_per_model_max_inflight,
+    );
+    if max_inflight != requested_max_inflight {
+        tracing::warn!(
+            requested_max_inflight,
+            max_inflight,
+            "clamping advertised max_inflight to match scheduler capacity"
+        );
+    }
 
     // The address the orchestrator uses to reach this worker over loopback.
     let self_addr = format!("{host}:{port}");
@@ -944,14 +993,14 @@ fn run_serve(
                 .await
                 {
                     Ok(r) => {
-                        eprintln!(
+                        tracing::info!(
                             "[ax-serving] registered with orchestrator {addr} as worker {}",
                             r.worker_id
                         );
                         Some(r)
                     }
                     Err(e) => {
-                        eprintln!("[ax-serving] WARNING: orchestrator registration failed: {e}");
+                        tracing::warn!(%e, "orchestrator registration failed");
                         None
                     }
                 }
@@ -978,9 +1027,9 @@ fn run_serve(
             });
 
             // Run servers until SIGINT / SIGTERM.
-            start_servers(layer, &config).await?;
+            let server_result = start_servers(layer, &config).await;
 
-            // Graceful shutdown:
+            // Graceful shutdown (always runs, even on start_servers error — BUG-091):
             // 1. Abort heartbeat so the orchestrator's TTL timer can expire naturally.
             // 2. POST drain — tell orchestrator to stop routing new requests here.
             //    (Server is already down; this prevents further reroute churn.)
@@ -997,7 +1046,7 @@ fn run_serve(
                 )
                 .await
                 {
-                    eprintln!("[ax-serving] drain warning: {e}");
+                    tracing::warn!(%e, "drain request failed");
                 }
                 if let Err(e) = drain_complete(
                     &client,
@@ -1007,14 +1056,32 @@ fn run_serve(
                 )
                 .await
                 {
-                    eprintln!("[ax-serving] drain-complete warning: {e}");
+                    tracing::warn!(%e, "drain-complete request failed");
                 } else {
-                    eprintln!("[ax-serving] drain-complete sent to orchestrator");
+                    tracing::info!("drain-complete sent to orchestrator");
                 }
             }
 
-            Ok::<(), anyhow::Error>(())
+            server_result
         })
+}
+
+fn default_advertised_max_inflight(config: &ax_serving_api::config::ServeConfig) -> usize {
+    config
+        .sched_max_inflight
+        .max(1)
+        .min(config.sched_per_model_max_inflight.max(1))
+}
+
+fn clamp_advertised_max_inflight(
+    requested: usize,
+    sched_max_inflight: usize,
+    sched_per_model_max_inflight: usize,
+) -> usize {
+    requested
+        .max(1)
+        .min(sched_max_inflight.max(1))
+        .min(sched_per_model_max_inflight.max(1))
 }
 
 fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
@@ -1042,8 +1109,12 @@ fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_inference_input, normalize_http_base_url, parse_rest_addr};
+    use super::{
+        build_inference_input, clamp_advertised_max_inflight, default_advertised_max_inflight,
+        normalize_http_base_url, parse_rest_addr,
+    };
     use anyhow::Result;
+    use ax_serving_api::config::ServeConfig;
     use ax_serving_engine::{ChatMessage, GenerateInput};
     use serde_json::json;
 
@@ -1151,5 +1222,30 @@ mod tests {
         let err = normalize_http_base_url("   ", "orchestrator")
             .expect_err("blank url should be rejected");
         assert!(err.to_string().contains("URL is empty"));
+    }
+
+    #[test]
+    fn default_advertised_max_inflight_matches_scheduler_limits() {
+        let cfg = ServeConfig {
+            sched_max_inflight: 16,
+            sched_per_model_max_inflight: 4,
+            ..ServeConfig::default()
+        };
+        assert_eq!(default_advertised_max_inflight(&cfg), 4);
+    }
+
+    #[test]
+    fn clamp_advertised_max_inflight_caps_to_per_model_limit() {
+        assert_eq!(clamp_advertised_max_inflight(8, 16, 4), 4);
+    }
+
+    #[test]
+    fn clamp_advertised_max_inflight_preserves_safe_values() {
+        assert_eq!(clamp_advertised_max_inflight(2, 16, 4), 2);
+    }
+
+    #[test]
+    fn clamp_advertised_max_inflight_enforces_minimum_one() {
+        assert_eq!(clamp_advertised_max_inflight(0, 0, 0), 1);
     }
 }

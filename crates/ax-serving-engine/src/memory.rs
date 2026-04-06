@@ -48,7 +48,12 @@ fn available_bytes() -> u64 {
 
         if ret == libc::KERN_SUCCESS {
             let stats = unsafe { stats.assume_init() };
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64 };
+            let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+            let page_size = if raw_page_size > 0 {
+                raw_page_size as u64
+            } else {
+                4096
+            };
             let free = stats.free_count as u64 + stats.inactive_count as u64;
             return free * page_size;
         }

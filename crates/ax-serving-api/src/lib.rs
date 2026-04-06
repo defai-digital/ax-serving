@@ -116,8 +116,6 @@ impl ServingLayer {
                 config.sched_max_queue,
                 config.sched_max_wait_ms,
                 &config.sched_overload_policy,
-                config.sched_max_batch_size,
-                config.sched_batch_window_ms,
                 thermal,
             ),
             per_model_scheduler: PerModelScheduler::new(config.sched_per_model_max_inflight),
@@ -163,8 +161,7 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
 
     if idle_secs > 0 {
         info!("idle eviction enabled: models idle > {idle_secs}s will be unloaded");
-        let registry = layer.registry.clone();
-        let backend = Arc::clone(&layer.backend);
+        let eviction_layer = Arc::clone(&layer);
         let check_interval_secs = config.registry.idle_check_interval_secs;
         tokio::spawn(async move {
             let mut interval =
@@ -173,8 +170,8 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
             loop {
                 interval.tick().await;
                 // Run the blocking eviction pass off the async executor.
-                let registry2 = registry.clone();
-                let backend2 = Arc::clone(&backend);
+                let registry2 = eviction_layer.registry.clone();
+                let backend2 = Arc::clone(&eviction_layer.backend);
                 let evicted = match tokio::task::spawn_blocking(move || {
                     registry2.idle_evict_pass(&*backend2, idle_ms)
                 })
@@ -187,6 +184,7 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
                     }
                 };
                 for id in &evicted {
+                    eviction_layer.per_model_scheduler.remove(id);
                     info!("idle eviction: unloaded '{id}' (idle > {idle_secs}s)");
                 }
             }

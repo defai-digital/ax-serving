@@ -44,7 +44,10 @@ pub async fn run(
     );
 
     let start = Instant::now();
-    let baseline_rss = ax_serving_api::metrics::current_rss_bytes() as f64;
+    let baseline_rss = {
+        let raw = ax_serving_api::metrics::current_rss_bytes() as f64;
+        if raw > 0.0 { raw } else { 1.0 }
+    };
     let mut baseline_p95: Option<Duration> = None;
     let mut measurements: Vec<serde_json::Value> = Vec::new();
     let mut last_check = start;
@@ -105,7 +108,10 @@ pub async fn run(
             let rss_drift = (rss - baseline_rss) / baseline_rss;
             // Guard against zero baseline (empty first burst) — NaN comparisons
             // are always false in IEEE 754, which would silently mask drift.
-            let baseline_secs = baseline_p95.unwrap().as_secs_f64().max(1e-9);
+            let baseline_secs = baseline_p95
+                .map(|d| d.as_secs_f64())
+                .filter(|secs| *secs > 0.0)
+                .unwrap_or(1e-9);
             let p95_drift = (p95.as_secs_f64() - baseline_secs) / baseline_secs;
             let thermal = backend.thermal_state().as_str().to_string();
 

@@ -13,12 +13,23 @@ struct ModelEntry {
 }
 
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
+    const DEFAULT_TIMEOUT_SECS: u64 = 120;
+    let timeout_secs = std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let url = format!("{base_url}/health");
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => tracing::warn!(status = %resp.status(), "sglang health not ready"),
             Err(err) => tracing::warn!(%err, "sglang health probe failed"),
+        }
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "sglang runtime at {base_url} did not become healthy within {timeout_secs}s"
+            );
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }

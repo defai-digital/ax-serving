@@ -7,6 +7,11 @@ use axum::response::{IntoResponse, Response};
 
 use super::schema::{MAX_MAX_TOKENS, MAX_MODEL_ID_BYTES, ResponseFormat};
 
+/// Build an error response with the given status code and message.
+pub fn validation_error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+    (status, Json(serde_json::json!({"error": msg.to_string()}))).into_response()
+}
+
 /// Validate a model identifier field (e.g., `model` or `model_id`).
 ///
 /// Returns `Some(Response)` when the ID is empty/whitespace-only, exceeds
@@ -14,50 +19,31 @@ use super::schema::{MAX_MAX_TOKENS, MAX_MODEL_ID_BYTES, ResponseFormat};
 pub fn validate_model_identifier(model: &str, field_name: &str) -> Option<Response> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("{field_name} must not be empty")})),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field_name} must not be empty"),
+        ));
     }
-
     if model != trimmed {
-        return Some(
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": format!("{field_name} contains unsupported whitespace")
-                })),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{field_name} contains unsupported whitespace"),
+        ));
     }
     if model.chars().count() > MAX_MODEL_ID_BYTES {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("{field_name} exceeds max length of {MAX_MODEL_ID_BYTES}")
-                })),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field_name} exceeds max length of {MAX_MODEL_ID_BYTES}"),
+        ));
     }
     if !model
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
-        return Some(
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": format!("{field_name} must be alphanumeric with '-', '_', or '.'")
-                })),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{field_name} must be alphanumeric with '-', '_', or '.'"),
+        ));
     }
     None
 }
@@ -81,13 +67,7 @@ pub fn validate_sampling_params(
 ) -> Option<Response> {
     macro_rules! reject {
         ($msg:expr) => {
-            return Some(
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({"error": $msg})),
-                )
-                    .into_response(),
-            )
+            return Some(validation_error(StatusCode::UNPROCESSABLE_ENTITY, $msg))
         };
     }
     if !(0.0..=2.0).contains(&temperature) {
@@ -135,24 +115,16 @@ pub fn validate_sampling_params(
 /// Returns `None` when max_tokens is valid or None.
 pub fn validate_max_tokens(max_tokens: Option<u32>) -> Option<Response> {
     if matches!(max_tokens, Some(0)) {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "max_tokens must be >= 1"})),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be >= 1",
+        ));
     }
     if matches!(max_tokens, Some(n) if n > MAX_MAX_TOKENS) {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})")
-                })),
-            )
-                .into_response(),
-        );
+        return Some(validation_error(
+            StatusCode::BAD_REQUEST,
+            format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})"),
+        ));
     }
     None
 }
@@ -182,6 +154,29 @@ pub fn resolve_logprobs(logprobs: Option<bool>, top_logprobs: Option<u32>) -> (b
         0
     };
     (enabled, top)
+}
+
+/// Validate multimodal requests against backend capability hints.
+///
+/// Only `llama_cpp` is explicitly supported for `image_url` multipart content
+/// in the OpenAI-compatible chat endpoint.
+pub fn validate_multimodal_backend_support(
+    has_images: bool,
+    backend_name: Option<&'static str>,
+) -> Option<Response> {
+    if !has_images {
+        return None;
+    }
+
+    match backend_name {
+        Some("llama_cpp") | None => None,
+        Some(other) => Some(validation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "image_url content requires a llama_cpp backend, but this model is loaded on {other}"
+            ),
+        )),
+    }
 }
 
 /// Build [`GenerationParams`] from sampling fields shared by both
@@ -244,11 +239,7 @@ pub fn build_generation_params(
 
 /// Build a 400 Bad Request response for an invalid `cache_ttl` value.
 pub fn cache_ttl_err(e: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": format!("invalid cache_ttl: {e}")})),
-    )
-        .into_response()
+    validation_error(StatusCode::BAD_REQUEST, format!("invalid cache_ttl: {e}"))
 }
 
 /// Validate response format parameter.
@@ -259,17 +250,30 @@ pub fn validate_response_format(response_format: Option<&ResponseFormat>) -> Opt
     let response_format = response_format?;
     match response_format.format_type.as_str() {
         "text" | "json_object" => None,
-        other => Some(
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "invalid response_format.type '{other}'; expected 'text' or 'json_object'"
-                    )
-                })),
-            )
-                .into_response(),
-        ),
+        other => Some(validation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid response_format.type '{other}'; expected 'text' or 'json_object'"),
+        )),
+    }
+}
+
+/// Compute effective max_tokens from the request value and server default.
+///
+/// Returns `None` when neither the client nor the server specifies a cap.
+pub fn effective_max_tokens(request_value: Option<u32>, server_default: u32) -> Option<u32> {
+    request_value.or(if server_default > 0 {
+        Some(server_default)
+    } else {
+        None
+    })
+}
+
+/// Map a backend stop reason to the OpenAI finish_reason string.
+pub fn map_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "length" => "length",
+        "content_filter" => "content_filter",
+        _ => "stop",
     }
 }
 
@@ -278,6 +282,8 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::validate_model_identifier;
+
+    use super::validate_multimodal_backend_support;
 
     #[test]
     fn validate_model_identifier_rejects_empty_or_whitespace() {
@@ -301,5 +307,22 @@ mod tests {
     fn validate_model_identifier_rejects_too_long() {
         let resp = validate_model_identifier(&"a".repeat(129), "model").unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_multimodal_backend_support_allows_llama_cpp() {
+        assert!(validate_multimodal_backend_support(true, Some("llama_cpp")).is_none());
+    }
+
+    #[test]
+    fn validate_multimodal_backend_support_rejects_native() {
+        let resp = validate_multimodal_backend_support(true, Some("native")).unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validate_multimodal_backend_support_skips_non_multimodal() {
+        assert!(validate_multimodal_backend_support(false, Some("native")).is_none());
+        assert!(validate_multimodal_backend_support(false, None).is_none());
     }
 }

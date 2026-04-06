@@ -17,14 +17,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
+
+use crate::bench_common::{CLASSES, LatencyCollector, create_bench_client, percentile, rps};
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -39,31 +39,6 @@ pub struct CompareConfig {
     pub max_tokens: usize,
     pub json: Option<PathBuf>,
 }
-
-// ── Prompt classes ─────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum PromptClass {
-    Short,
-    Medium,
-    Long,
-}
-
-impl PromptClass {
-    fn prompt(self) -> &'static str {
-        match self {
-            Self::Short => "What is 2+2?",
-            Self::Medium => {
-                "Explain the differences between supervised, unsupervised, and reinforcement learning in machine learning. Cover the key characteristics, when to use each approach, and give one concrete example for each."
-            }
-            Self::Long => {
-                "You are an expert in distributed systems. Provide a comprehensive analysis of the CAP theorem and its implications for modern distributed database design. Include discussion of BASE vs ACID properties, common trade-offs made by popular databases like Cassandra, MongoDB, and PostgreSQL, and provide guidance on selecting the right consistency model for different use cases such as financial transactions, social media feeds, and real-time analytics."
-            }
-        }
-    }
-}
-
-const CLASSES: [PromptClass; 3] = [PromptClass::Short, PromptClass::Medium, PromptClass::Long];
 
 // ── Per-class stats ────────────────────────────────────────────────────────────
 
@@ -81,15 +56,6 @@ impl ClassLatencies {
     fn p99(&self) -> f64 {
         percentile(&self.latencies_ms, 99)
     }
-}
-
-fn percentile(v: &[u64], p: usize) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mut s = v.to_vec();
-    s.sort_unstable();
-    s[(s.len() * p / 100).min(s.len() - 1)] as f64
 }
 
 // ── Single-endpoint result ─────────────────────────────────────────────────────
@@ -131,11 +97,7 @@ pub struct CompareResults {
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: CompareConfig) -> Result<()> {
-    let client = Arc::new(
-        Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?,
-    );
+    let client = create_bench_client()?;
 
     println!("\nComparing {} vs {}", cfg.label_a, cfg.label_b);
     println!("{}", "=".repeat(60));
@@ -175,19 +137,17 @@ pub async fn run(cfg: CompareConfig) -> Result<()> {
 
 async fn run_endpoint(
     cfg: &CompareConfig,
-    client: &Arc<Client>,
+    client: &Arc<reqwest::Client>,
     url: &str,
     label: &str,
 ) -> Result<EndpointResult> {
     println!("\nRunning against {label} ({url}) …");
 
+    anyhow::ensure!(cfg.concurrency > 0, "concurrency must be >= 1");
     let sem = Arc::new(Semaphore::new(cfg.concurrency));
     let chat_url = format!("{url}/v1/chat/completions");
 
-    let short_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let medium_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let long_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let errors = Arc::new(AtomicU64::new(0));
+    let collector = Arc::new(LatencyCollector::new());
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(cfg.total_requests);
@@ -200,10 +160,7 @@ async fn run_endpoint(
         let chat_url = chat_url.clone();
         let model_id = cfg.model_id.clone();
         let max_tokens = cfg.max_tokens;
-        let short_lats = Arc::clone(&short_lats);
-        let medium_lats = Arc::clone(&medium_lats);
-        let long_lats = Arc::clone(&long_lats);
-        let errors = Arc::clone(&errors);
+        let collector = Arc::clone(&collector);
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -223,27 +180,23 @@ async fn run_endpoint(
             let elapsed = t.elapsed().as_millis() as u64;
 
             if ok {
-                let bucket = match class {
-                    PromptClass::Short => &short_lats,
-                    PromptClass::Medium => &medium_lats,
-                    PromptClass::Long => &long_lats,
-                };
-                bucket.lock().unwrap().push(elapsed);
+                collector.record(class, elapsed);
             } else {
-                errors.fetch_add(1, Ordering::Relaxed);
+                collector.record_error();
             }
         }));
     }
 
     for h in handles {
-        let _ = h.await;
+        if let Err(e) = h.await
+            && e.is_panic()
+        {
+            tracing::warn!("bench task panicked: {e}");
+        }
     }
 
     let total_ms = start.elapsed().as_millis() as u64;
-    let sv = short_lats.lock().unwrap().clone();
-    let mv = medium_lats.lock().unwrap().clone();
-    let lv = long_lats.lock().unwrap().clone();
-    let err = errors.load(Ordering::Relaxed);
+    let (sv, mv, lv, err) = collector.snapshot();
 
     let classes = [
         ClassLatencies { latencies_ms: sv },
@@ -256,11 +209,7 @@ async fn run_endpoint(
         .flat_map(|c| c.latencies_ms.iter().copied())
         .collect();
     let total_success: usize = classes.iter().map(|c| c.latencies_ms.len()).sum();
-    let rps = if total_ms > 0 {
-        total_success as f64 / (total_ms as f64 / 1_000.0)
-    } else {
-        0.0
-    };
+    let computed_rps = rps(total_success, total_ms);
 
     Ok(EndpointResult {
         label: label.to_string(),
@@ -276,7 +225,7 @@ async fn run_endpoint(
         overall_p50: percentile(&all, 50),
         overall_p95: percentile(&all, 95),
         overall_p99: percentile(&all, 99),
-        rps,
+        rps: computed_rps,
         errors: err,
     })
 }
@@ -286,6 +235,9 @@ async fn run_endpoint(
 fn delta_str(a: f64, b: f64) -> String {
     if a == 0.0 && b == 0.0 {
         return "  N/A".to_string();
+    }
+    if a == 0.0 {
+        return "  new".to_string();
     }
     let pct = (b - a) / a * 100.0;
     format!("{pct:+.0}%")

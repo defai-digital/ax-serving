@@ -24,10 +24,6 @@ sched_overload_policy: "queue" # env: AXS_OVERLOAD_POLICY  ("queue" | "reject" |
                                # "reject" causes HTTP 500 when concurrent requests exceed the limit
 sched_per_model_max_inflight: 4  # env: AXS_PER_MODEL_MAX_INFLIGHT
                                # (max concurrent requests per distinct model ID)
-sched_max_batch_size: 8        # env: AXS_MAX_BATCH_SIZE
-                               # (advisory; reserved for future continuous-batching)
-sched_batch_window_ms: 5       # env: AXS_BATCH_WINDOW_MS
-                               # (advisory; reserved for future continuous-batching)
 
 # ── Idle eviction & thermal ───────────────────────────────────────────────────
 idle_timeout_secs: 0           # env: AXS_IDLE_TIMEOUT_SECS

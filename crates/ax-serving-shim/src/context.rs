@@ -97,10 +97,21 @@ pub unsafe extern "C" fn llama_eval(
         return -1;
     }
     let ctx_ref = unsafe { &mut *ctx };
-    // Reinterpret i32 token IDs as u32 for the backend (values are always
-    // non-negative valid token IDs; casting is safe for the expected range).
+    let i32_slice = unsafe { std::slice::from_raw_parts(tokens, n_tokens as usize) };
+    if i32_slice.iter().any(|&t| t < 0) {
+        tracing::error!("llama_eval: negative token ID in input");
+        return -1;
+    }
     let token_slice =
         unsafe { std::slice::from_raw_parts(tokens as *const u32, n_tokens as usize) };
+    if ctx_ref.token_buf.len() + token_slice.len() > ctx_ref.n_ctx as usize {
+        tracing::error!(
+            "llama_eval: token count ({}) would exceed n_ctx ({})",
+            ctx_ref.token_buf.len() + token_slice.len(),
+            ctx_ref.n_ctx
+        );
+        return -1;
+    }
     ctx_ref.token_buf.extend_from_slice(token_slice);
 
     match ctx_ref
@@ -115,6 +126,12 @@ pub unsafe extern "C" fn llama_eval(
             }
             if (next_id as usize) < ctx_ref.logits.len() {
                 ctx_ref.logits[next_id as usize] = 20.0;
+            } else {
+                tracing::warn!(
+                    next_id,
+                    vocab_size = ctx_ref.logits.len(),
+                    "eval: predicted token ID out of vocab range; logits are flat"
+                );
             }
             ctx_ref.position = ctx_ref.token_buf.len();
             0
@@ -131,9 +148,9 @@ pub unsafe extern "C" fn llama_eval(
 /// Valid until the next `llama_eval` call or until the context is freed.
 /// Returns null if `ctx` is null.
 #[unsafe(no_mangle)]
-pub extern "C" fn llama_get_logits(ctx: *const LlamaContext) -> *const f32 {
+pub extern "C" fn llama_get_logits(ctx: *mut LlamaContext) -> *mut f32 {
     if ctx.is_null() {
-        return std::ptr::null();
+        return std::ptr::null_mut();
     }
-    unsafe { (*ctx).logits.as_ptr() }
+    unsafe { (*ctx).logits.as_mut_ptr() }
 }

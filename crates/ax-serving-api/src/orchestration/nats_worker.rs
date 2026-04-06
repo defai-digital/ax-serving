@@ -243,7 +243,9 @@ async fn run_model_loop(
                         Ok(r) => r,
                         Err(e) => {
                             warn!(%model_id, %e, "NatsWorker: failed to parse request");
-                            let _ = msg.ack().await;
+                            if let Err(e) = msg.ack().await {
+                                warn!(%model_id, %e, "NatsWorker: ack failed for malformed request");
+                            }
                             continue;
                         }
                     };

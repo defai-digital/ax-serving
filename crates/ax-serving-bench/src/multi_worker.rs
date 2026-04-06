@@ -181,7 +181,11 @@ async fn bench(cfg: &MultiWorkerConfig) -> Result<MultiWorkerResults> {
     }
 
     for h in handles {
-        let _ = h.await;
+        if let Err(e) = h.await
+            && e.is_panic()
+        {
+            tracing::warn!("bench task panicked: {e}");
+        }
     }
 
     let total_ms = start.elapsed().as_millis() as u64;

@@ -26,6 +26,8 @@ pub struct ThorConfig {
     pub node_class: String,
     pub friendly_name: Option<String>,
     pub chip_model: Option<String>,
+    /// env: `AXS_THOR_SHUTDOWN_TIMEOUT_SECS` (default 30)
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 impl ThorConfig {
@@ -43,6 +45,14 @@ impl ThorConfig {
             .unwrap_or_else(|_| listen_addr.to_string())
             .parse()
             .context("invalid AXS_THOR_ADVERTISED_ADDR")?;
+        if advertised_addr.ip().is_unspecified() {
+            tracing::warn!(
+                %advertised_addr,
+                "advertised address is a wildcard; the control plane will not be \
+                 able to route traffic to this worker — set AXS_THOR_ADVERTISED_ADDR \
+                 to a routable IP"
+            );
+        }
         let max_inflight = std::env::var("AXS_THOR_MAX_INFLIGHT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -53,6 +63,9 @@ impl ThorConfig {
             std::env::var("AXS_THOR_NODE_CLASS").unwrap_or_else(|_| DEFAULT_NODE_CLASS.into());
         let friendly_name = load_optional_string_env("AXS_THOR_FRIENDLY_NAME");
         let chip_model = load_optional_string_env("AXS_THOR_CHIP_MODEL");
+        let shutdown_timeout_secs = std::env::var("AXS_THOR_SHUTDOWN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
 
         Ok(Self {
             control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
@@ -65,6 +78,7 @@ impl ThorConfig {
             node_class,
             friendly_name,
             chip_model,
+            shutdown_timeout_secs,
         })
     }
 }

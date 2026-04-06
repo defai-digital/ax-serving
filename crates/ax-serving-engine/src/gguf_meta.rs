@@ -116,7 +116,7 @@ fn parse_gguf_meta<R: Read + Seek>(mut r: R) -> Result<GgufMeta, GgufMetaError> 
     let mut array_lens: HashMap<String, u64> = HashMap::new();
 
     // Cap iteration to prevent runaway on malformed files.
-    let limit = n_kv.min(512);
+    let limit = n_kv.min(2048);
 
     for _ in 0..limit {
         let key = match read_str(&mut r) {

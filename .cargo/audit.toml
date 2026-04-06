@@ -1,7 +1,4 @@
 [advisories]
 ignore = [
-  "RUSTSEC-2025-0057", # fxhash via mistralrs-core/bm25; upstream supply-chain warning
-  "RUSTSEC-2025-0119", # number_prefix via hf-hub/indicatif in mistralrs stack; upstream warning
-  "RUSTSEC-2024-0436", # paste via Candle/tokenizers stack; upstream warning
   "RUSTSEC-2025-0134", # rustls-pemfile via async-nats TLS cert loading; no direct fix in current upstream
 ]

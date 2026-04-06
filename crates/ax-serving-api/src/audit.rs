@@ -1,10 +1,11 @@
 //! Lightweight in-process audit log for admin and control-plane actions.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tracing::warn;
 
 const DEFAULT_AUDIT_CAPACITY: usize = 256;
 
@@ -47,7 +48,7 @@ impl AuditLog {
         outcome: impl Into<String>,
         detail: Option<serde_json::Value>,
     ) {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events_lock();
         if events.len() >= self.capacity {
             events.pop_front();
         }
@@ -66,7 +67,7 @@ impl AuditLog {
     }
 
     pub fn tail(&self, limit: usize) -> Vec<AuditEvent> {
-        let events = self.events.lock().unwrap();
+        let events = self.events_lock();
         let len = events.len();
         let take = limit.min(len);
         events
@@ -74,6 +75,16 @@ impl AuditLog {
             .skip(len.saturating_sub(take))
             .cloned()
             .collect()
+    }
+
+    fn events_lock(&self) -> MutexGuard<'_, VecDeque<AuditEvent>> {
+        match self.events.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(%err, "audit log lock poisoned; continuing with poisoned state");
+                err.into_inner()
+            }
+        }
     }
 }
 

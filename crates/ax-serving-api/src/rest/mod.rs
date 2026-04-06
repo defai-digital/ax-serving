@@ -14,6 +14,7 @@ pub mod schema;
 pub mod validation;
 
 use std::collections::HashSet;
+use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,10 +93,17 @@ async fn shutdown_signal() {
 
     let ctrl_c = async { tokio::signal::ctrl_c().await.ok() };
     let sigterm = async {
-        signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => stream.recv().await,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to install SIGTERM handler; continuing with SIGINT only"
+                );
+                pending::<()>().await;
+                None
+            }
+        }
     };
 
     tokio::select! {

@@ -43,8 +43,8 @@ pub unsafe extern "C" fn llama_sample_temperature(
         return;
     }
 
-    if temp <= 0.0 {
-        // Greedy: leave logits unchanged; llama_sample_token_greedy picks max.
+    if temp <= 0.0 || temp.is_nan() {
+        // Greedy / invalid: leave logits unchanged; llama_sample_token_greedy picks max.
         return;
     }
 
@@ -64,11 +64,11 @@ pub unsafe extern "C" fn llama_sample_token_greedy(
     candidates: *mut LlamaTokenDataArray,
 ) -> LlamaToken {
     if candidates.is_null() {
-        return 0;
+        return -1;
     }
     let arr = unsafe { &*candidates };
     if arr.data.is_null() || arr.size == 0 {
-        return 0;
+        return -1;
     }
 
     let slice = unsafe { std::slice::from_raw_parts(arr.data, arr.size) };
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn llama_sample_token_greedy(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|e| e.id)
-        .unwrap_or(0)
+        .unwrap_or(-1)
 }
 
 /// Apply top-k filtering (keep only the k highest logits).
@@ -94,7 +94,12 @@ pub unsafe extern "C" fn llama_sample_top_k(
     k: i32,
     _min_keep: libc::size_t,
 ) {
-    if candidates.is_null() || k <= 0 {
+    if candidates.is_null() {
+        return;
+    }
+    if k <= 0 {
+        // Invalidate sorted flag when k<=0 is a no-op.
+        unsafe { (*candidates).sorted = false };
         return;
     }
     let arr = unsafe { &mut *candidates };
@@ -126,7 +131,8 @@ pub unsafe extern "C" fn llama_sample_top_p(
     p: f32,
     _min_keep: libc::size_t,
 ) {
-    if candidates.is_null() {
+    // p >= 1.0 means "keep all" — no-op to avoid float accumulation truncation.
+    if candidates.is_null() || p >= 1.0 {
         return;
     }
     let arr = unsafe { &mut *candidates };
@@ -146,8 +152,9 @@ pub unsafe extern "C" fn llama_sample_top_p(
         e.p = (e.logit - max_logit).exp();
         sum += e.p;
     }
+    let norm = if sum > 0.0 { sum } else { 1.0 };
     for e in slice.iter_mut() {
-        e.p /= sum;
+        e.p /= norm;
     }
 
     // Sort descending by probability (may already be sorted from top_k).

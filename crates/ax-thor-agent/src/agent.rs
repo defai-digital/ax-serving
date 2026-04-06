@@ -98,7 +98,10 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
         .as_str()
         .context("registration response missing worker_id")?
         .to_string();
-    let heartbeat_interval_ms = response["heartbeat_interval_ms"].as_u64().unwrap_or(5_000);
+    let heartbeat_interval_ms = response["heartbeat_interval_ms"]
+        .as_u64()
+        .unwrap_or(5_000)
+        .clamp(1_000, 300_000);
     Ok(RegistrationState {
         session: WorkerSession {
             worker_id,
@@ -163,7 +166,10 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
                         *runtime.models.write().await = registration.models;
                         *runtime.session.write().await = Some(registration.session);
                     }
-                    Err(err) => tracing::warn!(%err, "thor agent re-registration failed"),
+                    Err(err) => {
+                        tracing::warn!(%err, "thor agent re-registration failed, clearing stale session");
+                        *runtime.session.write().await = None;
+                    }
                 }
             }
             Ok(resp) => tracing::warn!(status = %resp.status(), "thor heartbeat rejected"),

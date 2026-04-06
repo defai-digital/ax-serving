@@ -10,6 +10,8 @@
 > - [Market Positioning](/Users/akiralam/code/ax-serving/docs/market-positioning.md)
 > - [Competitive Landscape](/Users/akiralam/code/ax-serving/docs/competitive-landscape.md)
 > - [Maintainability Refactor Plan](/Users/akiralam/code/ax-serving/docs/maintainability-refactor-plan.md)
+> - [Open-Source / Enterprise Boundary PRD](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md)
+> - [Enterprise Extraction And Release Execution PRD](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md)
 > - [ADR-001](/Users/akiralam/code/ax-serving/docs/adr/ADR-001-target-market-and-product-scope.md)
 > - [ADR-002](/Users/akiralam/code/ax-serving/docs/adr/ADR-002-software-value-boundary-vs-hardware-deployment-context.md)
 > - [ADR-012](/Users/akiralam/code/ax-serving/docs/adr/ADR-012-local-multi-worker-orchestration.md)

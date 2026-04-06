@@ -48,7 +48,7 @@ pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn has_valid_api_key(candidate: &str, keys: &HashSet<String>) -> bool {
+pub(crate) fn has_valid_api_key(candidate: &str, keys: &HashSet<String>) -> bool {
     keys.iter()
         .any(|expected| constant_time_eq_str(candidate, expected))
 }

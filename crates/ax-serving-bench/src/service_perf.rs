@@ -87,9 +87,11 @@ pub async fn run(cfg: ServicePerfConfig) -> Result<()> {
             .context("failed to build reqwest client")?,
     );
 
-    let baseline = fetch_snapshot(&client, &cfg.url)
-        .await
-        .unwrap_or(RunSnapshot {
+    let baseline = match fetch_snapshot(&client, &cfg.url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARNING: baseline metrics fetch failed ({e}); results may be incomplete");
+            RunSnapshot {
             cache_hits: 0,
             cache_misses: 0,
             cache_mode: "unknown".into(),
@@ -103,7 +105,9 @@ pub async fn run(cfg: ServicePerfConfig) -> Result<()> {
             generation_batches: 0,
             generation_batch_requests: 0,
             generation_batch_largest_requests: 0,
-        });
+        }
+        }
+    };
 
     let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
     let latency_ms: Arc<tokio::sync::Mutex<Vec<f64>>> =
@@ -179,7 +183,11 @@ pub async fn run(cfg: ServicePerfConfig) -> Result<()> {
     }
 
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await
+            && e.is_panic()
+        {
+            tracing::warn!("bench task panicked: {e}");
+        }
     }
 
     let total_duration_ms = start.elapsed().as_secs_f64() * 1000.0;

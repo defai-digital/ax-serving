@@ -7,7 +7,6 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::HeaderValue,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -21,14 +20,26 @@ pub struct ProxyState {
     pub client: reqwest::Client,
     pub sglang_url: String,
     pub inflight: Arc<AtomicUsize>,
+    pub max_inflight: usize,
 }
 
 struct InflightGuard(Arc<AtomicUsize>);
 
 impl InflightGuard {
-    fn acquire(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(Arc::clone(counter))
+    /// Try to acquire an inflight slot. Returns `None` if at capacity.
+    fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= max {
+                return None;
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self(Arc::clone(counter)));
+            }
+        }
     }
 }
 
@@ -43,6 +54,7 @@ pub fn router(config: &ThorConfig, client: reqwest::Client, inflight: Arc<Atomic
         client,
         sglang_url: config.sglang_url.clone(),
         inflight,
+        max_inflight: config.max_inflight,
     };
 
     Router::new()
@@ -57,39 +69,74 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn proxy_chat(State(state): State<ProxyState>, body: Bytes) -> impl IntoResponse {
-    proxy_to(&state, "/v1/chat/completions", body).await
+async fn proxy_chat(
+    State(state): State<ProxyState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_to(&state, "/v1/chat/completions", &headers, body).await
 }
 
-async fn proxy_completions(State(state): State<ProxyState>, body: Bytes) -> impl IntoResponse {
-    proxy_to(&state, "/v1/completions", body).await
+async fn proxy_completions(
+    State(state): State<ProxyState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_to(&state, "/v1/completions", &headers, body).await
 }
 
-async fn proxy_embeddings(State(state): State<ProxyState>, body: Bytes) -> impl IntoResponse {
-    proxy_to(&state, "/v1/embeddings", body).await
+async fn proxy_embeddings(
+    State(state): State<ProxyState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_to(&state, "/v1/embeddings", &headers, body).await
 }
 
-async fn proxy_to(state: &ProxyState, path: &str, body: Bytes) -> axum::response::Response {
-    let _guard = InflightGuard::acquire(&state.inflight);
+/// Headers forwarded from the client request to sglang.
+const FORWARDED_HEADERS: &[&str] = &["authorization", "x-request-id", "content-type"];
+
+async fn proxy_to(
+    state: &ProxyState,
+    path: &str,
+    client_headers: &axum::http::HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let Some(_guard) = InflightGuard::try_acquire(&state.inflight, state.max_inflight) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "max inflight requests reached",
+        )
+            .into_response();
+    };
     let url = format!("{}{}", state.sglang_url, path);
-    match state
-        .client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-    {
+    let mut req = state.client.post(url);
+    // Forward client headers first; fall back to application/json for content-type.
+    let mut has_content_type = false;
+    for &name in FORWARDED_HEADERS {
+        if let Some(val) = client_headers.get(name) {
+            req = req.header(name, val.clone());
+            if name == "content-type" {
+                has_content_type = true;
+            }
+        }
+    }
+    if !has_content_type {
+        req = req.header("content-type", "application/json");
+    }
+    match req.body(body).send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let content_type = resp
-                .headers()
+            let resp_headers = resp.headers().clone();
+            let content_type = resp_headers
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            let is_event_stream = content_type.starts_with("text/event-stream");
+            let is_event_stream = content_type
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream");
 
             if is_event_stream {
                 let byte_stream = resp.bytes_stream();
@@ -109,23 +156,25 @@ async fn proxy_to(state: &ProxyState, path: &str, body: Bytes) -> axum::response
                     },
                 );
 
-                return axum::response::Response::builder()
-                    .status(status)
-                    .header(
-                        "content-type",
-                        HeaderValue::from_str(&content_type)
-                            .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
-                    )
+                let mut builder = axum::response::Response::builder().status(status);
+                for (name, value) in &resp_headers {
+                    builder = builder.header(name, value);
+                }
+                return builder
                     .body(Body::from_stream(guarded))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
 
             match resp.bytes().await {
-                Ok(bytes) => axum::response::Response::builder()
-                    .status(status)
-                    .header("content-type", content_type)
-                    .body(axum::body::Body::from(bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                Ok(bytes) => {
+                    let mut builder = axum::response::Response::builder().status(status);
+                    for (name, value) in &resp_headers {
+                        builder = builder.header(name, value);
+                    }
+                    builder
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
                 Err(err) => (
                     StatusCode::BAD_GATEWAY,
                     format!("failed to read sglang response: {err}"),

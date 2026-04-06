@@ -27,7 +27,9 @@ pub async fn run(cfg: CacheBenchConfig) -> Result<()> {
         anyhow::bail!("--requests must be >= 2 (1 cold + at least 1 warm)");
     }
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
     let endpoint = format!("{}/v1/chat/completions", cfg.url.trim_end_matches('/'));
 
     let body = serde_json::json!({
@@ -66,7 +68,8 @@ pub async fn run(cfg: CacheBenchConfig) -> Result<()> {
 
     let cold_ms = latencies_ms[0];
     let warm_slice = &latencies_ms[1..];
-    let warm_avg_ms = warm_slice.iter().sum::<u128>() / warm_slice.len() as u128;
+    let warm_avg_ms_f = warm_slice.iter().map(|&v| v as f64).sum::<f64>() / warm_slice.len() as f64;
+    let warm_avg_ms = warm_avg_ms_f.round() as u128;
     let warm_min_ms = warm_slice.iter().copied().min().unwrap_or(0);
 
     let speedup = if warm_avg_ms > 0 {

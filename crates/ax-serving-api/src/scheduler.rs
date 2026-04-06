@@ -40,12 +40,6 @@
 //!
 //! The controller never exceeds `config.max_inflight` and never drops below 2.
 //!
-//! # Batching hints (`AXS_BATCH_WINDOW_MS`, `AXS_MAX_BATCH_SIZE`)
-//!
-//! These values are stored in [`SchedulerConfig`] and exposed to callers via
-//! [`Scheduler::config`].  They are advisory and have no effect on the current
-//! llama.cpp path.
-//!
 //! # Overload policy (`AXS_OVERLOAD_POLICY`)
 //!
 //! - `queue` *(default)* — allow queueing up to `max_queue`; reject with 503 when the queue is full.
@@ -108,12 +102,6 @@ pub struct SchedulerConfig {
     pub max_inflight: usize,
     pub max_wait_ms: u64,
     pub overload_policy: OverloadPolicy,
-    /// Maximum number of requests to group into one continuous batch.
-    /// `AXS_MAX_BATCH_SIZE` (default 8). Currently advisory.
-    pub max_batch_size: usize,
-    /// How long to wait for a batch to fill before dispatching it (ms).
-    /// `AXS_BATCH_WINDOW_MS` (default 5). Currently advisory.
-    pub batch_window_ms: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -123,8 +111,6 @@ impl Default for SchedulerConfig {
             max_inflight: 16,
             max_wait_ms: 120_000,
             overload_policy: OverloadPolicy::Queue,
-            max_batch_size: 8,
-            batch_window_ms: 5,
         }
     }
 }
@@ -135,8 +121,6 @@ impl SchedulerConfig {
         max_queue: usize,
         max_wait_ms: u64,
         overload_policy: &str,
-        max_batch_size: usize,
-        batch_window_ms: u64,
     ) -> Self {
         Self {
             max_inflight: max_inflight.max(1),
@@ -147,8 +131,6 @@ impl SchedulerConfig {
                 "reject" => OverloadPolicy::Reject,
                 _ => OverloadPolicy::Queue,
             },
-            max_batch_size: max_batch_size.max(1),
-            batch_window_ms,
         }
     }
 }
@@ -503,8 +485,6 @@ impl Scheduler {
         max_queue: usize,
         max_wait_ms: u64,
         overload_policy: &str,
-        max_batch_size: usize,
-        batch_window_ms: u64,
         thermal: Arc<ThermalMonitor>,
     ) -> Self {
         Self::new(
@@ -513,8 +493,6 @@ impl Scheduler {
                 max_queue,
                 max_wait_ms,
                 overload_policy,
-                max_batch_size,
-                batch_window_ms,
             ),
             thermal,
         )
@@ -791,6 +769,11 @@ impl PerModelScheduler {
         }
     }
 
+    /// Remove the semaphore entry for a model that has been unloaded.
+    pub fn remove(&self, model_id: &str) {
+        self.slots.remove(model_id);
+    }
+
     /// Acquire a per-model slot. Returns a permit that releases the slot on drop.
     ///
     /// Waits up to `max_wait_ms` ms. Returns `Err` on timeout or semaphore close.
@@ -904,8 +887,6 @@ mod tests {
                 max_queue: 10,
                 max_wait_ms: 100,
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         );
@@ -926,8 +907,6 @@ mod tests {
                 max_queue: 0,
                 max_wait_ms: 50,
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         );
@@ -947,8 +926,6 @@ mod tests {
                 max_queue: 10,
                 max_wait_ms: 100,
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         );
@@ -1048,22 +1025,22 @@ mod tests {
 
     #[test]
     fn scheduler_config_from_serve_config_policies() {
-        let shed = SchedulerConfig::from_serve_config(4, 32, 200, "shed_oldest", 8, 5);
+        let shed = SchedulerConfig::from_serve_config(4, 32, 200, "shed_oldest");
         assert_eq!(shed.overload_policy, OverloadPolicy::ShedOldest);
-        let shed2 = SchedulerConfig::from_serve_config(4, 32, 200, "shed-oldest", 8, 5);
+        let shed2 = SchedulerConfig::from_serve_config(4, 32, 200, "shed-oldest");
         assert_eq!(shed2.overload_policy, OverloadPolicy::ShedOldest);
-        let rej = SchedulerConfig::from_serve_config(4, 32, 200, "reject", 8, 5);
+        let rej = SchedulerConfig::from_serve_config(4, 32, 200, "reject");
         assert_eq!(rej.overload_policy, OverloadPolicy::Reject);
-        let queue = SchedulerConfig::from_serve_config(4, 32, 200, "queue", 8, 5);
+        let queue = SchedulerConfig::from_serve_config(4, 32, 200, "queue");
         assert_eq!(queue.overload_policy, OverloadPolicy::Queue);
         // Unknown falls back to Queue.
-        let unk = SchedulerConfig::from_serve_config(4, 32, 200, "DROP_ALL", 8, 5);
+        let unk = SchedulerConfig::from_serve_config(4, 32, 200, "DROP_ALL");
         assert_eq!(unk.overload_policy, OverloadPolicy::Queue);
     }
 
     #[test]
     fn scheduler_config_enforces_min_inflight() {
-        let cfg = SchedulerConfig::from_serve_config(0, 32, 200, "queue", 8, 5);
+        let cfg = SchedulerConfig::from_serve_config(0, 32, 200, "queue");
         assert_eq!(cfg.max_inflight, 1, "min inflight should be 1");
     }
 
@@ -1118,8 +1095,6 @@ mod tests {
                 max_queue: 1,
                 max_wait_ms: 100,
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         );
@@ -1179,8 +1154,6 @@ mod tests {
                 max_queue: 4,
                 max_wait_ms: 1000,
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         ));
@@ -1218,8 +1191,6 @@ mod tests {
                 max_queue: 4,
                 max_wait_ms: 5, // extremely short timeout
                 overload_policy: OverloadPolicy::Reject,
-                max_batch_size: 8,
-                batch_window_ms: 5,
             },
             Arc::new(ThermalMonitor::new()),
         );

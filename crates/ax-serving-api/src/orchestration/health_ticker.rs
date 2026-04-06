@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::registry::{WorkerId, WorkerRegistry};
@@ -88,30 +89,160 @@ impl HealthTicker {
 /// Timeout for each TCP liveness probe. Short enough that a dead worker is
 /// detected within one heartbeat interval; long enough for a loaded host to accept.
 const TCP_PROBE_TIMEOUT_SECS: u64 = 1;
+/// Cap concurrent liveness probes so a churny worker pool cannot fan out an
+/// unbounded number of probe tasks on a single health-ticker tick.
+const MAX_CONCURRENT_TCP_PROBES: usize = 32;
+
+async fn probe_candidate(
+    id: WorkerId,
+    addr: SocketAddr,
+    probe_timeout: Duration,
+) -> (WorkerId, SocketAddr, bool) {
+    let result = tokio::time::timeout(probe_timeout, tokio::net::TcpStream::connect(addr)).await;
+    let reachable = matches!(result, Ok(Ok(_)));
+    (id, addr, reachable)
+}
+
+async fn probe_candidates(
+    candidates: Vec<(WorkerId, SocketAddr)>,
+    probe_timeout: Duration,
+    max_concurrency: usize,
+) -> Vec<(WorkerId, SocketAddr, bool)> {
+    let limit = max_concurrency.max(1);
+    let mut pending = candidates.into_iter();
+    let mut probes = JoinSet::new();
+    let mut results = Vec::new();
+
+    loop {
+        while probes.len() < limit {
+            let Some((id, addr)) = pending.next() else {
+                break;
+            };
+            probes.spawn(probe_candidate(id, addr, probe_timeout));
+        }
+
+        let Some(joined) = probes.join_next().await else {
+            break;
+        };
+
+        if let Ok(result) = joined {
+            results.push(result);
+        }
+    }
+
+    results
+}
 
 /// Attempt TCP connects to `candidates` concurrently (1 s timeout each).
 /// Any worker whose probe fails is evicted from the registry immediately.
 async fn probe_and_evict(registry: &WorkerRegistry, candidates: Vec<(WorkerId, SocketAddr)>) {
     let probe_timeout = Duration::from_secs(TCP_PROBE_TIMEOUT_SECS);
 
-    let tasks: Vec<_> = candidates
-        .into_iter()
-        .map(|(id, addr)| {
-            tokio::spawn(async move {
-                let result =
-                    tokio::time::timeout(probe_timeout, tokio::net::TcpStream::connect(addr)).await;
-                let reachable = matches!(result, Ok(Ok(_)));
-                (id, addr, reachable)
-            })
-        })
-        .collect();
-
-    for task in tasks {
-        if let Ok((id, addr, reachable)) = task.await
-            && !reachable
-        {
+    for (id, addr, reachable) in
+        probe_candidates(candidates, probe_timeout, MAX_CONCURRENT_TCP_PROBES).await
+    {
+        if !reachable {
             warn!(%id, %addr, "worker evicted: TCP probe failed (unreachable)");
             registry.evict(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use super::{probe_and_evict, probe_candidates};
+    use crate::orchestration::registry::{
+        RegisterCapabilities, RegisterRequest, WorkerId, WorkerRegistry,
+    };
+
+    fn register_worker(registry: &WorkerRegistry, addr: SocketAddr) -> WorkerId {
+        let response = registry.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: addr.to_string(),
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".to_string()]),
+                backend: "auto".to_string(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5_000,
+        );
+        WorkerId::parse(&response.worker_id).expect("registry must return a valid worker id")
+    }
+
+    #[tokio::test]
+    async fn probe_candidates_reports_reachability() {
+        let reachable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reachable listener");
+        let reachable_addr = reachable_listener
+            .local_addr()
+            .expect("reachable listener local addr");
+
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed listener");
+        let closed_addr = closed_listener
+            .local_addr()
+            .expect("closed listener local addr");
+        drop(closed_listener);
+
+        let reachable_id = WorkerId::new();
+        let closed_id = WorkerId::new();
+        let results = probe_candidates(
+            vec![(reachable_id, reachable_addr), (closed_id, closed_addr)],
+            Duration::from_millis(100),
+            1,
+        )
+        .await;
+
+        let by_id: HashMap<WorkerId, bool> = results
+            .into_iter()
+            .map(|(id, _addr, reachable)| (id, reachable))
+            .collect();
+        assert_eq!(by_id.get(&reachable_id), Some(&true));
+        assert_eq!(by_id.get(&closed_id), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn probe_and_evict_removes_only_unreachable_workers() {
+        let reachable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reachable listener");
+        let reachable_addr = reachable_listener
+            .local_addr()
+            .expect("reachable listener local addr");
+
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed listener");
+        let closed_addr = closed_listener
+            .local_addr()
+            .expect("closed listener local addr");
+        drop(closed_listener);
+
+        let registry = WorkerRegistry::new();
+        let reachable_id = register_worker(&registry, reachable_addr);
+        let closed_id = register_worker(&registry, closed_addr);
+        registry.mark_unhealthy(reachable_id);
+        registry.mark_unhealthy(closed_id);
+
+        probe_and_evict(&registry, registry.list_unhealthy_addrs()).await;
+
+        assert!(
+            registry.get_snapshot(reachable_id).is_some(),
+            "reachable worker should remain registered"
+        );
+        assert!(
+            registry.get_snapshot(closed_id).is_none(),
+            "unreachable worker should be evicted"
+        );
     }
 }

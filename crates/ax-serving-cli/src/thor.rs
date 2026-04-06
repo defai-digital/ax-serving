@@ -59,6 +59,9 @@ fn normalize_control_plane_url(raw: &str) -> Result<String> {
     if rest.contains('/') {
         anyhow::bail!("control plane URL must not include a path: {trimmed}");
     }
+    if rest.contains('?') || rest.contains('#') {
+        anyhow::bail!("control plane URL must not include query params or fragments: {trimmed}");
+    }
 
     let normalized = if has_scheme {
         trimmed.to_string()
@@ -132,7 +135,11 @@ impl ThorEnvFile {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            values.insert(key.trim().to_string(), value.trim().to_string());
+            let trimmed_value = value.trim().to_string();
+            if trimmed_value.is_empty() {
+                continue;
+            }
+            values.insert(key.trim().to_string(), trimmed_value);
         }
         Ok(Self { values })
     }
@@ -438,7 +445,10 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
 fn default_thor_env_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| {
+            eprintln!("WARNING: $HOME not set; using /tmp for thor env file");
+            PathBuf::from("/tmp")
+        })
         .join(".config/ax-serving/thor.env")
 }
 
@@ -458,7 +468,10 @@ fn local_probe_base(listen_addr: SocketAddr) -> String {
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
         ip => ip,
     };
-    format!("http://{}:{}", ip, listen_addr.port())
+    match ip {
+        IpAddr::V6(v6) => format!("http://[{v6}]:{}", listen_addr.port()),
+        IpAddr::V4(v4) => format!("http://{v4}:{}", listen_addr.port()),
+    }
 }
 
 fn print_preflight(path: &Path, env_file: &ThorEnvFile) {
@@ -624,8 +637,17 @@ impl AgentHealth {
 
 async fn probe_agent_health(client: &reqwest::Client, url: &str) -> AgentHealth {
     match client.get(url).send().await {
-        Ok(response) => response.json().await.unwrap_or_default(),
-        Err(_) => AgentHealth::default(),
+        Ok(response) => match response.json().await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(%e, "agent health probe returned non-JSON response");
+                AgentHealth::default()
+            }
+        },
+        Err(e) => {
+            tracing::debug!(%e, "agent health probe failed");
+            AgentHealth::default()
+        }
     }
 }
 
@@ -741,13 +763,21 @@ async fn collect_status_report(
 
     let token = env_file.get("AXS_WORKER_TOKEN");
     let thor_health_url = format!("{local_agent_base}/health");
-    let (control, sglang, thor, agent_health, worker) = tokio::join!(
+    let (control, sglang, agent_health, worker) = tokio::join!(
         control_plane_readiness(&client, &control_plane, token),
         probe_sglang(&client, &runtime_url),
-        probe_health(&client, &thor_health_url),
         probe_agent_health(&client, &thor_health_url),
         probe_registered_worker(&client, &control_plane, token, advertised_addr),
     );
+    // Derive thor endpoint status from agent_health instead of a redundant probe (BUG-111).
+    let thor = EndpointStatus {
+        ok: agent_health.is_ok(),
+        detail: if agent_health.is_ok() {
+            "ok".to_string()
+        } else {
+            format!("agent status: {}", agent_health.status)
+        },
+    };
     let control = control?;
     let worker = worker?;
 
@@ -775,6 +805,7 @@ async fn collect_status_report(
     let ready = control.status == reqwest::StatusCode::OK
         && thor.ok
         && sglang.ok
+        && agent_health.is_ok()
         && registration_ok
         && config_mismatch.is_none()
         && worker

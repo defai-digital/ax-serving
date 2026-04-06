@@ -57,9 +57,11 @@ pub unsafe extern "C" fn llama_model_load_from_file(
         pooling_type: None,
     };
 
-    // Use the same routing chain as CLI/serve mode (configurable via
-    // AXS_ROUTING_CONFIG / backends.yaml), not a hardcoded backend.
-    let backend: Arc<dyn InferenceBackend> = Arc::new(RouterBackend::from_env());
+    // Share a single RouterBackend across all model loads (BUG-074).
+    static BACKEND: std::sync::OnceLock<Arc<dyn InferenceBackend>> = std::sync::OnceLock::new();
+    let backend = BACKEND
+        .get_or_init(|| Arc::new(RouterBackend::from_env()))
+        .clone();
 
     match backend.load_model(&path, config) {
         Ok((handle, meta)) => {
@@ -87,9 +89,9 @@ pub unsafe extern "C" fn llama_model_load_from_file(
             let model = Box::new(LlamaModel {
                 handle,
                 backend,
-                vocab_size: meta.vocab_size as i32,
+                vocab_size: (meta.vocab_size).min(i32::MAX as u32) as i32,
                 n_ctx: if meta.context_length > 0 {
-                    meta.context_length as i32
+                    (meta.context_length).min(i32::MAX as u32) as i32
                 } else {
                     4096
                 },

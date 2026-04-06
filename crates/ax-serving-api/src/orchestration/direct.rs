@@ -76,15 +76,28 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 impl DirectDispatcher {
     pub fn new(pool_max_idle_per_host: usize, request_timeout_secs: u64) -> Self {
+        let client = match Client::builder()
+            .pool_max_idle_per_host(pool_max_idle_per_host)
+            .connect_timeout(std::time::Duration::from_secs(
+                DISPATCHER_CONNECT_TIMEOUT_SECS,
+            ))
+            .timeout(std::time::Duration::from_secs(request_timeout_secs))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                warn!(
+                    %err,
+                    pool_max_idle_per_host,
+                    request_timeout_secs,
+                    "failed to build tuned reqwest client; falling back to default client"
+                );
+                Client::new()
+            }
+        };
+
         Self {
-            client: Client::builder()
-                .pool_max_idle_per_host(pool_max_idle_per_host)
-                .connect_timeout(std::time::Duration::from_secs(
-                    DISPATCHER_CONNECT_TIMEOUT_SECS,
-                ))
-                .timeout(std::time::Duration::from_secs(request_timeout_secs))
-                .build()
-                .expect("failed to build reqwest client"),
+            client,
             reroute_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -146,9 +159,13 @@ impl DirectDispatcher {
         body: Bytes,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers = preferred_pool_workers(
-            registry.eligible_workers_filtered(model_id, request_kind, backend_hint, min_context),
+        let workers = registry.dispatch_workers_filtered(
+            model_id,
+            request_kind,
+            backend_hint,
+            min_context,
             preferred_pool,
+            None,
         );
         if workers.is_empty() {
             return trace_response(
@@ -187,14 +204,46 @@ impl DirectDispatcher {
 
         let selected_id = selected.id;
         let url = worker_url(selected.addr, path);
-        let guard = InflightGuard::acquire(&selected.inflight_counter);
         // Only pre-clone the body when reroute is possible.
-        let can_reroute = workers.iter().any(|w| w.id != selected_id);
+        let can_reroute = candidate_count > 1;
         let retry_body = if can_reroute {
             Some(body.clone())
         } else {
             None
         };
+        let Some(inflight_counter) = registry.inflight_counter(selected_id) else {
+            warn!(
+                worker_id = %selected_id,
+                "selected worker disappeared before dispatch"
+            );
+            let Some(retry_body) = retry_body else {
+                return trace_response(
+                    worker_failure_response(format!(
+                        "selected worker unavailable for '{}'",
+                        ctx.model_id
+                    )),
+                    candidate_count,
+                    Some(selected_id),
+                    "selected_worker_unavailable",
+                );
+            };
+            self.reroute_total.fetch_add(1, Ordering::Relaxed);
+            return self
+                .reroute(
+                    registry,
+                    policy,
+                    &ctx,
+                    request_kind,
+                    backend_hint,
+                    min_context,
+                    path,
+                    retry_body,
+                    selected_id,
+                    auth_header,
+                )
+                .await;
+        };
+        let guard = InflightGuard::acquire(&inflight_counter);
 
         let result = attach_auth(
             self.client
@@ -277,16 +326,14 @@ impl DirectDispatcher {
         excluded_id: WorkerId,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers2 = registry.eligible_workers_filtered(
+        let candidates = registry.dispatch_workers_filtered(
             ctx.model_id,
             request_kind,
             backend_hint,
             min_context,
+            ctx.preferred_pool,
+            Some(excluded_id),
         );
-        let candidates: Vec<_> = preferred_pool_workers(workers2, ctx.preferred_pool)
-            .into_iter()
-            .filter(|w| w.id != excluded_id)
-            .collect();
 
         let selected2 = match policy.select(&candidates, ctx) {
             Some(w) => w,
@@ -306,7 +353,19 @@ impl DirectDispatcher {
 
         let selected2_id = selected2.id;
         let url2 = worker_url(selected2.addr, path);
-        let guard2 = InflightGuard::acquire(&selected2.inflight_counter);
+        let Some(inflight_counter2) = registry.inflight_counter(selected2_id) else {
+            warn!(
+                worker_id = %selected2_id,
+                "reroute worker disappeared before dispatch"
+            );
+            return trace_response(
+                worker_failure_response("all workers failed for this request"),
+                candidates.len(),
+                Some(selected2_id),
+                "reroute_target_unavailable",
+            );
+        };
+        let guard2 = InflightGuard::acquire(&inflight_counter2);
 
         let result2 = attach_auth(
             self.client
@@ -466,25 +525,6 @@ fn trace_response(
     response
 }
 
-fn preferred_pool_workers(
-    workers: Vec<super::registry::WorkerStatus>,
-    preferred_pool: Option<&str>,
-) -> Vec<super::registry::WorkerStatus> {
-    let Some(pool) = preferred_pool.map(str::trim).filter(|s| !s.is_empty()) else {
-        return workers;
-    };
-    let preferred: Vec<_> = workers
-        .iter()
-        .filter(|w| w.worker_pool.as_deref() == Some(pool))
-        .cloned()
-        .collect();
-    if preferred.is_empty() {
-        workers
-    } else {
-        preferred
-    }
-}
-
 fn worker_failure_response(message: impl Into<String>) -> Response {
     let mut resp = (StatusCode::SERVICE_UNAVAILABLE, message.into()).into_response();
     resp.headers_mut().insert(
@@ -499,10 +539,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::orchestration::registry::{WorkerCapabilities, WorkerId, WorkerStatus};
-    use uuid::Uuid;
-
-    use super::{InflightGuard, preferred_pool_workers, worker_url};
+    use super::{InflightGuard, worker_url};
 
     #[test]
     fn worker_url_with_leading_slash() {
@@ -548,42 +585,5 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    fn worker_with_pool(pool: Option<&str>) -> WorkerStatus {
-        WorkerStatus {
-            id: WorkerId(Uuid::new_v4()),
-            addr: "127.0.0.1:8081".parse().unwrap(),
-            inflight: 0,
-            max_inflight: 4,
-            inflight_counter: Arc::new(AtomicUsize::new(0)),
-            active_sequences: 0,
-            decode_tok_per_sec: 0.0,
-            ttft_p95_ms: 0,
-            worker_pool: pool.map(str::to_string),
-            node_class: None,
-            capabilities: WorkerCapabilities::default(),
-            queue_depth: 0,
-            error_rate: 0.0,
-        }
-    }
-
-    #[test]
-    fn preferred_pool_workers_prefers_matching_pool_when_present() {
-        let blue = worker_with_pool(Some("blue"));
-        let green = worker_with_pool(Some("green"));
-        let selected = preferred_pool_workers(vec![green, blue.clone()], Some("blue"));
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, blue.id);
-    }
-
-    #[test]
-    fn preferred_pool_workers_falls_back_when_pool_missing() {
-        let blue = worker_with_pool(Some("blue"));
-        let green = worker_with_pool(Some("green"));
-        let selected = preferred_pool_workers(vec![blue.clone(), green.clone()], Some("red"));
-        assert_eq!(selected.len(), 2);
-        assert!(selected.iter().any(|w| w.id == blue.id));
-        assert!(selected.iter().any(|w| w.id == green.id));
     }
 }

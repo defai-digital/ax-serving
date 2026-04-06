@@ -50,6 +50,7 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         node_class: "thor".into(),
         friendly_name: Some("thor-01".into()),
         chip_model: Some("RTX".into()),
+        shutdown_timeout_secs: None,
     };
 
     let client = reqwest::Client::builder()

@@ -22,40 +22,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
 use tracing::info;
 
-// ── Prompt classes ─────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug)]
-enum PromptClass {
-    Short,
-    Medium,
-    Long,
-}
-
-impl PromptClass {
-    fn prompt(self) -> &'static str {
-        match self {
-            Self::Short => "What is 2+2?",
-            Self::Medium => {
-                "Explain the differences between supervised, unsupervised, and reinforcement learning in machine learning. Cover the key characteristics, when to use each approach, and give one concrete example for each."
-            }
-            Self::Long => {
-                "You are an expert in distributed systems. Provide a comprehensive analysis of the CAP theorem and its implications for modern distributed database design. Include discussion of BASE vs ACID properties, common trade-offs made by popular databases like Cassandra, MongoDB, and PostgreSQL, and provide guidance on selecting the right consistency model for different use cases such as financial transactions, social media feeds, and real-time analytics."
-            }
-        }
-    }
-}
-
-const CLASSES: [PromptClass; 3] = [PromptClass::Short, PromptClass::Medium, PromptClass::Long];
+use crate::bench_common::{CLASSES, LatencyCollector, create_bench_client, mean, percentile, rps};
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -97,21 +72,8 @@ impl ClassStats {
         percentile(&self.latencies_ms, 99)
     }
     fn mean(&self) -> f64 {
-        if self.latencies_ms.is_empty() {
-            return 0.0;
-        }
-        self.latencies_ms.iter().sum::<u64>() as f64 / self.latencies_ms.len() as f64
+        mean(&self.latencies_ms)
     }
-}
-
-fn percentile(sorted_latencies: &[u64], p: usize) -> f64 {
-    if sorted_latencies.is_empty() {
-        return 0.0;
-    }
-    let mut v = sorted_latencies.to_vec();
-    v.sort_unstable();
-    let idx = (v.len() * p / 100).min(v.len() - 1);
-    v[idx] as f64
 }
 
 // ── JSON output format ─────────────────────────────────────────────────────────
@@ -145,11 +107,7 @@ pub async fn run(cfg: MixedConfig) -> Result<()> {
         cfg.concurrency_levels.clone()
     };
 
-    let client = Arc::new(
-        Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?,
-    );
+    let client = create_bench_client()?;
 
     let mut all_results: Vec<RunResult> = Vec::with_capacity(levels.len());
 
@@ -161,30 +119,10 @@ pub async fn run(cfg: MixedConfig) -> Result<()> {
     // Write JSON output if requested (worst-case P99 across all concurrency levels).
     if let Some(path) = &cfg.json {
         let worst = MixedResults {
-            short_p99: Some(
-                all_results
-                    .iter()
-                    .map(|r| r.short_p99)
-                    .fold(f64::NEG_INFINITY, f64::max),
-            ),
-            medium_p99: Some(
-                all_results
-                    .iter()
-                    .map(|r| r.medium_p99)
-                    .fold(f64::NEG_INFINITY, f64::max),
-            ),
-            long_p99: Some(
-                all_results
-                    .iter()
-                    .map(|r| r.long_p99)
-                    .fold(f64::NEG_INFINITY, f64::max),
-            ),
-            overall_p99: Some(
-                all_results
-                    .iter()
-                    .map(|r| r.overall_p99)
-                    .fold(f64::NEG_INFINITY, f64::max),
-            ),
+            short_p99: all_results.iter().map(|r| r.short_p99).reduce(f64::max),
+            medium_p99: all_results.iter().map(|r| r.medium_p99).reduce(f64::max),
+            long_p99: all_results.iter().map(|r| r.long_p99).reduce(f64::max),
+            overall_p99: all_results.iter().map(|r| r.overall_p99).reduce(f64::max),
         };
         let json_str = serde_json::to_string_pretty(&worst)?;
         std::fs::write(path, &json_str)?;
@@ -198,7 +136,7 @@ pub async fn run(cfg: MixedConfig) -> Result<()> {
 
 async fn run_at_concurrency(
     cfg: &MixedConfig,
-    client: &Arc<Client>,
+    client: &Arc<reqwest::Client>,
     concurrency: usize,
 ) -> Result<RunResult> {
     info!(
@@ -209,13 +147,11 @@ async fn run_at_concurrency(
         "mixed-workload bench starting"
     );
 
+    anyhow::ensure!(concurrency > 0, "concurrency must be >= 1");
     let sem = Arc::new(Semaphore::new(concurrency));
     let url = format!("{}/v1/chat/completions", cfg.url);
 
-    let short_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let medium_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let long_lats: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let error_count = Arc::new(AtomicU64::new(0));
+    let collector = Arc::new(LatencyCollector::new());
 
     let bench_start = Instant::now();
     let mut handles = Vec::with_capacity(cfg.total_requests);
@@ -228,10 +164,7 @@ async fn run_at_concurrency(
         let url = url.clone();
         let model_id = cfg.model_id.clone();
         let max_tokens = cfg.max_tokens;
-        let short_lats = Arc::clone(&short_lats);
-        let medium_lats = Arc::clone(&medium_lats);
-        let long_lats = Arc::clone(&long_lats);
-        let error_count = Arc::clone(&error_count);
+        let collector = Arc::clone(&collector);
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -253,28 +186,24 @@ async fn run_at_concurrency(
             };
 
             if ok {
-                let lats = match class {
-                    PromptClass::Short => &short_lats,
-                    PromptClass::Medium => &medium_lats,
-                    PromptClass::Long => &long_lats,
-                };
-                lats.lock().unwrap().push(elapsed_ms);
+                collector.record(class, elapsed_ms);
             } else {
-                error_count.fetch_add(1, Ordering::Relaxed);
+                collector.record_error();
             }
         }));
     }
 
     for h in handles {
-        let _ = h.await;
+        if let Err(e) = h.await
+            && e.is_panic()
+        {
+            tracing::warn!("bench task panicked: {e}");
+        }
     }
 
     let total_ms = bench_start.elapsed().as_millis() as u64;
 
-    let short_v = short_lats.lock().unwrap().clone();
-    let medium_v = medium_lats.lock().unwrap().clone();
-    let long_v = long_lats.lock().unwrap().clone();
-    let errors = error_count.load(Ordering::Relaxed);
+    let (short_v, medium_v, long_v, errors) = collector.snapshot();
 
     let all_lats: Vec<u64> = short_v
         .iter()
@@ -300,7 +229,7 @@ async fn run_at_concurrency(
 
     let overall_p99 = percentile(&all_lats, 99);
 
-    print_report(cfg, concurrency, &classes, &all_lats, errors, total_ms);
+    print_report(cfg, concurrency, &classes, &all_lats, errors, total_ms)?;
 
     Ok(RunResult {
         short_p99: classes[0].p99(),
@@ -319,13 +248,9 @@ fn print_report(
     all_lats: &[u64],
     errors: u64,
     total_ms: u64,
-) {
+) -> anyhow::Result<()> {
     let total_success: usize = classes.iter().map(|c| c.latencies_ms.len()).sum();
-    let rps = if total_ms > 0 {
-        total_success as f64 / (total_ms as f64 / 1_000.0)
-    } else {
-        0.0
-    };
+    let computed_rps = rps(total_success, total_ms);
 
     println!("\nMixed workload benchmark");
     println!("========================");
@@ -336,7 +261,7 @@ fn print_report(
         cfg.total_requests / 3,
         cfg.max_tokens
     );
-    println!("Duration: {total_ms} ms  |  RPS: {rps:.1}  |  Errors: {errors}");
+    println!("Duration: {total_ms} ms  |  RPS: {computed_rps:.1}  |  Errors: {errors}");
     println!();
     println!(
         "{:<8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
@@ -360,11 +285,7 @@ fn print_report(
     let overall_p50 = percentile(all_lats, 50);
     let overall_p95 = percentile(all_lats, 95);
     let overall_p99 = percentile(all_lats, 99);
-    let overall_mean = if all_lats.is_empty() {
-        0.0
-    } else {
-        all_lats.iter().sum::<u64>() as f64 / all_lats.len() as f64
-    };
+    let overall_mean = mean(all_lats);
     println!(
         "{:<8}  {:>8}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}",
         "overall", total_success, overall_mean, overall_p50, overall_p95, overall_p99,
@@ -378,4 +299,11 @@ fn print_report(
         if gate_pass { "PASS" } else { "FAIL" },
         overall_p99
     );
+    anyhow::ensure!(
+        gate_pass,
+        "P99 gate failed: {:.0}ms >= {}ms target",
+        overall_p99,
+        cfg.target_p99_ms
+    );
+    Ok(())
 }

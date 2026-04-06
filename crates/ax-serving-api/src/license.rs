@@ -1,13 +1,14 @@
 //! Soft license reminder system.
 //!
 //! Trust-based model: no enforcement, no feature gating.
-//! A reminder is emitted (once) when multi-machine usage is detected.
+//! A reminder is emitted (once) when multi-machine usage is detected so
+//! operators who need commercial terms outside AGPL obligations know where to go.
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::LicenseConfig;
 
@@ -49,7 +50,7 @@ impl LicenseState {
 
     /// Whether a license key is currently loaded.
     pub fn has_key(&self) -> bool {
-        self.key.lock().unwrap().is_some()
+        self.key_lock().is_some()
     }
 
     /// Persist a new license key to `~/.config/<config_dir>/<key_file>`
@@ -61,7 +62,7 @@ impl LicenseState {
             }
             std::fs::write(&path, &key)?;
         }
-        *self.key.lock().unwrap() = Some(key);
+        *self.key_lock() = Some(key);
         Ok(())
     }
 
@@ -81,8 +82,8 @@ impl LicenseState {
             let buy_link = &self.buy_link;
             info!(
                 "\n[ax-serving] A remote worker registered (multi-machine deployment detected).\n\
-                 \x20            This is a Business Edition feature.\n\
-                 \x20            If your annual revenue exceeds USD 2M, purchase a license at:\n\
+                 \x20            Commercial licensing is available for deployments operating outside AGPL obligations.\n\
+                 \x20            Contact or purchase information:\n\
                  \x20            {buy_link}"
             );
         }
@@ -119,6 +120,19 @@ impl LicenseState {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    fn key_lock(&self) -> MutexGuard<'_, Option<String>> {
+        match self.key.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "license key lock poisoned; continuing with poisoned lock state"
+                );
+                err.into_inner()
+            }
+        }
     }
 
     fn license_file_path(&self) -> Option<std::path::PathBuf> {

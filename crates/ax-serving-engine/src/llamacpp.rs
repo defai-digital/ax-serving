@@ -240,9 +240,9 @@ fn unix_ms_now() -> u64 {
 }
 
 use crate::{
-    EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
-    GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalMonitor,
-    ThermalState, gguf_meta::GgufMeta,
+    CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
+    GenerationParams, GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata,
+    ThermalMonitor, ThermalState, gguf_meta::GgufMeta,
 };
 
 // ── Health state ──────────────────────────────────────────────────────────────
@@ -384,6 +384,8 @@ struct LlamaCppProcess {
     _poller: std::thread::JoinHandle<()>,
     /// Circuit breaker for generate() failures.
     breaker: Arc<CircuitBreaker>,
+    /// EOS token ID queried from the model at load time.
+    eos_token: u32,
 }
 
 impl Drop for LlamaCppProcess {
@@ -420,9 +422,7 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
-    fn models_read(
-        &self,
-    ) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
+    fn models_read(&self) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
         match self.models.lock() {
             Ok(guard) => guard,
             Err(err) => {
@@ -435,9 +435,7 @@ impl LlamaCppBackend {
         }
     }
 
-    fn models_write(
-        &self,
-    ) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
+    fn models_write(&self) -> MutexGuard<'_, HashMap<ModelHandle, LlamaCppProcess>> {
         match self.models.lock() {
             Ok(guard) => guard,
             Err(err) => {
@@ -676,6 +674,21 @@ impl InferenceBackend for LlamaCppBackend {
         );
         let handle = next_llamacpp_handle();
 
+        // Query the actual EOS token from the llama-server /props endpoint.
+        let eos_token = self
+            .http
+            .get(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/props"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| {
+                v["default_generation_settings"]["eos_token_id"]
+                    .as_u64()
+                    .or_else(|| v["eos_token_id"].as_u64())
+            })
+            .unwrap_or(2) as u32;
+
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -733,7 +746,9 @@ impl InferenceBackend for LlamaCppBackend {
                             let _ = child.wait();
                         }
                     }
-                    return Err(anyhow::anyhow!("failed to spawn llama-server health poller: {err}"));
+                    return Err(anyhow::anyhow!(
+                        "failed to spawn llama-server health poller: {err}"
+                    ));
                 }
             }
         };
@@ -747,6 +762,7 @@ impl InferenceBackend for LlamaCppBackend {
                 stop,
                 _poller: poller,
                 breaker,
+                eos_token,
             },
         );
 
@@ -845,8 +861,11 @@ impl InferenceBackend for LlamaCppBackend {
                     let body = build_chat_completions_body(msgs, &params, cache_prompt);
                     complete_chat_completions(&http, port, &body, &tx, emit_logprobs)
                 }
-                (_, true) => build_completions_body(&input, &params, cache_prompt)
-                    .and_then(|body| stream_completions(&http, port, &body, &tx, batch_size, emit_logprobs)),
+                (_, true) => {
+                    build_completions_body(&input, &params, cache_prompt).and_then(|body| {
+                        stream_completions(&http, port, &body, &tx, batch_size, emit_logprobs)
+                    })
+                }
                 (_, false) => build_completions_body(&input, &params, cache_prompt)
                     .and_then(|body| complete_completions(&http, port, &body, &tx, emit_logprobs)),
             };
@@ -955,8 +974,12 @@ impl InferenceBackend for LlamaCppBackend {
         Ok(content)
     }
 
-    fn eos_tokens(&self, _handle: ModelHandle) -> Result<Vec<u32>> {
-        Ok(vec![2])
+    fn eos_tokens(&self, handle: ModelHandle) -> Result<Vec<u32>> {
+        let guard = self.models_read();
+        let proc = guard
+            .get(&handle)
+            .ok_or_else(|| anyhow::anyhow!("unknown model handle {:?}", handle))?;
+        Ok(vec![proc.eos_token])
     }
 
     fn embed(
@@ -1044,6 +1067,35 @@ impl InferenceBackend for LlamaCppBackend {
 
     fn recommended_concurrency(&self) -> usize {
         self.thermal.recommended_concurrency()
+    }
+
+    fn cache_telemetry(&self) -> CacheTelemetry {
+        // Snapshot port list under the lock, then release before making HTTP calls
+        // to avoid blocking all model operations during telemetry collection.
+        let ports: Vec<u16> = {
+            let guard = self.models_read();
+            guard.values().map(|p| p.port).collect()
+        };
+        let mut total = CacheTelemetry::default();
+        for port in ports {
+            let url = format!("http://{LLAMACPP_LOCAL_HOST}:{port}/health");
+            let resp = match self.http.get(&url).timeout(Duration::from_secs(1)).send() {
+                Ok(r) if r.status().is_success() => r,
+                _ => continue,
+            };
+            let json: serde_json::Value = match resp.json() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let idle = json.get("slots_idle").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let processing = json
+                .get("slots_processing")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            total.active_batch_size += processing;
+            total.max_batch_size += idle + processing;
+        }
+        total
     }
 }
 
@@ -1143,7 +1195,7 @@ fn run_health_poller(args: PollerArgs) {
         // applied consistently regardless of whether the failure is in spawn or
         // wait_ready.
         restart_count += 1;
-        let backoff = Duration::from_secs((2u64.pow(restart_count)).min(16));
+        let backoff = Duration::from_secs(1u64 << restart_count.min(4));
         warn!(
             "restarting llama-server port {port} (attempt {restart_count}/{max_restarts}) in {backoff:?}"
         );
@@ -1175,9 +1227,8 @@ fn run_health_poller(args: PollerArgs) {
                     *guard = Some(new_child);
                 }
                 Err(e) => {
-                    warn!("failed to spawn llama-server: {e}");
-                    health.store(HealthState::Dead as u8, Ordering::Relaxed);
-                    break;
+                    warn!("failed to spawn llama-server: {e}; will retry if budget remains");
+                    continue;
                 }
             }
         }
@@ -1198,6 +1249,13 @@ fn run_health_poller(args: PollerArgs) {
             }
             Err(e) => {
                 warn!("llama-server port {port} failed to start after restart: {e}");
+                // Kill the orphaned child to prevent resource leak (BUG-050).
+                if let Ok(mut guard) = child.lock()
+                    && let Some(c) = guard.as_mut()
+                {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
                 health.store(HealthState::Dead as u8, Ordering::Relaxed);
                 break;
             }
@@ -1522,6 +1580,28 @@ fn parse_nonstream_logprobs(val: &serde_json::Value) -> Vec<(String, TokenLogpro
         .unwrap_or_default()
 }
 
+/// POST to a llama-server endpoint and return the response, failing on non-success status.
+fn post_llama(
+    http: &reqwest::blocking::Client,
+    port: u16,
+    endpoint: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::blocking::Response> {
+    let url = format!("http://{LLAMACPP_LOCAL_HOST}:{port}{endpoint}");
+    let resp = http
+        .post(&url)
+        .json(body)
+        .send()
+        .with_context(|| format!("POST {endpoint}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        anyhow::bail!("llama-server {endpoint} error {status}: {text}");
+    }
+    Ok(resp)
+}
+
 fn complete_completions(
     http: &reqwest::blocking::Client,
     port: u16,
@@ -1529,19 +1609,7 @@ fn complete_completions(
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
     emit_logprobs: bool,
 ) -> Result<()> {
-    let resp = http
-        .post(format!(
-            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/completions"
-        ))
-        .json(body)
-        .send()
-        .context("POST /v1/completions")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::bail!("llama-server error {status}: {text}");
-    }
+    let resp = post_llama(http, port, "/v1/completions", body)?;
 
     let val: serde_json::Value = resp.json().context("parse /v1/completions JSON")?;
     let text = val["content"]
@@ -1593,19 +1661,7 @@ fn complete_chat_completions(
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
     emit_logprobs: bool,
 ) -> Result<()> {
-    let resp = http
-        .post(format!(
-            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/chat/completions"
-        ))
-        .json(body)
-        .send()
-        .context("POST /v1/chat/completions")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::bail!("llama-server chat error {status}: {text}");
-    }
+    let resp = post_llama(http, port, "/v1/chat/completions", body)?;
 
     let val: serde_json::Value = resp.json().context("parse /v1/chat/completions JSON")?;
     let text = val["choices"][0]["message"]["content"]
@@ -1683,19 +1739,7 @@ fn stream_completions(
     batch_size: usize,
     emit_logprobs: bool,
 ) -> Result<()> {
-    let resp = http
-        .post(format!(
-            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/completions"
-        ))
-        .json(body)
-        .send()
-        .context("POST /v1/completions")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::bail!("llama-server error {status}: {text}");
-    }
+    let resp = post_llama(http, port, "/v1/completions", body)?;
 
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();
@@ -1845,19 +1889,7 @@ fn stream_chat_completions(
     batch_size: usize,
     emit_logprobs: bool,
 ) -> Result<()> {
-    let resp = http
-        .post(format!(
-            "http://{LLAMACPP_LOCAL_HOST}:{port}/v1/chat/completions"
-        ))
-        .json(body)
-        .send()
-        .context("POST /v1/chat/completions")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::bail!("llama-server chat error {status}: {text}");
-    }
+    let resp = post_llama(http, port, "/v1/chat/completions", body)?;
 
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();

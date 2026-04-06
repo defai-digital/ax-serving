@@ -8,7 +8,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::warn;
 use ax_core::backend::{self, BackendConfig};
 use ax_core::chat::{self, ChatRenderOptions, ChatRole};
 use ax_core::gguf::MappedModel;
@@ -19,6 +18,7 @@ use ax_core::model::{
 use ax_core::sampling::{LogitBias, SampledTokenInfo, Sampler, SamplingConfig};
 use ax_core::tokenizer::Tokenizer;
 use rustc_hash::FxHashMap;
+use tracing::warn;
 
 use crate::{
     BackendType, ChatMessage, GenerateEvent, GenerateInput, GenerationParams, GenerationStats,
@@ -26,9 +26,57 @@ use crate::{
 };
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(8_000_000);
+const DEFAULT_STREAM_TOKEN_BATCH_SIZE: usize = 4;
+const MAX_STREAM_TOKEN_BATCH_SIZE: usize = 32;
 
 fn next_handle() -> ModelHandle {
     ModelHandle(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed))
+}
+
+fn stream_token_batch_size() -> usize {
+    std::env::var("AXS_STREAM_TOKEN_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
+        .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
+}
+
+fn flush_stream_token_batch(
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    buffer: &mut String,
+    buffered_pieces: &mut usize,
+) -> bool {
+    *buffered_pieces = 0;
+    if buffer.is_empty() {
+        return true;
+    }
+    tx.blocking_send(GenerateEvent::Token(std::mem::take(buffer)))
+        .is_ok()
+}
+
+fn push_stream_token_piece(
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    piece: String,
+    batch_size: usize,
+    first_chunk_sent: &mut bool,
+    buffer: &mut String,
+    buffered_pieces: &mut usize,
+) -> bool {
+    if piece.is_empty() {
+        return true;
+    }
+    if !*first_chunk_sent {
+        *first_chunk_sent = true;
+        return tx.blocking_send(GenerateEvent::Token(piece)).is_ok();
+    }
+
+    buffer.push_str(&piece);
+    *buffered_pieces += 1;
+    if *buffered_pieces < batch_size {
+        return true;
+    }
+
+    flush_stream_token_batch(tx, buffer, buffered_pieces)
 }
 
 struct LoadedModel {
@@ -438,6 +486,10 @@ fn run_generate(
     let mut generated_tokens = 0usize;
     let mut stop_buffer = String::new();
     let mut stopped_on_stop_sequence = false;
+    let stream_batch_size = stream_token_batch_size();
+    let mut first_stream_chunk_sent = false;
+    let mut stream_token_buffer = String::new();
+    let mut buffered_stream_tokens = 0usize;
     let decode = if emit_logprobs {
         let first_sample = sampler.sample_with_logprobs(&mut logits, &history, decode_top_logprobs);
         run_decode(
@@ -513,9 +565,14 @@ fn run_generate(
                 let piece = render_token_text(&loaded.tokenizer, token);
 
                 let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
-                if !action.emit.is_empty()
-                    && tx.blocking_send(GenerateEvent::Token(action.emit)).is_err()
-                {
+                if !push_stream_token_piece(
+                    &tx,
+                    action.emit,
+                    stream_batch_size,
+                    &mut first_stream_chunk_sent,
+                    &mut stream_token_buffer,
+                    &mut buffered_stream_tokens,
+                ) {
                     anyhow::bail!("receiver dropped");
                 }
                 if action.matched {
@@ -533,10 +590,17 @@ fn run_generate(
 
     let (completion_tokens, decode_duration) = match decode {
         Ok(outcome) => {
-            if !stop_buffer.is_empty()
-                && tx
-                    .blocking_send(GenerateEvent::Token(std::mem::take(&mut stop_buffer)))
-                    .is_err()
+            if !push_stream_token_piece(
+                &tx,
+                std::mem::take(&mut stop_buffer),
+                stream_batch_size,
+                &mut first_stream_chunk_sent,
+                &mut stream_token_buffer,
+                &mut buffered_stream_tokens,
+            ) {
+                return Ok(());
+            }
+            if !flush_stream_token_batch(&tx, &mut stream_token_buffer, &mut buffered_stream_tokens)
             {
                 return Ok(());
             }
@@ -575,26 +639,18 @@ impl AxEngineBackend {
         }
     }
 
-    fn models_read(
-        &self,
-    ) -> RwLockReadGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
-        self.models
-            .read()
-            .unwrap_or_else(|err| {
-                warn!("ax-engine models rwlock poisoned; recovering from poisoned read lock");
-                err.into_inner()
-            })
+    fn models_read(&self) -> RwLockReadGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
+        self.models.read().unwrap_or_else(|err| {
+            warn!("ax-engine models rwlock poisoned; recovering from poisoned read lock");
+            err.into_inner()
+        })
     }
 
-    fn models_write(
-        &self,
-    ) -> RwLockWriteGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
-        self.models
-            .write()
-            .unwrap_or_else(|err| {
-                warn!("ax-engine models rwlock poisoned; recovering from poisoned write lock");
-                err.into_inner()
-            })
+    fn models_write(&self) -> RwLockWriteGuard<'_, FxHashMap<ModelHandle, Arc<LoadedModel>>> {
+        self.models.write().unwrap_or_else(|err| {
+            warn!("ax-engine models rwlock poisoned; recovering from poisoned write lock");
+            err.into_inner()
+        })
     }
 
     fn get_model(&self, handle: ModelHandle) -> Result<Arc<LoadedModel>> {
@@ -700,8 +756,18 @@ impl InferenceBackend for AxEngineBackend {
         std::thread::Builder::new()
             .name("ax-engine-generate".into())
             .spawn(move || {
-                if let Err(err) = run_generate(loaded, input, params, tx.clone()) {
-                    let _ = tx.blocking_send(GenerateEvent::Error(err.to_string()));
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_generate(loaded, input, params, tx.clone())
+                })) {
+                    Ok(Err(err)) => {
+                        let _ = tx.blocking_send(GenerateEvent::Error(err.to_string()));
+                    }
+                    Err(_panic) => {
+                        let _ = tx.blocking_send(GenerateEvent::Error(
+                            "internal panic in ax-engine generate".into(),
+                        ));
+                    }
+                    Ok(Ok(())) => {}
                 }
             })
             .context("failed to spawn ax-engine generation thread")?;
@@ -747,12 +813,13 @@ mod tests {
     use std::sync::Mutex;
 
     use ax_core::chat::{self, ChatRenderOptions, ChatRole};
+    use tokio::sync::mpsc;
 
     use super::{
-        BackendConfig, BackendType, ChatMessage, GenerationParams, LoadConfig,
+        BackendConfig, BackendType, ChatMessage, GenerateEvent, GenerationParams, LoadConfig,
         build_sampling_config, consume_stop_piece, ensure_supported_generation_params,
-        infer_render_architecture, normalize_chat_messages, parse_chat_role,
-        resolve_backend_config,
+        flush_stream_token_batch, infer_render_architecture, normalize_chat_messages,
+        parse_chat_role, push_stream_token_piece, resolve_backend_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -850,6 +917,91 @@ mod tests {
             ..Default::default()
         };
         assert!(ensure_supported_generation_params(&params).is_ok());
+    }
+
+    #[test]
+    fn first_stream_piece_is_sent_immediately() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut first_chunk_sent = false;
+        let mut buffer = String::new();
+        let mut buffered_pieces = 0usize;
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "hello".to_string(),
+            4,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected first token event, got {other:?}"),
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(buffered_pieces, 0);
+    }
+
+    #[test]
+    fn steady_state_stream_pieces_are_batched() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut first_chunk_sent = false;
+        let mut buffer = String::new();
+        let mut buffered_pieces = 0usize;
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "a".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        let _ = rx.try_recv();
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "b".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        assert!(rx.try_recv().is_err());
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "c".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "bc"),
+            other => panic!("expected batched token event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_stream_token_batch_sends_remaining_buffer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buffer = "tail".to_string();
+        let mut buffered_pieces = 1usize;
+
+        assert!(flush_stream_token_batch(
+            &tx,
+            &mut buffer,
+            &mut buffered_pieces
+        ));
+
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "tail"),
+            other => panic!("expected flushed token event, got {other:?}"),
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(buffered_pieces, 0);
     }
 
     #[test]

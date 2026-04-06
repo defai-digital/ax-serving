@@ -13,8 +13,6 @@ sched_max_queue: 128
 sched_max_wait_ms: 120000
 sched_overload_policy: "queue"
 sched_per_model_max_inflight: 4
-sched_max_batch_size: 8        # advisory only; reserved for future scheduler-managed batching
-sched_batch_window_ms: 5       # advisory only; reserved for future scheduler-managed batching
 
 idle_timeout_secs: 0
 thermal_poll_secs: 5

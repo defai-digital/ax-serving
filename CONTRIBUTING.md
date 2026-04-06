@@ -33,11 +33,36 @@ AX Serving uses a dual-license model. To keep licensing, product direction, and
 commercial distribution rights clear, code changes are handled only by the core
 maintainers or by separately approved contributors under written terms.
 
+The public repository is also intended to remain the open-source serving core.
+Changes that introduce private crates, hidden enterprise-only code paths, or
+proprietary dependencies into the public workspace are out of bounds unless the
+maintainers explicitly approve a documented repository-boundary change.
+
 See:
 
 - [LICENSING.md](LICENSING.md)
 - [LICENSE](LICENSE)
 - [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)
+
+## Public Workspace Boundary
+
+When proposing public-repository changes, treat these as default rules:
+
+- keep the public Rust workspace self-contained and buildable
+- prefer documented REST / gRPC / worker-protocol boundaries over internal
+  proprietary module hooks
+- do not add private or unpublished workspace members to `crates/*`
+- do not rely on hidden Cargo features to carry enterprise-only logic
+
+Enterprise products should normally integrate through separate private
+repositories and service boundaries rather than through mixed public/private
+workspace code.
+
+Execution documents:
+
+- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
+- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
+- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
 
 ## Issue Reports
 

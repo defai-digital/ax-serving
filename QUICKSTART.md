@@ -98,9 +98,6 @@ AX Fabric integration should follow the runtime contract in
 `v1.4` runtime tuning knobs:
 - `AXS_SPLIT_SCHEDULER=true`
   - enables prefill/decode activity tracking in scheduler metrics
-- `AXS_MAX_BATCH_SIZE` / `AXS_BATCH_WINDOW_MS`
-  - currently advisory only
-  - they do not enable a scheduler-managed batching loop today
 
 ---
 

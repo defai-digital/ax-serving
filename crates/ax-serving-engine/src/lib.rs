@@ -322,6 +322,26 @@ pub struct EmbedResult {
     pub prompt_tokens: u32,
 }
 
+// ── Cache telemetry ──────────────────────────────────────────────────────────
+
+/// Cache and batch telemetry reported by a backend for scheduling decisions.
+///
+/// All fields default to 0 meaning "unknown / not supported". Callers must
+/// treat 0 as "no data" and degrade gracefully.
+#[derive(Debug, Clone, Default)]
+pub struct CacheTelemetry {
+    /// KV cache pages currently allocated.
+    pub kv_pages_used: u64,
+    /// KV cache page budget (0 = unknown).
+    pub kv_pages_total: u64,
+    /// Tokens in reusable prefix cache (0 = unsupported).
+    pub prefix_reusable_tokens: u64,
+    /// Current internal batch occupancy.
+    pub active_batch_size: u32,
+    /// Backend's max batch capacity (0 = unknown).
+    pub max_batch_size: u32,
+}
+
 // ── InferenceBackend trait ────────────────────────────────────────────────────
 
 /// Core inference interface implemented by concrete backend adapters.
@@ -365,6 +385,24 @@ pub trait InferenceBackend: Send + Sync {
 
     /// Recommended concurrency level given current thermal state.
     fn recommended_concurrency(&self) -> usize;
+
+    /// Return cache and batch telemetry for scheduling decisions.
+    ///
+    /// Default returns all zeros (unknown). Backends that can report KV
+    /// utilization or batch occupancy should override this.
+    fn cache_telemetry(&self) -> CacheTelemetry {
+        CacheTelemetry::default()
+    }
+
+    /// Return the concrete backend currently serving a given outer handle.
+    ///
+    /// Implemented by `RouterBackend` to distinguish native vs `llama.cpp`.
+    ///
+    /// Returns `Some("native")`, `Some("llama_cpp")`, or `Some("lib_llama")`.
+    /// Backends that cannot resolve handle ownership return `None`.
+    fn backend_name_for_handle(&self, _handle: ModelHandle) -> Option<&'static str> {
+        None
+    }
 
     /// Embed inputs and return one float vector per input.
     ///

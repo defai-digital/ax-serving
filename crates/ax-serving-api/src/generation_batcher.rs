@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use anyhow::Result;
 use ax_serving_engine::{
@@ -19,8 +18,6 @@ pub struct GenerationBatchMetrics {
 #[derive(Clone)]
 pub struct GenerationBatcher {
     backend: Arc<dyn InferenceBackend>,
-    max_batch_size: usize,
-    batch_window: Duration,
     metrics: Arc<GenerationBatchMetrics>,
 }
 
@@ -47,22 +44,11 @@ pub struct GenerationBatchRequest {
 }
 
 impl GenerationBatcher {
-    pub fn new(
-        backend: Arc<dyn InferenceBackend>,
-        max_batch_size: usize,
-        batch_window_ms: u64,
-    ) -> Self {
+    pub fn new(backend: Arc<dyn InferenceBackend>) -> Self {
         Self {
             backend,
-            max_batch_size: max_batch_size.max(1),
-            batch_window: Duration::from_millis(batch_window_ms),
             metrics: Arc::new(GenerationBatchMetrics::default()),
         }
-    }
-
-    pub fn enabled(&self) -> bool {
-        let _configured_for_batching = self.max_batch_size > 1 && !self.batch_window.is_zero();
-        false
     }
 
     pub fn metrics(&self) -> &Arc<GenerationBatchMetrics> {
@@ -192,17 +178,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generation_batching_is_disabled_until_backend_support_exists() {
-        let batcher = GenerationBatcher::new(SpyBackend::new(), 8, 10);
-        assert!(!batcher.enabled());
-    }
-
     #[tokio::test]
     async fn submit_routes_directly_to_backend_generate() {
         let spy = SpyBackend::new();
         let generate_calls = Arc::clone(&spy.generate_calls);
-        let batcher = GenerationBatcher::new(spy, 8, 10);
+        let batcher = GenerationBatcher::new(spy);
 
         let mut rx = batcher.submit(make_request()).await.unwrap();
 
@@ -229,7 +209,7 @@ mod tests {
     async fn direct_failure_increments_failed_metrics() {
         let spy = SpyBackend::new();
         spy.fail_generate.store(true, Ordering::Relaxed);
-        let batcher = GenerationBatcher::new(spy, 8, 10);
+        let batcher = GenerationBatcher::new(spy);
 
         let error = batcher.submit(make_request()).await.unwrap_err();
 

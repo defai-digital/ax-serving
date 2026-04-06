@@ -39,20 +39,52 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "ax-thor-agent listening");
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let server_shutdown_secs = config.shutdown_timeout_secs.unwrap_or(30).max(1);
+    let shutdown = async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!(
+            "shutdown signal received, draining connections (timeout {server_shutdown_secs}s)"
+        );
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    // Wrap graceful shutdown with a hard deadline so stuck streams don't hang forever (BUG-054).
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(server_shutdown_secs + 5),
+        server,
+    )
+    .await;
 
-    let _ = agent::drain(&client, &config, &runtime).await;
+    // Abort heartbeat BEFORE drain to prevent re-registration race (BUG-023).
+    heartbeat_task.abort();
+    if let Err(e) = agent::drain(&client, &config, &runtime).await {
+        tracing::warn!(%e, "drain request failed");
+    }
+    let shutdown_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(config.shutdown_timeout_secs.unwrap_or(30).max(1));
     while runtime.inflight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        if tokio::time::Instant::now() > shutdown_deadline {
+            tracing::warn!("shutdown timeout exceeded with inflight requests; forcing exit");
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    heartbeat_task.abort();
-    let _ = agent::drain_complete(&client, &config, &runtime).await;
+    if let Err(e) = agent::drain_complete(&client, &config, &runtime).await {
+        tracing::warn!(%e, "drain-complete request failed");
+    }
 
     Ok(())
 }

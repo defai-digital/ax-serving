@@ -2,6 +2,7 @@
 //!
 //! Ported from ax-engine's metrics module. No external dependencies.
 
+use std::cell::OnceCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,17 +44,20 @@ impl InferenceMetrics {
 #[derive(Debug)]
 pub struct LatencyHistogram {
     samples: Vec<Duration>,
+    sorted_samples: OnceCell<Vec<Duration>>,
 }
 
 impl LatencyHistogram {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             samples: Vec::with_capacity(cap),
+            sorted_samples: OnceCell::new(),
         }
     }
 
     pub fn record(&mut self, d: Duration) {
         self.samples.push(d);
+        let _ = self.sorted_samples.take();
     }
 
     pub fn p50(&self) -> Duration {
@@ -68,24 +72,32 @@ impl LatencyHistogram {
 
     /// Return (p50, p95, p99) in one sort pass instead of three.
     pub fn percentiles(&self) -> (Duration, Duration, Duration) {
-        if self.samples.is_empty() {
+        let sorted = self.sorted_samples();
+        if sorted.is_empty() {
             return (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         }
-        let mut sorted = self.samples.clone();
-        sorted.sort_unstable();
         let n = sorted.len();
         let at = |p: usize| sorted[(n * p / 100).min(n - 1)];
         (at(50), at(95), at(99))
     }
 
     fn percentile(&self, p: usize) -> Duration {
-        if self.samples.is_empty() {
+        let sorted = self.sorted_samples();
+        if sorted.is_empty() {
             return Duration::ZERO;
         }
-        let mut sorted = self.samples.clone();
-        sorted.sort_unstable();
         let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
         sorted[idx]
+    }
+
+    fn sorted_samples(&self) -> &[Duration] {
+        self.sorted_samples
+            .get_or_init(|| {
+                let mut sorted = self.samples.clone();
+                sorted.sort_unstable();
+                sorted
+            })
+            .as_slice()
     }
 }
 
@@ -360,6 +372,22 @@ mod tests {
         assert_eq!(pp50, h.p50());
         assert_eq!(pp95, h.p95());
         assert_eq!(pp99, h.p99());
+    }
+
+    #[test]
+    fn latency_histogram_cache_is_invalidated_on_record() {
+        let mut h = LatencyHistogram::with_capacity(4);
+        h.record(Duration::from_millis(10));
+        h.record(Duration::from_millis(20));
+        assert_eq!(h.p99(), Duration::from_millis(20));
+
+        h.record(Duration::from_millis(100));
+
+        assert_eq!(h.p99(), Duration::from_millis(100));
+        let (p50, p95, p99) = h.percentiles();
+        assert_eq!(p50, Duration::from_millis(20));
+        assert_eq!(p95, Duration::from_millis(100));
+        assert_eq!(p99, Duration::from_millis(100));
     }
 
     // ── BurnRateWindow ─────────────────────────────────────────────────────────

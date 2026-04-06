@@ -25,6 +25,7 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tracing::warn;
 
 use crate::config::CacheConfig;
 
@@ -92,7 +93,13 @@ impl CacheInflight {
     }
 
     pub fn enter(self: &Arc<Self>, key: &str) -> CacheInflightEnter {
-        let mut guard = self.inner.lock().expect("cache inflight mutex poisoned");
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!("cache inflight mutex poisoned; recovering from poisoned lock");
+                err.into_inner()
+            }
+        };
         if let Some(tx) = guard.get(key) {
             return CacheInflightEnter::Follower(tx.subscribe());
         }

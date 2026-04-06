@@ -34,7 +34,8 @@ private AI serving.
 AX Serving is built to win in three adjacent niches:
 
 - department-scale private AI fleet control planes
-- mixed-worker orchestration across Thor-class, Mac Studio-class, and future workers
+- Mac-native serving and orchestration for single-node and Mac-grid deployments
+- enterprise mixed-worker orchestration across NVIDIA / Thor-class, Mac Studio-class, and future workers
 - serving infrastructure for governed private AI stacks such as AX Fabric
 
 Who it is for:
@@ -53,9 +54,9 @@ What it is not:
 
 Deployment fit:
 
-- `Thor grid`: a strong fit for standard operations and high-parallel inference on `<=70B` models
-- `Mac Studio grid`: a strong fit for larger-memory tiers, including `>70B` models and memory-heavy workloads
-- `Mac` control plane: coordinates mixed worker fleets and turns heterogeneous hardware into one operable serving system
+- `Single Mac`: the default open-source deployment path
+- `Mac grid`: the default open-source multi-worker deployment path
+- `Enterprise heterogeneous fleet`: commercial path for NVIDIA / Thor-class workers, governed mixed-node deployments, and enterprise delivery requirements
 
 For market positioning, competitive analysis, and ICP details, see:
 
@@ -63,6 +64,11 @@ For market positioning, competitive analysis, and ICP details, see:
 - [docs/competitive-landscape.md](docs/competitive-landscape.md)
 - [docs/icp-and-demand.md](docs/icp-and-demand.md)
 - [docs/prd/PRD-AX-SERVING-v3.0.md](docs/prd/PRD-AX-SERVING-v3.0.md)
+- [docs/prd/PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md](docs/prd/PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md)
+- [docs/prd/PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md](docs/prd/PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md)
+- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
+- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
+- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
 - [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
 
 * * *
@@ -87,13 +93,44 @@ Commercial engagements may include:
 - enterprise fleet and mixed-node integration work
 - support, service, and deployment terms
 
+### Open-Source And Enterprise Boundary
+
+The public repository is the open-source core of AX Serving.
+
+The default open-source product scope is:
+
+- single-Mac serving
+- Mac-led local serving
+- Mac worker grids
+- core serving, orchestration, worker, metrics, and admin protocols
+
+Commercial offerings cover one or both of the following:
+
+- non-AGPL licensing rights for the AX Serving core itself
+- separate enterprise modules, deployment bundles, and supported integrations
+
+The intended enterprise expansion path is:
+
+- NVIDIA / Thor-class workers
+- heterogeneous Mac + accelerator fleets
+- enterprise auth, governance, and deployment packaging
+- supported private integrations and fleet operations tooling
+
 The public repository contains the public source distribution, including
 single-node and multi-worker serving/orchestration capabilities. Commercial
 agreements govern usage outside AGPL obligations, private packaging, and
-enterprise delivery terms.
+enterprise delivery terms. The recommended technical boundary is service-level
+integration, not private crates mixed into the public workspace.
 
 See [LICENSING.md](LICENSING.md) and
 [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+
+Execution artifacts for the open-source / enterprise split:
+
+- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
+- [docs/contracts/enterprise-compatibility-metadata.example.yaml](docs/contracts/enterprise-compatibility-metadata.example.yaml)
+- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
+- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
 
 * * *
 
@@ -254,6 +291,11 @@ cargo run -p ax-serving-cli --bin ax-serving -- serve \
   --port 18081 \
   --orchestrator http://127.0.0.1:19090
 ```
+
+This gateway + worker path is part of the open-source Mac-native deployment
+story. Enterprise fleet products build on the same serving contracts while
+adding supported NVIDIA / Thor-class worker integrations, deployment bundles,
+and governance layers under commercial terms.
 
 ---
 

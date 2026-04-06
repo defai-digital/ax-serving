@@ -18,6 +18,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod bench;
+pub mod bench_common;
 mod cache_bench;
 mod compare;
 mod mixed;

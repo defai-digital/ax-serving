@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use ax_serving_engine::{EmbedConfig, EmbedInput, InferenceBackend, ModelHandle};
 use tokio::sync::{Mutex, oneshot};
+use tracing::warn;
 
 use crate::scheduler::{PerModelScheduler, Scheduler};
 
@@ -248,10 +249,12 @@ impl EmbeddingBatcher {
                 spawn_timer_for = Some(batch_id);
             }
 
-            let batch = queue
-                .batches
-                .back_mut()
-                .expect("batch queue must contain the just-created batch");
+            let Some(batch) = queue.batches.back_mut() else {
+                return Err(EmbeddingBatchFailure {
+                    kind: EmbeddingBatchFailureKind::Internal,
+                    message: "embedding batch queue is empty".into(),
+                });
+            };
             batch.total_inputs += request.input_len();
             batch.items.push(PendingEmbeddingRequest { request, tx });
 
@@ -325,10 +328,14 @@ impl EmbeddingBatcher {
             let Some(index) = queue.batches.iter().position(|batch| batch.id == batch_id) else {
                 return;
             };
-            let batch = queue
-                .batches
-                .remove(index)
-                .expect("position returned a valid batch index");
+            let batch = queue.batches.remove(index).unwrap_or_else(|| {
+                warn!("batch was removed before flush; dropping coordinator request");
+                PendingBatch {
+                    id: batch_id,
+                    total_inputs: 0,
+                    items: Vec::new(),
+                }
+            });
             if queue.batches.is_empty() {
                 inner.remove(&key);
             }
@@ -688,8 +695,6 @@ mod tests {
                 max_queue: 64,
                 max_wait_ms: 1_000,
                 overload_policy: crate::scheduler::OverloadPolicy::Queue,
-                max_batch_size: 8,
-                batch_window_ms: 10,
             },
             Arc::new(ThermalMonitor::new()),
         ))
@@ -702,8 +707,6 @@ mod tests {
                 max_queue: 8,
                 max_wait_ms,
                 overload_policy: crate::scheduler::OverloadPolicy::Queue,
-                max_batch_size: 8,
-                batch_window_ms: 10,
             },
             Arc::new(ThermalMonitor::new()),
         ))

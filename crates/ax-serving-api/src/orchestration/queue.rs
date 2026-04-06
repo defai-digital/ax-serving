@@ -191,6 +191,18 @@ pub struct GlobalQueue {
 }
 
 impl GlobalQueue {
+    fn waiters_lock(&self) -> std::sync::MutexGuard<'_, VecDeque<WaiterEntry>> {
+        match self.waiters.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                tracing::warn!(
+                    "global queue waiters mutex poisoned; continuing with inner value after recovery"
+                );
+                err.into_inner()
+            }
+        }
+    }
+
     pub fn new(config: GlobalQueueConfig) -> Self {
         Self {
             active: Arc::new(AtomicUsize::new(0)),
@@ -248,7 +260,7 @@ impl GlobalQueue {
 
         // ── Slow path: take the waiters mutex ────────────────────────────────
         let rx = {
-            let mut waiters = self.waiters.lock().unwrap();
+            let mut waiters = self.waiters_lock();
 
             // Re-check under the mutex: a permit may have dropped (and
             // decremented `active`) between our CAS failure and this lock.
@@ -339,7 +351,7 @@ impl GlobalQueue {
 
     /// Current number of requests waiting in queue.
     pub fn queued(&self) -> usize {
-        self.waiters.lock().unwrap().len()
+        self.waiters_lock().len()
     }
 }
 

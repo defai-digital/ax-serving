@@ -75,3 +75,8 @@ Effects:
 - Do not use a bare `v2.0-beta1` style tag. Use valid SemVer prerelease formatting like `v2.0.0-beta.1`.
 - Do not publish a beta by reusing the stable version number.
 - If multiple betas are needed, increment the prerelease suffix: `beta.1`, `beta.2`, `beta.3`.
+
+For enterprise private-artifact delivery, use:
+
+- [enterprise-private-repo-bootstrap.md](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-private-repo-bootstrap.md)
+- [enterprise-release-governance.md](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-release-governance.md)

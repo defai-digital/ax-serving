@@ -83,7 +83,7 @@ fn test_n_vocab_null_returns_zero() {
 /// `llama_get_logits(null)` must return a null pointer.
 #[test]
 fn test_get_logits_null_returns_null() {
-    let ptr = llama_get_logits(std::ptr::null());
+    let ptr = llama_get_logits(std::ptr::null_mut());
     assert!(ptr.is_null(), "expected null pointer for null context");
 }
 

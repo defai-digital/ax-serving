@@ -32,16 +32,6 @@ pub struct ServeConfig {
     /// Per-model concurrency cap (each model ID gets its own semaphore).
     /// env: `AXS_PER_MODEL_MAX_INFLIGHT`
     pub sched_per_model_max_inflight: usize,
-    /// Advisory max batch size for future scheduler-managed batching support.
-    /// Stored in config and metrics surfaces only; does not currently change
-    /// request execution behavior on its own.
-    /// env: `AXS_MAX_BATCH_SIZE`
-    pub sched_max_batch_size: usize,
-    /// Advisory batch-fill window (ms) for future scheduler-managed batching.
-    /// Stored in config and metrics surfaces only; does not currently change
-    /// request execution behavior on its own.
-    /// env: `AXS_BATCH_WINDOW_MS`
-    pub sched_batch_window_ms: u64,
     /// Default `max_tokens` applied when the client omits the field.
     /// Prevents unbounded generation from monopolizing the inference slot.
     /// Set to 0 to disable the default (pass `None` to the backend).
@@ -99,8 +89,6 @@ impl Default for ServeConfig {
             sched_max_wait_ms: 120_000,
             sched_overload_policy: "queue".into(),
             sched_per_model_max_inflight: 4,
-            sched_max_batch_size: 8,
-            sched_batch_window_ms: 5,
             default_max_tokens: 2048,
             split_scheduler: false,
             sched_max_prefill_tokens: 4096,
@@ -277,7 +265,7 @@ impl Default for OrchestratorConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LicenseConfig {
-    /// URL shown in the dashboard "Buy Business Edition" link.
+    /// URL shown in the dashboard commercial licensing link.
     /// env: `AXS_LICENSE_BUY_LINK`
     pub buy_link: String,
     /// Directory under `~/.config/` (or `$XDG_CONFIG_HOME/`) where the license key file lives.
@@ -328,6 +316,26 @@ pub struct ProjectRuleConfig {
     pub max_tokens_limit: Option<u32>,
     /// Optional worker pool enforced by policy when routing through the orchestrator.
     pub worker_pool: Option<String>,
+}
+
+// ── Env-var parsing helpers ──────────────────────────────────────────────────
+
+/// Read an env var as a string, returning None if unset.
+fn env_str(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Read an env var and parse it as type T.
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+/// Read an env var as a boolean (true/1/yes -> true, anything else -> false).
+fn env_bool(name: &str) -> Option<bool> {
+    Some(matches!(
+        std::env::var(name).ok()?.to_lowercase().as_str(),
+        "true" | "1" | "yes"
+    ))
 }
 
 // ── ServeConfig methods ───────────────────────────────────────────────────────
@@ -489,142 +497,96 @@ impl ServeConfig {
 
     pub fn apply_env_overrides(&mut self) {
         // ── REST / gRPC ───────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_REST_PORT")
-            && let Ok(port) = v.parse::<u16>()
-        {
+        if let Some(port) = env_parse::<u16>("AXS_REST_PORT") {
             self.rest_addr = format!("{DEFAULT_BIND_HOST}:{port}");
         }
         if let Ok(v) = std::env::var("AXS_REST_HOST") {
             let port = self.rest_addr.rsplit(':').next().unwrap_or("18080");
             self.rest_addr = format!("{v}:{port}");
         }
-        if let Ok(v) = std::env::var("AXS_GRPC_SOCKET") {
+        if let Some(v) = env_str("AXS_GRPC_SOCKET") {
             self.grpc_socket = v;
         }
-        if let Ok(v) = std::env::var("AXS_GRPC_HOST") {
+        if let Some(v) = env_str("AXS_GRPC_HOST") {
             self.grpc_host = v;
         }
-        if let Ok(v) = std::env::var("AXS_GRPC_PORT")
-            && let Ok(port) = v.parse::<u16>()
-        {
+        if let Some(port) = env_parse::<u16>("AXS_GRPC_PORT") {
             self.grpc_port = Some(port);
         }
 
         // ── Scheduler ─────────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_SCHED_MAX_INFLIGHT")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_INFLIGHT") {
             self.sched_max_inflight = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_SCHED_MAX_QUEUE")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.sched_max_queue = n;
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_QUEUE") {
+            self.sched_max_queue = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_SCHED_MAX_WAIT_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_SCHED_MAX_WAIT_MS") {
             self.sched_max_wait_ms = ms;
         }
-        if let Ok(v) = std::env::var("AXS_OVERLOAD_POLICY") {
+        if let Some(v) = env_str("AXS_OVERLOAD_POLICY") {
             self.sched_overload_policy = v;
         }
-        if let Ok(v) = std::env::var("AXS_DEFAULT_MAX_TOKENS")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_DEFAULT_MAX_TOKENS") {
             self.default_max_tokens = n;
         }
-        if let Ok(v) = std::env::var("AXS_PER_MODEL_MAX_INFLIGHT")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_PER_MODEL_MAX_INFLIGHT") {
             self.sched_per_model_max_inflight = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_MAX_BATCH_SIZE")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.sched_max_batch_size = n.max(1);
+        if let Some(b) = env_bool("AXS_SPLIT_SCHEDULER") {
+            self.split_scheduler = b;
         }
-        if let Ok(v) = std::env::var("AXS_BATCH_WINDOW_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
-            self.sched_batch_window_ms = ms;
-        }
-        if let Ok(v) = std::env::var("AXS_SPLIT_SCHEDULER") {
-            self.split_scheduler = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes");
-        }
-        if let Ok(v) = std::env::var("AXS_SCHED_MAX_PREFILL_TOKENS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_SCHED_MAX_PREFILL_TOKENS") {
             self.sched_max_prefill_tokens = n;
         }
-        if let Ok(v) = std::env::var("AXS_SCHED_MAX_DECODE_SEQUENCES")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_DECODE_SEQUENCES") {
             self.sched_max_decode_sequences = n;
         }
 
         // ── Idle eviction & thermal ───────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_IDLE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_IDLE_TIMEOUT_SECS") {
             self.idle_timeout_secs = n;
         }
-        if let Ok(v) = std::env::var("AXS_THERMAL_POLL_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_THERMAL_POLL_SECS") {
             self.thermal_poll_secs = n.max(1);
         }
 
         // ── Cache ─────────────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_CACHE_ENABLED")
-            && let Ok(enabled) = v.parse::<bool>()
-        {
+        if let Some(enabled) = env_parse::<bool>("AXS_CACHE_ENABLED") {
             self.cache.enabled = enabled;
         }
-        if let Ok(v) = std::env::var("AXS_CACHE_URL") {
+        if let Some(v) = env_str("AXS_CACHE_URL") {
             self.cache.url = v;
         }
-        if let Ok(v) = std::env::var("AXS_CACHE_KEY_PREFIX") {
+        if let Some(v) = env_str("AXS_CACHE_KEY_PREFIX") {
             self.cache.key_prefix = v;
         }
-        if let Ok(v) = std::env::var("AXS_CACHE_DEFAULT_TTL") {
+        if let Some(v) = env_str("AXS_CACHE_DEFAULT_TTL") {
             self.cache.default_ttl = v;
         }
-        if let Ok(v) = std::env::var("AXS_CACHE_MAX_TTL") {
+        if let Some(v) = env_str("AXS_CACHE_MAX_TTL") {
             self.cache.max_ttl = v;
         }
 
         // ── Registry ─────────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_MAX_LOADED_MODELS")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_MAX_LOADED_MODELS") {
             self.registry.max_loaded_models = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_IDLE_CHECK_INTERVAL_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_IDLE_CHECK_INTERVAL_SECS") {
             self.registry.idle_check_interval_secs = n.max(1);
         }
 
         // ── Dispatcher ───────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_DISPATCHER_POOL_MAX_IDLE")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE") {
             self.dispatcher.pool_max_idle_per_host = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_DISPATCHER_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS") {
             self.dispatcher.request_timeout_secs = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_RETRY_AFTER_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS") {
             self.dispatcher.retry_after_secs = n;
         }
-        if let Ok(v) = std::env::var("AXS_CACHE_INFLIGHT_MAX_RETRIES")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_CACHE_INFLIGHT_MAX_RETRIES") {
             self.dispatcher.cache_inflight_max_retries = n.max(1);
         }
 
@@ -632,85 +594,63 @@ impl ServeConfig {
         self.llamacpp.apply_env_overrides();
 
         // ── Orchestrator ──────────────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_ORCHESTRATOR_HOST") {
+        if let Some(v) = env_str("AXS_ORCHESTRATOR_HOST") {
             self.orchestrator.host = v;
         }
-        if let Ok(v) = std::env::var("AXS_ORCHESTRATOR_PORT")
-            && let Ok(p) = v.parse::<u16>()
-        {
+        if let Some(p) = env_parse::<u16>("AXS_ORCHESTRATOR_PORT") {
             self.orchestrator.port = p;
         }
-        if let Ok(v) = std::env::var("AXS_INTERNAL_PORT")
-            && let Ok(p) = v.parse::<u16>()
-        {
+        if let Some(p) = env_parse::<u16>("AXS_INTERNAL_PORT") {
             self.orchestrator.internal_port = p;
         }
-        if let Ok(v) = std::env::var("AXS_INTERNAL_BIND_ADDR") {
+        if let Some(v) = env_str("AXS_INTERNAL_BIND_ADDR") {
             self.orchestrator.internal_bind_addr = v;
         }
-        if let Ok(v) = std::env::var("AXS_ALLOWED_NODE_CIDRS") {
+        if let Some(v) = env_str("AXS_ALLOWED_NODE_CIDRS") {
             self.orchestrator.allowed_node_cidrs = v;
         }
-        if let Ok(v) = std::env::var("AXS_WORKER_HEARTBEAT_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_WORKER_HEARTBEAT_MS") {
             self.orchestrator.worker_heartbeat_ms = ms.max(100);
         }
-        if let Ok(v) = std::env::var("AXS_WORKER_TTL_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_WORKER_TTL_MS") {
             self.orchestrator.worker_ttl_ms = ms.max(500);
         }
-        if let Ok(v) = std::env::var("AXS_DISPATCH_POLICY") {
+        if let Some(v) = env_str("AXS_DISPATCH_POLICY") {
             self.orchestrator.dispatch_policy = v;
         }
-        if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_MAX")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_MAX") {
             self.orchestrator.global_queue_max = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_DEPTH")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.orchestrator.global_queue_depth = n;
+        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_DEPTH") {
+            self.orchestrator.global_queue_depth = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_WAIT_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS") {
             self.orchestrator.global_queue_wait_ms = ms;
         }
-        if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_POLICY") {
+        if let Some(v) = env_str("AXS_GLOBAL_QUEUE_POLICY") {
             self.orchestrator.global_queue_policy = v;
         }
-        if let Ok(v) = std::env::var("AXS_RETRY_AFTER_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS") {
             self.orchestrator.retry_after_secs = n;
         }
-        if let Ok(v) = std::env::var("AXS_DISPATCHER_POOL_MAX_IDLE")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE") {
             self.orchestrator.pool_max_idle_per_host = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_DISPATCHER_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
+        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS") {
             self.orchestrator.request_timeout_secs = n.max(1);
         }
 
         // ── License / dashboard ───────────────────────────────────────────────
-        if let Ok(v) = std::env::var("AXS_LICENSE_BUY_LINK") {
+        if let Some(v) = env_str("AXS_LICENSE_BUY_LINK") {
             self.license.buy_link = v;
         }
-        if let Ok(v) = std::env::var("AXS_LICENSE_CONFIG_DIR") {
+        if let Some(v) = env_str("AXS_LICENSE_CONFIG_DIR") {
             self.license.config_dir = v;
         }
-        if let Ok(v) = std::env::var("AXS_LICENSE_KEY_FILE") {
+        if let Some(v) = env_str("AXS_LICENSE_KEY_FILE") {
             self.license.key_file = v;
         }
-        if let Ok(v) = std::env::var("AXS_DASHBOARD_POLL_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_DASHBOARD_POLL_MS") {
             self.license.dashboard_poll_ms = ms.max(500);
         }
     }

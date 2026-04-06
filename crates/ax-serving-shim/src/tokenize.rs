@@ -43,7 +43,7 @@ pub unsafe extern "C" fn llama_tokenize(
             // llama.h contract: return -(n_needed) when buffer is too small.
             // Callers use the negative value to learn the required size and retry.
             if ids.len() > n_tokens_max as usize {
-                return -(ids.len() as i32);
+                return -(ids.len().min(i32::MAX as usize) as i32);
             }
             for (i, id) in ids.iter().enumerate() {
                 unsafe {
@@ -84,7 +84,7 @@ pub unsafe extern "C" fn llama_token_to_piece(
             // llama.h contract: return -(n_needed) when buffer too small.
             // `n + 1` is needed (n bytes + null terminator); length must be > n.
             if n >= length as usize {
-                return -(n as i32);
+                return -(n.min(i32::MAX as usize) as i32);
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);

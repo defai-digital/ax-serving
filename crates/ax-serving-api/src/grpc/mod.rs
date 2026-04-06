@@ -71,7 +71,7 @@ pub async fn serve(
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.strip_prefix("Bearer "))
-                    .map(|key| keys.contains(key.trim()))
+                    .map(|key| crate::auth::has_valid_api_key(key.trim(), &keys))
                     .unwrap_or(false);
                 if authorized {
                     Ok(req)

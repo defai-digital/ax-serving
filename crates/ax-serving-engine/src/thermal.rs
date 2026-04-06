@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+use tracing::warn;
 
 /// Thermal pressure state reported by macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +79,7 @@ impl ThermalMonitor {
         // Spawn background poller. It holds a Weak reference so it exits
         // automatically when all ThermalMonitor clones are dropped.
         let state_weak = Arc::downgrade(&state);
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("ax-thermal-poll".to_string())
             .spawn(move || {
                 loop {
@@ -91,7 +92,13 @@ impl ThermalMonitor {
                     state.store(raw, Ordering::Relaxed);
                 }
             })
-            .expect("failed to spawn ax-thermal-poll thread");
+        {
+            warn!(
+                poll_secs,
+                %err,
+                "failed to spawn ax-thermal-poll thread; thermal state will remain static until restart"
+            );
+        }
 
         Self { state, max_cpus }
     }
@@ -134,7 +141,13 @@ fn detect_performance_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
-        let name = CString::new("hw.perflevel0.physicalcpu").unwrap();
+        let name = match CString::new("hw.perflevel0.physicalcpu") {
+            Ok(name) => name,
+            Err(err) => {
+                warn!(%err, "failed to build sysctl key for CPU core detection");
+                return fallback;
+            }
+        };
         let mut val: i32 = 0;
         let mut size = std::mem::size_of::<i32>();
         let ret = unsafe {

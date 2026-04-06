@@ -216,6 +216,16 @@ pub struct WorkerEntry {
     pub queue_depth: usize,
     /// Recent error rate fraction from the worker (0.0 = unknown / no errors).
     pub error_rate: f64,
+    /// KV cache pages currently allocated (0 = unknown).
+    pub kv_pages_used: u64,
+    /// KV cache page budget (0 = unknown).
+    pub kv_pages_total: u64,
+    /// Tokens in reusable prefix cache (0 = unsupported).
+    pub prefix_reusable_tokens: u64,
+    /// Current internal batch occupancy (0 = unknown).
+    pub active_batch_size: u32,
+    /// Backend's max batch capacity (0 = unknown).
+    pub max_batch_size: u32,
 }
 
 // ── Payloads (serialised over the internal REST API) ─────────────────────────
@@ -289,6 +299,21 @@ pub struct HeartbeatRequest {
     /// Recent worker-side error rate fraction (0.0-1.0).
     #[serde(default)]
     pub error_rate: f64,
+    /// KV cache pages currently allocated (0 = unknown).
+    #[serde(default)]
+    pub kv_pages_used: u64,
+    /// KV cache page budget (0 = unknown).
+    #[serde(default)]
+    pub kv_pages_total: u64,
+    /// Tokens in reusable prefix cache (0 = unsupported).
+    #[serde(default)]
+    pub prefix_reusable_tokens: u64,
+    /// Current internal batch occupancy (0 = unknown).
+    #[serde(default)]
+    pub active_batch_size: u32,
+    /// Backend's max batch capacity (0 = unknown).
+    #[serde(default)]
+    pub max_batch_size: u32,
 }
 
 // ── Read-only snapshot for dispatch policies ──────────────────────────────────
@@ -306,24 +331,14 @@ pub struct WorkerStatus {
     pub addr: SocketAddr,
     pub inflight: usize,
     pub max_inflight: usize,
-    /// Shared with `WorkerEntry` — increment before dispatch, decrement after.
-    pub inflight_counter: Arc<AtomicUsize>,
     /// Active inference sequences (token-cost dispatch).  0 = unknown (legacy worker).
     pub active_sequences: usize,
-    /// Recent decode throughput in tokens/second (0 = unknown).
-    pub decode_tok_per_sec: f64,
     /// P95 TTFT in milliseconds (0 = unknown / no streaming requests yet).
     pub ttft_p95_ms: u64,
-    /// Optional pool label for placement hints.
-    pub worker_pool: Option<String>,
-    /// Optional node class for topology and fleet inventory.
-    pub node_class: Option<String>,
-    /// Structured worker capabilities used by capability-aware filtering.
-    pub capabilities: WorkerCapabilities,
-    /// Current pending queue depth reported by the worker.
-    pub queue_depth: usize,
-    /// Recent worker-side error rate fraction.
-    pub error_rate: f64,
+    /// KV cache utilization (0.0-1.0). `None` = worker does not report KV telemetry.
+    pub kv_utilization: Option<f64>,
+    /// Batch headroom ratio (0.0-1.0). `None` = worker does not report batch telemetry.
+    pub batch_headroom: Option<f64>,
 }
 
 // ── JSON snapshot for the listing endpoints ───────────────────────────────────
@@ -368,6 +383,16 @@ pub struct WorkerSnapshot {
     pub queue_depth: usize,
     /// Recent worker-side error rate fraction.
     pub error_rate: f64,
+    /// KV cache pages currently allocated (0 = unknown).
+    pub kv_pages_used: u64,
+    /// KV cache page budget (0 = unknown).
+    pub kv_pages_total: u64,
+    /// Tokens in reusable prefix cache (0 = unsupported).
+    pub prefix_reusable_tokens: u64,
+    /// Current internal batch occupancy (0 = unknown).
+    pub active_batch_size: u32,
+    /// Backend's max batch capacity (0 = unknown).
+    pub max_batch_size: u32,
 }
 
 // ── WorkerRegistry ────────────────────────────────────────────────────────────
@@ -420,11 +445,18 @@ impl WorkerRegistry {
 
         // Sentinel: loopback on the reserved port 1 so the registry isn't
         // poisoned but the worker will never receive real traffic.
-        const SENTINEL_ADDR: &str = "127.0.0.1:1";
-        let addr: SocketAddr = raw_addr.parse().unwrap_or_else(|e| {
-            warn!(raw_addr = %raw_addr, err = %e, "worker registered with unparseable address; it will never receive traffic");
-            SENTINEL_ADDR.parse().unwrap()
-        });
+        let addr: SocketAddr = match raw_addr.parse() {
+            Ok(addr) => addr,
+            Err(err) => {
+                warn!(
+                    raw_addr = %raw_addr,
+                    err = %err,
+                    "worker registered with unparseable address; it will never receive traffic"
+                );
+                SocketAddr::from(([127, 0, 0, 1], 1))
+            }
+        };
+        let max_inflight = max_inflight.max(1);
         let backend = BackendKind::parse(&backend);
         let (capabilities, capability_source) = capabilities.into_parts();
 
@@ -476,6 +508,11 @@ impl WorkerRegistry {
                 ttft_p95_ms: 0,
                 queue_depth: 0,
                 error_rate: 0.0,
+                kv_pages_used: 0,
+                kv_pages_total: 0,
+                prefix_reusable_tokens: 0,
+                active_batch_size: 0,
+                max_batch_size: 0,
             });
 
         RegisterResponse {
@@ -504,6 +541,11 @@ impl WorkerRegistry {
                 e.ttft_p95_ms = req.ttft_p95_ms;
                 e.queue_depth = req.queue_depth;
                 e.error_rate = req.error_rate;
+                e.kv_pages_used = req.kv_pages_used;
+                e.kv_pages_total = req.kv_pages_total;
+                e.prefix_reusable_tokens = req.prefix_reusable_tokens;
+                e.active_batch_size = req.active_batch_size;
+                e.max_batch_size = req.max_batch_size;
                 true
             }
             None => false,
@@ -563,43 +605,96 @@ impl WorkerRegistry {
         backend_hint: Option<&str>,
         min_context: Option<u32>,
     ) -> Vec<WorkerStatus> {
+        self.dispatch_workers_filtered(
+            model_id,
+            request_kind,
+            backend_hint,
+            min_context,
+            None,
+            None,
+        )
+    }
+
+    pub fn dispatch_workers_filtered(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+        preferred_pool: Option<&str>,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerStatus> {
         let backend_filter = backend_filter_from_hint(backend_hint);
+        let preferred_pool = preferred_pool
+            .map(str::trim)
+            .filter(|pool| !pool.is_empty());
+        let Some(preferred_pool) = preferred_pool else {
+            return self
+                .inner
+                .iter()
+                .filter_map(|r| {
+                    let e = r.value();
+                    dispatch_filter_matches(
+                        e,
+                        model_id,
+                        request_kind,
+                        backend_filter.as_ref(),
+                        min_context,
+                        excluded_id,
+                    )
+                    .then(|| worker_status_of(e))
+                })
+                .collect();
+        };
+        let mut preferred_pool_exists = false;
+        let mut preferred_workers = Vec::new();
+        let mut fallback_workers = Vec::new();
+
+        for r in self.inner.iter() {
+            let e = r.value();
+            let in_preferred_pool = e.worker_pool.as_deref() == Some(preferred_pool);
+            let matches_without_exclusion = dispatch_filter_matches(
+                e,
+                model_id,
+                request_kind,
+                backend_filter.as_ref(),
+                min_context,
+                None,
+            );
+
+            if !matches_without_exclusion {
+                continue;
+            }
+            if in_preferred_pool {
+                preferred_pool_exists = true;
+            }
+            if excluded_id == Some(e.id) {
+                continue;
+            }
+
+            let worker = worker_status_of(e);
+            if in_preferred_pool {
+                preferred_workers.push(worker);
+            } else {
+                fallback_workers.push(worker);
+            }
+        }
+
+        if preferred_pool_exists {
+            preferred_workers
+        } else {
+            fallback_workers
+        }
+    }
+
+    /// Shared inflight counter for a specific worker.
+    ///
+    /// This is used only after dispatch policy selection so the hot-path
+    /// candidate list does not clone the counter `Arc` for every worker.
+    pub fn inflight_counter(&self, id: WorkerId) -> Option<Arc<AtomicUsize>> {
         self.inner
-            .iter()
-            .filter(|r| {
-                let e = r.value();
-                !e.drain
-                    && matches!(e.health, WorkerHealth::Healthy)
-                    && e.capabilities.models.iter().any(|c| c == model_id)
-                    && supports_request_kind(e, request_kind)
-                    && backend_filter
-                        .as_ref()
-                        .is_none_or(|kind| &e.backend == kind)
-                    && min_context.is_none_or(|required| {
-                        e.capabilities
-                            .max_context
-                            .is_none_or(|worker_max| worker_max >= required)
-                    })
-            })
-            .map(|r| {
-                let e = r.value();
-                WorkerStatus {
-                    id: e.id,
-                    addr: e.addr,
-                    inflight: e.inflight.load(Ordering::Relaxed),
-                    max_inflight: e.max_inflight,
-                    inflight_counter: Arc::clone(&e.inflight),
-                    active_sequences: e.active_sequences,
-                    decode_tok_per_sec: e.decode_tok_per_sec,
-                    ttft_p95_ms: e.ttft_p95_ms,
-                    worker_pool: e.worker_pool.clone(),
-                    node_class: e.node_class.clone(),
-                    capabilities: e.capabilities.clone(),
-                    queue_depth: e.queue_depth,
-                    error_rate: e.error_rate,
-                }
-            })
-            .collect()
+            .get(&id)
+            .map(|entry| Arc::clone(&entry.value().inflight))
     }
 
     /// All workers — for the `/internal/workers` listing endpoint.
@@ -745,7 +840,57 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         ttft_p95_ms: e.ttft_p95_ms,
         queue_depth: e.queue_depth,
         error_rate: e.error_rate,
+        kv_pages_used: e.kv_pages_used,
+        kv_pages_total: e.kv_pages_total,
+        prefix_reusable_tokens: e.prefix_reusable_tokens,
+        active_batch_size: e.active_batch_size,
+        max_batch_size: e.max_batch_size,
     }
+}
+
+fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
+    let kv_utilization = if e.kv_pages_total > 0 {
+        Some(e.kv_pages_used as f64 / e.kv_pages_total as f64)
+    } else {
+        None
+    };
+    let batch_headroom = if e.max_batch_size > 0 {
+        Some((1.0 - (e.active_batch_size as f64 / e.max_batch_size as f64)).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    WorkerStatus {
+        id: e.id,
+        addr: e.addr,
+        inflight: e.inflight.load(Ordering::Relaxed),
+        max_inflight: e.max_inflight,
+        active_sequences: e.active_sequences,
+        ttft_p95_ms: e.ttft_p95_ms,
+        kv_utilization,
+        batch_headroom,
+    }
+}
+
+fn dispatch_filter_matches(
+    entry: &WorkerEntry,
+    model_id: &str,
+    request_kind: RequestKind,
+    backend_filter: Option<&BackendKind>,
+    min_context: Option<u32>,
+    excluded_id: Option<WorkerId>,
+) -> bool {
+    excluded_id != Some(entry.id)
+        && !entry.drain
+        && matches!(entry.health, WorkerHealth::Healthy)
+        && entry.capabilities.models.iter().any(|c| c == model_id)
+        && supports_request_kind(entry, request_kind)
+        && backend_filter.is_none_or(|kind| &entry.backend == kind)
+        && min_context.is_none_or(|required| {
+            entry
+                .capabilities
+                .max_context
+                .is_none_or(|worker_max| worker_max >= required)
+        })
 }
 
 fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool {
@@ -793,6 +938,98 @@ mod tests {
 
         // Unknown model → empty
         assert!(r.eligible_workers("unknown-model").is_empty());
+    }
+
+    #[test]
+    fn dispatch_workers_prefer_matching_pool_when_available() {
+        let r = WorkerRegistry::new();
+        let blue = r.register(
+            RegisterRequest {
+                worker_pool: Some("blue".into()),
+                ..reg_req("127.0.0.1:8081", &["m1"], 4)
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_pool: Some("green".into()),
+                ..reg_req("127.0.0.1:8082", &["m1"], 4)
+            },
+            5000,
+        );
+
+        let workers =
+            r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, Some("blue"), None);
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, WorkerId::parse(&blue.worker_id).unwrap());
+    }
+
+    #[test]
+    fn dispatch_workers_fall_back_when_preferred_pool_missing() {
+        let r = WorkerRegistry::new();
+        let blue = r.register(
+            RegisterRequest {
+                worker_pool: Some("blue".into()),
+                ..reg_req("127.0.0.1:8081", &["m1"], 4)
+            },
+            5000,
+        );
+        let green = r.register(
+            RegisterRequest {
+                worker_pool: Some("green".into()),
+                ..reg_req("127.0.0.1:8082", &["m1"], 4)
+            },
+            5000,
+        );
+
+        let workers =
+            r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, Some("red"), None);
+
+        assert_eq!(workers.len(), 2);
+        assert!(
+            workers
+                .iter()
+                .any(|worker| worker.id == WorkerId::parse(&blue.worker_id).unwrap())
+        );
+        assert!(
+            workers
+                .iter()
+                .any(|worker| worker.id == WorkerId::parse(&green.worker_id).unwrap())
+        );
+    }
+
+    #[test]
+    fn dispatch_workers_apply_exclusion_after_pool_preference() {
+        let r = WorkerRegistry::new();
+        let blue = r.register(
+            RegisterRequest {
+                worker_pool: Some("blue".into()),
+                ..reg_req("127.0.0.1:8081", &["m1"], 4)
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_pool: Some("green".into()),
+                ..reg_req("127.0.0.1:8082", &["m1"], 4)
+            },
+            5000,
+        );
+
+        let workers = r.dispatch_workers_filtered(
+            "m1",
+            RequestKind::Llm,
+            None,
+            None,
+            Some("blue"),
+            Some(WorkerId::parse(&blue.worker_id).unwrap()),
+        );
+
+        assert!(
+            workers.is_empty(),
+            "preferred-pool filtering must still win before exclusion"
+        );
     }
 
     #[test]
@@ -1459,5 +1696,84 @@ mod tests {
         let evicted = r.tick(60_000);
         assert!(evicted.is_empty());
         assert_eq!(r.eligible_workers("m1").len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_stores_cache_telemetry() {
+        let reg = WorkerRegistry::new();
+        let resp = reg.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::default(),
+                backend: "auto".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        reg.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 2,
+                kv_pages_used: 100,
+                kv_pages_total: 256,
+                active_batch_size: 3,
+                max_batch_size: 8,
+                ..Default::default()
+            },
+        );
+        let workers = reg.list_all();
+        let snap = workers.iter().find(|w| w.id == id).unwrap();
+        assert_eq!(snap.kv_pages_used, 100);
+        assert_eq!(snap.kv_pages_total, 256);
+        assert_eq!(snap.active_batch_size, 3);
+        assert_eq!(snap.max_batch_size, 8);
+    }
+
+    #[test]
+    fn worker_status_computes_kv_utilization_and_batch_headroom() {
+        let reg = WorkerRegistry::new();
+        let resp = reg.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+                backend: "auto".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        reg.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 1,
+                kv_pages_used: 200,
+                kv_pages_total: 400,
+                active_batch_size: 2,
+                max_batch_size: 8,
+                model_ids: vec!["m1".into()],
+                ..Default::default()
+            },
+        );
+        let eligible = reg.eligible_workers("m1");
+        assert_eq!(eligible.len(), 1);
+        let ws = &eligible[0];
+        assert!((ws.kv_utilization.unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((ws.batch_headroom.unwrap() - 0.75).abs() < f64::EPSILON);
+
+        let all = reg.list_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].kv_pages_used, 200);
+        assert_eq!(all[0].kv_pages_total, 400);
     }
 }

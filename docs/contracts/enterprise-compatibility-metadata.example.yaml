@@ -1,0 +1,40 @@
+schema_version: 1
+
+enterprise_release:
+  product: ax-serving-enterprise-workers
+  version: 2.1.0-e1
+  channel: stable
+  release_date: 2026-03-29
+
+public_core:
+  minimum_supported: 2.1.0
+  maximum_validated_minor: 2.1.x
+  contract_revision: 2026-03
+
+dependencies:
+  rest_api: v2.1
+  worker_protocol: 2026-03
+  metrics_contract: 2026-03
+  config_contract: 2026-03
+
+artifacts:
+  images:
+    - registry.example.internal/ax-serving/enterprise-workers:2.1.0-e1
+  bundles:
+    - ax-serving-enterprise-workers-2.1.0-e1.tgz
+
+migration:
+  previous_enterprise_release: 2.0.4-e3
+  requires_upgrade_notes: true
+  upgrade_notes_ref: internal://ax-serving/releases/2.1.0-e1
+
+validation:
+  tested_public_core_versions:
+    - 2.1.0
+    - 2.1.1
+  integration_smoke_tests: passed
+  deployment_bundle_assembly: passed
+
+ownership:
+  team: enterprise-workers
+  approver: enterprise-release-manager

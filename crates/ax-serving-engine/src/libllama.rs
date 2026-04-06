@@ -43,7 +43,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -81,6 +81,9 @@ const DEFAULT_N_BATCH: u32 = 512;
 const DEFAULT_POOL_SIZE: usize = 4;
 /// GPU offload layers; 99 is effectively "all layers" for any model ≤ ~200 layers.
 const DEFAULT_N_GPU_LAYERS: i32 = 99;
+/// Steady-state token pieces are coalesced before crossing the thread/channel boundary.
+const DEFAULT_STREAM_TOKEN_BATCH_SIZE: usize = 4;
+const MAX_STREAM_TOKEN_BATCH_SIZE: usize = 32;
 
 // ── Handle counter ────────────────────────────────────────────────────────────
 
@@ -88,6 +91,52 @@ static NEXT_LIBLLAMA_HANDLE: AtomicU64 = AtomicU64::new(4_000_000);
 
 fn next_libllama_handle() -> ModelHandle {
     ModelHandle(NEXT_LIBLLAMA_HANDLE.fetch_add(1, Ordering::Relaxed))
+}
+
+fn stream_token_batch_size() -> usize {
+    std::env::var("AXS_STREAM_TOKEN_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
+        .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
+}
+
+fn flush_stream_token_batch(
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    buffer: &mut String,
+    buffered_pieces: &mut usize,
+) -> bool {
+    *buffered_pieces = 0;
+    if buffer.is_empty() {
+        return true;
+    }
+    tx.blocking_send(GenerateEvent::Token(std::mem::take(buffer)))
+        .is_ok()
+}
+
+fn push_stream_token_piece(
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    piece: String,
+    batch_size: usize,
+    first_chunk_sent: &mut bool,
+    buffer: &mut String,
+    buffered_pieces: &mut usize,
+) -> bool {
+    if piece.is_empty() {
+        return true;
+    }
+    if !*first_chunk_sent {
+        *first_chunk_sent = true;
+        return tx.blocking_send(GenerateEvent::Token(piece)).is_ok();
+    }
+
+    buffer.push_str(&piece);
+    *buffered_pieces += 1;
+    if *buffered_pieces < batch_size {
+        return true;
+    }
+
+    flush_stream_token_batch(tx, buffer, buffered_pieces)
 }
 
 // ── Safe pointer wrappers ─────────────────────────────────────────────────────
@@ -142,27 +191,58 @@ impl LlamaContextPool {
 
     /// Borrow a context, blocking until one is available.
     fn acquire(&self) -> LlamaContextPtr {
-        let mut guard = self.available.lock().unwrap();
+        let mut guard = match self.available.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!("libllama context pool mutex poisoned during acquire; recovering");
+                err.into_inner()
+            }
+        };
         loop {
             if let Some(ctx) = guard.pop() {
                 return ctx;
             }
-            guard = self.cv.wait(guard).unwrap();
+            guard = match self.cv.wait(guard) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    warn!("libllama condvar wait poisoned during acquire; recovering");
+                    err.into_inner()
+                }
+            };
         }
     }
 
     /// Return a context to the pool.
     fn release(&self, ctx: LlamaContextPtr) {
-        self.available.lock().unwrap().push(ctx);
+        let mut guard = match self.available.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!("libllama context pool mutex poisoned during release; recovering");
+                err.into_inner()
+            }
+        };
+        guard.push(ctx);
         self.cv.notify_one();
     }
 
     /// Wait for all in-flight requests to return their contexts, then drain
     /// and free every context. Called from `LlamaModelHolder::drop`.
     fn drain_all(&self) {
-        let mut guard = self.available.lock().unwrap();
+        let mut guard = match self.available.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!("libllama context pool mutex poisoned during drain_all; recovering");
+                err.into_inner()
+            }
+        };
         while guard.len() < self.total {
-            guard = self.cv.wait(guard).unwrap();
+            guard = match self.cv.wait(guard) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    warn!("libllama condvar wait poisoned during drain_all; recovering");
+                    err.into_inner()
+                }
+            };
         }
         guard.clear(); // Drops all LlamaContextPtr — calls llama_free on each.
     }
@@ -249,6 +329,20 @@ impl LibLlamaBackend {
             n_batch,
             pool_size,
         }
+    }
+
+    fn models_read(&self) -> RwLockReadGuard<'_, HashMap<ModelHandle, Arc<LlamaModelHolder>>> {
+        self.models.read().unwrap_or_else(|err| {
+            warn!("libllama models rwlock poisoned; recovering from poisoned read lock");
+            err.into_inner()
+        })
+    }
+
+    fn models_write(&self) -> RwLockWriteGuard<'_, HashMap<ModelHandle, Arc<LlamaModelHolder>>> {
+        self.models.write().unwrap_or_else(|err| {
+            warn!("libllama models rwlock poisoned; recovering from poisoned write lock");
+            err.into_inner()
+        })
     }
 }
 
@@ -387,13 +481,13 @@ impl InferenceBackend for LibLlamaBackend {
         });
 
         let handle = next_libllama_handle();
-        self.models.write().unwrap().insert(handle, holder);
+        self.models_write().insert(handle, holder);
 
         Ok((handle, meta))
     }
 
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
-        let entry = self.models.write().unwrap().remove(&handle);
+        let entry = self.models_write().remove(&handle);
         anyhow::ensure!(
             entry.is_some(),
             "no libllama model loaded with handle {:?}",
@@ -414,7 +508,7 @@ impl InferenceBackend for LibLlamaBackend {
         tx: tokio::sync::mpsc::Sender<GenerateEvent>,
     ) -> Result<()> {
         let holder = {
-            let guard = self.models.read().unwrap();
+            let guard = self.models_read();
             guard
                 .get(&handle)
                 .cloned()
@@ -422,19 +516,37 @@ impl InferenceBackend for LibLlamaBackend {
         };
 
         // Spawn a blocking thread: the llama.cpp C API is synchronous.
-        std::thread::spawn(move || {
-            // Acquire a context (blocks until one is available in the pool).
-            let ctx = holder.pool.acquire();
+        std::thread::Builder::new()
+            .name(format!("ax-libllama-generate-{handle:?}"))
+            .spawn(move || {
+                // Acquire a context (blocks until one is available in the pool).
+                let ctx = holder.pool.acquire();
 
-            let result = run_generate(holder.model.0, ctx.0, &holder.meta, &input, &params, &tx);
+                // Guarantee release even if run_generate panics (BUG-021).
+                let pool_ref = &holder.pool;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_generate(holder.model.0, ctx.0, &holder.meta, &input, &params, &tx)
+                }));
 
-            holder.pool.release(ctx);
+                pool_ref.release(ctx);
 
-            if let Err(e) = result {
-                warn!("libllama generate error: {e}");
-                let _ = tx.blocking_send(GenerateEvent::Error(e.to_string()));
-            }
-        });
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("libllama generate error: {e}");
+                        let _ = tx.blocking_send(GenerateEvent::Error(e.to_string()));
+                    }
+                    Err(panic) => {
+                        warn!("libllama generate panicked");
+                        let msg = match panic.downcast_ref::<&str>() {
+                            Some(s) => s.to_string(),
+                            None => "internal panic in FFI generate".to_string(),
+                        };
+                        let _ = tx.blocking_send(GenerateEvent::Error(msg));
+                    }
+                }
+            })
+            .context("failed to spawn libllama generation thread")?;
 
         Ok(())
     }
@@ -442,7 +554,7 @@ impl InferenceBackend for LibLlamaBackend {
     // ── Tokenization ──────────────────────────────────────────────────────────
 
     fn tokenize(&self, handle: ModelHandle, text: &str, add_bos: bool) -> Result<Vec<u32>> {
-        let guard = self.models.read().unwrap();
+        let guard = self.models_read();
         let holder = guard
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
@@ -453,7 +565,7 @@ impl InferenceBackend for LibLlamaBackend {
     }
 
     fn decode_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<String> {
-        let guard = self.models.read().unwrap();
+        let guard = self.models_read();
         let holder = guard
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
@@ -468,7 +580,7 @@ impl InferenceBackend for LibLlamaBackend {
     }
 
     fn eos_tokens(&self, handle: ModelHandle) -> Result<Vec<u32>> {
-        let guard = self.models.read().unwrap();
+        let guard = self.models_read();
         let holder = guard
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
@@ -497,7 +609,7 @@ impl InferenceBackend for LibLlamaBackend {
         config: &EmbedConfig,
     ) -> Result<EmbedResult> {
         let holder = {
-            let guard = self.models.read().unwrap();
+            let guard = self.models_read();
             guard
                 .get(&handle)
                 .cloned()
@@ -919,6 +1031,10 @@ fn run_generate(
     let emit_logprobs = params.logprobs.unwrap_or(false);
     let n_top_logprobs = params.top_logprobs.unwrap_or(0) as usize;
     let n_vocab = unsafe { ffi::llama_vocab_n_tokens(vocab) as usize };
+    let stream_batch_size = stream_token_batch_size();
+    let mut first_stream_chunk_sent = false;
+    let mut stream_token_buffer = String::new();
+    let mut buffered_stream_tokens = 0usize;
 
     // 5. Sample the first token from the prefill logits.
     //    idx = -1 means "last position with computed logits".
@@ -930,6 +1046,8 @@ fn run_generate(
     let mut n_decoded = 0usize;
     let mut current_pos = n_input;
     let mut accumulated = String::new();
+    // Only keep the tail needed for stop-sequence matching to bound memory.
+    let max_stop_len = params.stop_seqs.iter().map(|s| s.len()).max().unwrap_or(0);
 
     loop {
         // Check EOS.
@@ -937,9 +1055,28 @@ fn run_generate(
             break;
         }
 
-        // Convert token → text, emit.
+        // Convert token → text.
         let piece = unsafe { token_to_piece(vocab, next_tok) };
         accumulated.push_str(&piece);
+
+        n_decoded += 1;
+
+        // Check stop sequences BEFORE emitting to avoid leaking stop text.
+        if params
+            .stop_seqs
+            .iter()
+            .any(|seq| accumulated.ends_with(seq.as_str()))
+        {
+            break;
+        }
+
+        // Trim accumulated to only keep the tail needed for stop-sequence matching.
+        if max_stop_len > 0 && accumulated.len() > max_stop_len * 2 {
+            let tail_start = accumulated.len() - max_stop_len;
+            // Find a valid char boundary at or after tail_start.
+            let boundary = accumulated.ceil_char_boundary(tail_start);
+            accumulated.drain(..boundary);
+        }
 
         // Emit token event (and optionally logprob).
         if emit_logprobs {
@@ -957,19 +1094,15 @@ fn run_generate(
             {
                 break;
             }
-        } else if tx.blocking_send(GenerateEvent::Token(piece)).is_err() {
+        } else if !push_stream_token_piece(
+            tx,
+            piece,
+            stream_batch_size,
+            &mut first_stream_chunk_sent,
+            &mut stream_token_buffer,
+            &mut buffered_stream_tokens,
+        ) {
             // Receiver dropped (client disconnected).
-            break;
-        }
-
-        n_decoded += 1;
-
-        // Check stop sequences.
-        if params
-            .stop_seqs
-            .iter()
-            .any(|seq| accumulated.ends_with(seq.as_str()))
-        {
             break;
         }
 
@@ -1007,6 +1140,16 @@ fn run_generate(
 
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
+    if !emit_logprobs
+        && !flush_stream_token_batch(tx, &mut stream_token_buffer, &mut buffered_stream_tokens)
+    {
+        // Free sampler before early return to avoid leak on client disconnect.
+        if !sampler.is_null() {
+            unsafe { ffi::llama_sampler_free(sampler) };
+        }
+        return Ok(());
+    }
+
     // 7. Free sampler.
     if !sampler.is_null() {
         unsafe { ffi::llama_sampler_free(sampler) };
@@ -1029,7 +1172,106 @@ fn run_generate(
         completion_tokens: n_decoded,
         prefill_tok_per_sec: prefill_tps,
         decode_tok_per_sec: decode_tps,
+        stop_reason: if n_decoded >= max_new {
+            "length".to_string()
+        } else {
+            "stop".to_string()
+        },
     }));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use crate::GenerateEvent;
+
+    use super::{flush_stream_token_batch, push_stream_token_piece};
+
+    #[test]
+    fn first_stream_piece_is_sent_immediately() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut first_chunk_sent = false;
+        let mut buffer = String::new();
+        let mut buffered_pieces = 0usize;
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "hello".to_string(),
+            4,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected first token event, got {other:?}"),
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(buffered_pieces, 0);
+    }
+
+    #[test]
+    fn steady_state_stream_pieces_are_batched() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut first_chunk_sent = false;
+        let mut buffer = String::new();
+        let mut buffered_pieces = 0usize;
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "a".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        let _ = rx.try_recv();
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "b".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        assert!(rx.try_recv().is_err());
+
+        assert!(push_stream_token_piece(
+            &tx,
+            "c".to_string(),
+            2,
+            &mut first_chunk_sent,
+            &mut buffer,
+            &mut buffered_pieces,
+        ));
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "bc"),
+            other => panic!("expected batched token event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_stream_token_batch_sends_remaining_buffer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buffer = "tail".to_string();
+        let mut buffered_pieces = 1usize;
+
+        assert!(flush_stream_token_batch(
+            &tx,
+            &mut buffer,
+            &mut buffered_pieces
+        ));
+
+        match rx.try_recv() {
+            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "tail"),
+            other => panic!("expected flushed token event, got {other:?}"),
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(buffered_pieces, 0);
+    }
 }

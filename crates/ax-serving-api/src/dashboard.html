@@ -77,21 +77,21 @@
     <h2>License</h2>
     <div id="license-reminder" class="banner" style="display:none">
       <span class="banner-icon">⚠</span>
-      <p>Remote workers detected — this is a <strong>Business Edition</strong> feature.
-      For teams with annual revenue &gt; USD 2M, a license is required.<br>
-      <a id="banner-buy-link" href="#" target="_blank" rel="noopener">Purchase a license →</a></p>
+      <p>Remote workers detected.
+      Commercial licensing is available for deployments that need to operate outside AGPL obligations.<br>
+      <a id="banner-buy-link" href="#" target="_blank" rel="noopener">Commercial licensing →</a></p>
     </div>
     <div class="row">
       <span class="label">Edition</span>
-      <span id="edition-badge" class="badge badge-oss">OSS</span>
+      <span id="edition-badge" class="badge badge-oss">AGPL</span>
     </div>
     <div class="row">
       <span class="label">License key</span>
-      <input type="text" id="license-key-input" placeholder="Enter license key…">
+      <input type="text" id="license-key-input" placeholder="Enter commercial key…">
       <button onclick="activateLicense()">Activate</button>
     </div>
     <div class="buy-link">
-      Don't have a key? <a id="footer-buy-link" href="#" target="_blank" rel="noopener">Buy Business Edition</a>
+      Need commercial terms? <a id="footer-buy-link" href="#" target="_blank" rel="noopener">Contact licensing</a>
     </div>
     <div id="license-msg" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
   </div>
@@ -163,10 +163,10 @@
       const d = await fetchJSON('/v1/license');
       const badge = document.getElementById('edition-badge');
       if (d.edition === 'business') {
-        badge.textContent = 'Business ✓';
+        badge.textContent = 'Commercial key';
         badge.className = 'badge badge-business';
       } else {
-        badge.textContent = 'OSS';
+        badge.textContent = 'AGPL';
         badge.className = 'badge badge-oss';
       }
       document.getElementById('license-reminder').style.display =

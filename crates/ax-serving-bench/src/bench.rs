@@ -255,6 +255,7 @@ async fn drain_channel(
     let wall = Instant::now();
     let mut stats = GenerationStats::default();
 
+    let mut got_done = false;
     while let Some(event) = rx.recv().await {
         match event {
             GenerateEvent::Done(s) => {
@@ -266,6 +267,7 @@ async fn drain_channel(
                     stats.decode_tok_per_sec =
                         params.max_tokens.map(|n| n as f64 / elapsed).unwrap_or(0.0);
                 }
+                got_done = true;
                 break;
             }
             GenerateEvent::Error(e) => anyhow::bail!("generation error: {e}"),
@@ -273,6 +275,9 @@ async fn drain_channel(
             | GenerateEvent::ToolCall { .. }
             | GenerateEvent::TokenLogprob { .. } => {}
         }
+    }
+    if !got_done {
+        anyhow::bail!("generation channel closed without Done event");
     }
 
     Ok(stats)

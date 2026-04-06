@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
@@ -98,13 +98,50 @@ struct LoadingGuard {
 
 impl Drop for LoadingGuard {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.loading.lock() {
+        let mut g = match self.loading.lock() {
+            Ok(g) => g,
+            Err(err) => {
+                warn!(%err, id = %self.id, "loading set lock poisoned during load guard drop; continuing with poisoned state");
+                err.into_inner()
+            }
+        };
+        if !self.id.is_empty() {
             g.remove(&self.id);
         }
     }
 }
 
 impl ModelRegistry {
+    fn loading_lock(&self) -> MutexGuard<'_, HashSet<String>> {
+        match self.loading.lock() {
+            Ok(g) => g,
+            Err(err) => {
+                warn!(%err, "loading set lock poisoned; continuing with poisoned state");
+                err.into_inner()
+            }
+        }
+    }
+
+    fn inner_read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<LoadedModel>>> {
+        match self.inner.read() {
+            Ok(g) => g,
+            Err(err) => {
+                warn!(%err, "model registry read lock poisoned; continuing with poisoned state");
+                err.into_inner()
+            }
+        }
+    }
+
+    fn inner_write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<LoadedModel>>> {
+        match self.inner.write() {
+            Ok(g) => g,
+            Err(err) => {
+                warn!(%err, "model registry write lock poisoned; continuing with poisoned state");
+                err.into_inner()
+            }
+        }
+    }
+
     pub fn new(max_loaded_models: usize) -> Self {
         let warm_pool_size = std::env::var("AXS_MODEL_WARM_POOL_SIZE")
             .ok()
@@ -156,12 +193,12 @@ impl ModelRegistry {
         // Reserve model_id in the loading set so two concurrent load() calls for
         // the same model_id cannot both proceed past this point.
         {
-            let mut loading = self.loading.lock().unwrap();
+            let mut loading = self.loading_lock();
             if loading.contains(model_id) {
                 return Err(RegistryError::AlreadyLoaded(model_id.to_string()).into());
             }
             // Fast read to catch the already-loaded case without waiting for a write lock.
-            if self.inner.read().unwrap().contains_key(model_id) {
+            if self.inner_read().contains_key(model_id) {
                 return Err(RegistryError::AlreadyLoaded(model_id.to_string()).into());
             }
             loading.insert(model_id.to_string());
@@ -176,7 +213,7 @@ impl ModelRegistry {
         // Collect eviction candidates by removing them from the map; we'll call
         // backend.unload_model on them after releasing the lock.
         let eviction_candidates: Vec<Arc<LoadedModel>> = {
-            let mut guard = self.inner.write().unwrap();
+            let mut guard = self.inner_write();
 
             // TOCTOU: re-check under write lock (fast).
             if guard.contains_key(model_id) {
@@ -191,8 +228,15 @@ impl ModelRegistry {
                         .min_by_key(|(_, m)| m.last_accessed_ms.load(Ordering::Relaxed))
                         .map(|(id, _)| id.clone());
                     if let Some(id) = oldest_id {
-                        let evicted = guard.remove(&id).unwrap();
-                        candidates.push(evicted);
+                        if let Some(evicted) = guard.remove(&id) {
+                            candidates.push(evicted);
+                        } else {
+                            warn!(
+                                model_id,
+                                "warm-pool eviction candidate disappeared; continuing"
+                            );
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -226,7 +270,7 @@ impl ModelRegistry {
             }
         }
         if !failed_evictions.is_empty() {
-            let mut guard = self.inner.write().unwrap();
+            let mut guard = self.inner_write();
             for entry in failed_evictions {
                 guard.insert(entry.id.clone(), entry);
             }
@@ -251,7 +295,7 @@ impl ModelRegistry {
         // Commit: insert under write lock. The LoadingGuard ensures no other
         // load() for this model_id is concurrently in progress.
         {
-            let mut guard = self.inner.write().unwrap();
+            let mut guard = self.inner_write();
             if guard.len() >= self.max_loaded_models {
                 drop(guard);
                 backend.unload_model(handle).with_context(|| {
@@ -277,7 +321,7 @@ impl ModelRegistry {
     pub fn unload(&self, model_id: &str, backend: &dyn InferenceBackend) -> Result<()> {
         // Remove from map under write lock (fast).
         let entry = {
-            let mut guard = self.inner.write().unwrap();
+            let mut guard = self.inner_write();
             guard
                 .remove(model_id)
                 .ok_or_else(|| RegistryError::NotLoaded(model_id.to_string()))?
@@ -286,10 +330,10 @@ impl ModelRegistry {
         // Backend unload outside the lock — slow operation.
         if let Err(e) = backend.unload_model(entry.handle) {
             // Re-insert to prevent a handle leak.
-            self.inner
-                .write()
-                .unwrap()
-                .insert(model_id.to_string(), entry);
+            {
+                let mut guard = self.inner_write();
+                guard.insert(model_id.to_string(), entry);
+            }
             return Err(e).with_context(|| format!("backend failed to unload model '{model_id}'"));
         }
 
@@ -312,7 +356,7 @@ impl ModelRegistry {
     ) -> Result<Arc<LoadedModel>> {
         // Step 1: read path + config under read lock, then release.
         let (path, load_config) = {
-            let guard = self.inner.read().unwrap();
+            let guard = self.inner_read();
             let existing = guard
                 .get(model_id)
                 .ok_or_else(|| RegistryError::NotLoaded(model_id.to_string()))?;
@@ -327,7 +371,7 @@ impl ModelRegistry {
 
         // Step 3: under write lock, swap the registry entry.
         let (new_entry, old_handle) = {
-            let mut guard = self.inner.write().unwrap();
+            let mut guard = self.inner_write();
 
             let old_handle = match guard.get(model_id) {
                 Some(e) => e.handle,
@@ -368,7 +412,7 @@ impl ModelRegistry {
 
     /// Look up a model by ID (read lock). Updates `last_accessed_ms` on hit.
     pub fn get(&self, model_id: &str) -> Option<Arc<LoadedModel>> {
-        let entry = self.inner.read().unwrap().get(model_id).cloned()?;
+        let entry = self.inner_read().get(model_id).cloned()?;
         entry.touch();
         Some(entry)
     }
@@ -387,7 +431,7 @@ impl ModelRegistry {
         // Collect candidate IDs under read lock (IDs only, not handles).
         // We re-read the handle under write lock below to avoid TOCTOU.
         let candidates: Vec<String> = {
-            let guard = self.inner.read().unwrap();
+            let guard = self.inner_read();
             guard
                 .iter()
                 .filter(|(_, m)| {
@@ -408,7 +452,7 @@ impl ModelRegistry {
             // re-insert it into the map if backend.unload_model() fails,
             // preventing a permanent handle leak.
             let entry_to_evict: Option<Arc<LoadedModel>> = {
-                let mut guard = self.inner.write().unwrap();
+                let mut guard = self.inner_write();
                 let should_evict = if let Some(entry) = guard.get(&id) {
                     let last = entry.last_accessed_ms.load(Ordering::Relaxed);
                     now_ms.saturating_sub(last) >= idle_timeout_ms
@@ -425,7 +469,7 @@ impl ModelRegistry {
             if let Some(entry) = entry_to_evict {
                 if let Err(e) = backend.unload_model(entry.handle) {
                     warn!("idle eviction: failed to unload '{id}': {e}");
-                    let mut guard = self.inner.write().unwrap();
+                    let mut guard = self.inner_write();
                     guard.insert(id, entry); // re-insert: avoid handle leak
                 } else {
                     evicted.push(id);
@@ -437,7 +481,7 @@ impl ModelRegistry {
 
     /// List all loaded model IDs.
     pub fn list_ids(&self) -> Vec<String> {
-        self.inner.read().unwrap().keys().cloned().collect()
+        self.inner_read().keys().cloned().collect()
     }
 
     /// Return all loaded model entries without updating `last_accessed_ms`.
@@ -446,7 +490,7 @@ impl ModelRegistry {
     /// caller is not actually consuming the model — calling `get()` would
     /// incorrectly reset the idle eviction timer for every listed model.
     pub fn list_entries(&self) -> Vec<Arc<LoadedModel>> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.inner_read().values().cloned().collect()
     }
 
     /// Return `(model_id, metadata)` pairs for all currently loaded models.
@@ -454,9 +498,7 @@ impl ModelRegistry {
     /// Does not update `last_accessed_ms` — safe for read-only enumeration
     /// such as emitting Prometheus per-model metrics.
     pub fn loaded_models_with_meta(&self) -> Vec<(String, ModelMetadata)> {
-        self.inner
-            .read()
-            .unwrap()
+        self.inner_read()
             .iter()
             .map(|(id, m)| (id.clone(), m.metadata.clone()))
             .collect()
@@ -464,7 +506,7 @@ impl ModelRegistry {
 
     /// Number of currently loaded models.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner_read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -520,7 +562,7 @@ fn validate_model_id(id: &str) -> Result<(), RegistryError> {
     }
     if !id
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(RegistryError::InvalidModelId(format!(
             "model_id must be alphanumeric with dashes, underscores, or dots; got: {id}"

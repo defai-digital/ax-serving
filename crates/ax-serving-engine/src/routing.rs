@@ -53,7 +53,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{
-    Arc, RwLock,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -64,8 +64,8 @@ use tracing::{info, warn};
 #[cfg(feature = "libllama")]
 use crate::libllama::LibLlamaBackend;
 use crate::{
-    EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
-    InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
+    CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
+    GenerationParams, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
     ax_engine::AxEngineBackend,
     llamacpp::{LlamaCppBackend, LlamaCppConfig},
 };
@@ -365,6 +365,24 @@ pub struct RouterBackend {
 }
 
 impl RouterBackend {
+    fn entries_read(
+        &self,
+    ) -> RwLockReadGuard<'_, std::collections::HashMap<ModelHandle, RouterEntry>> {
+        self.entries.read().unwrap_or_else(|err| {
+            warn!("router entries rwlock poisoned; recovering from poisoned read lock");
+            err.into_inner()
+        })
+    }
+
+    fn entries_write(
+        &self,
+    ) -> RwLockWriteGuard<'_, std::collections::HashMap<ModelHandle, RouterEntry>> {
+        self.entries.write().unwrap_or_else(|err| {
+            warn!("router entries rwlock poisoned; recovering from poisoned write lock");
+            err.into_inner()
+        })
+    }
+
     pub fn new(routing: RoutingConfig, llamacpp: LlamaCppConfig) -> Self {
         Self {
             config: routing,
@@ -376,10 +394,51 @@ impl RouterBackend {
         }
     }
 
+    /// Look up a router entry by handle, returning the backend tag and inner handle.
+    fn resolve_entry(&self, handle: ModelHandle) -> Result<(BackendTag, ModelHandle)> {
+        let guard = self.entries_read();
+        let entry = guard
+            .get(&handle)
+            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
+        Ok((entry.tag, entry.inner))
+    }
+
+    /// Scan loaded entries and return which backend kinds have active models.
+    fn active_backend_tags(&self) -> (bool, bool, bool) {
+        let entries = self.entries_read();
+        let mut has_native = false;
+        let mut has_llamacpp = false;
+        let mut has_libllama = false;
+        for entry in entries.values() {
+            match entry.tag {
+                BackendTag::Native => has_native = true,
+                BackendTag::LlamaCpp => has_llamacpp = true,
+                BackendTag::LibLlama => has_libllama = true,
+            }
+        }
+        (has_native, has_llamacpp, has_libllama)
+    }
+
     /// Convenience: create with defaults loaded from environment.
     pub fn from_env() -> Self {
         Self::new(RoutingConfig::load_default(), LlamaCppConfig::from_env())
     }
+}
+
+/// Dispatch a method call to the correct backend based on tag.
+macro_rules! dispatch {
+    ($self:expr, $tag:expr, $inner:expr, $method:ident $(, $arg:expr)*) => {
+        match $tag {
+            BackendTag::Native => $self.native.$method($inner, $($arg),*),
+            BackendTag::LlamaCpp => $self.llamacpp.$method($inner, $($arg),*),
+            BackendTag::LibLlama => {
+                #[cfg(feature = "libllama")]
+                { $self.libllama.$method($inner, $($arg),*) }
+                #[cfg(not(feature = "libllama"))]
+                { Err(anyhow::anyhow!("libllama feature not compiled")) }
+            }
+        }
+    };
 }
 
 impl InferenceBackend for RouterBackend {
@@ -453,18 +512,24 @@ impl InferenceBackend for RouterBackend {
             }
         };
 
-        self.entries
-            .write()
-            .unwrap()
+        self.entries_write()
             .insert(outer, RouterEntry { tag, inner });
         Ok((outer, meta))
     }
 
+    fn backend_name_for_handle(&self, handle: ModelHandle) -> Option<&'static str> {
+        self.entries_read()
+            .get(&handle)
+            .map(|entry| match entry.tag {
+                BackendTag::Native => "native",
+                BackendTag::LlamaCpp => "llama_cpp",
+                BackendTag::LibLlama => "lib_llama",
+            })
+    }
+
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
         let entry = self
-            .entries
-            .write()
-            .unwrap()
+            .entries_write()
             .remove(&handle)
             .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
 
@@ -485,7 +550,7 @@ impl InferenceBackend for RouterBackend {
         if result.is_err() {
             // Preserve routing state so callers can retry unload rather than
             // losing the inner handle mapping permanently.
-            self.entries.write().unwrap().insert(handle, entry);
+            self.entries_write().insert(handle, entry);
         }
         result
     }
@@ -497,102 +562,30 @@ impl InferenceBackend for RouterBackend {
         params: GenerationParams,
         tx: tokio::sync::mpsc::Sender<GenerateEvent>,
     ) -> Result<()> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.generate(entry.inner, input, params, tx),
-            BackendTag::LlamaCpp => self.llamacpp.generate(entry.inner, input, params, tx),
-            BackendTag::LibLlama => {
-                #[cfg(feature = "libllama")]
-                {
-                    self.libllama.generate(entry.inner, input, params, tx)
-                }
-                #[cfg(not(feature = "libllama"))]
-                {
-                    Err(anyhow::anyhow!("libllama feature not compiled"))
-                }
-            }
-        }
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, generate, input, params, tx)
     }
 
     fn tokenize(&self, handle: ModelHandle, text: &str, add_bos: bool) -> Result<Vec<u32>> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.tokenize(entry.inner, text, add_bos),
-            BackendTag::LlamaCpp => self.llamacpp.tokenize(entry.inner, text, add_bos),
-            BackendTag::LibLlama => {
-                #[cfg(feature = "libllama")]
-                {
-                    self.libllama.tokenize(entry.inner, text, add_bos)
-                }
-                #[cfg(not(feature = "libllama"))]
-                {
-                    Err(anyhow::anyhow!("libllama feature not compiled"))
-                }
-            }
-        }
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, tokenize, text, add_bos)
     }
 
     fn decode_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<String> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.decode_tokens(entry.inner, tokens),
-            BackendTag::LlamaCpp => self.llamacpp.decode_tokens(entry.inner, tokens),
-            BackendTag::LibLlama => {
-                #[cfg(feature = "libllama")]
-                {
-                    self.libllama.decode_tokens(entry.inner, tokens)
-                }
-                #[cfg(not(feature = "libllama"))]
-                {
-                    Err(anyhow::anyhow!("libllama feature not compiled"))
-                }
-            }
-        }
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, decode_tokens, tokens)
     }
 
     fn eos_tokens(&self, handle: ModelHandle) -> Result<Vec<u32>> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.eos_tokens(entry.inner),
-            BackendTag::LlamaCpp => self.llamacpp.eos_tokens(entry.inner),
-            BackendTag::LibLlama => {
-                #[cfg(feature = "libllama")]
-                {
-                    self.libllama.eos_tokens(entry.inner)
-                }
-                #[cfg(not(feature = "libllama"))]
-                {
-                    Err(anyhow::anyhow!("libllama feature not compiled"))
-                }
-            }
-        }
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, eos_tokens)
     }
 
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<u32> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.eval_tokens(entry.inner, tokens),
-            BackendTag::LlamaCpp => self.llamacpp.eval_tokens(entry.inner, tokens),
+        let (tag, inner) = self.resolve_entry(handle)?;
+        match tag {
+            BackendTag::Native => self.native.eval_tokens(inner, tokens),
+            BackendTag::LlamaCpp => self.llamacpp.eval_tokens(inner, tokens),
             BackendTag::LibLlama => Err(anyhow::anyhow!(
                 "eval_tokens not supported by LibLlamaBackend"
             )),
@@ -600,18 +593,7 @@ impl InferenceBackend for RouterBackend {
     }
 
     fn thermal_state(&self) -> ThermalState {
-        let entries = self.entries.read().unwrap();
-        let mut has_native = false;
-        let mut has_llamacpp = false;
-        let mut has_libllama = false;
-        for entry in entries.values() {
-            match entry.tag {
-                BackendTag::Native => has_native = true,
-                BackendTag::LlamaCpp => has_llamacpp = true,
-                BackendTag::LibLlama => has_libllama = true,
-            }
-        }
-        drop(entries);
+        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
 
         // Collect thermal states from active backends and return the worst.
         let mut worst = self.llamacpp.thermal_state(); // default for empty router
@@ -639,18 +621,7 @@ impl InferenceBackend for RouterBackend {
     }
 
     fn recommended_concurrency(&self) -> usize {
-        let entries = self.entries.read().unwrap();
-        let mut has_native = false;
-        let mut has_llamacpp = false;
-        let mut has_libllama = false;
-        for entry in entries.values() {
-            match entry.tag {
-                BackendTag::Native => has_native = true,
-                BackendTag::LlamaCpp => has_llamacpp = true,
-                BackendTag::LibLlama => has_libllama = true,
-            }
-        }
-        drop(entries);
+        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
 
         // Report the minimum concurrency across active backends (conservative).
         let mut min = self.llamacpp.recommended_concurrency(); // default
@@ -668,31 +639,48 @@ impl InferenceBackend for RouterBackend {
         min
     }
 
+    fn cache_telemetry(&self) -> CacheTelemetry {
+        let (has_native, has_llamacpp, has_libllama) = self.active_backend_tags();
+
+        // Sum telemetry across all active backends.
+        let mut agg = CacheTelemetry::default();
+        if has_native {
+            let t = self.native.cache_telemetry();
+            agg.kv_pages_used += t.kv_pages_used;
+            agg.kv_pages_total += t.kv_pages_total;
+            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
+            agg.active_batch_size += t.active_batch_size;
+            agg.max_batch_size += t.max_batch_size;
+        }
+        if has_llamacpp {
+            let t = self.llamacpp.cache_telemetry();
+            agg.kv_pages_used += t.kv_pages_used;
+            agg.kv_pages_total += t.kv_pages_total;
+            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
+            agg.active_batch_size += t.active_batch_size;
+            agg.max_batch_size += t.max_batch_size;
+        }
+        #[cfg(feature = "libllama")]
+        if has_libllama {
+            let t = self.libllama.cache_telemetry();
+            agg.kv_pages_used += t.kv_pages_used;
+            agg.kv_pages_total += t.kv_pages_total;
+            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
+            agg.active_batch_size += t.active_batch_size;
+            agg.max_batch_size += t.max_batch_size;
+        }
+        let _ = has_libllama;
+        agg
+    }
+
     fn embed(
         &self,
         handle: ModelHandle,
         inputs: &EmbedInput<'_>,
         config: &EmbedConfig,
     ) -> Result<EmbedResult> {
-        let guard = self.entries.read().unwrap();
-        let entry = guard
-            .get(&handle)
-            .ok_or_else(|| anyhow::anyhow!("unknown router handle {:?}", handle))?;
-
-        match entry.tag {
-            BackendTag::Native => self.native.embed(entry.inner, inputs, config),
-            BackendTag::LlamaCpp => self.llamacpp.embed(entry.inner, inputs, config),
-            BackendTag::LibLlama => {
-                #[cfg(feature = "libllama")]
-                {
-                    self.libllama.embed(entry.inner, inputs, config)
-                }
-                #[cfg(not(feature = "libllama"))]
-                {
-                    Err(anyhow::anyhow!("libllama feature not compiled"))
-                }
-            }
-        }
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, embed, inputs, config)
     }
 }
 
@@ -705,6 +693,55 @@ mod tests {
             default_backend: default,
             families: families.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
+    }
+
+    #[test]
+    fn test_backend_name_for_handle() {
+        let backend = RouterBackend::new(RoutingConfig::default(), LlamaCppConfig::from_env());
+        {
+            let mut entries = backend.entries.write().unwrap();
+            entries.insert(
+                ModelHandle(10_001),
+                RouterEntry {
+                    tag: BackendTag::Native,
+                    inner: ModelHandle(1),
+                },
+            );
+            entries.insert(
+                ModelHandle(10_002),
+                RouterEntry {
+                    tag: BackendTag::LlamaCpp,
+                    inner: ModelHandle(2),
+                },
+            );
+            #[cfg(feature = "libllama")]
+            entries.insert(
+                ModelHandle(10_003),
+                RouterEntry {
+                    tag: BackendTag::LibLlama,
+                    inner: ModelHandle(3),
+                },
+            );
+        }
+
+        assert_eq!(
+            backend.backend_name_for_handle(ModelHandle(10_001)),
+            Some("native")
+        );
+        assert_eq!(
+            backend.backend_name_for_handle(ModelHandle(10_002)),
+            Some("llama_cpp")
+        );
+        #[cfg(feature = "libllama")]
+        assert_eq!(
+            backend.backend_name_for_handle(ModelHandle(10_003)),
+            Some("lib_llama")
+        );
+        assert!(
+            backend
+                .backend_name_for_handle(ModelHandle(10_099))
+                .is_none()
+        );
     }
 
     // Filename detection returns the correct family name for known substrings.
