@@ -1,6 +1,6 @@
 {
   "name": "@defai-digital/ax-serving",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "description": "TypeScript SDK for AX Serving (OpenAI-compatible REST client)",
   "license": "AGPL-3.0-only",
   "repository": {
