@@ -1,30 +1,39 @@
-//! Backend routing: dispatches inference to ax-engine (native) or llama.cpp
-//! based on a YAML config file.
+//! Backend routing: dispatches inference to ax-engine (native) or llama.cpp.
 //!
-//! **Current policy**: all models route through `llama.cpp` by default.
-//! `native` remains available as an explicit override for environments that
-//! require ax-engine.
-//! See `config/backends.yaml` for the full routing table.
+//! **Routing model**: ax-serving owns all routing decisions.  ax-engine is
+//! never asked to load a model and then fall back on failure.  Instead,
+//! `RoutingConfig` maintains a `native_families` allowlist of architectures
+//! known to be supported by the current ax-engine version.  Any model whose
+//! architecture is not in that list is sent directly to llama.cpp without
+//! attempting a native load.
 //!
 //! # Config file (`backends.yaml`)
 //!
 //! ```yaml
-//! # Default backend for families not listed below.
+//! # Default routing: consult native_families (see below).
 //! # Options: native | llama_cpp | auto
-//! #   native    — use ax-engine only (fail if not supported)
-//! #   llama_cpp — use llama.cpp only (requires llama-server on PATH)
-//! #   auto      — try native first, fall back to llama.cpp on unsupported arch
-//! default_backend: llama_cpp
+//! #   native    — ax-engine only (fail if not supported)
+//! #   llama_cpp — llama.cpp only (requires llama-server on PATH)
+//! #   auto      — check native_families; route native if matched, else llama.cpp
+//! default_backend: auto
+//!
+//! # Architectures ax-engine natively supports (prefix matching).
+//! # Used only when routing to `auto`.  Override to add/remove families.
+//! native_families:
+//!   - llama
+//!   - mistral
+//!   - mixtral
+//!   - qwen35
+//!   - gemma3
+//!   - gemma4
 //!
 //! # Per-family overrides.  Keys match `general.architecture` from GGUF metadata.
-//! # Prefix matching: "qwen" matches "qwen2", "qwen3", etc.
+//! # Prefix matching: "qwen" matches "qwen35", etc.
 //! # Exact match takes priority over prefix match.
+//! # An explicit entry here overrides native_families for that family.
 //! families:
-//!   llama:   llama_cpp   # llama, llama2, llama3, …
-//!   qwen:    llama_cpp   # qwen2, qwen3, qwen2_moe, …
-//!   gemma:   llama_cpp   # gemma2, gemma3, …
-//!   mistral: llama_cpp   # mistral, mistral3, …
 //!   phi:     llama_cpp   # phi2, phi3, …
+//!   glm:     llama_cpp
 //! ```
 //!
 //! Config is loaded from `$AXS_ROUTING_CONFIG` env var path, or
@@ -41,13 +50,6 @@
 //! If the GGUF header cannot be read (e.g. non-GGUF file, I/O error), the
 //! lowercase filename is matched against known family substrings as a best-
 //! effort fallback.
-//!
-//! # `auto` fallback scope
-//!
-//! In `auto` mode, native load errors are classified before falling back.
-//! Only errors that indicate an unsupported architecture or quantization
-//! will trigger the llama.cpp fallback.  Infrastructure failures (OOM,
-//! file corruption, permission denied) are propagated immediately.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -82,7 +84,9 @@ pub enum BackendChoice {
     LlamaCpp,
     /// Use libllama C API directly (no subprocess, requires `libllama` feature).
     LibLlama,
-    /// Try LibLlama first; fall back to LlamaCpp; fall back to Native.
+    /// Consult `RoutingConfig::native_families`: if the model's architecture
+    /// prefix-matches an entry, route to native ax-engine; otherwise llama.cpp.
+    /// No speculative probing — the decision is made before any load attempt.
     #[default]
     Auto,
 }
@@ -95,16 +99,48 @@ pub struct RoutingConfig {
     pub default_backend: BackendChoice,
     /// Per-family overrides.  Keys are lowercase family names.
     pub families: HashMap<String, BackendChoice>,
+    /// Architectures natively supported by ax-engine (used by `Auto` routing).
+    /// Prefix matching applies — `"llama"` matches `"llama3"`, `"llama2"`, etc.
+    /// An explicit `families` entry for the same arch takes priority.
+    #[serde(default = "RoutingConfig::default_native_families")]
+    pub native_families: Vec<String>,
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            // Default: use llama.cpp (widest model support).
-            // Override per-family in the config file.
-            default_backend: BackendChoice::LlamaCpp,
+            // Default: auto — deterministic routing via native_families list.
+            default_backend: BackendChoice::Auto,
             families: HashMap::new(),
+            native_families: Self::default_native_families(),
         }
+    }
+}
+
+impl RoutingConfig {
+    /// Built-in ax-engine v3.x native architecture support list.
+    /// qwen35 = Qwen 3.5 (hybrid attention+SSM); qwen2/qwen3 dense removed in v3.x.
+    /// gemma3/gemma4 supported; gemma/gemma2 removed in v3.x.
+    pub fn default_native_families() -> Vec<String> {
+        ["llama", "mistral", "mixtral", "qwen35", "gemma3", "gemma4"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// Expand `Auto` to `Native` or `LlamaCpp` by checking `native_families`.
+    /// Uses prefix matching on normalized (alphanumeric-only) arch strings.
+    fn resolve_auto(&self, arch: &str) -> BackendChoice {
+        let arch_norm = normalize_family_key(arch);
+        for family in &self.native_families {
+            let family_norm = normalize_family_key(family);
+            if !family_norm.is_empty()
+                && (arch_norm == family_norm || arch_norm.starts_with(&family_norm))
+            {
+                return BackendChoice::Native;
+            }
+        }
+        BackendChoice::LlamaCpp
     }
 }
 
@@ -209,10 +245,18 @@ impl RoutingConfig {
                 }
             }
         }
-        if let Some((_, _, choice)) = best_prefix {
-            return choice;
+        let choice = if let Some((_, _, choice)) = best_prefix {
+            choice
+        } else {
+            self.default_backend
+        };
+
+        // Expand Auto → Native or LlamaCpp using the native_families list.
+        // resolve() never returns Auto so callers always get a concrete backend.
+        if matches!(choice, BackendChoice::Auto) {
+            return self.resolve_auto(&arch);
         }
-        self.default_backend
+        choice
     }
 }
 
@@ -265,42 +309,6 @@ fn normalize_family_key(s: &str) -> String {
         .collect()
 }
 
-/// Returns `true` if the native backend error indicates an **unsupported**
-/// architecture or quantization — i.e. the error is expected and the
-/// `auto` fallback to llama.cpp is appropriate.
-///
-/// Returns `false` for infrastructure failures (OOM, file corruption,
-/// permissions) where falling back would mask a real problem.
-fn is_unsupported_model_error(e: &anyhow::Error) -> bool {
-    // Collect the full error chain into one lowercase string for matching.
-    let full: String = e
-        .chain()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-
-    // Positive signals: native backend cannot handle this architecture/capability.
-    let unsupported = full.contains("unsupported architecture")
-        || full.contains("unknown gguf architecture")
-        || full.contains("unsupported model architecture")
-        || full.contains("architecture not supported")
-        || full.contains("unsupported quantization")
-        || full.contains("quantization not supported")
-        || full.contains("unsupported gguf type")
-        || full.contains("unsupported ggml type")
-        || (full.contains("tokenizer") && full.contains("not supported"))
-        || (full.contains("embeddings") && full.contains("not supported"));
-
-    // Negative signals: real infrastructure failures — do NOT fall back.
-    let real_failure = full.contains("insufficient memory")
-        || full.contains("model file not found")
-        || full.contains("cannot stat model file")
-        || full.contains("not valid utf-8")
-        || full.contains("only .gguf models are supported");
-
-    unsupported && !real_failure
-}
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -449,7 +457,9 @@ impl InferenceBackend for RouterBackend {
                 "llama_cpp" => BackendChoice::LlamaCpp,
                 "native" => BackendChoice::Native,
                 "lib_llama" => BackendChoice::LibLlama,
-                "auto" => BackendChoice::Auto,
+                // "auto" hint: use standard routing table (same as no hint).
+                // resolve() expands Auto via native_families, never returns Auto.
+                "auto" => self.config.resolve(path),
                 other => anyhow::bail!(
                     "unknown backend hint '{}'; valid values: llama_cpp, native, lib_llama, auto",
                     other
@@ -489,26 +499,12 @@ impl InferenceBackend for RouterBackend {
                 }
             }
             BackendChoice::Auto => {
-                info!("routing {} → auto (trying native first)", path.display());
-                match try_native_load_model(&self.native, path, config.clone()) {
-                    Ok((inner, meta)) => {
-                        info!("auto-routing {} → native (success)", path.display());
-                        (BackendTag::Native, inner, meta)
-                    }
-                    Err(e) if is_unsupported_model_error(&e) => {
-                        // Native does not support this arch/quant: expected, fall back.
-                        warn!(
-                            "auto-routing {} → llama.cpp (native unsupported: {e})",
-                            path.display()
-                        );
-                        let (inner, meta) = self.llamacpp.load_model(path, config)?;
-                        (BackendTag::LlamaCpp, inner, meta)
-                    }
-                    Err(e) => {
-                        // Real failure (OOM, corruption, permissions): propagate.
-                        return Err(e);
-                    }
-                }
+                // resolve() always expands Auto before returning; this arm is
+                // unreachable in normal operation.
+                unreachable!(
+                    "BackendChoice::Auto reached RouterBackend::load_model — \
+                     RoutingConfig::resolve() must expand Auto before returning"
+                );
             }
         };
 
@@ -692,6 +688,20 @@ mod tests {
         RoutingConfig {
             default_backend: default,
             families: families.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            // Empty native_families: Auto with no list always resolves to LlamaCpp.
+            native_families: vec![],
+        }
+    }
+
+    fn make_config_with_native(
+        families: &[(&str, BackendChoice)],
+        default: BackendChoice,
+        native: &[&str],
+    ) -> RoutingConfig {
+        RoutingConfig {
+            default_backend: default,
+            families: families.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            native_families: native.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -894,33 +904,46 @@ mod tests {
         assert_eq!(choice, BackendChoice::LlamaCpp);
     }
 
-    // is_unsupported_model_error: "unsupported architecture" → true,
-    // infrastructure failures → false.
+    // Auto routing: arch in native_families → Native; unknown → LlamaCpp.
     #[test]
-    fn test_is_unsupported_model_error() {
-        let e_unsupported = anyhow::anyhow!("unsupported architecture: xyz");
-        assert!(is_unsupported_model_error(&e_unsupported));
+    fn test_auto_routes_native_arch_to_native() {
+        let cfg =
+            make_config_with_native(&[], BackendChoice::Auto, &["llama", "gemma3", "gemma4"]);
+        // Filename detection: "llama3-8b.gguf" → family "llama" → in native_families → Native.
+        assert_eq!(cfg.resolve(Path::new("llama3-8b.gguf")), BackendChoice::Native);
+        // "gemma3-4b.gguf" → family "gemma" which prefix-matches "gemma3" → Native.
+        assert_eq!(
+            cfg.resolve(Path::new("gemma3-4b.gguf")),
+            BackendChoice::Native
+        );
+    }
 
-        let e_arch_variant = anyhow::anyhow!("architecture not supported: gptj");
-        assert!(is_unsupported_model_error(&e_arch_variant));
+    // Auto routing: arch not in native_families → LlamaCpp (no probing).
+    #[test]
+    fn test_auto_routes_unknown_arch_to_llama_cpp() {
+        let cfg = make_config_with_native(&[], BackendChoice::Auto, &["llama", "gemma3"]);
+        // "phi-3.gguf" → family "phi" → not in native_families → LlamaCpp.
+        assert_eq!(
+            cfg.resolve(Path::new("phi-3-mini.gguf")),
+            BackendChoice::LlamaCpp
+        );
+        // Unknown file → "unknown" → LlamaCpp.
+        assert_eq!(
+            cfg.resolve(Path::new("completely-unknown.gguf")),
+            BackendChoice::LlamaCpp
+        );
+    }
 
-        let e_quant = anyhow::anyhow!("unsupported quantization: q3_k");
-        assert!(is_unsupported_model_error(&e_quant));
-
-        let e_ggml_type = anyhow::anyhow!("unsupported ggml type 37 in tensor");
-        assert!(is_unsupported_model_error(&e_ggml_type));
-
-        let e_tokenizer = anyhow::anyhow!("tokenizer not supported for this model");
-        assert!(is_unsupported_model_error(&e_tokenizer));
-
-        let e_oom = anyhow::anyhow!("insufficient memory: need 32 GB, have 16 GB");
-        assert!(!is_unsupported_model_error(&e_oom));
-
-        let e_not_found = anyhow::anyhow!("model file not found: /models/x.gguf");
-        assert!(!is_unsupported_model_error(&e_not_found));
-
-        let e_random = anyhow::anyhow!("some unrelated error");
-        assert!(!is_unsupported_model_error(&e_random));
+    // An explicit families entry overrides native_families for that arch.
+    #[test]
+    fn test_families_override_beats_native_families() {
+        // llama is in native_families but explicitly forced to LlamaCpp in families.
+        let cfg = make_config_with_native(
+            &[("llama", BackendChoice::LlamaCpp)],
+            BackendChoice::Auto,
+            &["llama", "gemma3"],
+        );
+        assert_eq!(cfg.resolve(Path::new("llama3-8b.gguf")), BackendChoice::LlamaCpp);
     }
 
     // RoutingConfig round-trips through YAML serialization.
@@ -928,21 +951,33 @@ mod tests {
     fn test_routing_config_serde() {
         let yaml = r#"
 default_backend: auto
+native_families:
+  - llama
+  - gemma3
+  - gemma4
 families:
-  llama: native
   gptj: llama_cpp
-  qwen: native
+  phi:  llama_cpp
 "#;
         let cfg: RoutingConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.default_backend, BackendChoice::Auto);
-        assert_eq!(cfg.families["llama"], BackendChoice::Native);
+        assert_eq!(cfg.native_families, vec!["llama", "gemma3", "gemma4"]);
         assert_eq!(cfg.families["gptj"], BackendChoice::LlamaCpp);
-        assert_eq!(cfg.families["qwen"], BackendChoice::Native);
+        assert_eq!(cfg.families["phi"], BackendChoice::LlamaCpp);
+
+        // YAML without native_families uses the built-in default list.
+        let yaml_no_native = "default_backend: auto\n";
+        let cfg_default: RoutingConfig = serde_yaml::from_str(yaml_no_native).unwrap();
+        assert_eq!(
+            cfg_default.native_families,
+            RoutingConfig::default_native_families()
+        );
 
         // Serialize and re-parse.
         let yaml2 = serde_yaml::to_string(&cfg).unwrap();
         let cfg2: RoutingConfig = serde_yaml::from_str(&yaml2).unwrap();
         assert_eq!(cfg2.default_backend, BackendChoice::Auto);
-        assert_eq!(cfg2.families.len(), 3);
+        assert_eq!(cfg2.native_families.len(), 3);
+        assert_eq!(cfg2.families.len(), 2);
     }
 }
