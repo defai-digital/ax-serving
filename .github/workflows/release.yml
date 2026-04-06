@@ -187,6 +187,9 @@ jobs:
     name: Publish JS SDK to npm
     runs-on: ubuntu-latest
     needs: build-macos
+    # npm publish can fail if the @defai-digital scope is not yet created on
+    # npmjs.com; treat it as a soft failure so the rest of the release succeeds.
+    continue-on-error: true
     steps:
       - name: Check npm token configuration
         id: npm-token
