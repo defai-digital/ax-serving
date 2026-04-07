@@ -190,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--ax-bin", default=str(root / "target/release/ax-llama"), help="ax-llama binary"
+        "--ax-bin", default=str(root / "target/release/ax-serving"), help="ax-serving binary"
     )
     parser.add_argument(
         "--config",
@@ -420,7 +420,7 @@ def main() -> int:
             print(f"missing required path: {p}", file=sys.stderr)
             return 2
 
-    subprocess.run(["killall", "ax-llama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["killall", "ax-serving"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["killall", "valkey-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     valkey = Valkey(vks, vkc)
@@ -433,7 +433,7 @@ def main() -> int:
         run_cross_model_isolation(root, ax_bin, cfg, qwen, llama, valkey)
     finally:
         valkey.stop()
-        subprocess.run(["killall", "ax-llama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["killall", "ax-serving"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     print("ALL CACHE TESTS PASSED")
     return 0

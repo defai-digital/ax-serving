@@ -345,9 +345,9 @@ and governance layers under commercial terms.
 - `DELETE /v1/workers/{id}`
 
 Runtime health contract:
-- `GET /health` is liveness plus readiness, not just process-up status
-- `status=ok` means the runtime is ready and at least one model is available
-- `status=degraded` means the process is alive but either no model is loaded or the runtime is thermally constrained
+- `GET /health` returns current status, loaded `model_ids`, `uptime_secs`, and thermal state.
+- Used for both liveness and readiness by orchestrators and monitoring.
+- See `docs/contracts/ax-fabric-runtime-contract.md` for the formal integration contract.
 
 AX Fabric integration contract:
 - documented in [docs/contracts/ax-fabric-runtime-contract.md](docs/contracts/ax-fabric-runtime-contract.md)

@@ -5,15 +5,15 @@
 > **Owner**: AX Serving Team
 > **Type**: Execution PRD
 > **Related**:
-> - [README](/Users/akiralam/code/ax-serving/README.md)
-> - [LICENSING](/Users/akiralam/code/ax-serving/LICENSING.md)
-> - [PRD — AX Serving v3.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-v3.0.md)
-> - [PRD — AX Serving Open-Source / Enterprise Boundary v1.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md)
-> - [AX Serving Public Contract Inventory](/Users/akiralam/code/ax-serving/docs/contracts/ax-serving-public-contract-inventory.md)
-> - [AX Serving Contract Change Note Template](/Users/akiralam/code/ax-serving/docs/contracts/ax-serving-contract-change-template.md)
-> - [Enterprise Compatibility Metadata Example](/Users/akiralam/code/ax-serving/docs/contracts/enterprise-compatibility-metadata.example.yaml)
-> - [Enterprise Private Repository Bootstrap](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-private-repo-bootstrap.md)
-> - [Enterprise Release Governance](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-release-governance.md)
+> - [README](../README.md)
+> - [LICENSING](../LICENSING.md)
+> - [PRD — AX Serving v3.0](./PRD-AX-SERVING-v3.0.md)
+> - [PRD — AX Serving Open-Source / Enterprise Boundary v1.0](./PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md)
+> - [AX Serving Public Contract Inventory](../contracts/ax-serving-public-contract-inventory.md)
+> - [AX Serving Contract Change Note Template](../contracts/ax-serving-contract-change-template.md)
+> - [Enterprise Compatibility Metadata Example](../contracts/enterprise-compatibility-metadata.example.yaml)
+> - [Enterprise Private Repository Bootstrap](../runbooks/enterprise-private-repo-bootstrap.md)
+> - [Enterprise Release Governance](../runbooks/enterprise-release-governance.md)
 
 ---
 

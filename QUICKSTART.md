@@ -15,6 +15,7 @@ Use this guide for:
 
 - Apple Silicon macOS 14+
 - Rust toolchain (`cargo`)
+- Python 3.10+ (for the official Python SDK)
 - `llama-server` available on `PATH` for `llama.cpp` fallback, embeddings, and explicit `llama_cpp` loads
 - A GGUF model file at `./models/<model>.gguf`
 
@@ -23,6 +24,7 @@ Validate your environment:
 ```bash
 cargo check --workspace
 which llama-server
+python3 -c "import sys; print('Python', sys.version); import httpx, grpcio; print('Dependencies OK')"
 ```
 
 Backend model:
@@ -82,18 +84,13 @@ curl -sS http://127.0.0.1:18080/health
 curl -sS http://127.0.0.1:18080/v1/models
 ```
 
-Runtime health contract:
-- `status`: `ok` or `degraded`
-- `ready`: whether the runtime is able to serve
-- `model_available`: whether at least one model is loaded
-- `reason`: present when health is degraded
+**Health contract** (`GET /health`):
+- Returns JSON with `status` ("ok", "degraded", or thermal state), `model_ids`, `uptime_secs`, and `thermal` state.
+- `/health` is used for both liveness and readiness.
+- The gateway and workers expose health for orchestration.
 
-Lifecycle expectation:
-- after `POST /v1/models`, health should become `status=ok` with `model_available=true`
-- after `DELETE /v1/models/{id}`, health should return to degraded if no models remain loaded
-
-AX Fabric integration should follow the runtime contract in
-`docs/contracts/ax-fabric-runtime-contract.md`.
+See `docs/contracts/ax-fabric-runtime-contract.md` for the formal AX Fabric integration contract.
+See `docs/python-sdk.md` for how to call health/metrics from Python.
 
 `v1.4` runtime tuning knobs:
 - `AXS_SPLIT_SCHEDULER=true`
@@ -178,6 +175,59 @@ curl -N -sS http://127.0.0.1:18080/v1/chat/completions \
     "stream": true,
     "max_tokens": 96
   }'
+```
+
+### Python SDK
+
+```bash
+# Install editable from project root
+cd sdk/python
+pip install -e ".[dev]"
+```
+
+**Basic usage (OpenAI-compatible interface):**
+
+```python
+from ax_serving import Client
+
+# REST (default)
+client = Client(base_url="http://127.0.0.1:18080")
+
+# or gRPC (UDS or TCP)
+# client = Client(grpc_socket="/tmp/ax-serving.sock")
+# client = Client(grpc_port=50051)
+
+resp = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Give me three short points about Rust."}],
+    max_tokens=96,
+    temperature=0.7,
+)
+
+print(resp.choices[0].message.content)
+```
+
+**Streaming:**
+
+```python
+for chunk in client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Tell me a story."}],
+    stream=True,
+):
+    content = chunk.choices[0].delta.content or ""
+    print(content, end="", flush=True)
+print()
+```
+
+**Raw gRPC client:**
+
+```python
+from ax_serving import GrpcClient
+
+with GrpcClient() as g:
+    result = g.infer_full("default", messages=[{"role": "user", "content": "Hello"}])
+    print(result.text)
 ```
 
 ### TypeScript SDK (with Zod validation)
@@ -611,6 +661,8 @@ Recommended profiles:
 ## Next references
 
 - [README.md](README.md)
+- [docs/python-sdk.md](docs/python-sdk.md) — **Python SDK usage, examples, and advantages**
+- [docs/advantages-and-use-cases.md](docs/advantages-and-use-cases.md) — Why AX Serving, target use cases, and comparisons
 - `docs/contracts/ax-fabric-runtime-contract.md` — supported AX Fabric integration contract
 - `config/serving.example.yaml` — full configuration reference
 - `config/backends.yaml` — backend routing rules (`ax-engine` native + `llama.cpp` fallback)

@@ -5,16 +5,16 @@
 > **Owner**: AX Serving Team
 > **Type**: Product + Licensing Boundary PRD
 > **Related**:
-> - [README](/Users/akiralam/code/ax-serving/README.md)
-> - [LICENSING](/Users/akiralam/code/ax-serving/LICENSING.md)
-> - [Commercial License Summary](/Users/akiralam/code/ax-serving/LICENSE-COMMERCIAL.md)
-> - [PRD — AX Serving v3.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-v3.0.md)
-> - [PRD — AX Serving Enterprise Extraction And Release Execution v1.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md)
-> - [AX Serving Public Contract Inventory](/Users/akiralam/code/ax-serving/docs/contracts/ax-serving-public-contract-inventory.md)
-> - [Enterprise Private Repository Bootstrap](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-private-repo-bootstrap.md)
-> - [Enterprise Release Governance](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-release-governance.md)
-> - [ADR-001](/Users/akiralam/code/ax-serving/docs/adr/ADR-001-target-market-and-product-scope.md)
-> - [ADR-012](/Users/akiralam/code/ax-serving/docs/adr/ADR-012-local-multi-worker-orchestration.md)
+> - [README](../README.md)
+> - [LICENSING](../LICENSING.md)
+> - [Commercial License Summary](../LICENSE-COMMERCIAL.md)
+> - [PRD — AX Serving v3.0](./PRD-AX-SERVING-v3.0.md)
+> - [PRD — AX Serving Enterprise Execution v1.0](./PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md)
+> - [AX Serving Public Contract Inventory](../contracts/ax-serving-public-contract-inventory.md)
+> - [Enterprise Private Repository Bootstrap](../runbooks/enterprise-private-repo-bootstrap.md)
+> - [Enterprise Release Governance](../runbooks/enterprise-release-governance.md)
+> - [ADR-001](../adr/ADR-001-target-market-and-product-scope.md)
+> - [ADR-012](../adr/ADR-012-local-multi-worker-orchestration.md)
 
 ---
 

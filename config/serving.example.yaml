@@ -88,7 +88,7 @@ llamacpp:
                                # with document chunks (500-2000 tokens), set both to 4096.
 
 # ── Multi-worker orchestrator ─────────────────────────────────────────────────
-# Used by `ax-llama orchestrate` (public proxy + internal worker API).
+# Used by the gateway (`ax-serving-api`) as the public proxy + internal worker API.
 orchestrator:
   host: 127.0.0.1               # env: AXS_ORCHESTRATOR_HOST  (public inference proxy host)
   port: 18080                   # env: AXS_ORCHESTRATOR_PORT  (public inference proxy)
