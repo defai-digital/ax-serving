@@ -9,6 +9,10 @@
 //!   POST   /v1/models/:id/reload     — atomically reload from same path/config
 //!   GET    /health                   — liveness + readiness
 
+pub mod admin;
+pub mod inference;
+pub mod license;
+pub mod models;
 pub mod routes;
 pub mod schema;
 pub mod validation;

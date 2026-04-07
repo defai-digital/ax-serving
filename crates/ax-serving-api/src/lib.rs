@@ -31,7 +31,6 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod embedding_batcher;
-pub mod generation_batcher;
 pub mod grpc;
 pub mod license;
 pub mod metrics;

@@ -46,8 +46,9 @@
 //! - `reject` — alias for `queue`; reject with 503 when the queue is full.
 //! - `shed_oldest` — when the queue is full, drop the oldest waiter and admit the new request.
 
+use std::collections::VecDeque;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -56,8 +57,7 @@ use anyhow::Result;
 use ax_serving_engine::ThermalMonitor;
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 const HISTOGRAM_SHARDS: usize = 8;
 
@@ -79,6 +79,9 @@ pub enum SchedulerError {
     /// Thermal or adaptive soft cap rejected the request after it acquired the semaphore (HTTP 503).
     #[error("request throttled: concurrency cap ({cap}) reached; try again later")]
     Throttled { cap: i64 },
+    /// Request was shed by the `shed_oldest` overload policy (HTTP 503).
+    #[error("request shed: a newer request evicted this one from the admission queue")]
+    Shed,
     /// Server is shutting down (HTTP 503).
     #[error("scheduler semaphore closed (server shutting down)")]
     ShuttingDown,
@@ -146,6 +149,8 @@ pub struct SchedulerMetrics {
     pub total_requests: AtomicU64,
     /// Total requests rejected (lifetime).
     pub rejected_requests: AtomicU64,
+    /// Requests shed by the `shed_oldest` overload policy (lifetime).
+    pub shed_requests: AtomicU64,
     /// Requests that actually entered the slow-path wait queue (lifetime).
     pub queued_requests: AtomicU64,
     /// Cumulative queue wait in microseconds (slow-path only).
@@ -172,6 +177,7 @@ impl Default for SchedulerMetrics {
             inflight_count: AtomicI64::new(0),
             total_requests: AtomicU64::new(0),
             rejected_requests: AtomicU64::new(0),
+            shed_requests: AtomicU64::new(0),
             queued_requests: AtomicU64::new(0),
             queue_wait_us_total: AtomicU64::new(0),
             cache_follower_waiting: AtomicI64::new(0),
@@ -428,6 +434,10 @@ pub struct Scheduler {
     adaptive: Option<Arc<AdaptiveController>>,
     /// WS2: split prefill/decode tracking enabled (AXS_SPLIT_SCHEDULER).
     pub split_enabled: bool,
+    /// Cancellation senders for requests in the slow-path wait queue.
+    /// Used by `shed_oldest` policy to evict the oldest waiter when the queue
+    /// is full, making room for the incoming request.
+    shed_waiters: Mutex<VecDeque<oneshot::Sender<()>>>,
 }
 
 impl Scheduler {
@@ -454,16 +464,10 @@ impl Scheduler {
                 "adaptive concurrency controller enabled"
             );
         }
-        // ShedOldest requires a VecDeque of oneshot channels (as in GlobalQueue) and is
-        // not implemented in the semaphore-based per-worker Scheduler. Warn at startup so
-        // the misconfiguration is visible; behavior will be identical to Queue (reject
-        // the incoming request when the admission queue is full).
         if config.overload_policy == OverloadPolicy::ShedOldest {
-            warn!(
-                "AXS_OVERLOAD_POLICY=shed_oldest is not supported in the per-worker scheduler \
-                 (only in the orchestrator GlobalQueue); requests will be rejected when the \
-                 admission queue is full, not shed. Use the orchestrator-level \
-                 AXS_GLOBAL_QUEUE_OVERLOAD_POLICY for shed_oldest behavior."
+            tracing::info!(
+                "AXS_OVERLOAD_POLICY=shed_oldest enabled: when the admission queue is full, \
+                 the oldest waiting request will be evicted (503) to make room for the new one."
             );
         }
         let split_enabled = std::env::var("AXS_SPLIT_SCHEDULER")
@@ -477,6 +481,7 @@ impl Scheduler {
             thermal,
             adaptive,
             split_enabled,
+            shed_waiters: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -551,35 +556,86 @@ impl Scheduler {
         // Slow path: all slots busy — check queue capacity.
         let queue_len = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
         if queue_len >= self.config.max_queue as i64 {
-            self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
-            self.metrics
-                .rejected_requests
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(SchedulerError::QueueFull {
-                waiting: queue_len,
-                max: self.config.max_queue,
+            if self.config.overload_policy == OverloadPolicy::ShedOldest {
+                // Evict the oldest waiter to make room for the incoming request.
+                let oldest = self.shed_waiters.lock().unwrap().pop_front();
+                if let Some(tx) = oldest {
+                    // Signal the victim — its select! branch will fire and return Shed.
+                    let _ = tx.send(());
+                    self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
+                    // queue_depth stays the same: oldest leaves, new request enters.
+                } else {
+                    // Queue was empty despite being "full" (max_queue=0) — nothing to shed.
+                    self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
+                    self.metrics
+                        .rejected_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(SchedulerError::QueueFull {
+                        waiting: queue_len,
+                        max: self.config.max_queue,
+                    }
+                    .into());
+                }
+            } else {
+                self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
+                self.metrics
+                    .rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SchedulerError::QueueFull {
+                    waiting: queue_len,
+                    max: self.config.max_queue,
+                }
+                .into());
             }
-            .into());
         }
 
         // Count requests that actually enter the wait queue (used as denominator
         // for avg_queue_wait_us — fast-path requests must not pollute this count).
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Wait for a slot with bounded timeout.
+        // Register a cancellation channel for shed_oldest eviction.
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        self.shed_waiters.lock().unwrap().push_back(cancel_tx);
+
+        // Wait for a slot with bounded timeout, racing against shed cancellation.
+        let sem = Arc::clone(&self.semaphore);
         let result = tokio::time::timeout(
             Duration::from_millis(self.config.max_wait_ms),
-            Arc::clone(&self.semaphore).acquire_owned(),
+            async {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => Err(SchedulerError::Shed),
+                    permit = sem.acquire_owned() => match permit {
+                        Ok(p) => Ok(p),
+                        Err(_) => Err(SchedulerError::ShuttingDown),
+                    },
+                }
+            },
         )
         .await;
 
         self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
 
         let permit = match result {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) => {
+            Ok(Ok(p)) => {
+                // Remove our cancel_tx from the deque (it was not used).
+                // It's already been consumed by the select, so the sender was dropped.
+                // Clean up any closed senders left behind.
+                self.cleanup_shed_waiters();
+                p
+            }
+            Ok(Err(SchedulerError::Shed)) => {
+                let wait_us = arrived_at.elapsed().as_micros() as u64;
+                self.metrics
+                    .queue_wait_us_total
+                    .fetch_add(wait_us, Ordering::Relaxed);
+                self.metrics.record_queue_wait(wait_us);
+                return Err(SchedulerError::Shed.into());
+            }
+            Ok(Err(e)) => {
                 // Semaphore closed (server shutting down). Record actual wait so
                 // percentiles reflect the full slow-path experience, not just successes.
+                self.cleanup_shed_waiters();
                 let wait_us = arrived_at.elapsed().as_micros() as u64;
                 self.metrics
                     .queue_wait_us_total
@@ -588,10 +644,11 @@ impl Scheduler {
                 self.metrics
                     .rejected_requests
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(SchedulerError::ShuttingDown.into());
+                return Err(e.into());
             }
             Err(_) => {
                 // Timeout: request waited the full max_wait_ms. Record that wait.
+                self.cleanup_shed_waiters();
                 let wait_us = arrived_at.elapsed().as_micros() as u64;
                 self.metrics
                     .queue_wait_us_total
@@ -668,6 +725,12 @@ impl Scheduler {
 
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
+    }
+
+    /// Remove closed/consumed senders from the shed waiter deque.
+    fn cleanup_shed_waiters(&self) {
+        let mut waiters = self.shed_waiters.lock().unwrap();
+        waiters.retain(|tx| !tx.is_closed());
     }
 }
 
@@ -1248,5 +1311,93 @@ mod tests {
             0,
             "decode_sequences must not be incremented when ttft never fired"
         );
+    }
+
+    // ── shed_oldest overload policy ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shed_oldest_evicts_oldest_waiter_when_queue_full() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5_000,
+                overload_policy: OverloadPolicy::ShedOldest,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        // Occupy the only inflight slot.
+        let p1 = s.acquire().await.unwrap();
+
+        // Spawn waiter A — will enter the queue (queue_len = 0, capacity = 1).
+        let s2 = Arc::clone(&s);
+        let waiter_a = tokio::spawn(async move { s2.acquire().await });
+
+        // Give waiter A time to block.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Spawn waiter B — queue is now full (len=1, cap=1), should shed waiter A.
+        let s3 = Arc::clone(&s);
+        let waiter_b = tokio::spawn(async move { s3.acquire().await });
+
+        // Give waiter B time to trigger the shed.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Waiter A should have been shed.
+        let a_result = waiter_a.await.expect("waiter_a task panicked");
+        assert!(a_result.is_err(), "oldest waiter should be shed");
+        let err_msg = match a_result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected shed error"),
+        };
+        assert!(
+            err_msg.contains("shed"),
+            "error should mention shed: {err_msg}"
+        );
+        assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 1);
+
+        // Release inflight slot so waiter B can proceed.
+        drop(p1);
+        let b_result = waiter_b.await.expect("waiter_b task panicked");
+        assert!(b_result.is_ok(), "newer waiter should succeed");
+    }
+
+    #[tokio::test]
+    async fn shed_oldest_with_zero_queue_rejects() {
+        // max_queue=0: nothing to shed, should reject.
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 0,
+                max_wait_ms: 50,
+                overload_policy: OverloadPolicy::ShedOldest,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+        let _p = Arc::clone(&s.semaphore).try_acquire_owned().unwrap();
+        let res = s.acquire().await;
+        assert!(res.is_err());
+        assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_policy_still_rejects_when_full() {
+        // Verify Queue policy is unchanged — always rejects, never sheds.
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 0,
+                max_wait_ms: 50,
+                overload_policy: OverloadPolicy::Queue,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+        let _p = Arc::clone(&s.semaphore).try_acquire_owned().unwrap();
+        let res = s.acquire().await;
+        assert!(res.is_err());
+        assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 0);
     }
 }
