@@ -239,6 +239,13 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+fn unix_ns_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 use crate::{
     CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
     GenerationParams, GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata,
@@ -2092,11 +2099,11 @@ fn stream_chat_completions(
     Ok(())
 }
 
-/// Generate a simple unique ID without pulling in uuid (use timestamp + counter).
+/// Generate a simple unique ID for tool calls.
 fn uuid_simple() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}{:08x}{:08x}", unix_ms_now(), std::process::id(), n)
+    format!("{:032x}{:08x}{:08x}", unix_ns_now(), std::process::id(), n)
 }
 
 /// Build `ModelMetadata` from GGUF header data + the running server's `/props`.
@@ -2192,6 +2199,13 @@ mod tests {
             pooling_type: None,
         };
         assert_eq!(LlamaCppBackend::effective_n_gpu_layers(&cfg), 0);
+    }
+
+    #[test]
+    fn uuid_simple_is_unique_across_calls() {
+        let first = uuid_simple();
+        let second = uuid_simple();
+        assert_ne!(first, second);
     }
 
     #[test]

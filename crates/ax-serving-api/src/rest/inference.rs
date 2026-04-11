@@ -979,7 +979,7 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
                                     metrics,
                                 ),
                             ))
@@ -1696,7 +1696,7 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
                                     metrics,
                                 ),
                             ))
