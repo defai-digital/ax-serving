@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
+const MAX_WORKER_INFLIGHT: usize = 1_000_000;
+
 // ── WorkerId ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -456,7 +458,7 @@ impl WorkerRegistry {
                 SocketAddr::from(([127, 0, 0, 1], 1))
             }
         };
-        let max_inflight = max_inflight.max(1);
+        let max_inflight = max_inflight.clamp(1, MAX_WORKER_INFLIGHT);
         let backend = BackendKind::parse(&backend);
         let (capabilities, capability_source) = capabilities.into_parts();
 
@@ -850,7 +852,7 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
 
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
     let kv_utilization = if e.kv_pages_total > 0 {
-        Some(e.kv_pages_used as f64 / e.kv_pages_total as f64)
+        Some((e.kv_pages_used as f64 / e.kv_pages_total as f64).clamp(0.0, 1.0))
     } else {
         None
     };
@@ -938,6 +940,15 @@ mod tests {
 
         // Unknown model → empty
         assert!(r.eligible_workers("unknown-model").is_empty());
+    }
+
+    #[test]
+    fn register_caps_max_inflight() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], usize::MAX), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.max_inflight, MAX_WORKER_INFLIGHT);
     }
 
     #[test]
@@ -1775,5 +1786,38 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].kv_pages_used, 200);
         assert_eq!(all[0].kv_pages_total, 400);
+    }
+
+    #[test]
+    fn worker_status_clamps_kv_utilization_to_one() {
+        let reg = WorkerRegistry::new();
+        let resp = reg.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+                backend: "auto".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        reg.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 1,
+                kv_pages_used: 500,
+                kv_pages_total: 400,
+                model_ids: vec!["m1".into()],
+                ..Default::default()
+            },
+        );
+        let eligible = reg.eligible_workers("m1");
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].kv_utilization, Some(1.0));
     }
 }

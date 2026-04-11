@@ -51,6 +51,9 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         friendly_name: Some("thor-01".into()),
         chip_model: Some("RTX".into()),
         shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
     };
 
     let client = reqwest::Client::builder()
@@ -73,6 +76,9 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         registrations[0]["capabilities"]["models"],
         json!(["qwen2-72b"])
     );
+    // BUG-114: verify capabilities are not blindly hardcoded.
+    assert_eq!(registrations[0]["capabilities"]["embedding"], json!(false));
+    assert_eq!(registrations[0]["capabilities"]["vision"], json!(false));
     drop(registrations);
 
     let heartbeat_task = tokio::spawn(agent::heartbeat_loop(

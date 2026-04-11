@@ -72,13 +72,8 @@ pub unsafe extern "C" fn llama_model_load_from_file(
                 .and_then(|v| v.first().copied())
                 .map(|t| t as i32)
                 .unwrap_or(-1);
-            // BOS token: tokenize empty string with add_bos=true.
-            let bos_token = backend
-                .tokenize(handle, "", true)
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(|t| t as i32)
-                .unwrap_or(-1);
+            // BOS token: query directly from backend (BUG-103).
+            let bos_token = backend.bos_token(handle).map(|t| t as i32).unwrap_or(-1);
             // Newline token: tokenize "\n" without BOS.
             let nl_token = backend
                 .tokenize(handle, "\n", false)

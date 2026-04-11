@@ -264,12 +264,17 @@ impl EmbeddingBatcher {
         }
 
         if let Some(batch_id) = spawn_timer_for {
-            let this = self.clone();
-            let key_for_task = key.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(this.batch_window).await;
-                this.flush_batch(key_for_task, batch_id).await;
-            });
+            // Skip the deferred timer if the batch already reached max_batch_size
+            // and will be flushed immediately — avoids spawning a redundant task
+            // that sleeps for batch_window then discovers the batch is already gone.
+            if flush_now.is_none() {
+                let this = self.clone();
+                let key_for_task = key.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(this.batch_window).await;
+                    this.flush_batch(key_for_task, batch_id).await;
+                });
+            }
         }
 
         if let Some(batch_id) = flush_now {

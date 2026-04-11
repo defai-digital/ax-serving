@@ -9,7 +9,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-use super::routes::{slo_pass_gauges, unix_now, AuditQuery, serving_startup_report_value};
+use super::routes::{AuditQuery, serving_startup_report_value, slo_pass_gauges, unix_now};
 use super::schema::*;
 use crate::ServingLayer;
 use crate::auth::RequestId;
@@ -200,7 +200,9 @@ pub async fn admin_diagnostics(
 
 /// `GET /v1/admin/policy` — authenticated project-policy summary.
 pub async fn admin_policy(State(layer): State<Arc<ServingLayer>>) -> impl IntoResponse {
-    Json(crate::project_policy::summary_json(&layer.config.project_policy))
+    Json(crate::project_policy::summary_json(
+        &layer.config.project_policy,
+    ))
 }
 
 /// `GET /v1/admin/audit` — authenticated recent audit events.

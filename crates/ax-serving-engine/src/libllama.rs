@@ -30,13 +30,7 @@
 //! implement `Send`; the model is safe to share (`Sync`) because it is
 //! read-only after loading.
 
-#![allow(
-    non_upper_case_globals,
-    non_camel_case_types,
-    non_snake_case,
-    dead_code,
-    unsafe_op_in_unsafe_fn
-)]
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -81,24 +75,12 @@ const DEFAULT_N_BATCH: u32 = 512;
 const DEFAULT_POOL_SIZE: usize = 4;
 /// GPU offload layers; 99 is effectively "all layers" for any model ≤ ~200 layers.
 const DEFAULT_N_GPU_LAYERS: i32 = 99;
-/// Steady-state token pieces are coalesced before crossing the thread/channel boundary.
-const DEFAULT_STREAM_TOKEN_BATCH_SIZE: usize = 4;
-const MAX_STREAM_TOKEN_BATCH_SIZE: usize = 32;
-
 // ── Handle counter ────────────────────────────────────────────────────────────
 
 static NEXT_LIBLLAMA_HANDLE: AtomicU64 = AtomicU64::new(4_000_000);
 
 fn next_libllama_handle() -> ModelHandle {
     ModelHandle(NEXT_LIBLLAMA_HANDLE.fetch_add(1, Ordering::Relaxed))
-}
-
-fn stream_token_batch_size() -> usize {
-    std::env::var("AXS_STREAM_TOKEN_BATCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
-        .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
 }
 
 fn flush_stream_token_batch(
@@ -259,9 +241,11 @@ struct LlamaModelHolder {
     pool: LlamaContextPool,
     model: LlamaModelPtr,
     meta: ModelMetadata,
+    ffi_lock: Mutex<()>,
 }
 
-// SAFETY: LlamaModelPtr is Send+Sync; pool is guarded by Mutex.
+// SAFETY: The model pointer is shared read-only and direct model-level FFI
+// helpers are serialized by `ffi_lock`; pool access is synchronized internally.
 unsafe impl Send for LlamaModelHolder {}
 unsafe impl Sync for LlamaModelHolder {}
 
@@ -364,6 +348,7 @@ impl InferenceBackend for LibLlamaBackend {
         let path_cstr = CString::new(path_str).context("model path contains NUL byte")?;
 
         let start = Instant::now();
+        let rss_before = crate::current_rss_bytes();
 
         // ── Load model ────────────────────────────────────────────────────────
         let model_ptr = unsafe {
@@ -419,7 +404,7 @@ impl InferenceBackend for LibLlamaBackend {
             .map(|m| m.architecture)
             .unwrap_or_else(|_| "gguf-libllama".to_string());
 
-        let peak_rss = crate::current_rss_bytes();
+        let peak_rss = crate::current_rss_bytes().saturating_sub(rss_before);
         let load_ms = start.elapsed().as_millis() as u64;
 
         let meta = ModelMetadata {
@@ -478,6 +463,7 @@ impl InferenceBackend for LibLlamaBackend {
             pool: LlamaContextPool::new(contexts),
             model: LlamaModelPtr(model_ptr),
             meta: meta.clone(),
+            ffi_lock: Mutex::new(()),
         });
 
         let handle = next_libllama_handle();
@@ -559,6 +545,10 @@ impl InferenceBackend for LibLlamaBackend {
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
 
+        let _ffi_guard = holder.ffi_lock.lock().unwrap_or_else(|err| {
+            warn!("libllama model ffi lock poisoned during tokenize; recovering");
+            err.into_inner()
+        });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let tokens = unsafe { tokenize_text(vocab, text, add_bos) }?;
         Ok(tokens.into_iter().map(|t| t as u32).collect())
@@ -570,6 +560,10 @@ impl InferenceBackend for LibLlamaBackend {
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
 
+        let _ffi_guard = holder.ffi_lock.lock().unwrap_or_else(|err| {
+            warn!("libllama model ffi lock poisoned during decode_tokens; recovering");
+            err.into_inner()
+        });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let mut out = String::new();
         for &tok in tokens {
@@ -585,9 +579,28 @@ impl InferenceBackend for LibLlamaBackend {
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
 
+        let _ffi_guard = holder.ffi_lock.lock().unwrap_or_else(|err| {
+            warn!("libllama model ffi lock poisoned during eos_tokens; recovering");
+            err.into_inner()
+        });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let eos = unsafe { ffi::llama_vocab_eos(vocab) };
         Ok(vec![eos as u32])
+    }
+
+    fn bos_token(&self, handle: ModelHandle) -> Result<u32> {
+        let guard = self.models_read();
+        let holder = guard
+            .get(&handle)
+            .ok_or_else(|| anyhow::anyhow!("invalid libllama model handle {:?}", handle))?;
+
+        let _ffi_guard = holder.ffi_lock.lock().unwrap_or_else(|err| {
+            warn!("libllama model ffi lock poisoned during bos_token; recovering");
+            err.into_inner()
+        });
+        let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
+        let bos = unsafe { ffi::llama_vocab_bos(vocab) };
+        Ok(bos as u32)
     }
 
     // ── Thermal ───────────────────────────────────────────────────────────────
@@ -645,7 +658,7 @@ impl InferenceBackend for LibLlamaBackend {
             };
 
             for mut tokens in sequences {
-                unsafe { ffi::llama_memory_clear(ffi::llama_get_memory(ctx.0), true) };
+                clear_context_memory(ctx.0)?;
 
                 if tokens.is_empty() {
                     embeddings.push(vec![0.0f32; n_embd]);
@@ -729,7 +742,7 @@ unsafe fn compute_logprob(
     n_vocab: usize,
     top_n: usize,
 ) -> (f32, Vec<(String, f32)>) {
-    let logits_ptr = ffi::llama_get_logits_ith(ctx, -1);
+    let logits_ptr = unsafe { ffi::llama_get_logits_ith(ctx, -1) };
     if logits_ptr.is_null() || n_vocab == 0 {
         return (-f32::INFINITY, Vec::new());
     }
@@ -738,7 +751,7 @@ unsafe fn compute_logprob(
     if sampled_tok < 0 || sampled_tok as usize >= n_vocab {
         return (-f32::INFINITY, Vec::new());
     }
-    let logits = std::slice::from_raw_parts(logits_ptr, n_vocab);
+    let logits = unsafe { std::slice::from_raw_parts(logits_ptr, n_vocab) };
 
     // Numerically-stable log-softmax: subtract max before exp.
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -746,7 +759,11 @@ unsafe fn compute_logprob(
     let log_sum = exp_sum.ln() as f32;
 
     // Log probability of the sampled token.
-    let sampled_lp = (logits[sampled_tok as usize] - max_logit) - log_sum;
+    let tok_idx = sampled_tok as usize;
+    if tok_idx >= logits.len() {
+        return (-f32::INFINITY, Vec::new());
+    }
+    let sampled_lp = (logits[tok_idx] - max_logit) - log_sum;
 
     // Top-N alternatives (sorted by logit descending).
     let top_entries = if top_n > 0 {
@@ -757,7 +774,7 @@ unsafe fn compute_logprob(
             .take(top_n)
             .map(|(i, logit)| {
                 let lp = (logit - max_logit) - log_sum;
-                let piece = token_to_piece(vocab, *i as i32);
+                let piece = unsafe { token_to_piece(vocab, *i as i32) };
                 (piece, lp)
             })
             .collect()
@@ -776,25 +793,29 @@ unsafe fn compute_logprob(
 /// owning `LlamaModelHolder`.
 unsafe fn token_to_piece(vocab: *const ffi::llama_vocab, token: i32) -> String {
     let mut buf = vec![0u8; 32];
-    let n = ffi::llama_token_to_piece(
-        vocab,
-        token,
-        buf.as_mut_ptr() as *mut c_char,
-        buf.len() as i32,
-        0,     // lstrip: 0 = no stripping
-        false, // special: do not render special tokens
-    );
-    if n < 0 {
-        let needed = (-n) as usize;
-        buf.resize(needed, 0);
-        let n2 = ffi::llama_token_to_piece(
+    let n = unsafe {
+        ffi::llama_token_to_piece(
             vocab,
             token,
             buf.as_mut_ptr() as *mut c_char,
             buf.len() as i32,
-            0,
-            false,
-        );
+            0,     // lstrip: 0 = no stripping
+            false, // special: do not render special tokens
+        )
+    };
+    if n < 0 {
+        let needed = (-n) as usize;
+        buf.resize(needed, 0);
+        let n2 = unsafe {
+            ffi::llama_token_to_piece(
+                vocab,
+                token,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as i32,
+                0,
+                false,
+            )
+        };
         if n2 > 0 {
             String::from_utf8_lossy(&buf[..n2 as usize]).into_owned()
         } else {
@@ -820,29 +841,33 @@ unsafe fn tokenize_text(
     let max_tokens = (text.len() as i32 + 2).max(16);
     let mut tokens = vec![0i32; max_tokens as usize];
 
-    let n = ffi::llama_tokenize(
-        vocab,
-        ctext.as_ptr(),
-        text.len() as i32,
-        tokens.as_mut_ptr(),
-        max_tokens,
-        add_bos,
-        false, // special
-    );
+    let n = unsafe {
+        ffi::llama_tokenize(
+            vocab,
+            ctext.as_ptr(),
+            text.len() as i32,
+            tokens.as_mut_ptr(),
+            max_tokens,
+            add_bos,
+            false, // special
+        )
+    };
 
     if n < 0 {
         // Buffer too small — retry with the exact size reported.
         let needed = (-n) as usize;
         tokens.resize(needed, 0);
-        let n2 = ffi::llama_tokenize(
-            vocab,
-            ctext.as_ptr(),
-            text.len() as i32,
-            tokens.as_mut_ptr(),
-            needed as i32,
-            add_bos,
-            false,
-        );
+        let n2 = unsafe {
+            ffi::llama_tokenize(
+                vocab,
+                ctext.as_ptr(),
+                text.len() as i32,
+                tokens.as_mut_ptr(),
+                needed as i32,
+                add_bos,
+                false,
+            )
+        };
         anyhow::ensure!(n2 >= 0, "llama_tokenize failed (n={})", n2);
         tokens.truncate(n2 as usize);
     } else {
@@ -869,8 +894,8 @@ unsafe fn build_sampler(
     _model: *const ffi::llama_model,
     params: &GenerationParams,
 ) -> *mut ffi::llama_sampler {
-    let chain_params = ffi::llama_sampler_chain_default_params();
-    let chain = ffi::llama_sampler_chain_init(chain_params);
+    let chain_params = unsafe { ffi::llama_sampler_chain_default_params() };
+    let chain = unsafe { ffi::llama_sampler_chain_init(chain_params) };
 
     let seed = params.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -883,7 +908,9 @@ unsafe fn build_sampler(
 
     // Greedy decoding.
     if temp <= 0.0 {
-        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_greedy());
+        unsafe {
+            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_greedy());
+        }
         return chain;
     }
 
@@ -892,8 +919,13 @@ unsafe fn build_sampler(
         let tau = params.mirostat_tau.unwrap_or(5.0) as f32;
         let eta = params.mirostat_eta.unwrap_or(0.1) as f32;
         // mirostat_v2 is the stable public API (v1 requires common.h internals).
-        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_mirostat_v2(seed, tau, eta));
-        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
+        unsafe {
+            ffi::llama_sampler_chain_add(
+                chain,
+                ffi::llama_sampler_init_mirostat_v2(seed, tau, eta),
+            );
+            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
+        }
         return chain;
     }
 
@@ -902,29 +934,37 @@ unsafe fn build_sampler(
     let freq = params.frequency_penalty.unwrap_or(0.0) as f32;
     let pres = params.presence_penalty.unwrap_or(0.0) as f32;
     if rep != 1.0 || freq != 0.0 || pres != 0.0 {
-        ffi::llama_sampler_chain_add(
-            chain,
-            ffi::llama_sampler_init_penalties(64, rep, freq, pres),
-        );
+        unsafe {
+            ffi::llama_sampler_chain_add(
+                chain,
+                ffi::llama_sampler_init_penalties(64, rep, freq, pres),
+            );
+        }
     }
 
     // Top-k.
     if let Some(k) = params.top_k
         && k > 0
     {
-        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_k(k as i32));
+        unsafe {
+            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_k(k as i32));
+        }
     }
 
     // Top-p.
     if let Some(p) = params.top_p
         && p < 1.0
     {
-        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_p(p as f32, 1));
+        unsafe {
+            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_p(p as f32, 1));
+        }
     }
 
     // Temperature + distribution sampler.
-    ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_temp(temp as f32));
-    ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
+    unsafe {
+        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_temp(temp as f32));
+        ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
+    }
 
     chain
 }
@@ -957,6 +997,14 @@ fn apply_simple_chat_template(msgs: &[ChatMessage]) -> String {
         .collect()
 }
 
+fn clear_context_memory(ctx: *mut ffi::llama_context) -> Result<()> {
+    anyhow::ensure!(!ctx.is_null(), "libllama context pointer was null");
+    let mem = unsafe { ffi::llama_get_memory(ctx) };
+    anyhow::ensure!(!mem.is_null(), "llama_get_memory returned null for context");
+    unsafe { ffi::llama_memory_clear(mem, true) };
+    Ok(())
+}
+
 /// Prefill + decode loop for one generation request.
 ///
 /// Runs entirely on the calling (non-tokio) thread. Communicates via
@@ -970,7 +1018,7 @@ fn run_generate(
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
 ) -> Result<()> {
     // 1. Clear KV cache from any previous request on this context.
-    unsafe { ffi::llama_memory_clear(ffi::llama_get_memory(ctx), true) };
+    clear_context_memory(ctx)?;
 
     // 2. Tokenize input.
     let vocab = unsafe { ffi::llama_model_get_vocab(model) };
@@ -1031,7 +1079,7 @@ fn run_generate(
     let emit_logprobs = params.logprobs.unwrap_or(false);
     let n_top_logprobs = params.top_logprobs.unwrap_or(0) as usize;
     let n_vocab = unsafe { ffi::llama_vocab_n_tokens(vocab) as usize };
-    let stream_batch_size = stream_token_batch_size();
+    let stream_batch_size = crate::stream_token_batch_size();
     let mut first_stream_chunk_sent = false;
     let mut stream_token_buffer = String::new();
     let mut buffered_stream_tokens = 0usize;

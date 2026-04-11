@@ -69,6 +69,7 @@ class Valkey:
         self.proc: subprocess.Popen[str] | None = None
 
     def start(self) -> None:
+        log_fd = open("/tmp/valkey-cache-tests.log", "w")  # noqa: SIM115
         self.proc = subprocess.Popen(
             [
                 str(self.server_bin),
@@ -81,10 +82,11 @@ class Valkey:
                 "--appendonly",
                 "no",
             ],
-            stdout=open("/tmp/valkey-cache-tests.log", "w"),
+            stdout=log_fd,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        log_fd.close()
         for _ in range(120):
             try:
                 if "PONG" in self.cli("PING"):
@@ -142,6 +144,7 @@ class AxServer:
         env = os.environ.copy()
         env["AXS_GRPC_SOCKET"] = self.grpc_socket
         env.update(self.extra_env)
+        log_fd = open(f"/tmp/{self.log_tag}.log", "w")  # noqa: SIM115
         self.proc = subprocess.Popen(
             [
                 str(self.ax_bin),
@@ -157,10 +160,11 @@ class AxServer:
             ],
             cwd=str(cwd),
             env=env,
-            stdout=open(f"/tmp/{self.log_tag}.log", "w"),
+            stdout=log_fd,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        log_fd.close()
         wait_http(f"http://127.0.0.1:{self.port}/health", timeout_s=360)
         if self.proc.poll() is not None:
             raise RuntimeError(f"ax server exited early: {self.log_tag}")

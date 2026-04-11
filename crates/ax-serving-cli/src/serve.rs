@@ -333,8 +333,11 @@ pub(crate) fn run_serve(
         ..config_base
     };
     config.validate()?;
-    let backend: Arc<dyn ax_serving_engine::InferenceBackend> =
-        Arc::new(RouterBackend::new(routing_cfg, config.llamacpp.clone(), config.mlx.clone()));
+    let backend: Arc<dyn ax_serving_engine::InferenceBackend> = Arc::new(RouterBackend::new(
+        routing_cfg,
+        config.llamacpp.clone(),
+        config.mlx.clone(),
+    ));
 
     let layer = Arc::new(ServingLayer::new(backend.clone(), config.clone()));
 

@@ -216,7 +216,8 @@ pub struct OrchestratorConfig {
     /// env: `AXS_WORKER_TTL_MS`
     pub worker_ttl_ms: u64,
     /// Dispatch policy name: `"least_inflight"` (default), `"weighted_round_robin"`,
-    /// `"model_affinity"`, or `"token_cost"`. env: `AXS_DISPATCH_POLICY`
+    /// `"model_affinity"`, `"token_cost"`, or `"cache_affinity"`.
+    /// env: `AXS_DISPATCH_POLICY`
     pub dispatch_policy: String,
     /// `Retry-After` header value on 429 responses (secs). env: `AXS_RETRY_AFTER_SECS`
     pub retry_after_secs: u64,
@@ -416,10 +417,11 @@ impl ServeConfig {
             "weighted_round_robin",
             "model_affinity",
             "token_cost",
+            "cache_affinity",
         ];
         if !VALID_DISPATCH.contains(&self.orchestrator.dispatch_policy.as_str()) {
             anyhow::bail!(
-                "unknown dispatch_policy '{}'; valid: least_inflight, weighted_round_robin, model_affinity, token_cost",
+                "unknown dispatch_policy '{}'; valid: least_inflight, weighted_round_robin, model_affinity, token_cost, cache_affinity",
                 self.orchestrator.dispatch_policy
             );
         }
@@ -747,6 +749,13 @@ mod tests {
         cfg.orchestrator.dispatch_policy = "random".into();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("dispatch_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_cache_affinity_dispatch_policy() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.dispatch_policy = "cache_affinity".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

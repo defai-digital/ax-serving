@@ -38,7 +38,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use axum::{Router, middleware, routing::{get, post}};
+use axum::{
+    Router,
+    extract::{ConnectInfo, Request},
+    middleware,
+    response::Response,
+    routing::{get, post},
+};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -173,7 +179,21 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
             "/v1/workers/{id}/drain-complete",
             post(proxy_drain_complete_worker),
         )
+        .layer(middleware::from_fn(ensure_public_connect_info))
         .with_state(layer)
+}
+
+async fn ensure_public_connect_info(mut request: Request, next: middleware::Next) -> Response {
+    if request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_none()
+    {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+    }
+    next.run(request).await
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -356,15 +376,18 @@ pub async fn start_orchestrator(
             .map_err(anyhow::Error::from)
         },
         async {
-            axum::serve(public_listener, public_app)
-                .with_graceful_shutdown(async move {
-                    let mut rx = public_shutdown;
-                    while !*rx.borrow() {
-                        rx.changed().await.ok();
-                    }
-                })
-                .await
-                .map_err(anyhow::Error::from)
+            axum::serve(
+                public_listener,
+                public_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let mut rx = public_shutdown;
+                while !*rx.borrow() {
+                    rx.changed().await.ok();
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)
         },
     )?;
 

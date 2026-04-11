@@ -28,6 +28,15 @@ pub struct ThorConfig {
     pub chip_model: Option<String>,
     /// env: `AXS_THOR_SHUTDOWN_TIMEOUT_SECS` (default 30)
     pub shutdown_timeout_secs: Option<u64>,
+    /// env: `AXS_THOR_MAX_CONTEXT` — max context window advertised to control
+    /// plane. If unset, the agent tries to derive it from the sglang runtime.
+    pub max_context: Option<u32>,
+    /// env: `AXS_THOR_EMBEDDING` — override embedding capability (true/false).
+    /// If unset, defaults to false (most LLM models are not embedding models).
+    pub embedding: Option<bool>,
+    /// env: `AXS_THOR_VISION` — override vision capability (true/false).
+    /// If unset, defaults to false.
+    pub vision: Option<bool>,
 }
 
 impl ThorConfig {
@@ -66,6 +75,23 @@ impl ThorConfig {
         let shutdown_timeout_secs = std::env::var("AXS_THOR_SHUTDOWN_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
+        let max_context = std::env::var("AXS_THOR_MAX_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let embedding = std::env::var("AXS_THOR_EMBEDDING").ok().and_then(|v| {
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            }
+        });
+        let vision = std::env::var("AXS_THOR_VISION").ok().and_then(|v| {
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            }
+        });
 
         Ok(Self {
             control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
@@ -79,6 +105,9 @@ impl ThorConfig {
             friendly_name,
             chip_model,
             shutdown_timeout_secs,
+            max_context,
+            embedding,
+            vision,
         })
     }
 }

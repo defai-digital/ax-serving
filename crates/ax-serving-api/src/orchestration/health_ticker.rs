@@ -125,8 +125,11 @@ async fn probe_candidates(
             break;
         };
 
-        if let Ok(result) = joined {
-            results.push(result);
+        match joined {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                tracing::warn!("health probe task panicked: {e}");
+            }
         }
     }
 

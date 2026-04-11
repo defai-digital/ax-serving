@@ -28,16 +28,22 @@ struct InflightGuard(Arc<AtomicUsize>);
 impl InflightGuard {
     /// Try to acquire an inflight slot. Returns `None` if at capacity.
     fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let mut spins = 0usize;
         loop {
-            let current = counter.load(Ordering::Relaxed);
+            let current = counter.load(Ordering::Acquire);
             if current >= max {
                 return None;
             }
             if counter
-                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return Some(Self(Arc::clone(counter)));
+            }
+            spins += 1;
+            std::hint::spin_loop();
+            if spins.is_multiple_of(16) {
+                std::thread::yield_now();
             }
         }
     }
@@ -45,7 +51,7 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -195,5 +201,34 @@ async fn proxy_to(
             format!("sglang proxy error: {err}"),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use super::InflightGuard;
+
+    #[test]
+    fn inflight_guard_stops_at_capacity() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let g1 = InflightGuard::try_acquire(&counter, 2);
+        let g2 = InflightGuard::try_acquire(&counter, 2);
+        let g3 = InflightGuard::try_acquire(&counter, 2);
+
+        assert!(g1.is_some());
+        assert!(g2.is_some());
+        assert!(g3.is_none());
+    }
+
+    #[test]
+    fn inflight_guard_releases_slot_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let g1 = InflightGuard::try_acquire(&counter, 1).expect("first permit");
+        assert!(InflightGuard::try_acquire(&counter, 1).is_none());
+        drop(g1);
+        assert!(InflightGuard::try_acquire(&counter, 1).is_some());
     }
 }

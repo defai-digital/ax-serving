@@ -16,7 +16,7 @@ use crate::utils::request_meta::default_audit_limit;
 // ── Re-exports so that rest/mod.rs router paths continue to work ─────────────
 
 pub use super::admin::{
-    admin_audit, admin_diagnostics, admin_policy, admin_status, admin_startup_report, health,
+    admin_audit, admin_diagnostics, admin_policy, admin_startup_report, admin_status, health,
     metrics, prometheus_metrics,
 };
 pub use super::inference::{chat_completions, embeddings, text_completions};
@@ -175,13 +175,15 @@ pub(crate) fn serving_startup_report_value(layer: &Arc<ServingLayer>) -> serde_j
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::inference::build_cache_key;
+    use std::time::Duration;
+
+    use super::super::inference::{build_cache_key, build_text_cache_key};
     use super::super::models::is_valid_pooling_type;
     use super::super::schema::*;
     use super::super::validation::{
         validate_max_tokens, validate_response_format, validate_sampling_params,
     };
+    use super::*;
     use crate::cache::CachePreference;
 
     fn mk_req(content: &str) -> ChatCompletionRequest {
@@ -217,6 +219,33 @@ mod tests {
         }
     }
 
+    fn mk_completion_req(prompt: &str) -> CompletionRequest {
+        CompletionRequest {
+            model: "default".into(),
+            prompt: prompt.into(),
+            stream: false,
+            temperature: 0.0,
+            max_tokens: Some(16),
+            top_p: 1.0,
+            min_p: None,
+            top_k: Some(1),
+            seed: None,
+            repeat_penalty: 1.1,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            grammar: None,
+            response_format: None,
+            mirostat: None,
+            mirostat_tau: None,
+            mirostat_eta: None,
+            logprobs: None,
+            top_logprobs: None,
+            cache: Some(CachePreference::Enable),
+            cache_ttl: Some("1h".into()),
+        }
+    }
+
     #[test]
     fn cache_key_changes_for_different_resolved_models() {
         let req = mk_req("same prompt");
@@ -237,6 +266,40 @@ mod tests {
         let k1 = build_cache_key(&req, "models/Qwen3-8B-Q4_K_M.gguf", "qwen3", Some(16)).unwrap();
         let k2 = build_cache_key(&req, "models/Qwen3-8B-Q4_K_M.gguf", "qwen3", Some(16)).unwrap();
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_changes_when_model_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.gguf");
+        std::fs::write(&model_path, b"old-model").unwrap();
+
+        let req = mk_req("same prompt");
+        let path_str = model_path.display().to_string();
+        let k1 = build_cache_key(&req, &path_str, "llama", Some(16)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&model_path, b"new-model-weights").unwrap();
+
+        let k2 = build_cache_key(&req, &path_str, "llama", Some(16)).unwrap();
+        assert_ne!(k1, k2, "model file changes must invalidate the cache key");
+    }
+
+    #[test]
+    fn text_cache_key_changes_when_model_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.gguf");
+        std::fs::write(&model_path, b"old-model").unwrap();
+
+        let req = mk_completion_req("same prompt");
+        let path_str = model_path.display().to_string();
+        let k1 = build_text_cache_key(&req, &path_str, "llama", Some(16)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&model_path, b"new-model-weights").unwrap();
+
+        let k2 = build_text_cache_key(&req, &path_str, "llama", Some(16)).unwrap();
+        assert_ne!(k1, k2, "text completion cache key must track model updates");
     }
 
     #[test]
@@ -345,8 +408,13 @@ mod tests {
 
     #[test]
     fn sampling_params_top_p_out_of_range() {
+        // top_p: 0.0 is valid (greedy); -0.1 is rejected
         assert!(
             validate_sampling_params(1.0, 0.0, None, None, 1.1, None, None, None, None, None)
+                .is_none()
+        );
+        assert!(
+            validate_sampling_params(1.0, -0.1, None, None, 1.1, None, None, None, None, None)
                 .is_some()
         );
         assert!(

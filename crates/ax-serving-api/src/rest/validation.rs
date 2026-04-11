@@ -30,7 +30,7 @@ pub fn validate_model_identifier(model: &str, field_name: &str) -> Option<Respon
             format!("{field_name} contains unsupported whitespace"),
         ));
     }
-    if model.chars().count() > MAX_MODEL_ID_BYTES {
+    if model.len() > MAX_MODEL_ID_BYTES {
         return Some(validation_error(
             StatusCode::BAD_REQUEST,
             format!("{field_name} exceeds max length of {MAX_MODEL_ID_BYTES}"),
@@ -73,8 +73,8 @@ pub fn validate_sampling_params(
     if !(0.0..=2.0).contains(&temperature) {
         reject!("temperature must be in [0, 2]");
     }
-    if !(top_p > 0.0 && top_p <= 1.0) {
-        reject!("top_p must be in (0, 1]");
+    if !(0.0..=1.0).contains(&top_p) {
+        reject!("top_p must be in [0, 1]");
     }
     if let Some(mp) = min_p
         && !(0.0..=1.0).contains(&mp)
@@ -212,7 +212,11 @@ pub fn build_generation_params(
         } else {
             Some(temperature as f64)
         },
-        top_p: Some(top_p as f64),
+        top_p: if top_p == 0.0 {
+            None
+        } else {
+            Some(top_p as f64)
+        },
         min_p: min_p.map(|v| v as f64),
         top_k: top_k.map(|k| k as usize),
         max_tokens: effective_max_tokens.map(|n| n as usize),
@@ -281,9 +285,9 @@ pub fn map_stop_reason(reason: &str) -> &'static str {
 mod tests {
     use axum::http::StatusCode;
 
-    use super::validate_model_identifier;
-
-    use super::validate_multimodal_backend_support;
+    use super::{
+        build_generation_params, validate_model_identifier, validate_multimodal_backend_support,
+    };
 
     #[test]
     fn validate_model_identifier_rejects_empty_or_whitespace() {
@@ -310,6 +314,12 @@ mod tests {
     }
 
     #[test]
+    fn validate_model_identifier_enforces_byte_limit() {
+        let resp = validate_model_identifier(&"é".repeat(65), "model").unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn validate_multimodal_backend_support_allows_llama_cpp() {
         assert!(validate_multimodal_backend_support(true, Some("llama_cpp")).is_none());
     }
@@ -324,5 +334,31 @@ mod tests {
     fn validate_multimodal_backend_support_skips_non_multimodal() {
         assert!(validate_multimodal_backend_support(false, Some("native")).is_none());
         assert!(validate_multimodal_backend_support(false, None).is_none());
+    }
+
+    #[test]
+    fn build_generation_params_normalizes_zero_top_p_to_backend_default() {
+        let params = build_generation_params(
+            false,
+            1.0,
+            0.0,
+            None,
+            None,
+            Some(16),
+            Vec::new(),
+            None,
+            1.1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+        );
+
+        assert_eq!(params.top_p, None);
     }
 }

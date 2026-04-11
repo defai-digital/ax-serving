@@ -31,6 +31,19 @@ async fn body_text(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+fn prometheus_metric_value(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(metric_name), Some(value)) if metric_name == name => value.parse().ok(),
+                _ => None,
+            }
+        })
+        .unwrap_or_default()
+}
+
 // ── NullBackend ───────────────────────────────────────────────────────────────
 
 /// Minimal backend that satisfies `InferenceBackend` without real inference.
@@ -327,6 +340,76 @@ impl InferenceBackend for EmbeddingFailureBackend {
         _config: &EmbedConfig,
     ) -> anyhow::Result<EmbedResult> {
         Err(anyhow::anyhow!("embedding backend failure"))
+    }
+}
+
+struct ErrorBackend;
+
+impl InferenceBackend for ErrorBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(6),
+            ModelMetadata {
+                architecture: "error".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        tokio::spawn(async move {
+            let _ = tx
+                .send(GenerateEvent::Error("backend failure".to_string()))
+                .await;
+        });
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
     }
 }
 
@@ -800,7 +883,7 @@ async fn embeddings_project_policy_requires_header_before_model_lookup() {
 }
 
 #[tokio::test]
-async fn load_model_defaults_to_llama_cpp_backend_hint() {
+async fn load_model_defaults_to_auto_backend_hint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("capture.gguf");
     std::fs::write(&path, b"dummy").unwrap();
@@ -828,7 +911,7 @@ async fn load_model_defaults_to_llama_cpp_backend_hint() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(observed.lock().unwrap().as_deref(), Some("llama_cpp"));
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("auto"));
 }
 
 #[tokio::test]
@@ -1331,6 +1414,70 @@ fn burn_rate_all_errors_exceeds_threshold() {
         w.burn_rate(0.001) > 14.4,
         "100% errors must trigger fast burn alert (burn_rate={:.1})",
         w.burn_rate(0.001)
+    );
+}
+
+#[tokio::test]
+async fn burn_rate_records_inference_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("error.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let backend: Arc<dyn InferenceBackend> = Arc::new(ErrorBackend);
+    let layer = make_layer_with_backend(backend);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let app = rest::router(Arc::clone(&layer), Arc::clone(&keys));
+
+    let load_body =
+        serde_json::json!({"model_id": "error-model", "path": path.to_string_lossy()}).to_string();
+    let load_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(load_resp.status().is_success());
+
+    let infer_body = serde_json::json!({
+        "model": "error-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string();
+    let infer_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(infer_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(infer_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let metrics_resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_resp.status(), StatusCode::OK);
+    let text = body_text(metrics_resp).await;
+    assert!(
+        prometheus_metric_value(&text, "axs_slo_burn_rate_1h") > 14.4,
+        "burn-rate alerting should record 5xx inference failures; got:\n{text}"
     );
 }
 

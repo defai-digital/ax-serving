@@ -3,14 +3,27 @@
 //! Queries macOS for available physical memory via `host_statistics64`
 //! and validates that the model can fit before attempting to load.
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
+fn required_memory_bytes(model_bytes: u64) -> u64 {
+    let (num, denom) = if model_bytes >= 16 * GIB {
+        (14u64, 10u64)
+    } else if model_bytes >= 4 * GIB {
+        (13u64, 10u64)
+    } else {
+        (12u64, 10u64)
+    };
+    model_bytes.saturating_mul(num) / denom
+}
+
 /// Check whether enough memory is available to load a model of the given size.
 ///
 /// `model_bytes` is the raw file size of the GGUF. Actual resident size will
-/// be similar (mmap) but GPU buffers add overhead; we gate on 1.1× to leave
-/// headroom.
+/// be similar (mmap) but GPU buffers add overhead, especially on larger Metal
+/// models, so the headroom scales with model size.
 pub fn check_memory_budget(model_bytes: u64) -> anyhow::Result<()> {
     let available = available_bytes();
-    let required = (model_bytes as f64 * 1.1) as u64;
+    let required = required_memory_bytes(model_bytes);
 
     if available < required {
         anyhow::bail!(
@@ -31,6 +44,9 @@ fn available_bytes() -> u64 {
         // host_statistics64 with HOST_VM_INFO64 flavor.
         // Returns vm_statistics64_data_t with free_count and inactive_count.
         // Each page is typically 16KB on Apple Silicon.
+        unsafe extern "C" {
+            fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        }
         #[allow(deprecated)]
         let host = unsafe { libc::mach_host_self() };
         let mut stats = MaybeUninit::<libc::vm_statistics64_data_t>::uninit();
@@ -45,6 +61,11 @@ fn available_bytes() -> u64 {
                 &mut count,
             )
         };
+
+        // Deallocate the Mach port to avoid leaking a send-right per call.
+        #[allow(deprecated)]
+        let task = unsafe { libc::mach_task_self() };
+        let _ = unsafe { mach_port_deallocate(task, host) };
 
         if ret == libc::KERN_SUCCESS {
             let stats = unsafe { stats.assume_init() };
@@ -61,4 +82,16 @@ fn available_bytes() -> u64 {
 
     // Fallback: assume 8GB available (conservative).
     8 * 1024 * 1024 * 1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GIB, required_memory_bytes};
+
+    #[test]
+    fn required_memory_budget_scales_with_model_size() {
+        assert_eq!(required_memory_bytes(2 * GIB), 2 * GIB * 12 / 10);
+        assert_eq!(required_memory_bytes(8 * GIB), 8 * GIB * 13 / 10);
+        assert_eq!(required_memory_bytes(32 * GIB), 32 * GIB * 14 / 10);
+    }
 }

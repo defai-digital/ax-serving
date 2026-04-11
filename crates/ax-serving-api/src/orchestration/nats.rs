@@ -469,7 +469,7 @@ impl NatsDispatcher {
     }
 }
 
-fn sanitize_subject_component(model_id: &str) -> String {
+pub(super) fn sanitize_subject_component(model_id: &str) -> String {
     model_id
         .chars()
         .map(|c| {

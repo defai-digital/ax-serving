@@ -25,8 +25,11 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::{
     Router,
+    extract::{Request, State},
     http::StatusCode,
     middleware,
+    middleware::Next,
+    response::Response,
     routing::{delete, get, post},
 };
 use tower_http::timeout::TimeoutLayer;
@@ -55,6 +58,7 @@ pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120);
+    let slo_layer = Arc::clone(&layer);
 
     Router::new()
         .route("/v1/chat/completions", post(routes::chat_completions))
@@ -88,7 +92,29 @@ pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(timeout_secs),
         ))
+        .layer(middleware::from_fn_with_state(
+            slo_layer,
+            inference_slo_middleware,
+        ))
         .with_state(layer)
+}
+
+async fn inference_slo_middleware(
+    State(layer): State<Arc<ServingLayer>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let track = matches!(
+        request.uri().path(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings"
+    );
+    let response = next.run(request).await;
+    if track {
+        layer
+            .metrics
+            .record_slo_sample(response.status().is_server_error());
+    }
+    response
 }
 
 /// Resolves when SIGINT (Ctrl-C) or SIGTERM is received.

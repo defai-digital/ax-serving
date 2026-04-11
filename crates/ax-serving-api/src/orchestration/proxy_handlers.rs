@@ -1,10 +1,12 @@
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use axum::{
     Json,
     body::{Body, BodyDataStream, Bytes},
-    extract::{Extension, Path, Query, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse},
 };
@@ -26,6 +28,7 @@ use crate::utils::request_meta::{
 
 async fn proxy_inference(
     layer: Arc<OrchestratorLayer>,
+    peer_addr: Option<SocketAddr>,
     req_headers: HeaderMap,
     body: Bytes,
     worker_path: &'static str,
@@ -82,7 +85,11 @@ async fn proxy_inference(
         .or(requested_pool);
 
     // Admission control: acquire a queue slot before dispatching.
-    let permit = match layer.queue.acquire(fairness_client_key(&req_headers)).await {
+    let permit = match layer
+        .queue
+        .acquire(fairness_client_key(&req_headers, peer_addr))
+        .await
+    {
         AcquireResult::Permit(p) => p,
 
         AcquireResult::Rejected => {
@@ -187,31 +194,19 @@ async fn proxy_inference(
     }
 }
 
-fn fairness_client_key(headers: &HeaderMap) -> String {
+fn fairness_client_key(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
     if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        return format!("auth:{auth}");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        auth.hash(&mut hasher);
+        return format!("auth:{:016x}", hasher.finish());
     }
-    if let Some(forwarded_for) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return format!("ip:{forwarded_for}");
-    }
-    if let Some(real_ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return format!("ip:{real_ip}");
+    if let Some(peer_ip) = peer_addr.map(|addr| addr.ip()) {
+        return format!("ip:{peer_ip}");
     }
     "anonymous".to_string()
 }
@@ -256,31 +251,39 @@ pub(super) fn orchestrator_startup_report_value(
 
 pub(super) async fn proxy_chat_completions(
     State(layer): State<Arc<OrchestratorLayer>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    proxy_inference(layer, headers, body, "/v1/chat/completions").await
+    proxy_inference(
+        layer,
+        Some(peer_addr),
+        headers,
+        body,
+        "/v1/chat/completions",
+    )
+    .await
 }
 
 pub(super) async fn proxy_completions(
     State(layer): State<Arc<OrchestratorLayer>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    proxy_inference(layer, headers, body, "/v1/completions").await
+    proxy_inference(layer, Some(peer_addr), headers, body, "/v1/completions").await
 }
 
 pub(super) async fn proxy_embeddings(
     State(layer): State<Arc<OrchestratorLayer>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    proxy_inference(layer, headers, body, "/v1/embeddings").await
+    proxy_inference(layer, Some(peer_addr), headers, body, "/v1/embeddings").await
 }
 
-pub(super) async fn proxy_models(
-    State(layer): State<Arc<OrchestratorLayer>>,
-) -> impl IntoResponse {
+pub(super) async fn proxy_models(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
     let workers = layer.registry.list_all();
     let mut models: Vec<String> = workers
         .iter()
@@ -309,9 +312,7 @@ pub(super) async fn proxy_models(
     }))
 }
 
-pub(super) async fn proxy_health(
-    State(layer): State<Arc<OrchestratorLayer>>,
-) -> impl IntoResponse {
+pub(super) async fn proxy_health(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
     let (healthy, unhealthy, draining) = layer.registry.counts();
     // "ok" only when at least one worker can actually accept requests:
     // healthy AND not draining. A fully-draining pool shows as "degraded" even
@@ -803,5 +804,35 @@ pub(super) async fn proxy_set_license(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::fairness_client_key;
+
+    #[test]
+    fn fairness_client_key_hashes_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-test-secret"),
+        );
+
+        let key = fairness_client_key(&headers, Some("10.0.0.8:443".parse().unwrap()));
+        assert!(key.starts_with("auth:"));
+        assert!(!key.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn fairness_client_key_uses_peer_addr_not_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+        headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.2"));
+
+        let key = fairness_client_key(&headers, Some("10.0.0.9:1234".parse().unwrap()));
+        assert_eq!(key, "ip:10.0.0.9");
     }
 }

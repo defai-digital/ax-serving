@@ -2,10 +2,9 @@
 //!
 //! Ported from ax-engine's metrics module. No external dependencies.
 
-use std::cell::OnceCell;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ax_serving_engine::GenerationStats;
@@ -44,20 +43,20 @@ impl InferenceMetrics {
 #[derive(Debug)]
 pub struct LatencyHistogram {
     samples: Vec<Duration>,
-    sorted_samples: OnceCell<Vec<Duration>>,
+    sorted_samples: OnceLock<Vec<Duration>>,
 }
 
 impl LatencyHistogram {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             samples: Vec::with_capacity(cap),
-            sorted_samples: OnceCell::new(),
+            sorted_samples: OnceLock::new(),
         }
     }
 
     pub fn record(&mut self, d: Duration) {
         self.samples.push(d);
-        let _ = self.sorted_samples.take();
+        self.sorted_samples = OnceLock::new();
     }
 
     pub fn p50(&self) -> Duration {
@@ -110,6 +109,8 @@ pub struct BurnRateWindow {
     samples: VecDeque<(u64, bool)>,
 }
 
+const BURN_RATE_MAX_SAMPLES: usize = 100_000;
+
 impl BurnRateWindow {
     pub fn new(window_ms: u64) -> Self {
         Self {
@@ -130,6 +131,9 @@ impl BurnRateWindow {
         {
             self.samples.pop_front();
         }
+        while self.samples.len() >= BURN_RATE_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
         self.samples.push_back((now_ms, is_error));
     }
 
@@ -139,8 +143,25 @@ impl BurnRateWindow {
         if self.samples.is_empty() || error_budget <= 0.0 {
             return 0.0;
         }
-        let errors = self.samples.iter().filter(|s| s.1).count();
-        let rate = errors as f64 / self.samples.len() as f64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut total = 0usize;
+        let mut errors = 0usize;
+        for &(timestamp_ms, is_error) in self.samples.iter().rev() {
+            if now_ms.saturating_sub(timestamp_ms) > self.window_ms {
+                break;
+            }
+            total += 1;
+            if is_error {
+                errors += 1;
+            }
+        }
+        if total == 0 {
+            return 0.0;
+        }
+        let rate = errors as f64 / total as f64;
         rate / error_budget
     }
 }
@@ -237,6 +258,23 @@ impl MetricsStore {
 
     pub fn record_cache_fill(&self) {
         self.cache_fills_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_slo_sample(&self, is_error: bool) {
+        match self.burn_1h.lock() {
+            Ok(mut metric) => metric.record(is_error),
+            Err(err) => {
+                tracing::warn!(%err, "burn-1h metric lock poisoned; continuing with poisoned state");
+                err.into_inner().record(is_error);
+            }
+        }
+        match self.burn_6h.lock() {
+            Ok(mut metric) => metric.record(is_error),
+            Err(err) => {
+                tracing::warn!(%err, "burn-6h metric lock poisoned; continuing with poisoned state");
+                err.into_inner().record(is_error);
+            }
+        }
     }
 
     pub fn cold_requests_total(&self) -> u64 {
@@ -440,6 +478,15 @@ mod tests {
         assert!((rate - 5.0).abs() < 0.01, "burn_rate={rate}");
     }
 
+    #[test]
+    fn burn_rate_window_caps_samples() {
+        let mut w = BurnRateWindow::new(60_000);
+        for i in 0..(BURN_RATE_MAX_SAMPLES + 10) {
+            w.record(i.is_multiple_of(2));
+        }
+        assert_eq!(w.samples.len(), BURN_RATE_MAX_SAMPLES);
+    }
+
     // ── MetricsStore & OpTimer ─────────────────────────────────────────────────
 
     #[test]
@@ -502,10 +549,12 @@ mod tests {
         store.record_exact_cache_hit();
         store.record_cache_follower_hit();
         store.record_cache_fill();
+        store.record_slo_sample(true);
         assert_eq!(store.cold_requests_total(), 1);
         assert_eq!(store.exact_cache_hits_total(), 1);
         assert_eq!(store.cache_follower_hits_total(), 1);
         assert_eq!(store.cache_fills_total(), 1);
+        assert!(store.burn_1h.lock().unwrap().burn_rate(0.001) > 0.0);
     }
 
     #[test]

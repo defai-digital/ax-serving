@@ -44,10 +44,7 @@ pub async fn run(
     );
 
     let start = Instant::now();
-    let baseline_rss = {
-        let raw = ax_serving_api::metrics::current_rss_bytes() as f64;
-        if raw > 0.0 { raw } else { 1.0 }
-    };
+    let mut baseline_rss: Option<f64> = None;
     // BUG-107: delay baseline capture until after the first check interval so
     // the cold-start latency spike is excluded from the drift denominator.
     let mut baseline_p95: Option<Duration> = None;
@@ -108,15 +105,19 @@ pub async fn run(
             // so the cold-start latency spike doesn't become the reference point.
             if !baseline_set_after_interval {
                 baseline_p95 = Some(p95);
+                let rss = ax_serving_api::metrics::current_rss_bytes() as f64;
+                baseline_rss = Some(if rss > 0.0 { rss } else { 1.0 });
                 baseline_set_after_interval = true;
                 println!(
-                    "soak: warmup complete; P95 baseline set to {:.1}ms",
-                    p95.as_secs_f64() * 1000.0
+                    "soak: warmup complete; P95 baseline set to {:.1}ms, RSS baseline {:.2} GiB",
+                    p95.as_secs_f64() * 1000.0,
+                    baseline_rss.unwrap_or(1.0) / 1024.0 / 1024.0 / 1024.0
                 );
             }
 
             let elapsed_min = start.elapsed().as_secs() / 60;
             let rss = ax_serving_api::metrics::current_rss_bytes() as f64;
+            let baseline_rss = baseline_rss.unwrap_or(if rss > 0.0 { rss } else { 1.0 });
             let rss_drift = (rss - baseline_rss) / baseline_rss;
             // Guard against zero baseline (empty first burst) — NaN comparisons
             // are always false in IEEE 754, which would silently mask drift.

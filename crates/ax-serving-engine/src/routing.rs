@@ -289,12 +289,15 @@ fn detect_family_from_filename(path: &Path) -> String {
         // More-specific entries must come before their generic prefixes so that
         // e.g. "gemma3-4b.gguf" maps to "gemma3", not the broader "gemma".
         ("deepseek", "deepseek"),
+        ("gpt2", "gpt2"),
         ("llama", "llama"),
         ("qwen35", "qwen35"),
         ("qwen3", "qwen3"),
         ("qwen", "qwen"),
         ("gemma4", "gemma4"),
+        ("gemma-4", "gemma4"),
         ("gemma3", "gemma3"),
+        ("gemma-3", "gemma3"),
         ("gemma", "gemma"),
         ("mistral", "mistral"),
         // Avoid broad "phi" substring matching (e.g. "graphite" false-positive).
@@ -314,7 +317,6 @@ fn detect_family_from_filename(path: &Path) -> String {
         ("gpt-neox", "gpt_neox"),
         ("gpt_neox", "gpt_neox"),
         ("gptneox", "gpt_neox"),
-        ("gpt2", "gpt2"),
         ("bloom", "bloom"),
     ] {
         if name.contains(needle) {
@@ -330,7 +332,6 @@ fn normalize_family_key(s: &str) -> String {
         .flat_map(|c| c.to_lowercase())
         .collect()
 }
-
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -627,14 +628,17 @@ impl InferenceBackend for RouterBackend {
         dispatch!(self, tag, inner, eos_tokens)
     }
 
+    fn bos_token(&self, handle: ModelHandle) -> Result<u32> {
+        let (tag, inner) = self.resolve_entry(handle)?;
+        dispatch!(self, tag, inner, bos_token)
+    }
+
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<u32> {
         let (tag, inner) = self.resolve_entry(handle)?;
         match tag {
             BackendTag::Native => self.native.eval_tokens(inner, tokens),
             BackendTag::LlamaCpp => self.llamacpp.eval_tokens(inner, tokens),
-            BackendTag::Mlx => Err(anyhow::anyhow!(
-                "eval_tokens not supported by MlxBackend"
-            )),
+            BackendTag::Mlx => Err(anyhow::anyhow!("eval_tokens not supported by MlxBackend")),
             BackendTag::LibLlama => Err(anyhow::anyhow!(
                 "eval_tokens not supported by LibLlamaBackend"
             )),
@@ -650,11 +654,19 @@ impl InferenceBackend for RouterBackend {
                 worst = t;
             }
         };
-        if has_native { update(self.native.thermal_state()); }
-        if has_llamacpp { update(self.llamacpp.thermal_state()); }
-        if has_mlx { update(self.mlx.thermal_state()); }
+        if has_native {
+            update(self.native.thermal_state());
+        }
+        if has_llamacpp {
+            update(self.llamacpp.thermal_state());
+        }
+        if has_mlx {
+            update(self.mlx.thermal_state());
+        }
         #[cfg(feature = "libllama")]
-        if has_libllama { update(self.libllama.thermal_state()); }
+        if has_libllama {
+            update(self.libllama.thermal_state());
+        }
         let _ = has_libllama;
         worst
     }
@@ -663,11 +675,19 @@ impl InferenceBackend for RouterBackend {
         let (has_native, has_llamacpp, has_mlx, has_libllama) = self.active_backend_tags();
 
         let mut min = self.llamacpp.recommended_concurrency(); // default
-        if has_native { min = min.min(self.native.recommended_concurrency()); }
-        if has_llamacpp { min = min.min(self.llamacpp.recommended_concurrency()); }
-        if has_mlx { min = min.min(self.mlx.recommended_concurrency()); }
+        if has_native {
+            min = min.min(self.native.recommended_concurrency());
+        }
+        if has_llamacpp {
+            min = min.min(self.llamacpp.recommended_concurrency());
+        }
+        if has_mlx {
+            min = min.min(self.mlx.recommended_concurrency());
+        }
         #[cfg(feature = "libllama")]
-        if has_libllama { min = min.min(self.libllama.recommended_concurrency()); }
+        if has_libllama {
+            min = min.min(self.libllama.recommended_concurrency());
+        }
         let _ = has_libllama;
         min
     }
@@ -683,11 +703,19 @@ impl InferenceBackend for RouterBackend {
             agg.active_batch_size += t.active_batch_size;
             agg.max_batch_size += t.max_batch_size;
         };
-        if has_native { merge(self.native.cache_telemetry()); }
-        if has_llamacpp { merge(self.llamacpp.cache_telemetry()); }
-        if has_mlx { merge(self.mlx.cache_telemetry()); }
+        if has_native {
+            merge(self.native.cache_telemetry());
+        }
+        if has_llamacpp {
+            merge(self.llamacpp.cache_telemetry());
+        }
+        if has_mlx {
+            merge(self.mlx.cache_telemetry());
+        }
         #[cfg(feature = "libllama")]
-        if has_libllama { merge(self.libllama.cache_telemetry()); }
+        if has_libllama {
+            merge(self.libllama.cache_telemetry());
+        }
         let _ = has_libllama;
         agg
     }
@@ -730,7 +758,11 @@ mod tests {
 
     #[test]
     fn test_backend_name_for_handle() {
-        let backend = RouterBackend::new(RoutingConfig::default(), LlamaCppConfig::from_env(), crate::mlx::MlxConfig::from_env());
+        let backend = RouterBackend::new(
+            RoutingConfig::default(),
+            LlamaCppConfig::from_env(),
+            crate::mlx::MlxConfig::from_env(),
+        );
         {
             let mut entries = backend.entries.write().unwrap();
             entries.insert(
@@ -790,7 +822,7 @@ mod tests {
         );
         assert_eq!(
             detect_family_from_filename(Path::new("gemma-3-4b-it-Q4_K_M.gguf")),
-            "gemma"
+            "gemma3"
         );
         assert_eq!(
             detect_family_from_filename(Path::new("Phi-3-mini-4k-instruct-Q4_K_M.gguf")),
@@ -831,6 +863,10 @@ mod tests {
         assert_eq!(
             detect_family_from_filename(Path::new("gpt-neox-20b-Q4_K_M.gguf")),
             "gpt_neox"
+        );
+        assert_eq!(
+            detect_family_from_filename(Path::new("gpt2-llama-compatible.gguf")),
+            "gpt2"
         );
         assert_eq!(
             detect_family_from_filename(Path::new("graphite-7b-Q4_K_M.gguf")),
@@ -930,10 +966,12 @@ mod tests {
     // Auto routing: arch in native_families → Native; unknown → LlamaCpp.
     #[test]
     fn test_auto_routes_native_arch_to_native() {
-        let cfg =
-            make_config_with_native(&[], BackendChoice::Auto, &["llama", "gemma3", "gemma4"]);
+        let cfg = make_config_with_native(&[], BackendChoice::Auto, &["llama", "gemma3", "gemma4"]);
         // Filename detection: "llama3-8b.gguf" → family "llama" → in native_families → Native.
-        assert_eq!(cfg.resolve(Path::new("llama3-8b.gguf")), BackendChoice::Native);
+        assert_eq!(
+            cfg.resolve(Path::new("llama3-8b.gguf")),
+            BackendChoice::Native
+        );
         // "gemma3-4b.gguf" → family "gemma" which prefix-matches "gemma3" → Native.
         assert_eq!(
             cfg.resolve(Path::new("gemma3-4b.gguf")),
@@ -966,7 +1004,10 @@ mod tests {
             BackendChoice::Auto,
             &["llama", "gemma3"],
         );
-        assert_eq!(cfg.resolve(Path::new("llama3-8b.gguf")), BackendChoice::LlamaCpp);
+        assert_eq!(
+            cfg.resolve(Path::new("llama3-8b.gguf")),
+            BackendChoice::LlamaCpp
+        );
     }
 
     // RoutingConfig round-trips through YAML serialization.

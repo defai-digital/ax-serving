@@ -1,54 +1,58 @@
-# Commercial Licensing Summary
+# Commercial License
 
-This document summarizes the commercial licensing path for AX Serving
-(`ax-serving`).
+Copyright (c) 2026 DEFAI Private Limited (https://defai.digital)
 
-AX Serving is the serving and orchestration layer in the AutomatosX ecosystem
-by DEFAI Private Limited.
+## Open-Source License
 
-This repository is dual-licensed. Unless you have a separate commercial
-agreement, your use is governed by the GNU Affero General Public License,
-version 3 or any later version (`LICENSE`).
+This software is licensed under the GNU Affero General Public License,
+version 3 or any later version (AGPL-3.0-or-later). See the `LICENSE` file
+for the full text.
 
-This file is a commercial licensing summary only. It is not the full commercial
-agreement and does not by itself grant a commercial license.
+Under the AGPL, you may freely use, modify, and distribute this software
+provided that:
 
-## Commercial License Summary
+- Any modified version served over a network must make the complete
+  corresponding source code available to all users of that service.
+- All derivative works must also be licensed under the AGPL.
 
-A commercial license is available for organizations that want to use AX Serving
-as a proprietary serving backend, private inference/control plane, embedded
-runtime, managed fleet component, or enterprise integration layer.
+## Commercial License
 
-In product terms, the public repository is the open-source core of AX Serving.
-The default open-source deployment focus is single-Mac serving and Mac-grid
-serving. Commercial offerings may cover the same core under non-AGPL terms and
-may additionally include separate enterprise modules and supported deployment
-paths for heterogeneous fleets, including NVIDIA / Thor-class workers.
+A commercial license is available as an alternative to the AGPL for
+organizations that cannot or do not wish to comply with its copyleft terms.
 
-Commercial agreements may cover one or more of the following:
+### Free Tier — Organizations Under USD 2,000,000 Annual Revenue
 
-- proprietary internal use without AGPL obligations
-- private deployment in on-premise, air-gapped, or controlled environments
-- embedding AX Serving into commercial products, appliances, or internal platforms
-- managed multi-node or mixed-node fleet deployments, including Mac and Thor-style workers
-- managed heterogeneous fleets that include NVIDIA / Thor-class workers
+Organizations with **annual gross revenue below USD 2,000,000** may obtain a
+free commercial license that waives AGPL obligations for internal and
+production use of this software. To request this license, contact
+**sales@automatosx.com**.
+
+### Paid Tier — Organizations at USD 2,000,000+ Annual Revenue
+
+Organizations with **annual gross revenue of USD 2,000,000 or more** must
+obtain a paid commercial license to use this software outside the terms of
+the AGPL.
+
+### What the Commercial License Covers
+
+Commercial licenses may cover one or more of the following:
+
+- Proprietary internal use without AGPL source-disclosure obligations
+- Embedding into commercial products, appliances, or internal platforms
+- Private deployment in on-premise, air-gapped, or controlled environments
+- Managed multi-node or mixed-node fleet deployments
 - OEM redistribution, custom integrations, and enterprise support terms
 
-## Open-Source vs Commercial Path
+## Scope
 
-- Open-source path: use AX Serving under `AGPL-3.0-or-later`
-- Commercial path: obtain a separate written license from DEFAI Private Limited / AutomatosX
+This commercial licensing applies to **AX Serving** (`ax-serving`), the
+serving and orchestration layer in the AutomatosX ecosystem. AX Serving
+provides model serving, load balancing, and fleet orchestration for
+private AI inference infrastructure.
 
-## Commercial Packaging
+## Contact
 
-Commercial packaging is offered by agreement and may include:
+For licensing, OEM, integration, and custom solution enquiries:
 
-- commercial runtime licensing
-- private deployment rights
-- OEM / embedded redistribution rights
-- enterprise fleet integration work
-- enterprise control-plane modules and deployment bundles
-- support, service, and deployment terms
-
-For licensing, OEM, integration, and custom solution enquiries, contact
-`enquiry@automatosx.com`.
+- **Email:** sales@automatosx.com
+- **Web:** https://automatosx.com

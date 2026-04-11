@@ -244,44 +244,47 @@ fn one_run(
     )?;
 
     // Now enter the drain runtime ONLY for channel recv — no backend calls here.
-    drain_rt.block_on(drain_channel(rx, tokens.len(), params))
+    drain_rt.block_on(drain_channel(rx, tokens.len()))
 }
 
 async fn drain_channel(
     mut rx: mpsc::Receiver<GenerateEvent>,
     n_prompt: usize,
-    params: &GenerationParams,
 ) -> Result<GenerationStats> {
     let wall = Instant::now();
     let mut stats = GenerationStats::default();
+    let mut first_token_after = None::<f64>;
 
     let mut got_done = false;
     while let Some(event) = rx.recv().await {
         match event {
+            GenerateEvent::Token(_) => {
+                first_token_after.get_or_insert_with(|| wall.elapsed().as_secs_f64());
+            }
             GenerateEvent::Done(s) => {
                 if s.prefill_tok_per_sec > 0.0 && s.decode_tok_per_sec > 0.0 {
                     stats = s;
                 } else {
-                    // BUG-106: the wall-clock fallback divides both prefill and
-                    // decode throughput by total elapsed time, producing a ~10x
-                    // underestimate when decode dominates.  Emit an explicit
-                    // warning so users know the numbers are approximate.
-                    let elapsed = wall.elapsed().as_secs_f64();
+                    let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
+                    let (prefill_tps, decode_tps) = fallback_phase_tps(
+                        n_prompt,
+                        s.completion_tokens,
+                        first_token_after,
+                        elapsed,
+                    );
                     tracing::warn!(
                         "backend did not report split-phase stats; \
-                         throughput numbers are approximate (divided by total wall time)"
+                         throughput numbers estimated from first-token timing"
                     );
-                    stats.prefill_tok_per_sec = n_prompt as f64 / elapsed;
-                    stats.decode_tok_per_sec =
-                        params.max_tokens.map(|n| n as f64 / elapsed).unwrap_or(0.0);
+                    stats = s;
+                    stats.prefill_tok_per_sec = prefill_tps;
+                    stats.decode_tok_per_sec = decode_tps;
                 }
                 got_done = true;
                 break;
             }
             GenerateEvent::Error(e) => anyhow::bail!("generation error: {e}"),
-            GenerateEvent::Token(_)
-            | GenerateEvent::ToolCall { .. }
-            | GenerateEvent::TokenLogprob { .. } => {}
+            GenerateEvent::ToolCall { .. } | GenerateEvent::TokenLogprob { .. } => {}
         }
     }
     if !got_done {
@@ -289,6 +292,26 @@ async fn drain_channel(
     }
 
     Ok(stats)
+}
+
+fn fallback_phase_tps(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    first_token_after_secs: Option<f64>,
+    total_elapsed_secs: f64,
+) -> (f64, f64) {
+    let total_elapsed_secs = total_elapsed_secs.max(1e-9);
+    match first_token_after_secs {
+        Some(ttft_secs) => {
+            let prefill_elapsed = ttft_secs.max(1e-9);
+            let decode_elapsed = (total_elapsed_secs - ttft_secs).max(1e-9);
+            (
+                prompt_tokens as f64 / prefill_elapsed,
+                completion_tokens as f64 / decode_elapsed,
+            )
+        }
+        None => (prompt_tokens as f64 / total_elapsed_secs, 0.0),
+    }
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -306,7 +329,7 @@ fn median(v: &mut [f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::median;
+    use super::{fallback_phase_tps, median};
 
     #[test]
     fn median_even_uses_average_of_middle_values() {
@@ -318,5 +341,19 @@ mod tests {
     fn median_odd_uses_middle_value() {
         let mut values = vec![3.0, 1.0, 2.0];
         assert_eq!(median(&mut values), 2.0);
+    }
+
+    #[test]
+    fn fallback_phase_tps_uses_first_token_timing() {
+        let (prefill_tps, decode_tps) = fallback_phase_tps(1000, 100, Some(0.5), 1.0);
+        assert_eq!(prefill_tps, 2000.0);
+        assert_eq!(decode_tps, 200.0);
+    }
+
+    #[test]
+    fn fallback_phase_tps_without_tokens_reports_zero_decode() {
+        let (prefill_tps, decode_tps) = fallback_phase_tps(50, 0, None, 2.0);
+        assert_eq!(prefill_tps, 25.0);
+        assert_eq!(decode_tps, 0.0);
     }
 }

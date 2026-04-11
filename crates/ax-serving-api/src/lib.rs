@@ -158,6 +158,9 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
 
     let idle_secs = config.idle_timeout_secs;
 
+    // Shutdown signal for the idle eviction background task.
+    let (eviction_shutdown_tx, mut eviction_shutdown_rx) = tokio::sync::watch::channel(false);
+
     if idle_secs > 0 {
         info!("idle eviction enabled: models idle > {idle_secs}s will be unloaded");
         let eviction_layer = Arc::clone(&layer);
@@ -167,7 +170,13 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
                 tokio::time::interval(std::time::Duration::from_secs(check_interval_secs));
             let idle_ms = idle_secs * 1_000;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = eviction_shutdown_rx.changed() => {
+                        info!("idle eviction task shutting down");
+                        break;
+                    }
+                }
                 // Run the blocking eviction pass off the async executor.
                 let registry2 = eviction_layer.registry.clone();
                 let backend2 = Arc::clone(&eviction_layer.backend);
@@ -210,7 +219,7 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
     }
     layer.set_public_auth_required(!api_keys.is_empty());
 
-    tokio::try_join!(
+    let result = tokio::try_join!(
         rest::serve(layer.clone(), config.rest_addr.clone(), api_keys.clone()),
         grpc::serve(
             layer.clone(),
@@ -219,7 +228,11 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
             config.grpc_port,
             api_keys
         ),
-    )?;
+    );
 
+    // Signal idle eviction to stop before returning.
+    let _ = eviction_shutdown_tx.send(true);
+
+    result?;
     Ok(())
 }

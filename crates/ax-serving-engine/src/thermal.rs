@@ -178,8 +178,11 @@ fn read_nsprocessinfo_thermal_state() -> u8 {
         unsafe extern "C" {
             fn objc_getClass(name: *const libc::c_char) -> *mut libc::c_void;
             fn sel_registerName(name: *const libc::c_char) -> *const libc::c_void;
-            #[allow(improper_ctypes)]
-            fn objc_msgSend(recv: *mut libc::c_void, sel: *const libc::c_void, ...) -> usize;
+            // Non-variadic declaration: `thermalState` and `processInfo` take no
+            // arguments beyond (receiver, selector). Using the variadic form
+            // (`...`) is unsound on ARM64 because `objc_msgSend` does NOT follow
+            // the standard C variadic ABI on Apple Silicon.
+            fn objc_msgSend(recv: *mut libc::c_void, sel: *const libc::c_void) -> usize;
         }
         unsafe {
             let cls = objc_getClass(c"NSProcessInfo".as_ptr().cast());
@@ -237,7 +240,10 @@ mod tests {
         assert!(
             matches!(
                 state,
-                ThermalState::Nominal | ThermalState::Fair | ThermalState::Serious | ThermalState::Critical
+                ThermalState::Nominal
+                    | ThermalState::Fair
+                    | ThermalState::Serious
+                    | ThermalState::Critical
             ),
             "unexpected thermal state: {state:?}"
         );

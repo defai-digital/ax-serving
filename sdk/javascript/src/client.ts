@@ -47,24 +47,33 @@ export class AxServingClient {
     input: unknown,
   ): AsyncGenerator<ChatCompletionResponse, void, unknown> {
     const req = ChatCompletionRequestSchema.parse(input);
-    const response = await this.fetchImpl(`${this.baseURL}/v1/chat/completions`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ ...req, stream: true }),
-    });
-    if (!response.ok) {
-      throw await this.buildHttpError(response);
-    }
-    if (!response.body) {
-      throw new Error("stream response has no body");
-    }
-
-    for await (const chunk of parseSseData(response.body)) {
-      if (chunk === "[DONE]") {
-        return;
+    const controller = new AbortController();
+    try {
+      const response = await this.fetchImpl(
+        `${this.baseURL}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify({ ...req, stream: true }),
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        throw await this.buildHttpError(response);
       }
-      const parsed = parseJsonSafe(chunk);
-      yield ChatCompletionResponseSchema.parse(parsed);
+      if (!response.body) {
+        throw new Error("stream response has no body");
+      }
+
+      for await (const chunk of parseSseData(response.body)) {
+        if (chunk === "[DONE]") {
+          return;
+        }
+        const parsed = parseJsonSafe(chunk);
+        yield ChatCompletionResponseSchema.parse(parsed);
+      }
+    } finally {
+      controller.abort();
     }
   }
 
@@ -117,25 +126,29 @@ async function* parseSseData(
   const reader = stream.getReader();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      if (buffer.length > 0) {
-        const tail = collectSsePayloads(buffer, true);
-        for (const payload of tail.payloads) {
-          yield payload;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        if (buffer.length > 0) {
+          const tail = collectSsePayloads(buffer, true);
+          for (const payload of tail.payloads) {
+            yield payload;
+          }
         }
+        break;
       }
-      break;
-    }
 
-    buffer += decoder.decode(value, { stream: true });
-    const { remainder, payloads } = collectSsePayloads(buffer, false);
-    buffer = remainder;
-    for (const payload of payloads) {
-      yield payload;
+      buffer += decoder.decode(value, { stream: true });
+      const { remainder, payloads } = collectSsePayloads(buffer, false);
+      buffer = remainder;
+      for (const payload of payloads) {
+        yield payload;
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
 }
 

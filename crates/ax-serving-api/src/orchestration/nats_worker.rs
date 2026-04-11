@@ -176,7 +176,10 @@ async fn run_model_loop(
         worker_id.as_str(),
         model_id.replace(['.', '/'], "-")
     );
-    let filter_subject = format!("axs.requests.{}", model_id);
+    let filter_subject = format!(
+        "axs.requests.{}",
+        super::nats::sanitize_subject_component(&model_id)
+    );
 
     // Get the stream so we can attach a pull consumer.
     let stream = match jetstream.get_stream(config.stream_name.as_str()).await {

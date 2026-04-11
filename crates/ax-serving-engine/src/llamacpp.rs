@@ -387,6 +387,8 @@ struct LlamaCppProcess {
     breaker: Arc<CircuitBreaker>,
     /// EOS token ID queried from the model at load time.
     eos_token: u32,
+    /// BOS token ID queried from the model at load time.
+    bos_token: u32,
 }
 
 impl Drop for LlamaCppProcess {
@@ -648,8 +650,8 @@ impl InferenceBackend for LlamaCppBackend {
         let mut last_err = None;
         let (port, child) = 'retry: {
             for attempt in 0..PORT_RETRY_LIMIT {
-                let port = find_free_port()
-                    .context("failed to find free TCP port for llama-server")?;
+                let port =
+                    find_free_port().context("failed to find free TCP port for llama-server")?;
                 info!(
                     "spawning llama-server for {} on port {} (attempt {})",
                     path.display(),
@@ -664,11 +666,9 @@ impl InferenceBackend for LlamaCppBackend {
                     }
                 }
             }
-            return Err(
-                last_err
-                    .unwrap()
-                    .context(format!("spawning llama-server for {}", path.display())),
-            );
+            return Err(last_err
+                .unwrap()
+                .context(format!("spawning llama-server for {}", path.display())));
         };
 
         Self::wait_ready(
@@ -700,20 +700,30 @@ impl InferenceBackend for LlamaCppBackend {
         );
         let handle = next_llamacpp_handle();
 
-        // Query the actual EOS token from the llama-server /props endpoint.
-        let eos_token = self
+        // Query the actual EOS and BOS tokens from the llama-server /props endpoint.
+        let props = self
             .http
             .get(format!("http://{LLAMACPP_LOCAL_HOST}:{port}/props"))
             .timeout(Duration::from_secs(5))
             .send()
             .ok()
-            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|r| r.json::<serde_json::Value>().ok());
+        let eos_token = props
+            .as_ref()
             .and_then(|v| {
                 v["default_generation_settings"]["eos_token_id"]
                     .as_u64()
                     .or_else(|| v["eos_token_id"].as_u64())
             })
             .unwrap_or(2) as u32;
+        let bos_token = props
+            .as_ref()
+            .and_then(|v| {
+                v["default_generation_settings"]["bos_token_id"]
+                    .as_u64()
+                    .or_else(|| v["bos_token_id"].as_u64())
+            })
+            .unwrap_or(1) as u32;
 
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
         let child_arc = Arc::new(Mutex::new(Some(child)));
@@ -789,6 +799,7 @@ impl InferenceBackend for LlamaCppBackend {
                 poller: Some(poller),
                 breaker,
                 eos_token,
+                bos_token,
             },
         );
 
@@ -1002,6 +1013,14 @@ impl InferenceBackend for LlamaCppBackend {
             .get(&handle)
             .ok_or_else(|| anyhow::anyhow!("unknown model handle {:?}", handle))?;
         Ok(vec![proc.eos_token])
+    }
+
+    fn bos_token(&self, handle: ModelHandle) -> Result<u32> {
+        let guard = self.models_read();
+        let proc = guard
+            .get(&handle)
+            .ok_or_else(|| anyhow::anyhow!("unknown model handle {:?}", handle))?;
+        Ok(proc.bos_token)
     }
 
     fn embed(
@@ -2075,10 +2094,9 @@ fn stream_chat_completions(
 
 /// Generate a simple unique ID without pulling in uuid (use timestamp + counter).
 fn uuid_simple() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}{:08x}", unix_ms_now(), n)
+    format!("{:016x}{:08x}{:08x}", unix_ms_now(), std::process::id(), n)
 }
 
 /// Build `ModelMetadata` from GGUF header data + the running server's `/props`.

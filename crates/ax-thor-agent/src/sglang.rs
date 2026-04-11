@@ -1,16 +1,4 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct ModelList {
-    #[serde(default)]
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    id: String,
-}
 
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
     const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -37,7 +25,23 @@ pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result
     }
 }
 
+/// Model information returned from the runtime.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub max_model_len: Option<u32>,
+}
+
 pub async fn get_loaded_models(client: &reqwest::Client, base_url: &str) -> Result<Vec<String>> {
+    let info = get_model_info(client, base_url).await?;
+    Ok(info.into_iter().map(|m| m.id).collect())
+}
+
+/// Query the runtime for loaded models and available metadata.
+///
+/// Parses optional `max_model_len` from the response (sglang and vLLM both
+/// include this field when available).
+pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<Vec<ModelInfo>> {
     let url = format!("{base_url}/v1/models");
     let resp = client
         .get(&url)
@@ -46,9 +50,25 @@ pub async fn get_loaded_models(client: &reqwest::Client, base_url: &str) -> Resu
         .context("failed to fetch sglang model list")?
         .error_for_status()
         .context("sglang returned error status for /v1/models")?;
-    let models: ModelList = resp
+    let raw: serde_json::Value = resp
         .json()
         .await
         .context("failed to parse sglang /v1/models response")?;
-    Ok(models.data.into_iter().map(|m| m.id).collect())
+    let entries = raw["data"].as_array().cloned().unwrap_or_default();
+    let mut models = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(id) = entry["id"].as_str() {
+            let max_model_len = entry["max_model_len"]
+                .as_u64()
+                .or_else(|| entry["context_length"].as_u64())
+                .map(|v| v as u32);
+            models.push(ModelInfo {
+                id: id.to_string(),
+                max_model_len,
+            });
+        } else {
+            tracing::warn!("sglang /v1/models entry missing 'id' field, skipping: {entry}");
+        }
+    }
+    Ok(models)
 }

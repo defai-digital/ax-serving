@@ -266,6 +266,11 @@ impl DirectDispatcher {
                     warn!(%url, status = r.status().as_u16(), "worker returned 5xx, rerouting")
                 }
             }
+            // Drain the error response body so the connection can be reused
+            // from the pool instead of being discarded.
+            if let Ok(resp) = result {
+                let _ = resp.bytes().await;
+            }
             drop(guard);
             registry.mark_unhealthy(selected_id);
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
@@ -387,6 +392,10 @@ impl DirectDispatcher {
                 Ok(r) => {
                     warn!(%url2, status = r.status().as_u16(), "reroute worker also returned 5xx")
                 }
+            }
+            // Drain the error response body so the connection can be reused.
+            if let Ok(resp) = result2 {
+                let _ = resp.bytes().await;
             }
             registry.mark_unhealthy(selected2_id);
             return trace_response(

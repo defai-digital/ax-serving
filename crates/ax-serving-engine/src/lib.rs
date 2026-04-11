@@ -28,14 +28,25 @@ pub mod thermal;
 
 use std::path::Path;
 
-pub use ax_engine_core::metrics::current_rss_bytes;
 pub use ax_engine::AxEngineBackend;
+pub use ax_engine_core::metrics::current_rss_bytes;
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
 pub use mlx::{MlxBackend, MlxConfig, is_mlx_model};
 pub use routing::{BackendChoice, RouterBackend, RoutingConfig};
 pub use thermal::{ThermalMonitor, ThermalState};
+
+const DEFAULT_STREAM_TOKEN_BATCH_SIZE: usize = 4;
+const MAX_STREAM_TOKEN_BATCH_SIZE: usize = 32;
+
+pub(crate) fn stream_token_batch_size() -> usize {
+    std::env::var("AXS_STREAM_TOKEN_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
+        .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -381,6 +392,18 @@ pub trait InferenceBackend: Send + Sync {
 
     /// Returns the EOS token IDs for the loaded model.
     fn eos_tokens(&self, handle: ModelHandle) -> anyhow::Result<Vec<u32>>;
+
+    /// Returns the BOS (beginning-of-sequence) token ID for the loaded model.
+    ///
+    /// Default falls back to tokenizing an empty string with `add_bos=true`,
+    /// which is unreliable for some tokenizers. Backends that can query BOS
+    /// from model metadata or FFI should override this.
+    fn bos_token(&self, handle: ModelHandle) -> anyhow::Result<u32> {
+        self.tokenize(handle, "", true)?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer returned empty result for BOS probe"))
+    }
 
     /// Current thermal state (affects concurrency recommendations).
     fn thermal_state(&self) -> ThermalState;

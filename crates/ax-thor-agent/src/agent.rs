@@ -83,15 +83,31 @@ impl Default for SharedRuntime {
 }
 
 pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
-    let models = sglang::get_loaded_models(client, &config.sglang_url).await?;
+    let model_info = sglang::get_model_info(client, &config.sglang_url).await?;
+    let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
+
+    // BUG-114: derive capabilities from config overrides or runtime metadata
+    // instead of hardcoding them.
+    let max_context: serde_json::Value = config
+        .max_context
+        .or_else(|| {
+            // Use the max context from any loaded model as a best-effort default.
+            model_info.iter().filter_map(|m| m.max_model_len).max()
+        })
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+
+    let embedding = config.embedding.unwrap_or(false);
+    let vision = config.vision.unwrap_or(false);
+
     let body = json!({
         "addr": config.advertised_addr.to_string(),
         "capabilities": {
             "llm": true,
-            "embedding": true,
-            "vision": false,
+            "embedding": embedding,
+            "vision": vision,
             "models": models,
-            "max_context": serde_json::Value::Null
+            "max_context": max_context
         },
         "backend": "sglang",
         "max_inflight": config.max_inflight,

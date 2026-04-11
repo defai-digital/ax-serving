@@ -1,8 +1,10 @@
 //! Inference route handlers: chat completions, text completions, embeddings.
 
 use std::convert::Infallible;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::UNIX_EPOCH;
 
 use ax_serving_engine::{ChatMessage, GenerateEvent, GenerateInput};
 use axum::Json;
@@ -25,7 +27,9 @@ use crate::ServingLayer;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
 use crate::project_policy;
 use crate::scheduler::SchedulerPermit;
-use crate::utils::request_meta::{estimate_chat_prompt_tokens_u64, estimate_text_prompt_tokens_u64};
+use crate::utils::request_meta::{
+    estimate_chat_prompt_tokens_u64, estimate_text_prompt_tokens_u64,
+};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::routes::{
@@ -190,11 +194,26 @@ pub(crate) struct NormalizedMessage {
     content: String,
 }
 
-/// Cache key payload (v2).
+fn model_cache_fingerprint(path: &Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("size={};mtime_ns={modified_ns}", metadata.len())
+}
+
+/// Cache key payload.
 ///
 /// # Normalization rules
-/// - `requested_model_id` is dropped: the resolved path already uniquely
-///   identifies the weights, so model-alias changes no longer bust the cache.
+/// - `requested_model_id` is dropped: the resolved path already identifies the
+///   loaded model, so model-alias changes no longer bust the cache.
+/// - `model_fingerprint` includes file metadata so cache entries invalidate
+///   when weights are replaced in place at the same path.
 /// - `messages`: role lowercased, content trimmed (leading/trailing whitespace).
 /// - Floating-point params serialized with 4-decimal precision to absorb f32
 ///   representation noise (`0.6999999` and `0.7` both become `"0.7000"`).
@@ -202,6 +221,7 @@ pub(crate) struct NormalizedMessage {
 pub(crate) struct CacheKeyPayload<'a> {
     version: &'static str,
     resolved_model_path: &'a str,
+    model_fingerprint: String,
     resolved_model_arch: &'a str,
     messages: Vec<NormalizedMessage>,
     temperature: String,
@@ -236,6 +256,7 @@ pub(crate) fn build_cache_key(
     resolved_model_arch: &str,
     effective_max_tokens: Option<u32>,
 ) -> anyhow::Result<Vec<u8>> {
+    let model_fingerprint = model_cache_fingerprint(Path::new(resolved_model_path));
     let messages = req
         .messages
         .iter()
@@ -246,8 +267,9 @@ pub(crate) fn build_cache_key(
         .collect();
 
     let payload = CacheKeyPayload {
-        version: "v3",
+        version: "v4",
         resolved_model_path,
+        model_fingerprint,
         resolved_model_arch,
         messages,
         temperature: format!("{:.4}", req.temperature),
@@ -285,6 +307,7 @@ pub(crate) struct TextCacheKeyPayload<'a> {
     version: &'static str,
     kind: &'static str,
     resolved_model_path: &'a str,
+    model_fingerprint: String,
     resolved_model_arch: &'a str,
     prompt: &'a str,
     temperature: String,
@@ -313,10 +336,12 @@ pub(crate) fn build_text_cache_key(
     resolved_model_arch: &str,
     effective_max_tokens: Option<u32>,
 ) -> anyhow::Result<Vec<u8>> {
+    let model_fingerprint = model_cache_fingerprint(Path::new(resolved_model_path));
     let payload = TextCacheKeyPayload {
-        version: "v2",
+        version: "v3",
         kind: "text_completion",
         resolved_model_path,
+        model_fingerprint,
         resolved_model_arch,
         prompt: req.prompt.trim(),
         temperature: format!("{:.4}", req.temperature),
@@ -928,10 +953,13 @@ fn stream_response(
                                     "{\"error\":\"serialization failure\"}".to_string()
                                 }),
                             );
+                            // Transition to phase 1 (not 2) so the next
+                            // iteration emits the `data: [DONE]` sentinel
+                            // required by the OpenAI SSE protocol.
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
                                     metrics,
                                 ),
                             ))
@@ -1625,10 +1653,13 @@ fn text_stream_response(
                                     "{\"error\":\"serialization failure\"}".to_string()
                                 }),
                             );
+                            // Transition to phase 1 (not 2) so the next
+                            // iteration emits the `data: [DONE]` sentinel
+                            // required by the OpenAI SSE protocol.
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 2, false, None, None, logprobs, None,
+                                    rx, id, model, created, 1, false, None, None, logprobs, None,
                                     metrics,
                                 ),
                             ))

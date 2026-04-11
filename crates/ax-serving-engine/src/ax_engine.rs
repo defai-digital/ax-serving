@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::{
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -26,19 +26,9 @@ use crate::{
 };
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(8_000_000);
-const DEFAULT_STREAM_TOKEN_BATCH_SIZE: usize = 4;
-const MAX_STREAM_TOKEN_BATCH_SIZE: usize = 32;
 
 fn next_handle() -> ModelHandle {
     ModelHandle(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed))
-}
-
-fn stream_token_batch_size() -> usize {
-    std::env::var("AXS_STREAM_TOKEN_BATCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
-        .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
 }
 
 fn flush_stream_token_batch(
@@ -85,12 +75,12 @@ struct LoadedModel {
     model: InferenceModel,
     metadata: ModelMetadata,
     render_architecture: String,
+    inference_lock: Mutex<()>,
 }
 
-// SAFETY: LoadedModel is immutable after load. Per-request mutable state lives
-// in fresh KV caches and sampler/history buffers, not in the loaded model.
-// `MappedModel` is read-only mmap-backed data, `Tokenizer` is immutable, and
-// `InferenceModel` methods take `&self` and operate on caller-owned buffers.
+// SAFETY: Access to `InferenceModel` is serialized by `inference_lock`, so the
+// backend never performs concurrent calls into the loaded model object. The
+// remaining fields are immutable after load.
 unsafe impl Send for LoadedModel {}
 unsafe impl Sync for LoadedModel {}
 
@@ -418,6 +408,10 @@ fn run_generate(
     tx: tokio::sync::mpsc::Sender<GenerateEvent>,
 ) -> Result<()> {
     ensure_supported_generation_params(&params)?;
+    let _model_guard = loaded.inference_lock.lock().unwrap_or_else(|err| {
+        warn!("ax-engine inference lock poisoned; recovering from poisoned state");
+        err.into_inner()
+    });
 
     let prompt = match input {
         GenerateInput::Tokens(tokens) => tokens,
@@ -497,7 +491,7 @@ fn run_generate(
     let mut generated_tokens = 0usize;
     let mut stop_buffer = String::new();
     let mut stopped_on_stop_sequence = false;
-    let stream_batch_size = stream_token_batch_size();
+    let stream_batch_size = crate::stream_token_batch_size();
     let mut first_stream_chunk_sent = false;
     let mut stream_token_buffer = String::new();
     let mut buffered_stream_tokens = 0usize;
@@ -535,11 +529,7 @@ fn run_generate(
                     && tx
                         .blocking_send(GenerateEvent::TokenLogprob {
                             logprob: info.logprob,
-                            top: sample_top_logprobs_text(
-                                &loaded.tokenizer,
-                                info,
-                                top_logprobs,
-                            ),
+                            top: sample_top_logprobs_text(&loaded.tokenizer, info, top_logprobs),
                         })
                         .is_err()
                 {
@@ -745,6 +735,7 @@ impl InferenceBackend for AxEngineBackend {
             model,
             metadata: metadata.clone(),
             render_architecture,
+            inference_lock: Mutex::new(()),
         });
         self.models_write().insert(handle, loaded);
 
@@ -813,6 +804,10 @@ impl InferenceBackend for AxEngineBackend {
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<u32> {
         anyhow::ensure!(!tokens.is_empty(), "eval_tokens: empty input");
         let loaded = self.get_model(handle)?;
+        let _model_guard = loaded.inference_lock.lock().unwrap_or_else(|err| {
+            warn!("ax-engine inference lock poisoned during eval; recovering");
+            err.into_inner()
+        });
         let weights = WeightStore::new(&loaded.mapped);
         let mut kv = loaded.model.create_model_kv();
         let mut logits = vec![0.0f32; loaded.metadata.vocab_size as usize];

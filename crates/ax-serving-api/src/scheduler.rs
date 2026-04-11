@@ -553,19 +553,45 @@ impl Scheduler {
             });
         }
 
-        // Slow path: all slots busy — check queue capacity.
-        let queue_len = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
-        if queue_len >= self.config.max_queue as i64 {
-            if self.config.overload_policy == OverloadPolicy::ShedOldest {
-                // Evict the oldest waiter to make room for the incoming request.
-                let oldest = self.shed_waiters.lock().unwrap().pop_front();
-                if let Some(tx) = oldest {
-                    // Signal the victim — its select! branch will fire and return Shed.
-                    let _ = tx.send(());
-                    self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
-                    // queue_depth stays the same: oldest leaves, new request enters.
+        // Slow path: all slots busy — register waiter and check queue capacity
+        // atomically under the shed_waiters lock to prevent TOCTOU races where a
+        // request claims a queue slot but isn't yet visible to shed_oldest eviction.
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let queue_len = {
+            let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
+            // Register *before* checking capacity so this request is visible to
+            // concurrent shed_oldest callers from the moment it claims a slot.
+            waiters.push_back(cancel_tx);
+            let queue_len = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
+            if queue_len >= self.config.max_queue as i64 {
+                if self.config.overload_policy == OverloadPolicy::ShedOldest {
+                    // Evict the oldest waiter to make room for the incoming request.
+                    // We need len > 1 so pop_front returns someone *other* than us
+                    // (we just pushed to the back).
+                    if waiters.len() > 1 {
+                        if let Some(tx) = waiters.pop_front() {
+                            // Signal the victim — its select! branch will fire and return Shed.
+                            let _ = tx.send(());
+                            self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
+                            // queue_depth stays the same: oldest leaves, new request enters.
+                        }
+                    } else {
+                        // We are the only waiter (max_queue=0 or all others already
+                        // drained) — cannot shed ourselves; reject instead.
+                        waiters.pop_back(); // remove ourselves
+                        self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
+                        self.metrics
+                            .rejected_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(SchedulerError::QueueFull {
+                            waiting: queue_len,
+                            max: self.config.max_queue,
+                        }
+                        .into());
+                    }
                 } else {
-                    // Queue was empty despite being "full" (max_queue=0) — nothing to shed.
+                    // Queue policy: reject immediately. Remove the waiter we just pushed.
+                    waiters.pop_back();
                     self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
                     self.metrics
                         .rejected_requests
@@ -576,42 +602,27 @@ impl Scheduler {
                     }
                     .into());
                 }
-            } else {
-                self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
-                self.metrics
-                    .rejected_requests
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(SchedulerError::QueueFull {
-                    waiting: queue_len,
-                    max: self.config.max_queue,
-                }
-                .into());
             }
-        }
+            queue_len
+        };
+        let _ = queue_len;
 
         // Count requests that actually enter the wait queue (used as denominator
         // for avg_queue_wait_us — fast-path requests must not pollute this count).
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Register a cancellation channel for shed_oldest eviction.
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        self.shed_waiters.lock().unwrap().push_back(cancel_tx);
-
         // Wait for a slot with bounded timeout, racing against shed cancellation.
         let sem = Arc::clone(&self.semaphore);
-        let result = tokio::time::timeout(
-            Duration::from_millis(self.config.max_wait_ms),
-            async {
-                tokio::select! {
-                    biased;
-                    _ = cancel_rx => Err(SchedulerError::Shed),
-                    permit = sem.acquire_owned() => match permit {
-                        Ok(p) => Ok(p),
-                        Err(_) => Err(SchedulerError::ShuttingDown),
-                    },
-                }
-            },
-        )
+        let result = tokio::time::timeout(Duration::from_millis(self.config.max_wait_ms), async {
+            tokio::select! {
+                biased;
+                _ = cancel_rx => Err(SchedulerError::Shed),
+                permit = sem.acquire_owned() => match permit {
+                    Ok(p) => Ok(p),
+                    Err(_) => Err(SchedulerError::ShuttingDown),
+                },
+            }
+        })
         .await;
 
         self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
@@ -716,9 +727,10 @@ impl Scheduler {
         let mut permit = self.acquire().await?;
         if tokens > 0 && self.split_enabled {
             permit.estimated_prompt_tokens = tokens;
+            let clamped = tokens.min(i64::MAX as u64) as i64;
             self.metrics
                 .prefill_tokens_active
-                .fetch_add(tokens as i64, Ordering::Relaxed);
+                .fetch_add(clamped, Ordering::Relaxed);
         }
         Ok(permit)
     }
@@ -729,7 +741,7 @@ impl Scheduler {
 
     /// Remove closed/consumed senders from the shed waiter deque.
     fn cleanup_shed_waiters(&self) {
-        let mut waiters = self.shed_waiters.lock().unwrap();
+        let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
         waiters.retain(|tx| !tx.is_closed());
     }
 }
@@ -773,9 +785,10 @@ impl SchedulerPermit {
             .record_ttft(self.arrived_at.elapsed().as_micros() as u64);
         // WS2: on first token, transition from prefill to decode phase.
         if self.estimated_prompt_tokens > 0 {
-            self.metrics
-                .prefill_tokens_active
-                .fetch_sub(self.estimated_prompt_tokens as i64, Ordering::Relaxed);
+            self.metrics.prefill_tokens_active.fetch_sub(
+                self.estimated_prompt_tokens.min(i64::MAX as u64) as i64,
+                Ordering::Relaxed,
+            );
             self.metrics
                 .decode_sequences_active
                 .fetch_add(1, Ordering::Relaxed);
@@ -800,9 +813,10 @@ impl Drop for SchedulerPermit {
                     .fetch_sub(1, Ordering::Relaxed);
             } else {
                 // Non-streaming or error: never transitioned, still in prefill.
-                self.metrics
-                    .prefill_tokens_active
-                    .fetch_sub(self.estimated_prompt_tokens as i64, Ordering::Relaxed);
+                self.metrics.prefill_tokens_active.fetch_sub(
+                    self.estimated_prompt_tokens.min(i64::MAX as u64) as i64,
+                    Ordering::Relaxed,
+                );
             }
         }
     }

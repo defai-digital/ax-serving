@@ -189,11 +189,14 @@ impl DispatchPolicy for WeightedRoundRobinPolicy {
 /// # Affinity tracking
 ///
 /// The dispatcher calls `record_dispatch(worker_id, model_id)` after each
-/// successful dispatch.  Affinity entries for workers no longer in the
-/// eligible set are pruned lazily on each `select` call.
+/// successful dispatch. Each worker keeps a bounded LRU of recently-served
+/// model IDs, and entries for workers no longer in the eligible set are pruned
+/// lazily on each `select` call.
+const MODEL_AFFINITY_LRU_CAPACITY: usize = 64;
+
 pub struct ModelAffinityPolicy {
-    /// `worker_id -> (model_id -> dispatch count)`
-    affinity: Mutex<HashMap<WorkerId, HashMap<String, u64>>>,
+    /// `worker_id -> recently served model IDs`, newest at the back.
+    affinity: Mutex<HashMap<WorkerId, VecDeque<String>>>,
 }
 
 impl ModelAffinityPolicy {
@@ -203,7 +206,7 @@ impl ModelAffinityPolicy {
         }
     }
 
-    fn affinity_lock(&self) -> std::sync::MutexGuard<'_, HashMap<WorkerId, HashMap<String, u64>>> {
+    fn affinity_lock(&self) -> std::sync::MutexGuard<'_, HashMap<WorkerId, VecDeque<String>>> {
         match self.affinity.lock() {
             Ok(guard) => guard,
             Err(err) => {
@@ -249,10 +252,7 @@ impl DispatchPolicy for ModelAffinityPolicy {
             w.inflight < w.max_inflight
                 && map
                     .get(&w.id)
-                    .and_then(|models| models.get(ctx.model_id))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
+                    .is_some_and(|models| models.iter().any(|model| model == ctx.model_id))
         });
 
         if !has_affinity_match {
@@ -264,10 +264,7 @@ impl DispatchPolicy for ModelAffinityPolicy {
                 w.inflight < w.max_inflight
                     && map
                         .get(&w.id)
-                        .and_then(|models| models.get(ctx.model_id))
-                        .copied()
-                        .unwrap_or(0)
-                        > 0
+                        .is_some_and(|models| models.iter().any(|model| model == ctx.model_id))
             }))
         }
     }
@@ -275,7 +272,13 @@ impl DispatchPolicy for ModelAffinityPolicy {
     fn record_dispatch(&self, worker_id: WorkerId, model_id: &str) {
         let mut map = self.affinity_lock();
         let models = map.entry(worker_id).or_default();
-        *models.entry(model_id.to_string()).or_insert(0) += 1;
+        if let Some(pos) = models.iter().position(|existing| existing == model_id) {
+            models.remove(pos);
+        }
+        models.push_back(model_id.to_string());
+        if models.len() > MODEL_AFFINITY_LRU_CAPACITY {
+            models.pop_front();
+        }
     }
 }
 
@@ -748,6 +751,23 @@ mod tests {
         // Affinity map should no longer contain gone worker.
         let map = policy.affinity_lock();
         assert!(!map.contains_key(&gone.id));
+    }
+
+    #[test]
+    fn affinity_lru_is_bounded_per_worker() {
+        let policy = ModelAffinityPolicy::new();
+        let worker = make_worker(0, 4);
+        for i in 0..(MODEL_AFFINITY_LRU_CAPACITY + 1) {
+            policy.record_dispatch(worker.id, &format!("m{i}"));
+        }
+
+        let map = policy.affinity_lock();
+        let models = map.get(&worker.id).unwrap();
+        assert_eq!(models.len(), MODEL_AFFINITY_LRU_CAPACITY);
+        assert!(
+            !models.iter().any(|model| model == "m0"),
+            "oldest model should be evicted once the LRU reaches capacity"
+        );
     }
 
     // ── policy_from_str ───────────────────────────────────────────────────────

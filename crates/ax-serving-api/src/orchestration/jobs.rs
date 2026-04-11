@@ -9,6 +9,23 @@ use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 const RESTART_INTERRUPTED_ERROR: &str = "job interrupted by orchestrator restart before completion";
+const DEFAULT_COMPLETED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_MAX_COMPLETED_JOBS: usize = 1_000;
+
+fn completed_job_ttl_ms() -> u64 {
+    std::env::var("AXS_JOB_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COMPLETED_JOB_TTL_SECS)
+        .saturating_mul(1_000)
+}
+
+fn max_completed_jobs() -> usize {
+    std::env::var("AXS_JOB_MAX_COMPLETED")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_COMPLETED_JOBS)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -357,6 +374,7 @@ impl JobStore {
             entry.result = result;
             entry.error = error;
         }
+        self.prune_completed(completed_job_ttl_ms(), max_completed_jobs());
     }
 
     pub fn persist_to_path(&self, path: &Path) -> anyhow::Result<()> {
@@ -471,9 +489,13 @@ fn normalize_restored_job_record(record: &mut JobRecord, restored_at_ms: u128) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{
         JobRecord, JobStatus, JobStore, PersistedJobStoreState, RESTART_INTERRUPTED_ERROR,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── basic CRUD ────────────────────────────────────────────────────────────
 
@@ -790,6 +812,29 @@ mod tests {
         assert!(store.get(&newest.id).is_some());
         assert_eq!(store.summary().total_jobs, 2);
         assert_eq!(store.summary().pruned_total, 1);
+    }
+
+    #[test]
+    fn mark_finished_auto_prunes_completed_jobs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AXS_JOB_TTL_SECS", "3600") };
+        unsafe { std::env::set_var("AXS_JOB_MAX_COMPLETED", "2") };
+
+        let store = JobStore::default();
+        let oldest = store.create("completions", Some("m1".into()), None);
+        store.mark_finished(&oldest.id, JobStatus::Succeeded, 200, None, None, None);
+        let middle = store.create("completions", Some("m2".into()), None);
+        store.mark_finished(&middle.id, JobStatus::Succeeded, 200, None, None, None);
+        let newest = store.create("completions", Some("m3".into()), None);
+        store.mark_finished(&newest.id, JobStatus::Succeeded, 200, None, None, None);
+
+        assert!(store.get(&oldest.id).is_none());
+        assert!(store.get(&middle.id).is_some());
+        assert!(store.get(&newest.id).is_some());
+        assert_eq!(store.summary().pruned_total, 1);
+
+        unsafe { std::env::remove_var("AXS_JOB_TTL_SECS") };
+        unsafe { std::env::remove_var("AXS_JOB_MAX_COMPLETED") };
     }
 
     #[test]
