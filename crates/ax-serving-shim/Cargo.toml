@@ -18,3 +18,6 @@ libc = "0.2"
 [build-dependencies]
 # cbindgen generates llama.h from this crate's extern "C" symbols
 # Run: cbindgen --config cbindgen.toml --crate ax-serving-shim --output llama.h
+
+[dev-dependencies]
+tokio = { workspace = true }

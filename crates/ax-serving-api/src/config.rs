@@ -412,6 +412,9 @@ impl ServeConfig {
         if self.orchestrator.global_queue_max == 0 {
             anyhow::bail!("global_queue_max must be > 0");
         }
+        if self.orchestrator.global_queue_wait_ms == 0 {
+            anyhow::bail!("global_queue_wait_ms must be > 0");
+        }
         const VALID_DISPATCH: &[&str] = &[
             "least_inflight",
             "weighted_round_robin",
@@ -633,7 +636,7 @@ impl ServeConfig {
             self.orchestrator.global_queue_depth = n.max(1);
         }
         if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS") {
-            self.orchestrator.global_queue_wait_ms = ms;
+            self.orchestrator.global_queue_wait_ms = ms.max(1);
         }
         if let Some(v) = env_str("AXS_GLOBAL_QUEUE_POLICY") {
             self.orchestrator.global_queue_policy = v;
@@ -1066,6 +1069,23 @@ mod tests {
         let mut cfg = valid_cfg();
         cfg.orchestrator.request_timeout_secs = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_global_queue_wait_ms() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.global_queue_wait_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("global_queue_wait_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn from_env_clamps_global_queue_wait_ms_to_one() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "0") };
+        let cfg = ServeConfig::from_env();
+        unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
+        assert_eq!(cfg.orchestrator.global_queue_wait_ms, 1);
     }
 
     #[test]

@@ -541,7 +541,20 @@ impl Scheduler {
         if current_inflight < effective_limit as i64
             && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned()
         {
-            self.metrics.inflight_count.fetch_add(1, Ordering::Relaxed);
+            let effective_limit_now = self
+                .thermal
+                .recommended_concurrency()
+                .min(self.effective_inflight_limit()) as i64;
+            if !self.try_claim_inflight_slot(effective_limit_now) {
+                drop(permit);
+                self.metrics
+                    .rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SchedulerError::Throttled {
+                    cap: effective_limit_now,
+                }
+                .into());
+            }
             return Ok(SchedulerPermit {
                 _permit: permit,
                 metrics: Arc::clone(&self.metrics),
@@ -680,7 +693,7 @@ impl Scheduler {
             .thermal
             .recommended_concurrency()
             .min(self.effective_inflight_limit()) as i64;
-        if self.metrics.inflight_count.load(Ordering::Relaxed) >= effective_limit_now {
+        if !self.try_claim_inflight_slot(effective_limit_now) {
             drop(permit);
             // Record actual wait (request did spend time in the queue before being throttled).
             let wait_us = arrived_at.elapsed().as_micros() as u64;
@@ -702,8 +715,6 @@ impl Scheduler {
             .queue_wait_us_total
             .fetch_add(queue_wait_us, Ordering::Relaxed);
         self.metrics.record_queue_wait(queue_wait_us);
-        self.metrics.inflight_count.fetch_add(1, Ordering::Relaxed);
-
         Ok(SchedulerPermit {
             _permit: permit,
             metrics: Arc::clone(&self.metrics),
@@ -713,6 +724,24 @@ impl Scheduler {
             estimated_prompt_tokens: 0,
             ttft_fired: AtomicBool::new(false),
         })
+    }
+
+    fn try_claim_inflight_slot(&self, limit: i64) -> bool {
+        let mut current = self.metrics.inflight_count.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.metrics.inflight_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Acquire a permit and set the estimated prompt token count for split-scheduler tracking.
@@ -1413,5 +1442,20 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
         assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn try_claim_inflight_slot_respects_limit() {
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 2,
+                max_queue: 2,
+                max_wait_ms: 100,
+                overload_policy: OverloadPolicy::Reject,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+        assert!(s.try_claim_inflight_slot(1));
+        assert!(!s.try_claim_inflight_slot(1));
     }
 }

@@ -50,6 +50,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -163,14 +164,14 @@ impl NatsResponse {
     }
 
     /// The done sentinel that closes a streaming response.
-    pub fn streaming_done(request_id: String, status: u16) -> Self {
+    pub fn streaming_done(request_id: String, status: u16, error: Option<String>) -> Self {
         Self {
             request_id,
             status,
             content_type: "text/event-stream".into(),
             done: true,
             data_hex: None,
-            error: None,
+            error,
         }
     }
 
@@ -455,6 +456,14 @@ impl NatsDispatcher {
                 if !chunk.is_empty() && tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                     break;
                 }
+                if let Some(err_msg) = resp.error.as_deref() {
+                    let payload = serde_json::to_string(&serde_json::json!({ "error": err_msg }))
+                        .unwrap_or_else(|_| "{\"error\":\"serialization failure\"}".to_string());
+                    let sse = format!("event: error\ndata: {payload}\n\n");
+                    if tx.send(Ok(Bytes::from(sse))).await.is_err() {
+                        break;
+                    }
+                }
                 if resp.done {
                     break;
                 }
@@ -470,16 +479,8 @@ impl NatsDispatcher {
 }
 
 pub(super) fn sanitize_subject_component(model_id: &str) -> String {
-    model_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let digest = Sha256::digest(model_id.as_bytes());
+    hex::encode(&digest[..16])
 }
 
 impl std::fmt::Debug for NatsDispatcher {
@@ -497,17 +498,16 @@ mod tests {
 
     #[test]
     fn sanitize_subject_component_preserves_allowed_chars() {
-        assert_eq!(
-            sanitize_subject_component("llama3_8b-instruct"),
-            "llama3_8b-instruct"
-        );
+        let out = sanitize_subject_component("llama3_8b-instruct");
+        assert_eq!(out.len(), 32);
+        assert!(out.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn sanitize_subject_component_replaces_disallowed_chars() {
-        assert_eq!(
-            sanitize_subject_component("org/model.v1:beta"),
-            "org_model_v1_beta"
+    fn sanitize_subject_component_distinguishes_colliding_plaintext_forms() {
+        assert_ne!(
+            sanitize_subject_component("org/model.v1"),
+            sanitize_subject_component("org_model.v1")
         );
     }
 }

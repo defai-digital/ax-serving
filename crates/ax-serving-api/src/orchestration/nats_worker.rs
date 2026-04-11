@@ -87,6 +87,7 @@ impl NatsWorker {
             .context("NatsWorker: failed to get/create JetStream stream")?;
 
         let http_client = Client::builder()
+            .connect_timeout(Duration::from_millis(config.wait_ms.max(1)))
             .pool_max_idle_per_host(4)
             .build()
             .context("NatsWorker: failed to build HTTP client")?;
@@ -174,7 +175,7 @@ async fn run_model_loop(
     let consumer_name = format!(
         "worker-{}-{}",
         worker_id.as_str(),
-        model_id.replace(['.', '/'], "-")
+        super::nats::sanitize_subject_component(&model_id)
     );
     let filter_subject = format!(
         "axs.requests.{}",
@@ -253,8 +254,33 @@ async fn run_model_loop(
                         }
                     };
 
-                    let succeeded =
-                        dispatch_to_local(&http_client, &client, local_addr, &req).await;
+                    if req.model_id != model_id {
+                        warn!(
+                            expected_model = %model_id,
+                            got_model = %req.model_id,
+                            request_id = %req.request_id,
+                            "NatsWorker: request model_id did not match consumer model"
+                        );
+                        publish_error(
+                            &client,
+                            &req,
+                            "worker received request for a different model",
+                        )
+                        .await;
+                        if let Err(e) = msg.ack().await {
+                            warn!(%model_id, %e, "NatsWorker: ack failed for mismatched model");
+                        }
+                        continue;
+                    }
+
+                    let succeeded = dispatch_to_local(
+                        &http_client,
+                        &client,
+                        local_addr,
+                        &req,
+                        Duration::from_millis(config.wait_ms.max(1)),
+                    )
+                    .await;
 
                     if succeeded {
                         if let Err(e) = msg.ack().await {
@@ -286,6 +312,7 @@ async fn dispatch_to_local(
     nats_client: &async_nats::Client,
     local_addr: SocketAddr,
     req: &NatsRequest,
+    request_timeout: Duration,
 ) -> bool {
     let url = format!("http://{}{}", local_addr, req.path);
 
@@ -300,9 +327,25 @@ async fn dispatch_to_local(
     };
 
     if !req.stream {
-        dispatch_non_streaming(http_client, nats_client, &url, req, body_bytes).await
+        dispatch_non_streaming(
+            http_client,
+            nats_client,
+            &url,
+            req,
+            body_bytes,
+            request_timeout,
+        )
+        .await
     } else {
-        dispatch_streaming(http_client, nats_client, &url, req, body_bytes).await
+        dispatch_streaming(
+            http_client,
+            nats_client,
+            &url,
+            req,
+            body_bytes,
+            request_timeout,
+        )
+        .await
     }
 }
 
@@ -326,8 +369,25 @@ async fn dispatch_non_streaming(
     url: &str,
     req: &NatsRequest,
     body_bytes: Vec<u8>,
+    request_timeout: Duration,
 ) -> bool {
-    let result = http_post_json(http_client, url, body_bytes).await;
+    let result = match tokio::time::timeout(
+        request_timeout,
+        http_post_json(http_client, url, body_bytes),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                request_id = %req.request_id,
+                timeout_ms = request_timeout.as_millis(),
+                "NatsWorker: local HTTP request timed out"
+            );
+            publish_error(nats_client, req, "local HTTP request timed out").await;
+            return false;
+        }
+    };
 
     match result {
         Err(e) => {
@@ -344,24 +404,39 @@ async fn dispatch_non_streaming(
                 .unwrap_or("application/json")
                 .to_string();
 
-            match resp.bytes().await {
-                Err(e) => {
-                    warn!(request_id = %req.request_id, %e, "NatsWorker: reading response body failed");
-                    publish_error(nats_client, req, &e.to_string()).await;
+            match tokio::time::timeout(request_timeout, resp.bytes()).await {
+                Err(_) => {
+                    warn!(
+                        request_id = %req.request_id,
+                        timeout_ms = request_timeout.as_millis(),
+                        "NatsWorker: reading response body timed out"
+                    );
+                    publish_error(nats_client, req, "reading local response body timed out").await;
                     false
                 }
-                Ok(body) => {
-                    let payload =
-                        NatsResponse::complete(req.request_id.clone(), status, content_type, &body)
-                            .to_payload();
-                    if let Err(e) = nats_client
-                        .publish(req.reply_subject.clone(), payload)
-                        .await
-                    {
-                        error!(request_id = %req.request_id, %e, "NatsWorker: reply publish failed");
+                Ok(result) => match result {
+                    Err(e) => {
+                        warn!(request_id = %req.request_id, %e, "NatsWorker: reading response body failed");
+                        publish_error(nats_client, req, &e.to_string()).await;
+                        false
                     }
-                    status < 500 // ack on success; nack on 5xx (allows redelivery)
-                }
+                    Ok(body) => {
+                        let payload = NatsResponse::complete(
+                            req.request_id.clone(),
+                            status,
+                            content_type,
+                            &body,
+                        )
+                        .to_payload();
+                        if let Err(e) = nats_client
+                            .publish(req.reply_subject.clone(), payload)
+                            .await
+                        {
+                            error!(request_id = %req.request_id, %e, "NatsWorker: reply publish failed");
+                        }
+                        status < 500 // ack on success; nack on 5xx (allows redelivery)
+                    }
+                },
             }
         }
     }
@@ -373,14 +448,31 @@ async fn dispatch_streaming(
     url: &str,
     req: &NatsRequest,
     body_bytes: Vec<u8>,
+    request_timeout: Duration,
 ) -> bool {
-    let resp = match http_post_json(http_client, url, body_bytes).await {
-        Err(e) => {
-            warn!(request_id = %req.request_id, %e, "NatsWorker: streaming local HTTP failed");
-            publish_error(nats_client, req, &e.to_string()).await;
+    let resp = match tokio::time::timeout(
+        request_timeout,
+        http_post_json(http_client, url, body_bytes),
+    )
+    .await
+    {
+        Err(_) => {
+            warn!(
+                request_id = %req.request_id,
+                timeout_ms = request_timeout.as_millis(),
+                "NatsWorker: streaming local HTTP request timed out"
+            );
+            publish_error(nats_client, req, "streaming local HTTP request timed out").await;
             return false;
         }
-        Ok(r) => r,
+        Ok(result) => match result {
+            Err(e) => {
+                warn!(request_id = %req.request_id, %e, "NatsWorker: streaming local HTTP failed");
+                publish_error(nats_client, req, &e.to_string()).await;
+                return false;
+            }
+            Ok(r) => r,
+        },
     };
 
     let status = resp.status().as_u16();
@@ -429,13 +521,25 @@ async fn dispatch_streaming(
 
     // Stream chunks to the reply subject.
     let mut byte_stream = resp.bytes_stream();
-    while let Some(chunk_result) = byte_stream.next().await {
-        match chunk_result {
-            Err(e) => {
-                warn!(request_id = %req.request_id, %e, "NatsWorker: stream read error");
+    let mut stream_error = None;
+    loop {
+        match tokio::time::timeout(request_timeout, byte_stream.next()).await {
+            Err(_) => {
+                warn!(
+                    request_id = %req.request_id,
+                    timeout_ms = request_timeout.as_millis(),
+                    "NatsWorker: stream read timed out"
+                );
+                stream_error = Some("local stream read timed out".to_string());
                 break;
             }
-            Ok(chunk) => {
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                warn!(request_id = %req.request_id, %e, "NatsWorker: stream read error");
+                stream_error = Some(format!("local stream read failed: {e}"));
+                break;
+            }
+            Ok(Some(Ok(chunk))) => {
                 let payload = NatsResponse::streaming_chunk(req.request_id.clone(), status, &chunk)
                     .to_payload();
                 if let Err(e) = nats_client
@@ -450,7 +554,9 @@ async fn dispatch_streaming(
     }
 
     // Send the done sentinel.
-    let payload = NatsResponse::streaming_done(req.request_id.clone(), status).to_payload();
+    let done_status = if stream_error.is_some() { 502 } else { status };
+    let payload = NatsResponse::streaming_done(req.request_id.clone(), done_status, stream_error)
+        .to_payload();
     let _ = nats_client
         .publish(req.reply_subject.clone(), payload)
         .await;

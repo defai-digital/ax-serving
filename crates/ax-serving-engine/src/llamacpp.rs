@@ -299,15 +299,16 @@ impl CircuitBreaker {
     }
 
     fn trip(&self) {
-        self.state.store(CircuitState::Open as u8, Ordering::SeqCst);
         self.last_opened_ms.store(unix_ms_now(), Ordering::Relaxed);
+        self.state
+            .store(CircuitState::Open as u8, Ordering::Release);
         self.consecutive_generate_failures
             .store(0, Ordering::Relaxed);
     }
 
     fn reset(&self) {
         self.state
-            .store(CircuitState::Closed as u8, Ordering::SeqCst);
+            .store(CircuitState::Closed as u8, Ordering::Release);
         self.consecutive_generate_failures
             .store(0, Ordering::Relaxed);
     }
@@ -849,7 +850,7 @@ impl InferenceBackend for LlamaCppBackend {
             }
 
             // Circuit breaker check.
-            let cb_state = proc.breaker.state.load(Ordering::Relaxed);
+            let cb_state = proc.breaker.state.load(Ordering::Acquire);
             if cb_state == CircuitState::Open as u8 {
                 let opened_ms = proc.breaker.last_opened_ms.load(Ordering::Relaxed);
                 let elapsed_ms = unix_ms_now().saturating_sub(opened_ms);
@@ -871,8 +872,8 @@ impl InferenceBackend for LlamaCppBackend {
                 let _ = proc.breaker.state.compare_exchange(
                     CircuitState::Open as u8,
                     CircuitState::HalfOpen as u8,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
             }
 
@@ -1973,6 +1974,15 @@ fn stream_chat_completions(
             continue;
         };
 
+        // Read usage from any chunk that carries it, including the final
+        // usage-only chunk emitted with empty choices.
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
+            prompt_tokens = n as usize;
+        }
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
+            completion_tokens = n as usize;
+        }
+
         let Some(choice) = val.choices.first() else {
             continue;
         };
@@ -2018,14 +2028,6 @@ fn stream_chat_completions(
             finish_reason == "stop" || finish_reason == "length" || finish_reason == "tool_calls";
         if stopped && !finish_reason.is_empty() {
             stop_reason = finish_reason.to_string();
-        }
-
-        // Read usage from any chunk that carries it.
-        if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
-            prompt_tokens = n as usize;
-        }
-        if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
-            completion_tokens = n as usize;
         }
 
         if (stopped || token_buf.len() >= effective_batch) && !token_buf.is_empty() {

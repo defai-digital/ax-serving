@@ -757,9 +757,18 @@ impl WorkerRegistry {
             };
         }
 
-        // Second pass: remove dead entries.
+        // Second pass: remove only entries that are still stale. This closes the
+        // race where a heartbeat or re-registration refreshes the worker after
+        // the first pass but before removal.
         for id in &evicted {
-            self.inner.remove(id);
+            self.inner.remove_if(id, |_, entry| {
+                let age_ms = entry.last_heartbeat.elapsed().as_millis() as u64;
+                if entry.drain {
+                    age_ms > ttl_ms
+                } else {
+                    age_ms > ttl_ms && matches!(entry.health, WorkerHealth::Dead)
+                }
+            });
         }
 
         evicted

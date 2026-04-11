@@ -460,8 +460,10 @@ pub async fn chat_completions(
     let handle = entry.handle;
     let model_name = req.model.clone();
     let cache_requested = req.cache.unwrap_or(CachePreference::Enable);
-    let cache_active =
-        cache_requested == CachePreference::Enable && !req.stream && layer.cache.is_some();
+    let cache_active = cache_requested == CachePreference::Enable
+        && !req.stream
+        && !has_image_input
+        && layer.cache.is_some();
     let mut cache_key = None::<String>;
     let mut cache_ttl = None;
     let mut cache_leader_guard: Option<CacheInflightLeaderGuard> = None;
@@ -908,7 +910,7 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx, id, model, created, 0, false, permit, pm, logprobs, None,
                                     metrics,
                                 ),
                             ))

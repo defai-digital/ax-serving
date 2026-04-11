@@ -292,15 +292,16 @@ impl CircuitBreaker {
     }
 
     fn trip(&self) {
-        self.state.store(CircuitState::Open as u8, Ordering::SeqCst);
         self.last_opened_ms.store(unix_ms_now(), Ordering::Relaxed);
+        self.state
+            .store(CircuitState::Open as u8, Ordering::Release);
         self.consecutive_generate_failures
             .store(0, Ordering::Relaxed);
     }
 
     fn reset(&self) {
         self.state
-            .store(CircuitState::Closed as u8, Ordering::SeqCst);
+            .store(CircuitState::Closed as u8, Ordering::Release);
         self.consecutive_generate_failures
             .store(0, Ordering::Relaxed);
     }
@@ -846,7 +847,7 @@ impl InferenceBackend for MlxBackend {
             }
 
             // Circuit breaker check.
-            let cb_state = proc.breaker.state.load(Ordering::Relaxed);
+            let cb_state = proc.breaker.state.load(Ordering::Acquire);
             if cb_state == CircuitState::Open as u8 {
                 let opened_ms = proc.breaker.last_opened_ms.load(Ordering::Relaxed);
                 let elapsed_ms = unix_ms_now().saturating_sub(opened_ms);
@@ -860,8 +861,8 @@ impl InferenceBackend for MlxBackend {
                 let _ = proc.breaker.state.compare_exchange(
                     CircuitState::Open as u8,
                     CircuitState::HalfOpen as u8,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
             }
 

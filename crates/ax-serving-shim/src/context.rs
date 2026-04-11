@@ -28,6 +28,13 @@ pub unsafe extern "C" fn llama_new_context_with_model(
 
     let model_ref = unsafe { &*model };
     let n_ctx = if params.n_ctx > 0 {
+        if params.n_ctx > i32::MAX as u32 {
+            tracing::error!(
+                n_ctx = params.n_ctx,
+                "llama_new_context_with_model: n_ctx exceeds i32::MAX"
+            );
+            return std::ptr::null_mut();
+        }
         params.n_ctx as i32
     } else {
         model_ref.n_ctx
@@ -153,4 +160,112 @@ pub extern "C" fn llama_get_logits(ctx: *mut LlamaContext) -> *mut f32 {
         return std::ptr::null_mut();
     }
     unsafe { (*ctx).logits.as_mut_ptr() }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use ax_serving_engine::{
+        CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
+        GenerationParams, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
+    };
+
+    use super::*;
+    use crate::types::LlamaModel;
+
+    struct DummyBackend;
+
+    impl InferenceBackend for DummyBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _handle: ModelHandle,
+            _input: GenerateInput,
+            _params: GenerationParams,
+            _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn tokenize(
+            &self,
+            _handle: ModelHandle,
+            _text: &str,
+            _add_bos: bool,
+        ) -> anyhow::Result<Vec<u32>> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            1
+        }
+
+        fn cache_telemetry(&self) -> CacheTelemetry {
+            CacheTelemetry::default()
+        }
+
+        fn embed(
+            &self,
+            _handle: ModelHandle,
+            _inputs: &EmbedInput<'_>,
+            _config: &EmbedConfig,
+        ) -> anyhow::Result<EmbedResult> {
+            anyhow::bail!("not used in tests")
+        }
+    }
+
+    #[test]
+    fn llama_new_context_rejects_n_ctx_over_i32_max() {
+        let backend: Arc<dyn InferenceBackend> = Arc::new(DummyBackend);
+        let model = Box::into_raw(Box::new(LlamaModel {
+            handle: ModelHandle(1),
+            backend,
+            vocab_size: 32,
+            n_ctx: 1024,
+            bos_token: 1,
+            eos_token: 2,
+            nl_token: 3,
+        }));
+
+        let ctx = unsafe {
+            llama_new_context_with_model(
+                model,
+                LlamaContextParams {
+                    n_ctx: i32::MAX as u32 + 1,
+                    seed: 0,
+                    _pad: [0; 6],
+                },
+            )
+        };
+        assert!(ctx.is_null());
+
+        unsafe {
+            drop(Box::from_raw(model));
+        }
+    }
 }

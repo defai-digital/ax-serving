@@ -305,6 +305,7 @@ dependencies = [
  "anyhow",
  "ax-serving-engine",
  "libc",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
