@@ -481,6 +481,9 @@ fn parse_prometheus_sample(line: &str) -> Option<(String, f64)> {
     let mut parts = line.split_whitespace();
     let metric = parts.next()?;
     let value = parts.next()?.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
     let name = metric
         .split_once('{')
         .map(|(name, _)| name)
@@ -541,7 +544,7 @@ fn max_f64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64
 fn max_ratio(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
     max_f64(samples, aliases).map(|value| {
         let normalized = if value > 1.0 { value / 100.0 } else { value };
-        normalized.clamp(0.0, 1.0)
+        ratio_or_zero(normalized)
     })
 }
 
@@ -671,12 +674,21 @@ fn seconds_to_ms(value: f64) -> u64 {
     (value.max(0.0) * 1_000.0).round() as u64
 }
 
+fn ratio_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn json_f64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
     pointers.iter().find_map(|pointer| {
         body.pointer(pointer).and_then(|value| {
             value
                 .as_f64()
                 .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+                .filter(|value| value.is_finite())
         })
     })
 }
@@ -696,7 +708,7 @@ fn json_u32_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u32> {
 fn json_ratio_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
     json_f64_any(body, pointers).map(|value| {
         let normalized = if value > 1.0 { value / 100.0 } else { value };
-        normalized.clamp(0.0, 1.0)
+        ratio_or_zero(normalized)
     })
 }
 
@@ -823,6 +835,25 @@ vllm:batch_utilization 0.5
     }
 
     #[test]
+    fn ignores_non_finite_runtime_metric_values() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_runtime_decode_tok_per_sec NaN
+ax_runtime_error_rate +Inf
+ax_runtime_kv_utilization -Inf
+ax_runtime_batch_utilization NaN
+ax_runtime_queue_depth 3
+"#,
+        );
+
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.error_rate, None);
+        assert_eq!(telemetry.kv_utilization, None);
+        assert_eq!(telemetry.batch_utilization, None);
+        assert_eq!(telemetry.queue_depth, Some(3));
+    }
+
+    #[test]
     fn parses_ax_serving_prometheus_alias_metrics() {
         let telemetry = parse_prometheus_telemetry(
             r#"
@@ -892,6 +923,23 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(telemetry.active_batch_size, Some(4));
         assert_eq!(telemetry.max_batch_size, Some(16));
         assert_eq!(telemetry.batch_utilization, Some(0.75));
+    }
+
+    #[test]
+    fn ignores_non_finite_json_metric_strings() {
+        let telemetry = parse_json_telemetry(&serde_json::json!({
+            "decode_tok_per_sec": "NaN",
+            "error_rate": "inf",
+            "kv_utilization": "-inf",
+            "batch_utilization": "NaN",
+            "queue_depth": 2
+        }));
+
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.error_rate, None);
+        assert_eq!(telemetry.kv_utilization, None);
+        assert_eq!(telemetry.batch_utilization, None);
+        assert_eq!(telemetry.queue_depth, Some(2));
     }
 
     #[test]

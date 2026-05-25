@@ -782,11 +782,11 @@ impl WorkerRegistry {
                 e.error_rate = ratio_or_zero(req.error_rate);
                 e.kv_pages_used = req.kv_pages_used;
                 e.kv_pages_total = req.kv_pages_total;
-                e.kv_utilization = req.kv_utilization.map(|value| value.clamp(0.0, 1.0));
+                e.kv_utilization = req.kv_utilization.map(ratio_or_zero);
                 e.prefix_reusable_tokens = req.prefix_reusable_tokens;
                 e.active_batch_size = req.active_batch_size;
                 e.max_batch_size = req.max_batch_size;
-                e.batch_utilization = req.batch_utilization.map(|value| value.clamp(0.0, 1.0));
+                e.batch_utilization = req.batch_utilization.map(ratio_or_zero);
                 true
             }
             None => false,
@@ -2281,6 +2281,8 @@ mod tests {
                 decode_tok_per_sec: f64::INFINITY,
                 queue_depth: usize::MAX,
                 error_rate: 2.5,
+                kv_utilization: Some(f64::NAN),
+                batch_utilization: Some(f64::INFINITY),
                 ..Default::default()
             }
         ));
@@ -2291,9 +2293,12 @@ mod tests {
         assert_eq!(snap.decode_tok_per_sec, 0.0);
         assert_eq!(snap.queue_depth, MAX_WORKER_INFLIGHT);
         assert_eq!(snap.error_rate, 1.0);
+        assert_eq!(snap.kv_utilization, Some(0.0));
+        assert_eq!(snap.batch_utilization, Some(0.0));
 
         let worker = r.eligible_workers("m1").remove(0);
         assert_eq!(worker.active_sequences, MAX_WORKER_INFLIGHT);
+        assert_eq!(worker.kv_utilization, Some(0.0));
     }
 
     #[test]
