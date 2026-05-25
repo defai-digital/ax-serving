@@ -337,12 +337,13 @@ fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.parse().ok()
 }
 
-/// Read an env var as a boolean (true/1/yes -> true, anything else -> false).
+/// Read an env var as a boolean.
 fn env_bool(name: &str) -> Option<bool> {
-    Some(matches!(
-        std::env::var(name).ok()?.to_lowercase().as_str(),
-        "true" | "1" | "yes"
-    ))
+    match std::env::var(name).ok()?.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 // ── ServeConfig methods ───────────────────────────────────────────────────────
@@ -596,7 +597,7 @@ impl ServeConfig {
         }
 
         // ── Cache ─────────────────────────────────────────────────────────────
-        if let Some(enabled) = env_parse::<bool>("AXS_CACHE_ENABLED") {
+        if let Some(enabled) = env_bool("AXS_CACHE_ENABLED") {
             self.cache.enabled = enabled;
         }
         if let Some(v) = env_str("AXS_CACHE_URL") {
@@ -1005,6 +1006,47 @@ mod tests {
         cfg.apply_env_overrides();
         unsafe { std::env::remove_var("AXS_SCHED_MAX_INFLIGHT") };
         assert_eq!(cfg.sched_max_inflight, 1, "0 should be clamped to 1");
+    }
+
+    #[test]
+    fn env_override_cache_enabled_accepts_numeric_true() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CACHE_ENABLED", "1") };
+        let mut cfg = ServeConfig::default();
+        cfg.cache.enabled = false;
+        cfg.apply_env_overrides();
+        unsafe { std::env::remove_var("AXS_CACHE_ENABLED") };
+        assert!(cfg.cache.enabled, "1 should enable cache");
+    }
+
+    #[test]
+    fn env_override_cache_enabled_accepts_numeric_false() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CACHE_ENABLED", "0") };
+        let mut cfg = ServeConfig::default();
+        cfg.cache.enabled = true;
+        cfg.apply_env_overrides();
+        unsafe { std::env::remove_var("AXS_CACHE_ENABLED") };
+        assert!(!cfg.cache.enabled, "0 should disable cache");
+    }
+
+    #[test]
+    fn env_override_invalid_bool_value_ignored() {
+        let _g = crate::test_env::lock();
+        unsafe {
+            std::env::set_var("AXS_CACHE_ENABLED", "not_bool");
+            std::env::set_var("AXS_SPLIT_SCHEDULER", "not_bool");
+        }
+        let mut cfg = ServeConfig::default();
+        cfg.cache.enabled = true;
+        cfg.split_scheduler = true;
+        cfg.apply_env_overrides();
+        unsafe {
+            std::env::remove_var("AXS_CACHE_ENABLED");
+            std::env::remove_var("AXS_SPLIT_SCHEDULER");
+        }
+        assert!(cfg.cache.enabled);
+        assert!(cfg.split_scheduler);
     }
 
     #[test]
