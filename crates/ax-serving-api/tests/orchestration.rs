@@ -303,6 +303,63 @@ async fn test_dispatch_to_mock_worker() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
+/// Dispatcher must re-check worker capacity after policy selection. Policies
+/// operate on snapshots, so a worker can become full between selection and
+/// dispatch under concurrent load.
+#[tokio::test]
+async fn test_dispatch_rejects_worker_that_fills_after_selection() {
+    let addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"hi"}}]}"#).await
+    );
+
+    let registry = WorkerRegistry::new();
+    let mut req = reg_req(addr, &["race-model"]);
+    req.max_inflight = 1;
+    let registered = registry.register(req, 5000);
+    let worker_id = WorkerId::parse(&registered.worker_id).unwrap();
+    let counter = registry
+        .inflight_counter(worker_id)
+        .expect("registered worker counter");
+
+    // Simulate a concurrent dispatch that filled the worker after a policy saw
+    // an older eligible snapshot.
+    counter.fetch_add(1, Ordering::Relaxed);
+
+    let recorded = Arc::new(AtomicUsize::new(0));
+    let policy = CountingPolicy {
+        recorded: Arc::clone(&recorded),
+    };
+    let dispatcher = DirectDispatcher::new(8, 300);
+
+    let response = dispatcher
+        .forward(
+            &registry,
+            &policy,
+            "race-model",
+            false,
+            None,
+            "/v1/chat/completions",
+            axum::body::Bytes::from(r#"{"model":"race-model","messages":[]}"#),
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "failed dispatch must not over-increment worker inflight"
+    );
+    assert_eq!(
+        recorded.load(Ordering::Relaxed),
+        0,
+        "capacity rejection must not be recorded as a successful dispatch"
+    );
+}
+
 /// Primary 4xx responses must not be recorded as successful dispatches for
 /// model-affinity accounting.
 #[tokio::test]

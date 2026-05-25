@@ -32,9 +32,29 @@ use super::registry::{RequestKind, WorkerId, WorkerRegistry};
 struct InflightGuard(Arc<AtomicUsize>);
 
 impl InflightGuard {
+    #[cfg(test)]
     fn acquire(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self(Arc::clone(counter))
+    }
+
+    fn try_acquire(counter: &Arc<AtomicUsize>, max_inflight: usize) -> Option<Self> {
+        let max_inflight = max_inflight.max(1);
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= max_inflight {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(Arc::clone(counter))),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -376,7 +396,41 @@ impl DirectDispatcher {
                 )
                 .await;
         };
-        let guard = InflightGuard::acquire(&inflight_counter);
+        let Some(guard) = InflightGuard::try_acquire(&inflight_counter, selected.max_inflight)
+        else {
+            warn!(
+                worker_id = %selected_id,
+                max_inflight = selected.max_inflight,
+                "selected worker reached capacity before dispatch"
+            );
+            let Some(retry_body) = retry_body else {
+                return trace_response(
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("all workers for '{}' are at capacity", ctx.model_id),
+                    )
+                        .into_response(),
+                    candidate_count,
+                    Some(selected_id),
+                    "selected_at_capacity",
+                );
+            };
+            self.reroute_total.fetch_add(1, Ordering::Relaxed);
+            return self
+                .reroute(
+                    registry,
+                    policy,
+                    &ctx,
+                    request_kind,
+                    backend_hint,
+                    min_context,
+                    path,
+                    retry_body,
+                    selected_id,
+                    auth_header,
+                )
+                .await;
+        };
 
         let result = attach_auth(
             self.client
@@ -503,7 +557,24 @@ impl DirectDispatcher {
                 "reroute_target_unavailable",
             );
         };
-        let guard2 = InflightGuard::acquire(&inflight_counter2);
+        let Some(guard2) = InflightGuard::try_acquire(&inflight_counter2, selected2.max_inflight)
+        else {
+            warn!(
+                worker_id = %selected2_id,
+                max_inflight = selected2.max_inflight,
+                "reroute worker reached capacity before dispatch"
+            );
+            return trace_response(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no alternative worker for '{}' after reroute", ctx.model_id),
+                )
+                    .into_response(),
+                candidates.len(),
+                Some(selected2_id),
+                "reroute_target_at_capacity",
+            );
+        };
 
         let result2 = attach_auth(
             self.client
@@ -780,6 +851,19 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn inflight_guard_try_acquire_respects_max_inflight() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let g1 = InflightGuard::try_acquire(&counter, 1).expect("first slot");
+        assert!(InflightGuard::try_acquire(&counter, 1).is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        drop(g1);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let g2 = InflightGuard::try_acquire(&counter, 1).expect("slot after release");
+        drop(g2);
     }
 
     #[test]
