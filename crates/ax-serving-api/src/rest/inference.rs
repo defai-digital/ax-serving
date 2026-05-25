@@ -196,6 +196,20 @@ fn record_generation_stats(
     metrics.record_generation_stats(stats);
 }
 
+fn usage_from_generation_stats(stats: &ax_serving_engine::GenerationStats) -> Usage {
+    let prompt_tokens = usize_to_u32_saturating(stats.prompt_tokens);
+    let completion_tokens = usize_to_u32_saturating(stats.completion_tokens);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 /// Normalized form of a single chat message used exclusively for cache-key
 /// construction.  Role is lowercased and content is whitespace-trimmed so
 /// that minor client-side formatting differences never cause a false miss.
@@ -1114,11 +1128,7 @@ async fn blocking_response(
             }
             GenerateEvent::Done(stats) => {
                 record_generation_stats(metrics, &stats);
-                usage = Usage {
-                    prompt_tokens: stats.prompt_tokens as u32,
-                    completion_tokens: stats.completion_tokens as u32,
-                    total_tokens: (stats.prompt_tokens + stats.completion_tokens) as u32,
-                };
+                usage = usage_from_generation_stats(&stats);
                 // Only update if not already set by a ToolCall event.
                 if finish_reason == FinishReason::Stop {
                     finish_reason = match stats.stop_reason.as_str() {
@@ -1842,11 +1852,7 @@ async fn text_blocking_response(
             GenerateEvent::ToolCall { .. } => {}
             GenerateEvent::Done(stats) => {
                 record_generation_stats(metrics, &stats);
-                usage = Usage {
-                    prompt_tokens: stats.prompt_tokens as u32,
-                    completion_tokens: stats.completion_tokens as u32,
-                    total_tokens: (stats.prompt_tokens + stats.completion_tokens) as u32,
-                };
+                usage = usage_from_generation_stats(&stats);
                 finish_reason = match stats.stop_reason.as_str() {
                     "length" => FinishReason::Length,
                     "content_filter" => FinishReason::ContentFilter,
@@ -2248,6 +2254,21 @@ mod tests {
             stop_reason: "stop".into(),
             ..GenerationStats::default()
         }
+    }
+
+    #[test]
+    fn usage_from_generation_stats_saturates_u32_fields() {
+        let stats = GenerationStats {
+            prompt_tokens: u32::MAX as usize + 1,
+            completion_tokens: u32::MAX as usize + 1,
+            ..GenerationStats::default()
+        };
+
+        let usage = usage_from_generation_stats(&stats);
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
     }
 
     fn dummy_model_entry() -> Arc<LoadedModel> {

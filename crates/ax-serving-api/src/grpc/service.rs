@@ -41,6 +41,10 @@ fn registry_error_to_status(e: &anyhow::Error) -> Status {
     }
 }
 
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 /// gRPC service backed by a [`ServingLayer`].
 #[derive(Clone)]
 pub struct AxServingService {
@@ -306,8 +310,8 @@ impl AxServingServiceTrait for AxServingService {
                             finished: true,
                             finish_reason: proto::FinishReason::Eos as i32,
                             metrics: Some(proto::GenerationMetrics {
-                                prefill_tokens: stats.prompt_tokens as u32,
-                                decode_tokens: stats.completion_tokens as u32,
+                                prefill_tokens: usize_to_u32_saturating(stats.prompt_tokens),
+                                decode_tokens: usize_to_u32_saturating(stats.completion_tokens),
                                 prefill_tok_per_sec: stats.prefill_tok_per_sec as f32,
                                 decode_tok_per_sec: stats.decode_tok_per_sec as f32,
                                 total_time_ms: total_ms,
@@ -627,6 +631,11 @@ mod tests {
     #[test]
     fn infer_validation_accepts_valid_prompt_request() {
         assert!(validate_infer_request(&valid_infer_request()).is_none());
+    }
+
+    #[test]
+    fn grpc_usage_conversion_saturates_u32_fields() {
+        assert_eq!(usize_to_u32_saturating(u32::MAX as usize + 1), u32::MAX);
     }
 
     #[test]
