@@ -553,14 +553,58 @@ impl DirectDispatcher {
                         std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
                     let byte_stream: GuardedResponseStream =
                         Box::pin(resp.bytes_stream().map_err(std::io::Error::other));
+                    let stream_url = url.clone();
                     let guarded = futures::stream::unfold(
-                        (byte_stream, Some(guard)),
-                        |(mut inner, guard): (GuardedResponseStream, Option<InflightGuard>)| async move {
-                            match inner.next().await {
-                                Some(item) => Some((item, (inner, guard))),
-                                None => {
+                        (byte_stream, Some(guard), 0usize, false),
+                        move |(mut inner, guard, total_len, done): (
+                            GuardedResponseStream,
+                            Option<InflightGuard>,
+                            usize,
+                            bool,
+                        )| {
+                            let stream_url = stream_url.clone();
+                            async move {
+                                if done {
                                     drop(guard);
-                                    None
+                                    return None;
+                                }
+                                match inner.next().await {
+                                    Some(Ok(chunk)) => {
+                                        match add_limited_body_len(
+                                            total_len,
+                                            chunk.len(),
+                                            MAX_WORKER_RESPONSE_BODY_BYTES,
+                                        ) {
+                                            Ok(next_len) => {
+                                                Some((Ok(chunk), (inner, guard, next_len, false)))
+                                            }
+                                            Err(WorkerBodyError::TooLarge) => {
+                                                error!(
+                                                    url = %stream_url,
+                                                    limit = MAX_WORKER_RESPONSE_BODY_BYTES,
+                                                    "worker streaming response body exceeded size limit"
+                                                );
+                                                drop(guard);
+                                                Some((
+                                                    Err(std::io::Error::new(
+                                                        std::io::ErrorKind::InvalidData,
+                                                        "worker streaming response body exceeded size limit",
+                                                    )),
+                                                    (inner, None, total_len, true),
+                                                ))
+                                            }
+                                            Err(WorkerBodyError::Read(_)) => {
+                                                unreachable!("length accounting does not read")
+                                            }
+                                        }
+                                    }
+                                    Some(Err(err)) => {
+                                        Some((Err(err), (inner, guard, total_len, false)))
+                                    }
+                                    None => {
+                                        drop(guard);
+                                        None
+                                    }
                                 }
                             }
                         },
@@ -742,6 +786,7 @@ mod tests {
     fn add_limited_body_len_rejects_incremental_excess() {
         assert_eq!(add_limited_body_len(5, 3, 8).unwrap(), 8);
         assert!(add_limited_body_len(5, 4, 8).is_err());
+        assert!(add_limited_body_len(usize::MAX, 1, usize::MAX).is_err());
     }
 
     #[tokio::test]

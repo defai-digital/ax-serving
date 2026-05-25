@@ -83,6 +83,20 @@ fn append_limited_body_chunk(
     Ok(())
 }
 
+fn add_limited_body_len(
+    current_len: usize,
+    chunk_len: usize,
+    max_bytes: usize,
+) -> Result<usize, ProxyBodyError> {
+    let next_len = current_len
+        .checked_add(chunk_len)
+        .ok_or(ProxyBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(ProxyBodyError::TooLarge);
+    }
+    Ok(next_len)
+}
+
 async fn read_response_body_limited(
     resp: reqwest::Response,
     max_bytes: usize,
@@ -192,12 +206,40 @@ async fn proxy_to(
             if is_event_stream {
                 let byte_stream = resp.bytes_stream();
                 let guarded = futures::stream::unfold(
-                    (Box::pin(byte_stream), Some(_guard)),
-                    |(mut stream, guard)| async move {
+                    (Box::pin(byte_stream), Some(_guard), 0usize, false),
+                    |(mut stream, guard, total_len, done)| async move {
+                        if done {
+                            drop(guard);
+                            return None;
+                        }
                         match stream.next().await {
-                            Some(item) => {
-                                let mapped = item.map_err(axum::Error::new);
-                                Some((mapped, (stream, guard)))
+                            Some(Ok(chunk)) => {
+                                match add_limited_body_len(
+                                    total_len,
+                                    chunk.len(),
+                                    MAX_PROXY_RESPONSE_BODY_BYTES,
+                                ) {
+                                    Ok(next_len) => {
+                                        Some((Ok(chunk), (stream, guard, next_len, false)))
+                                    }
+                                    Err(ProxyBodyError::TooLarge) => {
+                                        drop(guard);
+                                        Some((
+                                            Err(axum::Error::new(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "upstream streaming response body exceeded 64 MiB limit",
+                                            ))),
+                                            (stream, None, total_len, true),
+                                        ))
+                                    }
+                                    Err(ProxyBodyError::Read(_)) => {
+                                        unreachable!("length accounting does not read")
+                                    }
+                                }
+                            }
+                            Some(Err(err)) => {
+                                let mapped = Err(axum::Error::new(err));
+                                Some((mapped, (stream, guard, total_len, false)))
                             }
                             None => {
                                 drop(guard);
@@ -251,7 +293,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    use super::{InflightGuard, append_limited_body_chunk, response_declares_oversize};
+    use super::{
+        InflightGuard, add_limited_body_len, append_limited_body_chunk, response_declares_oversize,
+    };
 
     #[test]
     fn inflight_guard_stops_at_capacity() {
@@ -287,5 +331,12 @@ mod tests {
         append_limited_body_chunk(&mut body, b"12345", 8).expect("first chunk fits");
         assert!(append_limited_body_chunk(&mut body, b"6789", 8).is_err());
         assert_eq!(body, b"12345");
+    }
+
+    #[test]
+    fn add_limited_body_len_rejects_incremental_excess() {
+        assert_eq!(add_limited_body_len(5, 3, 8).unwrap(), 8);
+        assert!(add_limited_body_len(5, 4, 8).is_err());
+        assert!(add_limited_body_len(usize::MAX, 1, usize::MAX).is_err());
     }
 }
