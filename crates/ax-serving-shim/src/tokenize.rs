@@ -23,13 +23,10 @@ pub unsafe extern "C" fn llama_tokenize(
     add_bos: bool,
     _special: bool,
 ) -> i32 {
-    if model.is_null() || text.is_null() || tokens.is_null() {
+    if model.is_null() || text.is_null() {
         return -1;
     }
-    if n_tokens_max <= 0 {
-        return -1;
-    }
-    if text_len < 0 {
+    if text_len < 0 || n_tokens_max < 0 {
         return -1;
     }
 
@@ -48,6 +45,9 @@ pub unsafe extern "C" fn llama_tokenize(
             // Callers use the negative value to learn the required size and retry.
             if ids.len() > n_tokens_max as usize {
                 return -(ids.len().min(i32::MAX as usize) as i32);
+            }
+            if !ids.is_empty() && tokens.is_null() {
+                return -1;
             }
             for (i, id) in ids.iter().enumerate() {
                 unsafe {
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn llama_token_to_piece(
     buf: *mut libc::c_char,
     length: i32,
 ) -> i32 {
-    if model.is_null() || buf.is_null() || length <= 0 {
+    if model.is_null() || length < 0 {
         return -1;
     }
 
@@ -94,6 +94,9 @@ pub unsafe extern "C" fn llama_token_to_piece(
             // buffers are valid and no trailing nul is written.
             if n > length as usize {
                 return -(n.min(i32::MAX as usize) as i32);
+            }
+            if n > 0 && buf.is_null() {
+                return -1;
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
@@ -231,6 +234,56 @@ mod tests {
     }
 
     #[test]
+    fn llama_tokenize_allows_null_output_size_query() {
+        let observed = Arc::new(Mutex::new(None));
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::clone(&observed),
+            decoded: String::new(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -2);
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn llama_tokenize_rejects_null_output_when_buffer_is_claimed_large_enough() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: String::new(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                4,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -1);
+    }
+
+    #[test]
     fn llama_token_to_piece_accepts_exact_size_buffer() {
         let backend = Arc::new(RecordingBackend {
             observed: Arc::new(Mutex::new(None)),
@@ -261,5 +314,31 @@ mod tests {
 
         assert_eq!(n, -5);
         assert_eq!(out, [0_i8; 4]);
+    }
+
+    #[test]
+    fn llama_token_to_piece_allows_null_output_size_query() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+
+        let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 0) };
+
+        assert_eq!(n, -5);
+    }
+
+    #[test]
+    fn llama_token_to_piece_rejects_null_output_when_buffer_is_claimed_large_enough() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+
+        let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 8) };
+
+        assert_eq!(n, -1);
     }
 }
