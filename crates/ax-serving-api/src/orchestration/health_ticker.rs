@@ -174,6 +174,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5_000,
         );

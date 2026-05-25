@@ -73,7 +73,7 @@ Minimum fields:
 
 See:
 
-- [enterprise-compatibility-metadata.example.yaml](/Users/akiralam/code/ax-serving/docs/contracts/enterprise-compatibility-metadata.example.yaml)
+- [enterprise-compatibility-metadata.example.yaml](../contracts/enterprise-compatibility-metadata.example.yaml)
 
 ## Contract Change Rule
 
@@ -85,7 +85,7 @@ If a public contract changes in a way that affects enterprise repositories:
 
 See:
 
-- [ax-serving-contract-change-template.md](/Users/akiralam/code/ax-serving/docs/contracts/ax-serving-contract-change-template.md)
+- [ax-serving-contract-change-template.md](../contracts/ax-serving-contract-change-template.md)
 
 ## Approval Rule
 

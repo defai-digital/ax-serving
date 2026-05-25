@@ -18,7 +18,7 @@ use crate::config::ThorConfig;
 #[derive(Clone)]
 pub struct ProxyState {
     pub client: reqwest::Client,
-    pub sglang_url: String,
+    pub runtime_url: String,
     pub inflight: Arc<AtomicUsize>,
     pub max_inflight: usize,
 }
@@ -58,7 +58,7 @@ impl Drop for InflightGuard {
 pub fn router(config: &ThorConfig, client: reqwest::Client, inflight: Arc<AtomicUsize>) -> Router {
     let state = ProxyState {
         client,
-        sglang_url: config.sglang_url.clone(),
+        runtime_url: config.runtime_url.clone(),
         inflight,
         max_inflight: config.max_inflight,
     };
@@ -115,7 +115,7 @@ async fn proxy_to(
         )
             .into_response();
     };
-    let url = format!("{}{}", state.sglang_url, path);
+    let url = format!("{}{}", state.runtime_url, path);
     let mut req = state.client.post(url);
     // Forward client headers first; fall back to application/json for content-type.
     let mut has_content_type = false;

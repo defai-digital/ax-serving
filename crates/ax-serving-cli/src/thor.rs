@@ -8,15 +8,17 @@ use anyhow::{Context, Result};
 
 /// Default listen/advertised address for the Thor agent proxy.
 const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
-/// Default SGLang (or vLLM) runtime URL on the same host.
-const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
+/// Default vLLM runtime URL on the same host.
+const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8000";
+const DEFAULT_THOR_RUNTIME: &str = "vllm";
 
 const THOR_ENV_KEYS: &[&str] = &[
     "AXS_CONTROL_PLANE_URL",
     "AXS_WORKER_TOKEN",
+    "AXS_THOR_RUNTIME",
+    "AXS_THOR_RUNTIME_URL",
     "AXS_SGLANG_URL",
     "AXS_THOR_BACKEND",
-    "AXS_THOR_RUNTIME_URL",
     "AXS_THOR_LISTEN_ADDR",
     "AXS_THOR_ADVERTISED_ADDR",
     "AXS_THOR_MAX_INFLIGHT",
@@ -76,7 +78,8 @@ pub struct InstallArgs {
     pub control_plane: Option<String>,
     pub listen_addr: String,
     pub advertised_addr: Option<String>,
-    pub sglang_url: String,
+    pub runtime: String,
+    pub runtime_url: String,
     pub worker_token: Option<String>,
     pub max_inflight: usize,
     pub worker_pool: Option<String>,
@@ -90,7 +93,8 @@ pub struct JoinArgs {
     pub control_plane: String,
     pub advertised_addr: Option<String>,
     pub listen_addr: Option<String>,
-    pub sglang_url: Option<String>,
+    pub runtime: Option<String>,
+    pub runtime_url: Option<String>,
     pub worker_token: Option<String>,
     pub max_inflight: Option<usize>,
     pub worker_pool: Option<String>,
@@ -207,12 +211,14 @@ pub fn install(args: InstallArgs) -> Result<()> {
     {
         env_file.set("AXS_CONTROL_PLANE_URL", Some(control_plane));
     }
-    env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
-    env_file.set("AXS_SGLANG_URL", Some(trim_trailing_slash(args.sglang_url)));
-    env_file.set(
-        "AXS_THOR_RUNTIME_URL",
-        env_file.get("AXS_SGLANG_URL").map(str::to_string),
-    );
+    let runtime = normalize_runtime(&args.runtime);
+    let runtime_url = trim_trailing_slash(args.runtime_url);
+    env_file.set("AXS_THOR_RUNTIME", Some(runtime.clone()));
+    env_file.set("AXS_THOR_BACKEND", Some(runtime.clone()));
+    env_file.set("AXS_THOR_RUNTIME_URL", Some(runtime_url.clone()));
+    if runtime == "sglang" {
+        env_file.set("AXS_SGLANG_URL", Some(runtime_url));
+    }
     env_file.set("AXS_WORKER_TOKEN", args.worker_token);
     env_file.set("AXS_THOR_LISTEN_ADDR", Some(listen_addr.to_string()));
     env_file.set(
@@ -245,10 +251,29 @@ pub async fn join(args: JoinArgs) -> Result<()> {
         "AXS_CONTROL_PLANE_URL",
         Some(normalize_control_plane_url(&args.control_plane)?),
     );
-    env_file.set("AXS_THOR_BACKEND", Some("sglang".into()));
+    let runtime = args
+        .runtime
+        .as_deref()
+        .map(normalize_runtime)
+        .or_else(|| env_file.get("AXS_THOR_RUNTIME").map(normalize_runtime))
+        .or_else(|| env_file.get("AXS_THOR_BACKEND").map(normalize_runtime))
+        .unwrap_or_else(|| DEFAULT_THOR_RUNTIME.to_string());
+    env_file.set("AXS_THOR_RUNTIME", Some(runtime.clone()));
+    env_file.set("AXS_THOR_BACKEND", Some(runtime.clone()));
     env_file.set_if_some("AXS_WORKER_TOKEN", args.worker_token);
-    env_file.set_if_some("AXS_SGLANG_URL", args.sglang_url.map(trim_trailing_slash));
-    if let Some(runtime_url) = env_file.get("AXS_SGLANG_URL") {
+    env_file.set_if_some(
+        "AXS_THOR_RUNTIME_URL",
+        args.runtime_url.map(trim_trailing_slash),
+    );
+    if runtime == "sglang"
+        && env_file.get("AXS_SGLANG_URL").is_none()
+        && let Some(runtime_url) = env_file.get("AXS_THOR_RUNTIME_URL")
+    {
+        env_file.set("AXS_SGLANG_URL", Some(runtime_url.to_string()));
+    }
+    if env_file.get("AXS_THOR_RUNTIME_URL").is_none()
+        && let Some(runtime_url) = env_file.get("AXS_SGLANG_URL")
+    {
         env_file.set("AXS_THOR_RUNTIME_URL", Some(runtime_url.to_string()));
     }
     if let Some(listen_addr) = args.listen_addr {
@@ -456,6 +481,16 @@ fn trim_trailing_slash(input: String) -> String {
     input.trim().trim_end_matches('/').to_string()
 }
 
+fn normalize_runtime(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "v_llm" | "v-llm" => "vllm".to_string(),
+        "sg_lang" | "sg-lang" => "sglang".to_string(),
+        "ax-engine" | "axengine" => "ax_engine".to_string(),
+        value if !value.is_empty() => value.to_string(),
+        _ => DEFAULT_THOR_RUNTIME.to_string(),
+    }
+}
+
 fn parse_socket_addr(raw: &str, label: &str) -> Result<SocketAddr> {
     raw.trim()
         .parse()
@@ -573,17 +608,17 @@ async fn probe_health(client: &reqwest::Client, url: &str) -> EndpointStatus {
     }
 }
 
-async fn probe_sglang(client: &reqwest::Client, sglang_url: &str) -> EndpointStatus {
+async fn probe_runtime(client: &reqwest::Client, runtime_url: &str) -> EndpointStatus {
     let health = probe_health(
         client,
-        &format!("{}/health", sglang_url.trim_end_matches('/')),
+        &format!("{}/health", runtime_url.trim_end_matches('/')),
     )
     .await;
     if !health.ok {
         return health;
     }
     match client
-        .get(format!("{}/v1/models", sglang_url.trim_end_matches('/')))
+        .get(format!("{}/v1/models", runtime_url.trim_end_matches('/')))
         .send()
         .await
     {
@@ -656,6 +691,8 @@ struct WorkerSnapshot {
     id: String,
     addr: String,
     backend: String,
+    #[serde(default)]
+    runtime: String,
     health: String,
     drain: bool,
 }
@@ -690,9 +727,17 @@ fn runtime_base_url(env_file: &ThorEnvFile) -> String {
     env_file
         .get("AXS_THOR_RUNTIME_URL")
         .or_else(|| env_file.get("AXS_SGLANG_URL"))
-        .unwrap_or(DEFAULT_SGLANG_URL)
+        .unwrap_or(DEFAULT_RUNTIME_URL)
         .trim_end_matches('/')
         .to_string()
+}
+
+fn thor_runtime(env_file: &ThorEnvFile) -> String {
+    env_file
+        .get("AXS_THOR_RUNTIME")
+        .or_else(|| env_file.get("AXS_THOR_BACKEND"))
+        .map(normalize_runtime)
+        .unwrap_or_else(|| DEFAULT_THOR_RUNTIME.to_string())
 }
 
 fn resolve_worker_id(env_file: &ThorEnvFile) -> Option<String> {
@@ -704,10 +749,10 @@ fn resolve_worker_id(env_file: &ThorEnvFile) -> Option<String> {
 }
 
 fn expected_capabilities(backend: &str) -> AgentCapabilities {
-    match backend {
-        "sglang" => AgentCapabilities {
+    match normalize_runtime(backend).as_str() {
+        "vllm" | "sglang" => AgentCapabilities {
             llm: true,
-            embedding: true,
+            embedding: false,
             vision: false,
         },
         _ => AgentCapabilities::default(),
@@ -720,8 +765,9 @@ struct ThorStatusReport {
     control: ReadinessCheck,
     local_agent_base: String,
     thor: EndpointStatus,
+    runtime: String,
     runtime_url: String,
-    sglang: EndpointStatus,
+    runtime_endpoint: EndpointStatus,
     worker: Option<WorkerSnapshot>,
     config_mismatch: Option<&'static str>,
     overall_state: &'static str,
@@ -748,8 +794,9 @@ async fn collect_status_report(
     let listen_addr = parse_socket_addr(listen_addr_raw, "listen address")?;
     let advertised_addr = parse_socket_addr(advertised_addr_raw, "advertised address")?;
     let local_agent_base = local_probe_base(listen_addr);
+    let runtime = thor_runtime(&env_file);
     let runtime_url = runtime_base_url(&env_file);
-    let expected_backend = env_file.get("AXS_THOR_BACKEND").unwrap_or("sglang");
+    let expected_backend = runtime.as_str();
     let expected_max_context = env_file
         .get("AXS_THOR_MAX_CONTEXT")
         .and_then(|v| v.parse::<u32>().ok());
@@ -763,9 +810,9 @@ async fn collect_status_report(
 
     let token = env_file.get("AXS_WORKER_TOKEN");
     let thor_health_url = format!("{local_agent_base}/health");
-    let (control, sglang, agent_health, worker) = tokio::join!(
+    let (control, runtime_endpoint, agent_health, worker) = tokio::join!(
         control_plane_readiness(&client, &control_plane, token),
-        probe_sglang(&client, &runtime_url),
+        probe_runtime(&client, &runtime_url),
         probe_agent_health(&client, &thor_health_url),
         probe_registered_worker(&client, &control_plane, token, advertised_addr),
     );
@@ -804,7 +851,7 @@ async fn collect_status_report(
 
     let ready = control.status == reqwest::StatusCode::OK
         && thor.ok
-        && sglang.ok
+        && runtime_endpoint.ok
         && agent_health.is_ok()
         && registration_ok
         && config_mismatch.is_none()
@@ -816,7 +863,7 @@ async fn collect_status_report(
         "ready"
     } else if !registration_ok || config_mismatch.is_some() {
         "registration_mismatch"
-    } else if !thor.ok || !sglang.ok {
+    } else if !thor.ok || !runtime_endpoint.ok {
         "local_unhealthy"
     } else {
         "not_ready"
@@ -828,8 +875,9 @@ async fn collect_status_report(
         control,
         local_agent_base,
         thor,
+        runtime,
         runtime_url,
-        sglang,
+        runtime_endpoint,
         worker,
         config_mismatch,
         overall_state,
@@ -850,14 +898,15 @@ fn print_status_report(report: &ThorStatusReport) {
         report.thor.summary()
     );
     println!(
-        "sglang: {} ({})",
+        "runtime: {} {} ({})",
+        report.runtime,
         report.runtime_url,
-        report.sglang.summary()
+        report.runtime_endpoint.summary()
     );
     match &report.worker {
         Some(worker) => println!(
-            "registry: registered as {} backend={} health={} drain={}",
-            worker.id, worker.backend, worker.health, worker.drain
+            "registry: registered as {} backend={} runtime={} health={} drain={}",
+            worker.id, worker.backend, worker.runtime, worker.health, worker.drain
         ),
         None => println!("registry: no worker currently registered"),
     }
@@ -895,8 +944,9 @@ fn fallback_status_report_from_env(
             ok: false,
             detail: "timeout".to_string(),
         },
+        runtime: thor_runtime(env_file),
         runtime_url: runtime_base_url(env_file),
-        sglang: EndpointStatus {
+        runtime_endpoint: EndpointStatus {
             ok: false,
             detail: "timeout".to_string(),
         },
@@ -997,7 +1047,8 @@ mod tests {
             control_plane: None,
             listen_addr: "127.0.0.1:18081".into(),
             advertised_addr: None,
-            sglang_url: "http://127.0.0.1:30000".into(),
+            runtime: "vllm".into(),
+            runtime_url: "http://127.0.0.1:8000".into(),
             worker_token: None,
             max_inflight: 8,
             worker_pool: None,

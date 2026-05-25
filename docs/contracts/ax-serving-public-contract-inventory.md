@@ -4,9 +4,8 @@
 > **Date**: 2026-03-29
 > **Owner**: AX Serving Core Team
 > **Related**:
-> - [PRD — AX Serving Open-Source / Enterprise Boundary v1.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-OSS-ENTERPRISE-BOUNDARY-v1.0.md)
-> - [PRD — AX Serving Enterprise Extraction And Release Execution v1.0](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-ENTERPRISE-EXECUTION-v1.0.md)
-> - [AX Fabric Runtime Contract](/Users/akiralam/code/ax-serving/docs/contracts/ax-fabric-runtime-contract.md)
+> - [PRD - AX Serving](../../.internal/prd/PRD-AX-SERVING.md)
+> - [AX Fabric Runtime Contract](ax-fabric-runtime-contract.md)
 
 # Purpose
 

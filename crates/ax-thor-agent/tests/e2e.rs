@@ -42,7 +42,8 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     let config = ThorConfig {
         control_plane_url: control_base.clone(),
         worker_token: Some("secret".into()),
-        sglang_url: sglang_base.clone(),
+        runtime_url: sglang_base.clone(),
+        runtime: "sglang".into(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         advertised_addr: "127.0.0.1:18081".parse().unwrap(),
         max_inflight: 8,

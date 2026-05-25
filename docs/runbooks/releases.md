@@ -23,8 +23,8 @@ In this repo that means:
 
 Before tagging any release:
 
-1. Update the Rust workspace version in [Cargo.toml](/Users/akiralam/code/ax-serving/Cargo.toml).
-2. Update the JS SDK version in [package.json](/Users/akiralam/code/ax-serving/sdk/javascript/package.json) if the SDK is being published.
+1. Update the Rust workspace version in [Cargo.toml](../../Cargo.toml).
+2. Update the JS SDK version in [package.json](../../sdk/javascript/package.json) if the SDK is being published.
 3. Ensure the tag exactly matches those versions, without the leading `v`.
 
 Examples:
@@ -78,5 +78,5 @@ Effects:
 
 For enterprise private-artifact delivery, use:
 
-- [enterprise-private-repo-bootstrap.md](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-private-repo-bootstrap.md)
-- [enterprise-release-governance.md](/Users/akiralam/code/ax-serving/docs/runbooks/enterprise-release-governance.md)
+- [enterprise-private-repo-bootstrap.md](enterprise-private-repo-bootstrap.md)
+- [enterprise-release-governance.md](enterprise-release-governance.md)

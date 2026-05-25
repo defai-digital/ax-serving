@@ -63,6 +63,7 @@ pub enum BackendKind {
     Native,
     LlamaCpp,
     SgLang,
+    Vllm,
     Auto,
 }
 
@@ -71,6 +72,7 @@ impl BackendKind {
         match s.to_lowercase().as_str() {
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
+            "vllm" | "v_llm" | "v-llm" => Self::Vllm,
             "native" => Self::Native,
             _ => Self::Auto,
         }
@@ -81,6 +83,7 @@ impl BackendKind {
             Self::Native => "native",
             Self::LlamaCpp => "llama_cpp",
             Self::SgLang => "sglang",
+            Self::Vllm => "vllm",
             Self::Auto => "auto",
         }
     }
@@ -94,6 +97,61 @@ fn backend_filter_from_hint(hint: Option<&str>) -> Option<BackendKind> {
     match BackendKind::parse(raw) {
         BackendKind::Auto => None,
         kind => Some(kind),
+    }
+}
+
+fn runtime_filter_from_hint(hint: Option<&str>) -> Option<RuntimeKind> {
+    let raw = hint?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match RuntimeKind::parse(raw) {
+        RuntimeKind::Unknown => None,
+        kind => Some(kind),
+    }
+}
+
+// ── RuntimeKind ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    AxEngine,
+    LlamaCpp,
+    SgLang,
+    Vllm,
+    Unknown,
+}
+
+impl RuntimeKind {
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "ax_engine" | "ax-engine" | "axengine" | "native" => Self::AxEngine,
+            "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
+            "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
+            "vllm" | "v_llm" | "v-llm" => Self::Vllm,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn from_backend(backend: &BackendKind) -> Self {
+        match backend {
+            BackendKind::Native => Self::AxEngine,
+            BackendKind::LlamaCpp => Self::LlamaCpp,
+            BackendKind::SgLang => Self::SgLang,
+            BackendKind::Vllm => Self::Vllm,
+            BackendKind::Auto => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AxEngine => "ax_engine",
+            Self::LlamaCpp => "llama_cpp",
+            Self::SgLang => "sglang",
+            Self::Vllm => "vllm",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -190,6 +248,15 @@ pub struct WorkerEntry {
     pub capabilities: WorkerCapabilities,
     capability_source: CapabilitySource,
     pub backend: BackendKind,
+    pub runtime: RuntimeKind,
+    /// Runtime version reported by the worker adapter, if known.
+    pub runtime_version: Option<String>,
+    /// Hardware class used for placement and fleet summaries.
+    pub hardware_class: Option<String>,
+    /// Runtime-compatible endpoint or proxy target reported by the worker.
+    pub runtime_endpoint: Option<String>,
+    /// Operations the worker supports, e.g. `llm`, `embedding`, `vision`.
+    pub supported_operations: Vec<String>,
     pub max_inflight: usize,
     /// Atomically updated by the dispatcher without taking the registry lock.
     pub inflight: Arc<AtomicUsize>,
@@ -241,9 +308,24 @@ pub struct RegisterRequest {
     /// Either a legacy model-id list or a structured capability descriptor.
     #[serde(default)]
     pub capabilities: RegisterCapabilities,
-    /// `"native"` | `"llama_cpp"` | `"auto"`
+    /// `"native"` | `"llama_cpp"` | `"sglang"` | `"vllm"` | `"auto"`
     #[serde(default = "default_backend")]
     pub backend: String,
+    /// Runtime type owned by the node, e.g. `"ax_engine"` or `"vllm"`.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// Runtime version, if the node adapter can report it.
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+    /// Hardware placement class, e.g. `"mac"`, `"pc-cuda"`, or `"thor"`.
+    #[serde(default)]
+    pub hardware_class: Option<String>,
+    /// Runtime-compatible endpoint or proxy target, if different from `addr`.
+    #[serde(default)]
+    pub runtime_endpoint: Option<String>,
+    /// Explicit supported operations. If absent, AX Serving derives them from capabilities.
+    #[serde(default)]
+    pub supported_operations: Vec<String>,
     pub max_inflight: usize,
     /// Human-readable machine name from `scutil --get ComputerName` (optional).
     #[serde(default)]
@@ -257,6 +339,27 @@ pub struct RegisterRequest {
     /// Operator-defined node class label (e.g. "m3-max-128g").
     #[serde(default)]
     pub node_class: Option<String>,
+}
+
+impl Default for RegisterRequest {
+    fn default() -> Self {
+        Self {
+            worker_id: None,
+            addr: String::new(),
+            capabilities: RegisterCapabilities::default(),
+            backend: default_backend(),
+            runtime: None,
+            runtime_version: None,
+            hardware_class: None,
+            runtime_endpoint: None,
+            supported_operations: Vec::new(),
+            max_inflight: 1,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: None,
+        }
+    }
 }
 
 fn default_backend() -> String {
@@ -352,6 +455,14 @@ pub struct WorkerSnapshot {
     pub capabilities: Vec<String>,
     pub capability_descriptor: WorkerCapabilities,
     pub backend: String,
+    pub runtime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_endpoint: Option<String>,
+    pub supported_operations: Vec<String>,
     pub max_inflight: usize,
     pub inflight: usize,
     /// `inflight / max_inflight` — 0.0 when idle, ≥ 1.0 when at or above capacity.
@@ -434,6 +545,11 @@ impl WorkerRegistry {
             addr: raw_addr,
             capabilities,
             backend,
+            runtime,
+            runtime_version,
+            hardware_class,
+            runtime_endpoint,
+            supported_operations,
             max_inflight,
             friendly_name,
             chip_model,
@@ -460,7 +576,17 @@ impl WorkerRegistry {
         };
         let max_inflight = max_inflight.clamp(1, MAX_WORKER_INFLIGHT);
         let backend = BackendKind::parse(&backend);
+        let runtime = runtime
+            .as_deref()
+            .map(RuntimeKind::parse)
+            .filter(|runtime| *runtime != RuntimeKind::Unknown)
+            .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let (capabilities, capability_source) = capabilities.into_parts();
+        let supported_operations = if supported_operations.is_empty() {
+            supported_operations_from_capabilities(&capabilities)
+        } else {
+            supported_operations
+        };
 
         self.inner
             .entry(id)
@@ -470,11 +596,22 @@ impl WorkerRegistry {
                 existing.capabilities = capabilities.clone();
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
+                existing.runtime = runtime.clone();
                 existing.max_inflight = max_inflight;
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
                 existing.drain = false;
+                existing.supported_operations = supported_operations.clone();
                 // Preserve richer identity fields if re-registering with them.
+                if runtime_version.is_some() {
+                    existing.runtime_version = runtime_version.clone();
+                }
+                if hardware_class.is_some() {
+                    existing.hardware_class = hardware_class.clone();
+                }
+                if runtime_endpoint.is_some() {
+                    existing.runtime_endpoint = runtime_endpoint.clone();
+                }
                 if friendly_name.is_some() {
                     existing.friendly_name = friendly_name.clone();
                 }
@@ -494,6 +631,11 @@ impl WorkerRegistry {
                 capabilities,
                 capability_source,
                 backend,
+                runtime,
+                runtime_version,
+                hardware_class,
+                runtime_endpoint,
+                supported_operations,
                 max_inflight,
                 inflight: Arc::new(AtomicUsize::new(0)),
                 health: WorkerHealth::Healthy,
@@ -627,6 +769,7 @@ impl WorkerRegistry {
         excluded_id: Option<WorkerId>,
     ) -> Vec<WorkerStatus> {
         let backend_filter = backend_filter_from_hint(backend_hint);
+        let runtime_filter = runtime_filter_from_hint(backend_hint);
         let preferred_pool = preferred_pool
             .map(str::trim)
             .filter(|pool| !pool.is_empty());
@@ -641,6 +784,7 @@ impl WorkerRegistry {
                         model_id,
                         request_kind,
                         backend_filter.as_ref(),
+                        runtime_filter.as_ref(),
                         min_context,
                         excluded_id,
                     )
@@ -660,6 +804,7 @@ impl WorkerRegistry {
                 model_id,
                 request_kind,
                 backend_filter.as_ref(),
+                runtime_filter.as_ref(),
                 min_context,
                 None,
             );
@@ -834,6 +979,11 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         capabilities: e.capabilities.models.clone(),
         capability_descriptor: e.capabilities.clone(),
         backend: e.backend.as_str().to_string(),
+        runtime: e.runtime.as_str().to_string(),
+        runtime_version: e.runtime_version.clone(),
+        hardware_class: e.hardware_class.clone(),
+        runtime_endpoint: e.runtime_endpoint.clone(),
+        supported_operations: e.supported_operations.clone(),
         max_inflight: e.max_inflight,
         inflight,
         saturation: inflight as f64 / e.max_inflight.max(1) as f64,
@@ -857,6 +1007,20 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         active_batch_size: e.active_batch_size,
         max_batch_size: e.max_batch_size,
     }
+}
+
+fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> Vec<String> {
+    let mut operations = Vec::new();
+    if capabilities.llm {
+        operations.push("llm".to_string());
+    }
+    if capabilities.embedding {
+        operations.push("embedding".to_string());
+    }
+    if capabilities.vision {
+        operations.push("vision".to_string());
+    }
+    operations
 }
 
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
@@ -887,6 +1051,7 @@ fn dispatch_filter_matches(
     model_id: &str,
     request_kind: RequestKind,
     backend_filter: Option<&BackendKind>,
+    runtime_filter: Option<&RuntimeKind>,
     min_context: Option<u32>,
     excluded_id: Option<WorkerId>,
 ) -> bool {
@@ -896,6 +1061,7 @@ fn dispatch_filter_matches(
         && entry.capabilities.models.iter().any(|c| c == model_id)
         && supports_request_kind(entry, request_kind)
         && backend_filter.is_none_or(|kind| &entry.backend == kind)
+        && runtime_filter.is_none_or(|kind| &entry.runtime == kind)
         && min_context.is_none_or(|required| {
             entry
                 .capabilities
@@ -934,6 +1100,7 @@ mod tests {
             chip_model: None,
             worker_pool: None,
             node_class: None,
+            ..Default::default()
         }
     }
 
@@ -1061,6 +1228,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_vllm_backend() {
+        assert_eq!(BackendKind::parse("vllm"), BackendKind::Vllm);
+        assert_eq!(BackendKind::parse("v_llm"), BackendKind::Vllm);
+        assert_eq!(BackendKind::parse("v-llm"), BackendKind::Vllm);
+        assert_eq!(BackendKind::Vllm.as_str(), "vllm");
+        assert_eq!(
+            RuntimeKind::from_backend(&BackendKind::Vllm),
+            RuntimeKind::Vllm
+        );
+    }
+
+    #[test]
     fn structured_capabilities_registration_is_preserved() {
         let r = WorkerRegistry::new();
         let resp = r.register(
@@ -1080,13 +1259,19 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: Some("thor".into()),
+                ..Default::default()
             },
             5000,
         );
         let id = WorkerId::parse(&resp.worker_id).unwrap();
         let snapshot = r.get_snapshot(id).unwrap();
         assert_eq!(snapshot.backend, "sglang");
+        assert_eq!(snapshot.runtime, "sglang");
         assert_eq!(snapshot.capabilities, vec!["embed-1".to_string()]);
+        assert_eq!(
+            snapshot.supported_operations,
+            vec!["llm".to_string(), "embedding".to_string()]
+        );
         assert!(snapshot.capability_descriptor.embedding);
         assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
     }
@@ -1111,6 +1296,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: Some("thor".into()),
+                ..Default::default()
             },
             5000,
         );
@@ -1143,6 +1329,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: Some("mac".into()),
+                ..Default::default()
             },
             5000,
         );
@@ -1163,6 +1350,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: Some("thor".into()),
+                ..Default::default()
             },
             5000,
         );
@@ -1181,6 +1369,110 @@ mod tests {
             r.eligible_workers_filtered("shared-model", RequestKind::Llm, Some("unknown"), None)
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn runtime_hint_filters_workers() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["runtime-model".into()],
+                    max_context: Some(4096),
+                }),
+                backend: "auto".into(),
+                runtime: Some("ax_engine".into()),
+                max_inflight: 4,
+                node_class: Some("mac".into()),
+                ..Default::default()
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["runtime-model".into()],
+                    max_context: Some(16384),
+                }),
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                max_inflight: 4,
+                node_class: Some("pc-cuda".into()),
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_filtered("runtime-model", RequestKind::Llm, Some("ax_engine"), None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            r.eligible_workers_filtered("runtime-model", RequestKind::Llm, Some("vllm"), None)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn vllm_worker_exposes_runtime_metadata() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: true,
+                    models: vec!["qwen3-32b".into()],
+                    max_context: Some(32768),
+                }),
+                backend: "vllm".into(),
+                max_inflight: 16,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: Some("cuda".into()),
+                node_class: Some("pc-cuda".into()),
+                runtime: Some("vllm".into()),
+                runtime_version: Some("0.13.0".into()),
+                hardware_class: Some("pc-cuda".into()),
+                runtime_endpoint: Some("http://127.0.0.1:8000".into()),
+                supported_operations: vec!["llm".into(), "vision".into()],
+            },
+            5000,
+        );
+
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.backend, "vllm");
+        assert_eq!(snapshot.runtime, "vllm");
+        assert_eq!(snapshot.runtime_version.as_deref(), Some("0.13.0"));
+        assert_eq!(snapshot.hardware_class.as_deref(), Some("pc-cuda"));
+        assert_eq!(
+            snapshot.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(
+            snapshot.supported_operations,
+            vec!["llm".to_string(), "vision".to_string()]
+        );
+        assert_eq!(
+            r.eligible_workers_filtered("qwen3-32b", RequestKind::Llm, Some("vllm"), None)
+                .len(),
+            1
         );
     }
 
@@ -1204,6 +1496,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );
@@ -1224,6 +1517,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );
@@ -1427,6 +1721,7 @@ mod tests {
             chip_model: Some("Apple M3 Pro".to_string()),
             worker_pool: Some("blue".to_string()),
             node_class: Some("m3-pro".to_string()),
+            ..Default::default()
         };
         let resp = r.register(req, 5000);
         let id = WorkerId::parse(&resp.worker_id).unwrap();
@@ -1495,6 +1790,12 @@ mod tests {
         assert_eq!(BackendKind::parse("llamacpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("llama-cpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("LLAMA_CPP"), BackendKind::LlamaCpp);
+        assert_eq!(BackendKind::parse("sglang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::parse("sg_lang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::parse("sg-lang"), BackendKind::SgLang);
+        assert_eq!(BackendKind::parse("vllm"), BackendKind::Vllm);
+        assert_eq!(BackendKind::parse("v_llm"), BackendKind::Vllm);
+        assert_eq!(BackendKind::parse("v-llm"), BackendKind::Vllm);
         assert_eq!(BackendKind::parse("native"), BackendKind::Native);
         assert_eq!(BackendKind::parse("NATIVE"), BackendKind::Native);
         assert_eq!(BackendKind::parse("auto"), BackendKind::Auto);
@@ -1529,6 +1830,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );
@@ -1732,6 +2034,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );
@@ -1769,6 +2072,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );
@@ -1811,6 +2115,7 @@ mod tests {
                 chip_model: None,
                 worker_pool: None,
                 node_class: None,
+                ..Default::default()
             },
             5000,
         );

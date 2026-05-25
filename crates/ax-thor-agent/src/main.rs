@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()?;
 
-    sglang::wait_for_sglang(&cp_client, &config.sglang_url).await?;
+    sglang::wait_for_sglang(&cp_client, &config.runtime_url).await?;
 
     let runtime = SharedRuntime::new();
     let registration = agent::register(&cp_client, &config).await?;

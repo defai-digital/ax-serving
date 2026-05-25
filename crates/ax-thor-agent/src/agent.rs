@@ -83,7 +83,7 @@ impl Default for SharedRuntime {
 }
 
 pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
-    let model_info = sglang::get_model_info(client, &config.sglang_url).await?;
+    let model_info = sglang::get_model_info(client, &config.runtime_url).await?;
     let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
 
     // BUG-114: derive capabilities from config overrides or runtime metadata
@@ -99,6 +99,13 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
 
     let embedding = config.embedding.unwrap_or(false);
     let vision = config.vision.unwrap_or(false);
+    let mut supported_operations = vec!["llm"];
+    if embedding {
+        supported_operations.push("embedding");
+    }
+    if vision {
+        supported_operations.push("vision");
+    }
 
     let body = json!({
         "addr": config.advertised_addr.to_string(),
@@ -109,7 +116,11 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
             "models": models,
             "max_context": max_context
         },
-        "backend": "sglang",
+        "backend": config.runtime.as_str(),
+        "runtime": config.runtime.as_str(),
+        "hardware_class": "thor",
+        "runtime_endpoint": config.runtime_url.as_str(),
+        "supported_operations": supported_operations,
         "max_inflight": config.max_inflight,
         "friendly_name": config.friendly_name,
         "chip_model": config.chip_model,
@@ -167,7 +178,7 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             continue;
         };
 
-        let models = match sglang::get_loaded_models(&client, &config.sglang_url).await {
+        let models = match sglang::get_loaded_models(&client, &config.runtime_url).await {
             Ok(models) => {
                 *runtime.models.write().await = models.clone();
                 models

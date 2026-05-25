@@ -91,7 +91,7 @@ async fn thor_wait_ready_honors_timeout_without_sleeping_full_poll_interval() ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thor_drain_complete_when_idle_calls_drain_and_drain_complete() -> Result<()> {
     let state = Arc::new(MockServerState::default());
-    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"sglang","health":"healthy","drain":false}]"#;
+    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
     let (base_url, listen_addr, server_task) =
         spawn_mock_server(worker_list, state.clone()).await?;
     let config_path = temp_path("thor-drain", "env");
@@ -140,8 +140,8 @@ async fn thor_drain_complete_when_idle_calls_drain_and_drain_complete() -> Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thor_status_require_ready_detects_live_agent_capability_mismatch() -> Result<()> {
     let state = Arc::new(MockServerState::default());
-    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"sglang","health":"healthy","drain":false}]"#;
-    let health_json = r#"{"status":"ok","backend":"sglang","capabilities":{"llm":true,"embedding":false,"vision":false},"max_context":null,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#;
+    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
+    let health_json = r#"{"status":"ok","backend":"vllm","runtime":"vllm","capabilities":{"llm":true,"embedding":true,"vision":false},"max_context":null,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#;
     let (base_url, listen_addr, server_task) =
         spawn_mock_server_with_health(worker_list, health_json, state).await?;
     let config_path = temp_path("thor-status-config-drift", "env");
@@ -175,8 +175,8 @@ async fn thor_status_require_ready_detects_live_agent_capability_mismatch() -> R
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thor_status_require_ready_detects_live_agent_max_context_mismatch() -> Result<()> {
     let state = Arc::new(MockServerState::default());
-    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"sglang","health":"healthy","drain":false}]"#;
-    let health_json = r#"{"status":"ok","backend":"sglang","capabilities":{"llm":true,"embedding":true,"vision":false},"max_context":16384,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#;
+    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
+    let health_json = r#"{"status":"ok","backend":"vllm","runtime":"vllm","capabilities":{"llm":true,"embedding":false,"vision":false},"max_context":16384,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#;
     let (base_url, listen_addr, server_task) =
         spawn_mock_server_with_health(worker_list, health_json, state).await?;
     let config_path = temp_path("thor-status-max-context-drift", "env");
@@ -233,7 +233,8 @@ fn write_thor_env(
     let contents = format!(
         "\
 AXS_CONTROL_PLANE_URL={base_url}
-AXS_THOR_BACKEND=sglang
+AXS_THOR_RUNTIME=vllm
+AXS_THOR_BACKEND=vllm
 AXS_THOR_RUNTIME_URL={base_url}
 AXS_THOR_LISTEN_ADDR={listen_addr}
 AXS_THOR_ADVERTISED_ADDR={listen_addr}
@@ -261,7 +262,7 @@ async fn spawn_mock_server(
 ) -> Result<(String, std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     spawn_mock_server_with_health(
         worker_list_json,
-        r#"{"status":"ok","backend":"sglang","capabilities":{"llm":true,"embedding":true,"vision":false},"max_context":null,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#,
+        r#"{"status":"ok","backend":"vllm","runtime":"vllm","capabilities":{"llm":true,"embedding":false,"vision":false},"max_context":null,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#,
         state,
     )
     .await

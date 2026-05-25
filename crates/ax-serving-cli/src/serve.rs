@@ -60,6 +60,11 @@ struct HeartbeatConfig {
     chip_model: Option<String>,
     worker_pool: Option<String>,
     node_class: Option<String>,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+    hardware_class: Option<String>,
+    runtime_endpoint: Option<String>,
+    supported_operations: Vec<String>,
 }
 
 struct RegisterConfig<'a> {
@@ -69,7 +74,40 @@ struct RegisterConfig<'a> {
     chip_model: Option<&'a str>,
     worker_pool: Option<&'a str>,
     node_class: Option<&'a str>,
+    runtime: Option<&'a str>,
+    runtime_version: Option<&'a str>,
+    hardware_class: Option<&'a str>,
+    runtime_endpoint: Option<&'a str>,
+    supported_operations: &'a [String],
     internal_api_token: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerRuntimeMetadata {
+    runtime: String,
+    runtime_version: Option<String>,
+    hardware_class: String,
+    runtime_endpoint: String,
+    supported_operations: Vec<String>,
+}
+
+fn derive_worker_runtime_metadata(
+    node_class: Option<&str>,
+    self_addr: &str,
+    runtime: Option<String>,
+    runtime_version: Option<String>,
+    hardware_class: Option<String>,
+    runtime_endpoint: Option<String>,
+) -> WorkerRuntimeMetadata {
+    WorkerRuntimeMetadata {
+        runtime: runtime.unwrap_or_else(|| "ax_engine".to_string()),
+        runtime_version,
+        hardware_class: hardware_class
+            .or_else(|| node_class.map(str::to_string))
+            .unwrap_or_else(|| "mac".to_string()),
+        runtime_endpoint: runtime_endpoint.unwrap_or_else(|| format!("http://{self_addr}")),
+        supported_operations: vec!["llm".to_string()],
+    }
 }
 
 /// Register this worker with the orchestrator.
@@ -87,6 +125,11 @@ async fn register_with_orchestrator(
         "addr": self_addr,
         "capabilities": cfg.capabilities,
         "backend": "auto",
+        "runtime": cfg.runtime,
+        "runtime_version": cfg.runtime_version,
+        "hardware_class": cfg.hardware_class,
+        "runtime_endpoint": cfg.runtime_endpoint,
+        "supported_operations": cfg.supported_operations,
         "max_inflight": cfg.max_inflight,
         "friendly_name": cfg.friendly_name,
         "chip_model": cfg.chip_model,
@@ -217,6 +260,11 @@ async fn heartbeat_loop(
                         chip_model: cfg.chip_model.as_deref(),
                         worker_pool: cfg.worker_pool.as_deref(),
                         node_class: cfg.node_class.as_deref(),
+                        runtime: cfg.runtime.as_deref(),
+                        runtime_version: cfg.runtime_version.as_deref(),
+                        hardware_class: cfg.hardware_class.as_deref(),
+                        runtime_endpoint: cfg.runtime_endpoint.as_deref(),
+                        supported_operations: &cfg.supported_operations,
                         internal_api_token: cfg.internal_api_token.as_deref(),
                     },
                 )
@@ -345,6 +393,7 @@ pub(crate) fn run_serve(
     tracing::info!(%host, %port, "worker starting");
 
     // Preload model (sync, before starting the async runtime).
+    let preloaded_model = model.is_some();
     let capabilities: Vec<String> = if let Some(path) = model {
         let load_config = LoadConfig::default();
         layer
@@ -377,6 +426,23 @@ pub(crate) fn run_serve(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let runtime = std::env::var("AXS_WORKER_RUNTIME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let runtime_version = std::env::var("AXS_WORKER_RUNTIME_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let hardware_class = std::env::var("AXS_WORKER_HARDWARE_CLASS")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| node_class.clone());
+    let runtime_endpoint = std::env::var("AXS_WORKER_RUNTIME_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Max inflight reported to the orchestrator.  This must not overstate the
     // serving layer's own admission limits or the orchestrator will route
@@ -401,6 +467,27 @@ pub(crate) fn run_serve(
 
     // The address the orchestrator uses to reach this worker over loopback.
     let self_addr = format!("{host}:{port}");
+    let runtime_metadata = derive_worker_runtime_metadata(
+        node_class.as_deref(),
+        &self_addr,
+        runtime,
+        runtime_version,
+        hardware_class,
+        runtime_endpoint,
+    );
+
+    if !preloaded_model {
+        tracing::info!(
+            runtime = %runtime_metadata.runtime,
+            hardware_class = %runtime_metadata.hardware_class,
+            "worker registering as runtime node without preloaded model"
+        );
+    } else {
+        tracing::warn!(
+            runtime = %runtime_metadata.runtime,
+            "embedded local model loading is a compatibility path; prefer an ax-engine node adapter for Mac inference"
+        );
+    }
 
     // Start servers on a multi-thread runtime.  The async block handles
     // orchestrator registration, runs the servers, then does cleanup.
@@ -426,6 +513,11 @@ pub(crate) fn run_serve(
                         chip_model: chip_model.as_deref(),
                         worker_pool: worker_pool.as_deref(),
                         node_class: node_class.as_deref(),
+                        runtime: Some(runtime_metadata.runtime.as_str()),
+                        runtime_version: runtime_metadata.runtime_version.as_deref(),
+                        hardware_class: Some(runtime_metadata.hardware_class.as_str()),
+                        runtime_endpoint: Some(runtime_metadata.runtime_endpoint.as_str()),
+                        supported_operations: &runtime_metadata.supported_operations,
                         internal_api_token: internal_api_token.as_deref(),
                     },
                 )
@@ -461,6 +553,11 @@ pub(crate) fn run_serve(
                     chip_model: chip_model.clone(),
                     worker_pool: worker_pool.clone(),
                     node_class: node_class.clone(),
+                    runtime: Some(runtime_metadata.runtime.clone()),
+                    runtime_version: runtime_metadata.runtime_version.clone(),
+                    hardware_class: Some(runtime_metadata.hardware_class.clone()),
+                    runtime_endpoint: Some(runtime_metadata.runtime_endpoint.clone()),
+                    supported_operations: runtime_metadata.supported_operations.clone(),
                 };
                 tokio::spawn(heartbeat_loop(client.clone(), Arc::clone(&layer), cfg))
             });
@@ -548,7 +645,10 @@ fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_advertised_max_inflight, default_advertised_max_inflight, parse_rest_addr};
+    use super::{
+        clamp_advertised_max_inflight, default_advertised_max_inflight,
+        derive_worker_runtime_metadata, parse_rest_addr,
+    };
     use ax_serving_api::config::ServeConfig;
 
     #[test]
@@ -615,5 +715,33 @@ mod tests {
     #[test]
     fn clamp_advertised_max_inflight_enforces_minimum_one() {
         assert_eq!(clamp_advertised_max_inflight(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn worker_runtime_metadata_defaults_to_ax_engine_mac_node() {
+        let metadata =
+            derive_worker_runtime_metadata(None, "127.0.0.1:18080", None, None, None, None);
+
+        assert_eq!(metadata.runtime, "ax_engine");
+        assert_eq!(metadata.hardware_class, "mac");
+        assert_eq!(metadata.runtime_endpoint, "http://127.0.0.1:18080");
+        assert_eq!(metadata.supported_operations, vec!["llm".to_string()]);
+    }
+
+    #[test]
+    fn worker_runtime_metadata_respects_operator_overrides() {
+        let metadata = derive_worker_runtime_metadata(
+            Some("m3-max-128g"),
+            "127.0.0.1:18080",
+            Some("vllm".into()),
+            Some("0.13.0".into()),
+            Some("pc-cuda".into()),
+            Some("http://10.0.0.12:8000".into()),
+        );
+
+        assert_eq!(metadata.runtime, "vllm");
+        assert_eq!(metadata.runtime_version.as_deref(), Some("0.13.0"));
+        assert_eq!(metadata.hardware_class, "pc-cuda");
+        assert_eq!(metadata.runtime_endpoint, "http://10.0.0.12:8000");
     }
 }

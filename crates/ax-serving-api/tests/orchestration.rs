@@ -188,6 +188,7 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
         chip_model: None,
         worker_pool: None,
         node_class: None,
+        ..Default::default()
     }
 }
 
@@ -933,6 +934,7 @@ async fn test_wrr_dispatch_proportional() {
             chip_model: None,
             worker_pool: None,
             node_class: None,
+            ..Default::default()
         },
         5000,
     );
@@ -947,6 +949,7 @@ async fn test_wrr_dispatch_proportional() {
             chip_model: None,
             worker_pool: None,
             node_class: None,
+            ..Default::default()
         },
         5000,
     );
@@ -1501,6 +1504,7 @@ async fn test_proxy_models_uses_structured_capability_models() {
             chip_model: Some("RTX".into()),
             worker_pool: Some("thor".into()),
             node_class: Some("thor".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -1934,6 +1938,7 @@ async fn test_structured_embedding_worker_is_not_used_for_chat() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("thor".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2008,6 +2013,7 @@ async fn test_backend_hint_routes_to_matching_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("mac".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2028,6 +2034,7 @@ async fn test_backend_hint_routes_to_matching_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("thor".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2087,6 +2094,7 @@ async fn test_routing_trace_header_includes_selected_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("mac".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2107,6 +2115,7 @@ async fn test_routing_trace_header_includes_selected_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("thor".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2207,6 +2216,7 @@ async fn test_prompt_size_routes_to_sufficient_context_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("mac".into()),
+            ..Default::default()
         },
         5000,
     );
@@ -2227,6 +2237,7 @@ async fn test_prompt_size_routes_to_sufficient_context_worker() {
             chip_model: None,
             worker_pool: None,
             node_class: Some("thor".into()),
+            ..Default::default()
         },
         5000,
     );

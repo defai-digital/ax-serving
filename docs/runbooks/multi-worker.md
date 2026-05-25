@@ -1,7 +1,7 @@
 # Multi-Worker Orchestration Runbook
 
 **Version:** 1.2
-**ADR:** [ADR-012](../adr/ADR-012-local-multi-worker-orchestration.md)
+**ADR:** [ADR-012](../../.internal/adr/ADR-012-local-multi-worker-orchestration.md)
 **Date:** 2026-03-03
 
 ---

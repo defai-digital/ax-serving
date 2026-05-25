@@ -40,6 +40,8 @@ async fn proxy_inference(
         #[serde(default)]
         backend: Option<String>,
         #[serde(default)]
+        runtime: Option<String>,
+        #[serde(default)]
         stream: bool,
         #[serde(default)]
         max_tokens: Option<u32>,
@@ -60,7 +62,7 @@ async fn proxy_inference(
         match serde_json::from_slice::<ProxyRequestMeta>(&body) {
             Ok(v) => (
                 v.model.unwrap_or_else(|| "default".to_string()),
-                v.backend,
+                v.runtime.or(v.backend),
                 v.stream,
                 v.max_tokens,
                 if !v.messages.is_empty() {

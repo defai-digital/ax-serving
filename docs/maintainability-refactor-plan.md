@@ -3,7 +3,7 @@
 > **Status**: Draft  
 > **Date**: 2026-03-29  
 > **Type**: Engineering Refactor Plan  
-> **Scope**: Supports [docs/prd/PRD-AX-SERVING-v3.0.md](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-v3.0.md) without changing product positioning
+> **Scope**: Supports [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md) without changing product positioning
 
 ## 1. Purpose
 
@@ -14,7 +14,7 @@ feature work begins.
 It is intentionally an engineering plan, not a new product PRD. The canonical
 product PRD remains:
 
-- [docs/prd/PRD-AX-SERVING-v3.0.md](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-v3.0.md)
+- [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md)
 
 ## 2. Problem Statement
 
@@ -329,7 +329,7 @@ Exit criteria:
 This plan is complete when all of the following are true:
 
 - The canonical product PRD remains unchanged:
-  - [docs/prd/PRD-AX-SERVING-v3.0.md](/Users/akiralam/code/ax-serving/docs/prd/PRD-AX-SERVING-v3.0.md)
+  - [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md)
 - No single production Rust file exceeds 1500 LOC, except engine adapter files
   explicitly exempted for FFI/backend reasons.
 - No single integration-test Rust file exceeds 1500 LOC.

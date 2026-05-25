@@ -114,4 +114,4 @@
 - [QUICKSTART.md](../QUICKSTART.md)
 - [python-sdk.md](python-sdk.md)
 - [market-positioning.md](market-positioning.md)
-- [PRD](../prd/PRD-AX-SERVING-v3.0.md)
+- [PRD](../.internal/prd/PRD-AX-SERVING.md)

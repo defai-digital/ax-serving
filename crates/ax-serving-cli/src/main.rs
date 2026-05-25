@@ -222,9 +222,16 @@ enum ThorCommand {
         /// Worker address the control plane should route to.
         #[arg(long)]
         advertised_addr: Option<String>,
-        /// Local SGLang base URL.
-        #[arg(long, default_value = "http://127.0.0.1:30000")]
-        sglang_url: String,
+        /// Thor inference runtime (`vllm` by default; `sglang` kept for compatibility).
+        #[arg(long, default_value = "vllm")]
+        runtime: String,
+        /// Local runtime base URL.
+        #[arg(
+            long,
+            visible_alias = "sglang-url",
+            default_value = "http://127.0.0.1:8000"
+        )]
+        runtime_url: String,
         /// Internal worker token for control-plane auth.
         #[arg(long)]
         worker_token: Option<String>,
@@ -258,9 +265,12 @@ enum ThorCommand {
         /// Local thor-agent listen address.
         #[arg(long)]
         listen_addr: Option<String>,
-        /// Local SGLang base URL.
+        /// Thor inference runtime (`vllm` by default; `sglang` kept for compatibility).
         #[arg(long)]
-        sglang_url: Option<String>,
+        runtime: Option<String>,
+        /// Local runtime base URL.
+        #[arg(long, visible_alias = "sglang-url")]
+        runtime_url: Option<String>,
         /// Internal worker token for control-plane auth.
         #[arg(long)]
         worker_token: Option<String>,
@@ -379,7 +389,8 @@ fn main() -> Result<()> {
                         control_plane,
                         listen_addr,
                         advertised_addr,
-                        sglang_url,
+                        runtime,
+                        runtime_url,
                         worker_token,
                         max_inflight,
                         worker_pool,
@@ -391,7 +402,8 @@ fn main() -> Result<()> {
                         control_plane,
                         listen_addr,
                         advertised_addr,
-                        sglang_url,
+                        runtime,
+                        runtime_url,
                         worker_token,
                         max_inflight,
                         worker_pool,
@@ -404,7 +416,8 @@ fn main() -> Result<()> {
                         control_plane,
                         advertised_addr,
                         listen_addr,
-                        sglang_url,
+                        runtime,
+                        runtime_url,
                         worker_token,
                         max_inflight,
                         worker_pool,
@@ -417,7 +430,8 @@ fn main() -> Result<()> {
                             control_plane,
                             advertised_addr,
                             listen_addr,
-                            sglang_url,
+                            runtime,
+                            runtime_url,
                             worker_token,
                             max_inflight,
                             worker_pool,

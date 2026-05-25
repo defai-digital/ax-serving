@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 
-const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
+const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8000";
 const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MAX_INFLIGHT: usize = 8;
 const DEFAULT_NODE_CLASS: &str = "thor";
+const DEFAULT_RUNTIME: &str = "vllm";
 
 fn load_optional_string_env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -18,7 +19,8 @@ fn load_optional_string_env(key: &str) -> Option<String> {
 pub struct ThorConfig {
     pub control_plane_url: String,
     pub worker_token: Option<String>,
-    pub sglang_url: String,
+    pub runtime_url: String,
+    pub runtime: String,
     pub listen_addr: SocketAddr,
     pub advertised_addr: SocketAddr,
     pub max_inflight: usize,
@@ -29,7 +31,7 @@ pub struct ThorConfig {
     /// env: `AXS_THOR_SHUTDOWN_TIMEOUT_SECS` (default 30)
     pub shutdown_timeout_secs: Option<u64>,
     /// env: `AXS_THOR_MAX_CONTEXT` — max context window advertised to control
-    /// plane. If unset, the agent tries to derive it from the sglang runtime.
+    /// plane. If unset, the agent tries to derive it from the runtime.
     pub max_context: Option<u32>,
     /// env: `AXS_THOR_EMBEDDING` — override embedding capability (true/false).
     /// If unset, defaults to false (most LLM models are not embedding models).
@@ -44,8 +46,12 @@ impl ThorConfig {
         let control_plane_url =
             std::env::var("AXS_CONTROL_PLANE_URL").context("AXS_CONTROL_PLANE_URL is required")?;
         let worker_token = load_optional_string_env("AXS_WORKER_TOKEN");
-        let sglang_url =
-            std::env::var("AXS_SGLANG_URL").unwrap_or_else(|_| DEFAULT_SGLANG_URL.into());
+        let runtime_url = load_optional_string_env("AXS_THOR_RUNTIME_URL")
+            .or_else(|| load_optional_string_env("AXS_SGLANG_URL"))
+            .unwrap_or_else(|| DEFAULT_RUNTIME_URL.into());
+        let runtime = load_optional_string_env("AXS_THOR_RUNTIME")
+            .or_else(|| load_optional_string_env("AXS_THOR_BACKEND"))
+            .unwrap_or_else(|| DEFAULT_RUNTIME.into());
         let listen_addr: SocketAddr = std::env::var("AXS_THOR_LISTEN_ADDR")
             .unwrap_or_else(|_| DEFAULT_THOR_LISTEN_ADDR.into())
             .parse()
@@ -96,7 +102,8 @@ impl ThorConfig {
         Ok(Self {
             control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
             worker_token,
-            sglang_url: sglang_url.trim_end_matches('/').to_string(),
+            runtime_url: runtime_url.trim_end_matches('/').to_string(),
+            runtime,
             listen_addr,
             advertised_addr,
             max_inflight,
