@@ -566,7 +566,7 @@ impl ServeConfig {
             self.sched_max_queue = n.max(1);
         }
         if let Some(ms) = env_parse::<u64>("AXS_SCHED_MAX_WAIT_MS") {
-            self.sched_max_wait_ms = ms;
+            self.sched_max_wait_ms = ms.max(1);
         }
         if let Some(v) = env_str("AXS_OVERLOAD_POLICY") {
             self.sched_overload_policy = v;
@@ -1223,6 +1223,15 @@ mod tests {
         let cfg = ServeConfig::from_env();
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
         assert_eq!(cfg.orchestrator.global_queue_wait_ms, 1);
+    }
+
+    #[test]
+    fn from_env_clamps_sched_max_wait_ms_to_one() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_SCHED_MAX_WAIT_MS", "0") };
+        let cfg = ServeConfig::from_env();
+        unsafe { std::env::remove_var("AXS_SCHED_MAX_WAIT_MS") };
+        assert_eq!(cfg.sched_max_wait_ms, 1);
     }
 
     #[test]
