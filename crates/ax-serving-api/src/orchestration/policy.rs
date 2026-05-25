@@ -162,7 +162,7 @@ impl DispatchPolicy for WeightedRoundRobinPolicy {
         for w in workers {
             let cap = w.max_inflight.saturating_sub(w.inflight);
             if cap > 0 {
-                cumulative += cap;
+                cumulative = cumulative.saturating_add(cap);
                 if slot < cumulative {
                     return Some(w);
                 }
@@ -665,6 +665,21 @@ mod tests {
 
         let sel = policy.select(&workers, &ctx()).unwrap();
         assert_eq!(sel.id, avail.id);
+    }
+
+    #[test]
+    fn wrr_saturates_cumulative_capacity() {
+        let policy = WeightedRoundRobinPolicy::new();
+        policy
+            .position
+            .store(usize::MAX as u64 - 1, Ordering::Relaxed);
+        let first = make_worker(0, usize::MAX - 1);
+        let second = make_worker(0, 10);
+        let workers = vec![first, second.clone()];
+
+        let sel = policy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(sel.id, second.id);
     }
 
     // ── ModelAffinityPolicy ───────────────────────────────────────────────────
