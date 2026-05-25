@@ -76,6 +76,101 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Maximum buffered non-streaming worker response body.
 const MAX_WORKER_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug)]
+enum WorkerBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+fn response_declares_oversize(content_length: Option<u64>, max_bytes: usize) -> bool {
+    content_length.is_some_and(|len| len > max_bytes as u64)
+}
+
+fn append_limited_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), WorkerBodyError> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(WorkerBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(WorkerBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn add_limited_body_len(
+    current_len: usize,
+    chunk_len: usize,
+    max_bytes: usize,
+) -> Result<usize, WorkerBodyError> {
+    let next_len = current_len
+        .checked_add(chunk_len)
+        .ok_or(WorkerBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(WorkerBodyError::TooLarge);
+    }
+    Ok(next_len)
+}
+
+async fn read_worker_response_body_limited(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Bytes, WorkerBodyError> {
+    if response_declares_oversize(resp.content_length(), max_bytes) {
+        return Err(WorkerBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_limited_body_chunk(&mut body, &chunk.map_err(WorkerBodyError::Read)?, max_bytes)?;
+    }
+    Ok(Bytes::from(body))
+}
+
+async fn drain_worker_error_response(resp: reqwest::Response, url: &str) {
+    if response_declares_oversize(resp.content_length(), MAX_WORKER_RESPONSE_BODY_BYTES) {
+        warn!(
+            %url,
+            content_length = resp.content_length().unwrap_or_default(),
+            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
+            "skipping oversized worker error response drain"
+        );
+        return;
+    }
+
+    let mut total_len = 0usize;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                match add_limited_body_len(total_len, chunk.len(), MAX_WORKER_RESPONSE_BODY_BYTES) {
+                    Ok(next_len) => total_len = next_len,
+                    Err(WorkerBodyError::TooLarge) => {
+                        warn!(
+                            %url,
+                            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
+                            "stopping oversized worker error response drain"
+                        );
+                        return;
+                    }
+                    Err(WorkerBodyError::Read(_)) => {
+                        unreachable!("length accounting does not read")
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(%url, err = %err, "draining worker error response failed");
+                return;
+            }
+        }
+    }
+}
+
 impl DirectDispatcher {
     pub fn new(pool_max_idle_per_host: usize, request_timeout_secs: u64) -> Self {
         let client = match Client::builder()
@@ -271,7 +366,7 @@ impl DirectDispatcher {
             // Drain the error response body so the connection can be reused
             // from the pool instead of being discarded.
             if let Ok(resp) = result {
-                let _ = resp.bytes().await;
+                drain_worker_error_response(resp, &url).await;
             }
             drop(guard);
             registry.mark_unhealthy(selected_id);
@@ -397,7 +492,7 @@ impl DirectDispatcher {
             }
             // Drain the error response body so the connection can be reused.
             if let Ok(resp) = result2 {
-                let _ = resp.bytes().await;
+                drain_worker_error_response(resp, &url2).await;
             }
             registry.mark_unhealthy(selected2_id);
             return trace_response(
@@ -473,26 +568,12 @@ impl DirectDispatcher {
                         .body(Body::from_stream(guarded))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 } else {
-                    if resp
-                        .content_length()
-                        .is_some_and(|len| len > MAX_WORKER_RESPONSE_BODY_BYTES as u64)
+                    match read_worker_response_body_limited(resp, MAX_WORKER_RESPONSE_BODY_BYTES)
+                        .await
                     {
-                        error!(
-                            %url,
-                            content_length = resp.content_length().unwrap_or_default(),
-                            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
-                            "worker response body exceeded size limit"
-                        );
-                        return worker_failure_response(format!(
-                            "worker response body exceeded {} byte limit",
-                            MAX_WORKER_RESPONSE_BODY_BYTES
-                        ));
-                    }
-                    match resp.bytes().await {
-                        Ok(bytes) if bytes.len() > MAX_WORKER_RESPONSE_BODY_BYTES => {
+                        Err(WorkerBodyError::TooLarge) => {
                             error!(
                                 %url,
-                                len = bytes.len(),
                                 limit = MAX_WORKER_RESPONSE_BODY_BYTES,
                                 "worker response body exceeded size limit"
                             );
@@ -506,7 +587,7 @@ impl DirectDispatcher {
                             .header("content-type", content_type)
                             .body(Body::from(bytes))
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-                        Err(e) => {
+                        Err(WorkerBodyError::Read(e)) => {
                             error!(%url, err = %e, "reading worker response body failed");
                             worker_failure_response(e.to_string())
                         }
@@ -580,7 +661,10 @@ mod tests {
     use axum::body;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{DirectDispatcher, InflightGuard, InflightGuard as Guard, worker_url};
+    use super::{
+        DirectDispatcher, InflightGuard, InflightGuard as Guard, add_limited_body_len,
+        append_limited_body_chunk, response_declares_oversize, worker_url,
+    };
 
     #[test]
     fn worker_url_with_leading_slash() {
@@ -626,6 +710,27 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn response_declares_oversize_rejects_only_declared_excess() {
+        assert!(response_declares_oversize(Some(11), 10));
+        assert!(!response_declares_oversize(Some(10), 10));
+        assert!(!response_declares_oversize(None, 10));
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_incremental_excess() {
+        let mut body = Vec::new();
+        append_limited_body_chunk(&mut body, b"12345", 8).expect("first chunk fits");
+        assert!(append_limited_body_chunk(&mut body, b"6789", 8).is_err());
+        assert_eq!(body, b"12345");
+    }
+
+    #[test]
+    fn add_limited_body_len_rejects_incremental_excess() {
+        assert_eq!(add_limited_body_len(5, 3, 8).unwrap(), 8);
+        assert!(add_limited_body_len(5, 4, 8).is_err());
     }
 
     #[tokio::test]
