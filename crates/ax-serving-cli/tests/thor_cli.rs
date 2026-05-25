@@ -138,6 +138,45 @@ async fn thor_drain_complete_when_idle_calls_drain_and_drain_complete() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thor_status_require_ready_accepts_dynamic_runtime_capabilities() -> Result<()> {
+    let state = Arc::new(MockServerState::default());
+    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
+    let health_json = r#"{"status":"ok","backend":"vllm","runtime":"vllm","capabilities":{"llm":true,"embedding":true,"vision":true},"max_context":null,"model_ids":["qwen2-72b"],"inflight":0,"queue_depth":0}"#;
+    let (base_url, listen_addr, server_task) =
+        spawn_mock_server_with_health(worker_list, health_json, state).await?;
+    let config_path = temp_path("thor-status-dynamic-capabilities", "env");
+    let worker_id_path = temp_path("thor-status-dynamic-capabilities-worker", "id");
+    std::fs::write(&worker_id_path, "worker-1\n")
+        .with_context(|| format!("failed to write {}", worker_id_path.display()))?;
+    write_thor_env(&config_path, &base_url, listen_addr, &worker_id_path)?;
+    append_to_env(&config_path, "AXS_THOR_ADVERTISED_ADDR=127.0.0.1:18081\n")?;
+
+    let config_arg = config_path.to_str().unwrap().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(ax_serving_bin())
+            .args(["thor", "status", "--config", &config_arg, "--require-ready"])
+            .output()
+    })
+    .await
+    .context("thor status dynamic-capabilities task join failed")?
+    .context("failed to run ax-serving thor status for dynamic capabilities")?;
+
+    server_task.abort();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("overall_state=ready"));
+    assert!(!stdout.contains("capability_mismatch"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thor_status_require_ready_detects_live_agent_capability_mismatch() -> Result<()> {
     let state = Arc::new(MockServerState::default());
     let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
@@ -149,6 +188,7 @@ async fn thor_status_require_ready_detects_live_agent_capability_mismatch() -> R
     std::fs::write(&worker_id_path, "worker-1\n")
         .with_context(|| format!("failed to write {}", worker_id_path.display()))?;
     write_thor_env(&config_path, &base_url, listen_addr, &worker_id_path)?;
+    append_to_env(&config_path, "AXS_THOR_EMBEDDING=false\n")?;
 
     let config_arg = config_path.to_str().unwrap().to_string();
     let output = tokio::task::spawn_blocking(move || {

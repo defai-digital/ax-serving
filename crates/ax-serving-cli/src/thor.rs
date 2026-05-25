@@ -23,6 +23,8 @@ const THOR_ENV_KEYS: &[&str] = &[
     "AXS_THOR_ADVERTISED_ADDR",
     "AXS_THOR_MAX_INFLIGHT",
     "AXS_THOR_MAX_CONTEXT",
+    "AXS_THOR_EMBEDDING",
+    "AXS_THOR_VISION",
     "AXS_THOR_WORKER_POOL",
     "AXS_THOR_NODE_CLASS",
     "AXS_THOR_FRIENDLY_NAME",
@@ -639,7 +641,6 @@ async fn probe_runtime(client: &reqwest::Client, runtime_url: &str) -> EndpointS
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 struct AgentCapabilities {
-    llm: bool,
     embedding: bool,
     vision: bool,
 }
@@ -748,15 +749,26 @@ fn resolve_worker_id(env_file: &ThorEnvFile) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn expected_capabilities(backend: &str) -> AgentCapabilities {
-    match normalize_runtime(backend).as_str() {
-        "vllm" | "sglang" => AgentCapabilities {
-            llm: true,
-            embedding: false,
-            vision: false,
-        },
-        _ => AgentCapabilities::default(),
+fn parse_bool_value(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
     }
+}
+
+fn configured_bool(env_file: &ThorEnvFile, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| env_file.get(key).and_then(parse_bool_value))
+}
+
+fn capability_override_mismatch(env_file: &ThorEnvFile, capabilities: &AgentCapabilities) -> bool {
+    let expected_embedding =
+        configured_bool(env_file, &["AXS_NODE_EMBEDDING", "AXS_THOR_EMBEDDING"]);
+    let expected_vision = configured_bool(env_file, &["AXS_NODE_VISION", "AXS_THOR_VISION"]);
+
+    expected_embedding.is_some_and(|expected| capabilities.embedding != expected)
+        || expected_vision.is_some_and(|expected| capabilities.vision != expected)
 }
 
 struct ThorStatusReport {
@@ -832,10 +844,7 @@ async fn collect_status_report(
         && agent_health.backend != expected_backend
     {
         Some("backend_mismatch")
-    } else if agent_health.capabilities.llm != expected_capabilities(expected_backend).llm
-        || agent_health.capabilities.embedding != expected_capabilities(expected_backend).embedding
-        || agent_health.capabilities.vision != expected_capabilities(expected_backend).vision
-    {
+    } else if capability_override_mismatch(&env_file, &agent_health.capabilities) {
         Some("capability_mismatch")
     } else if expected_max_context.is_some() && agent_health.max_context != expected_max_context {
         Some("max_context_mismatch")
