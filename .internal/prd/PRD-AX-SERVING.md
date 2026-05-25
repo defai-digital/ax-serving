@@ -362,7 +362,7 @@ by the amount of runtime code inside AX Serving.
 |---|---|
 | PR-1 Runtime-neutral serving API | README, OpenAI-compatible REST tests, AX Fabric runtime contract |
 | PR-2 Inference node contract | [AX Serving Node Contract](../../docs/contracts/ax-serving-node-contract.md) |
-| PR-3 Runtime adapter support | Implementation plan phases 3-4; ADR-012; Thor/vLLM worker contract tests |
+| PR-3 Runtime adapter support | `ax-runtime-agent`, node contract, multi-worker runbook, and Thor/runtime-agent e2e tests |
 | PR-4 Model and placement semantics | Worker registry, admin fleet summary, routing/placement tests |
 | PR-5 Routing, admission, resilience | Multi-worker runbook, orchestration tests, scheduler tests |
 | PR-6 Observability and audit | Admin status/diagnostics/audit surfaces and model-management tests |
@@ -410,46 +410,34 @@ Boundary rules:
 
 ---
 
-## 10. Rework Plan
+## 10. Consolidated Execution Plan
 
-### Phase 1: Contract Clarification
+Sequencing lives in
+[AX Serving PRD Implementation Plan](./IMPLEMENTATION-PLAN-AX-SERVING.md).
+This PRD keeps only the durable product boundary and current execution state.
 
-Deliverables:
+Current state:
 
-- document the AX Serving node contract
-- classify existing backend paths as `gateway`, `node adapter`, or
-  `embedded runtime`
-- define capability fields required for ax-engine and vLLM nodes
-- update ADRs to supersede stale backend-routing decisions
+- the node contract is documented and treats runtime, hardware class, capacity,
+  health, supported operations, and model inventory as first-class metadata
+- `ax-runtime-agent` provides the generic runtime-node adapter path for Mac
+  ax-engine, PC CUDA vLLM, and NVIDIA Thor vLLM deployments
+- `ax-thor-agent` remains as a compatibility binary for existing Thor
+  deployments
+- admin status and orchestration tests cover runtime metadata and runtime fleet
+  grouping
+- embedded llama.cpp, MLX, libllama, and direct native paths are compatibility
+  paths, not the product direction
 
-### Phase 2: Node Adapter Direction
+Remaining work:
 
-Deliverables:
-
-- ax-engine node adapter path for Mac
-- vLLM node adapter path for PC CUDA
-- vLLM node adapter path for NVIDIA Thor
-- common health, metrics, drain, and model inventory translation
-
-### Phase 3: Remove Runtime Duplication
-
-Deliverables:
-
-- deprecate or extract embedded llama.cpp/MLX/libllama paths where they
-  duplicate runtime-node responsibility
-- keep temporary compatibility paths only where they are needed for migration
-- move runtime-specific tuning guidance out of AX Serving's core requirements
-- simplify backend routing language into node placement language
-
-### Phase 4: Fleet Product Hardening
-
-Deliverables:
-
-- operator runbooks for Mac ax-engine nodes, PC CUDA vLLM nodes, and Thor vLLM
-  nodes
-- fleet-level metrics and diagnostics by runtime class
-- tested drain/replacement workflows across mixed nodes
-- AX Fabric contract validation against the runtime-neutral gateway
+- improve ax-engine-specific health, model inventory, and metrics translation
+  behind the generic runtime-node adapter
+- continue extracting, deprecating, or quarantining embedded runtime paths after
+  node-adapter replacements are validated
+- deepen dashboard, diagnostics, and operator workflows by runtime class,
+  hardware class, pool, and model placement
+- keep AX Fabric validation aligned to the public serving and node contracts
 
 ---
 

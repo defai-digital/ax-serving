@@ -92,6 +92,9 @@ Stable contract family:
 - audit listing response shape where documented
 - fleet and admin-status grouping by pool, node class, backend compatibility
   hint, and runtime class where documented
+- diagnostics `runtime_diagnostics.runtimes` grouping for runtime model
+  inventory, hardware classes, supported operations, runtime endpoints, and
+  operator-facing issue codes
 
 Stability rule:
 
@@ -123,6 +126,14 @@ Current documented examples include:
 - `AXS_WORKER_RUNTIME_VERSION`
 - `AXS_WORKER_HARDWARE_CLASS`
 - `AXS_WORKER_RUNTIME_ENDPOINT`
+- `AXS_NODE_RUNTIME`
+- `AXS_NODE_RUNTIME_URL`
+- `AXS_NODE_LISTEN_ADDR`
+- `AXS_NODE_ADVERTISED_ADDR`
+- `AXS_NODE_HARDWARE_CLASS`
+- `AXS_NODE_CLASS`
+- `AXS_NODE_WORKER_POOL`
+- `AXS_NODE_MAX_INFLIGHT`
 - `AXS_THOR_RUNTIME`
 - `AXS_THOR_RUNTIME_URL`
 

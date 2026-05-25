@@ -175,6 +175,9 @@ Current evidence:
   embedded compatibility mode
 - operator runbook examples now cover Mac ax-engine, PC CUDA vLLM, and Thor vLLM
   runtime-node registration through the common adapter
+- `/v1/admin/diagnostics` exposes runtime-class diagnostics with model
+  inventory, hardware classes, supported operations, runtime endpoints, and
+  operator issue codes
 
 Remaining major slices:
 
@@ -182,5 +185,4 @@ Remaining major slices:
   OpenAI-compatible adapter path
 - extraction or deprecation of embedded llama.cpp, MLX, libllama, and native
   runtime responsibilities after adapter replacements exist
-- dashboard diagnostics details by runtime class beyond the existing status,
-  diagnostics, and fleet runtime buckets
+- dashboard rendering of runtime diagnostics beyond the JSON admin surface

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -433,6 +434,7 @@ pub(super) async fn proxy_admin_diagnostics(
     let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
     let total_active_sequences: usize = workers.iter().map(|w| w.active_sequences).sum();
     let runtime_buckets = runtime_fleet_buckets(&workers);
+    let runtime_diagnostics = runtime_diagnostics(&workers);
     let eligible = layer.registry.eligible_healthy_count();
     let qm = &layer.queue.metrics;
     Json(serde_json::json!({
@@ -467,6 +469,7 @@ pub(super) async fn proxy_admin_diagnostics(
                 "total_active_sequences": total_active_sequences,
                 "runtimes": runtime_buckets,
             },
+            "runtime_diagnostics": runtime_diagnostics,
             "reroute_total": layer.dispatcher.reroutes(),
             "queue": {
                 "active": layer.queue.active(),
@@ -477,6 +480,7 @@ pub(super) async fn proxy_admin_diagnostics(
                 "timeout_total": qm.timeout_total.load(Ordering::Relaxed),
             }
         },
+        "runtime_diagnostics": runtime_diagnostics,
         "workers": workers,
         "audit_tail": layer.audit.tail(50),
     }))
@@ -590,6 +594,195 @@ fn runtime_fleet_buckets(
         accumulate_fleet_bucket(&mut runtimes, &worker.runtime, worker);
     }
     runtimes
+}
+
+#[derive(Default)]
+struct RuntimeDiagnostic {
+    workers: usize,
+    healthy: usize,
+    unhealthy: usize,
+    draining: usize,
+    eligible: usize,
+    total_inflight: usize,
+    total_active_sequences: usize,
+    total_queue_depth: usize,
+    max_error_rate: f64,
+    models: BTreeSet<String>,
+    hardware_classes: BTreeMap<String, usize>,
+    node_classes: BTreeMap<String, usize>,
+    worker_pools: BTreeMap<String, usize>,
+    supported_operations: BTreeSet<String>,
+    runtime_endpoints: BTreeSet<String>,
+    missing_runtime_endpoint_workers: Vec<String>,
+    unhealthy_workers: Vec<String>,
+    draining_workers: Vec<String>,
+    compatibility_workers: Vec<String>,
+    unknown_runtime_workers: Vec<String>,
+    empty_model_inventory_workers: Vec<String>,
+}
+
+impl RuntimeDiagnostic {
+    fn observe(&mut self, worker: &super::registry::WorkerSnapshot) {
+        self.workers += 1;
+        if worker.health == "healthy" {
+            self.healthy += 1;
+        } else {
+            self.unhealthy += 1;
+            self.unhealthy_workers.push(worker.id.to_string());
+        }
+        if worker.drain {
+            self.draining += 1;
+            self.draining_workers.push(worker.id.to_string());
+        }
+        if worker.health == "healthy" && !worker.drain {
+            self.eligible += 1;
+        }
+        self.total_inflight += worker.inflight;
+        self.total_active_sequences += worker.active_sequences;
+        self.total_queue_depth += worker.queue_depth;
+        self.max_error_rate = self.max_error_rate.max(worker.error_rate);
+
+        if worker.capabilities.is_empty() {
+            self.empty_model_inventory_workers
+                .push(worker.id.to_string());
+        }
+        for model in &worker.capabilities {
+            self.models.insert(model.clone());
+        }
+        if let Some(hardware_class) = worker.hardware_class.as_deref() {
+            increment_count(&mut self.hardware_classes, hardware_class);
+        }
+        if let Some(node_class) = worker.node_class.as_deref() {
+            increment_count(&mut self.node_classes, node_class);
+        }
+        if let Some(worker_pool) = worker.worker_pool.as_deref() {
+            increment_count(&mut self.worker_pools, worker_pool);
+        }
+        for operation in &worker.supported_operations {
+            self.supported_operations.insert(operation.clone());
+        }
+        if let Some(endpoint) = worker.runtime_endpoint.as_deref() {
+            self.runtime_endpoints.insert(endpoint.to_string());
+        } else {
+            self.missing_runtime_endpoint_workers
+                .push(worker.id.to_string());
+        }
+
+        if worker.runtime == "unknown" {
+            self.unknown_runtime_workers.push(worker.id.to_string());
+        }
+        if worker.runtime == "ax_engine"
+            && matches!(
+                worker.backend.as_str(),
+                "native" | "auto" | "llama_cpp" | "mlx"
+            )
+        {
+            self.compatibility_workers.push(worker.id.to_string());
+        }
+    }
+
+    fn issues(&self) -> Vec<serde_json::Value> {
+        let mut issues = Vec::new();
+        if self.eligible == 0 {
+            issues.push(serde_json::json!({
+                "code": "no_eligible_workers",
+                "severity": "error",
+                "message": "runtime has no healthy non-draining workers"
+            }));
+        }
+        if !self.unknown_runtime_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "unknown_runtime",
+                "severity": "warning",
+                "workers": self.unknown_runtime_workers
+            }));
+        }
+        if !self.missing_runtime_endpoint_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "missing_runtime_endpoint",
+                "severity": "warning",
+                "workers": self.missing_runtime_endpoint_workers
+            }));
+        }
+        if !self.empty_model_inventory_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "empty_model_inventory",
+                "severity": "warning",
+                "workers": self.empty_model_inventory_workers
+            }));
+        }
+        if !self.compatibility_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "embedded_compatibility_path",
+                "severity": "info",
+                "workers": self.compatibility_workers
+            }));
+        }
+        issues
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "workers": self.workers,
+            "healthy": self.healthy,
+            "unhealthy": self.unhealthy,
+            "draining": self.draining,
+            "eligible": self.eligible,
+            "total_inflight": self.total_inflight,
+            "total_active_sequences": self.total_active_sequences,
+            "total_queue_depth": self.total_queue_depth,
+            "max_error_rate": self.max_error_rate,
+            "models": self.models,
+            "hardware_classes": self.hardware_classes,
+            "node_classes": self.node_classes,
+            "worker_pools": self.worker_pools,
+            "supported_operations": self.supported_operations,
+            "runtime_endpoints": self.runtime_endpoints,
+            "unhealthy_workers": self.unhealthy_workers,
+            "draining_workers": self.draining_workers,
+            "issues": self.issues(),
+        })
+    }
+}
+
+fn increment_count(counts: &mut BTreeMap<String, usize>, key: &str) {
+    *counts.entry(key.to_string()).or_default() += 1;
+}
+
+fn runtime_diagnostics(workers: &[super::registry::WorkerSnapshot]) -> serde_json::Value {
+    let mut diagnostics = BTreeMap::<String, RuntimeDiagnostic>::new();
+    for worker in workers {
+        diagnostics
+            .entry(worker.runtime.clone())
+            .or_default()
+            .observe(worker);
+    }
+
+    let mut runtimes = serde_json::Map::new();
+    let mut issues = Vec::new();
+    if workers.is_empty() {
+        issues.push(serde_json::json!({
+            "code": "no_workers_registered",
+            "severity": "error",
+            "message": "no runtime nodes are registered"
+        }));
+    }
+    for (runtime, diagnostic) in diagnostics {
+        let runtime_issues = diagnostic.issues();
+        for issue in &runtime_issues {
+            issues.push(serde_json::json!({
+                "runtime": runtime,
+                "code": issue["code"],
+                "severity": issue["severity"],
+            }));
+        }
+        runtimes.insert(runtime, diagnostic.to_json());
+    }
+
+    serde_json::json!({
+        "runtimes": runtimes,
+        "issues": issues,
+    })
 }
 
 fn increment_bucket(

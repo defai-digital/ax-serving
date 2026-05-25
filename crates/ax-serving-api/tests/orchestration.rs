@@ -1392,6 +1392,114 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
 }
 
 #[tokio::test]
+async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut mac_req = reg_req("127.0.0.1:28081".parse().unwrap(), &["mac-model"]);
+    mac_req.runtime = Some("ax_engine".into());
+    mac_req.hardware_class = Some("mac".into());
+    mac_req.node_class = Some("mac-studio".into());
+    mac_req.worker_pool = Some("mac".into());
+    let mac_resp = layer.registry.register(mac_req, 5000);
+    let mac_id = WorkerId::parse(&mac_resp.worker_id).unwrap();
+    assert!(layer.registry.heartbeat(
+        mac_id,
+        HeartbeatRequest {
+            inflight: 1,
+            model_ids: vec!["mac-model".into()],
+            active_sequences: 1,
+            queue_depth: 2,
+            error_rate: 0.1,
+            ..Default::default()
+        }
+    ));
+
+    let mut vllm_req = reg_req("127.0.0.1:28082".parse().unwrap(), &["cuda-model"]);
+    vllm_req.backend = "vllm".into();
+    vllm_req.runtime = Some("vllm".into());
+    vllm_req.runtime_endpoint = Some("http://127.0.0.1:8000".into());
+    vllm_req.hardware_class = Some("pc-cuda".into());
+    vllm_req.node_class = Some("pc-cuda".into());
+    vllm_req.worker_pool = Some("cuda".into());
+    vllm_req.supported_operations = vec!["llm".into(), "embedding".into()];
+    let vllm_resp = layer.registry.register(vllm_req, 5000);
+    let vllm_id = WorkerId::parse(&vllm_resp.worker_id).unwrap();
+    assert!(layer.registry.heartbeat(
+        vllm_id,
+        HeartbeatRequest {
+            inflight: 3,
+            model_ids: vec!["cuda-model".into()],
+            active_sequences: 3,
+            queue_depth: 4,
+            error_rate: 0.02,
+            ..Default::default()
+        }
+    ));
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let runtime_diag = &json["runtime_diagnostics"]["runtimes"];
+    assert_eq!(runtime_diag["ax_engine"]["workers"], 1);
+    assert_eq!(runtime_diag["ax_engine"]["hardware_classes"]["mac"], 1);
+    assert_eq!(
+        runtime_diag["ax_engine"]["models"],
+        serde_json::json!(["mac-model"])
+    );
+    assert_eq!(runtime_diag["ax_engine"]["total_queue_depth"], 2);
+    assert!(
+        runtime_diag["ax_engine"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "embedded_compatibility_path")
+    );
+    assert!(
+        runtime_diag["ax_engine"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "missing_runtime_endpoint")
+    );
+
+    assert_eq!(runtime_diag["vllm"]["workers"], 1);
+    assert_eq!(runtime_diag["vllm"]["hardware_classes"]["pc-cuda"], 1);
+    assert_eq!(
+        runtime_diag["vllm"]["supported_operations"],
+        serde_json::json!(["embedding", "llm"])
+    );
+    assert_eq!(
+        runtime_diag["vllm"]["runtime_endpoints"],
+        serde_json::json!(["http://127.0.0.1:8000"])
+    );
+    assert_eq!(runtime_diag["vllm"]["total_queue_depth"], 4);
+}
+
+#[tokio::test]
 async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     let layer = Arc::new(
         OrchestratorLayer::new(

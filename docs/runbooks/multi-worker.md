@@ -298,6 +298,10 @@ curl -s http://127.0.0.1:18080/v1/admin/status \
 curl -s http://127.0.0.1:18080/v1/admin/status \
   -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.workers.runtimes'
 
+# Runtime diagnostics with model inventory, endpoint, operations, and issues.
+curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.runtimes'
+
 # Detailed metrics including per-worker inflight and reroute count
 curl -s http://127.0.0.1:18080/v1/metrics | jq .
 
