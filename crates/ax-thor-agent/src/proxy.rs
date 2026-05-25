@@ -6,7 +6,7 @@ use std::sync::{
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 
 use crate::config::ThorConfig;
 
+const MAX_PROXY_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ pub fn router(config: &ThorConfig, client: reqwest::Client, inflight: Arc<Atomic
         .route("/v1/chat/completions", post(proxy_chat))
         .route("/v1/completions", post(proxy_completions))
         .route("/v1/embeddings", post(proxy_embeddings))
+        .layer(DefaultBodyLimit::max(MAX_PROXY_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 

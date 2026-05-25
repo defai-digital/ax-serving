@@ -9,7 +9,7 @@ use ax_thor_agent::proxy;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -242,6 +242,68 @@ async fn thor_proxy_rejects_oversized_runtime_content_length_without_buffering()
     Ok(())
 }
 
+#[tokio::test]
+async fn thor_proxy_accepts_valid_body_above_axum_default_limit() -> Result<()> {
+    let sglang_state = Arc::new(SgLangState::default());
+    let (sglang_base, _sglang_task) = spawn_server(sglang_router(sglang_state.clone())).await?;
+
+    let config = ThorConfig {
+        control_plane_url: "http://127.0.0.1:1".into(),
+        worker_token: None,
+        runtime_url: sglang_base,
+        runtime: "sglang".into(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+        max_inflight: 8,
+        worker_pool: None,
+        node_class: "thor".into(),
+        hardware_class: "thor".into(),
+        friendly_name: None,
+        chip_model: None,
+        shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build reqwest client")?;
+    let runtime = SharedRuntime::new();
+    let (proxy_base, _proxy_task) = spawn_server(proxy::router(
+        &config,
+        client.clone(),
+        runtime.inflight.clone(),
+    ))
+    .await?;
+
+    let large_content = "a".repeat(2 * 1024 * 1024 + 4096);
+    let body = serde_json::to_vec(&json!({
+        "model": "qwen2-72b",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": false
+    }))
+    .context("failed to serialize large request")?;
+
+    let response = client
+        .post(format!("{proxy_base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .context("failed to call thor proxy")?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chats = sglang_state.chats.lock().await;
+    assert_eq!(chats.len(), 1);
+    assert_eq!(
+        chats[0]["messages"][0]["content"].as_str().unwrap().len(),
+        2 * 1024 * 1024 + 4096
+    );
+
+    Ok(())
+}
+
 fn control_plane_router(state: Arc<ControlPlaneState>) -> Router {
     Router::new()
         .route("/internal/workers/register", post(handle_register))
@@ -276,6 +338,7 @@ fn sglang_router(state: Arc<SgLangState>) -> Router {
         )
         .route("/metrics", get(runtime_metrics))
         .route("/v1/chat/completions", post(handle_chat))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
 }
 
