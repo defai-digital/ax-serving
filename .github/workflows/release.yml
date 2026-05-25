@@ -25,10 +25,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install protobuf compiler
+      - name: Install native build dependencies
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             brew install protobuf
+          fi
+          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
+            brew install mlx
           fi
 
       - name: Rust cache
