@@ -31,7 +31,7 @@ jobs:
             brew install protobuf
           fi
           if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx
+            brew install mlx-c
           fi
 
       - name: Rust cache
