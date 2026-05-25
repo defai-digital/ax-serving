@@ -646,7 +646,7 @@ impl WorkerRegistry {
         let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
         let model_inventory =
             normalize_model_inventory(&capabilities.models, incoming_model_inventory);
-        if capabilities.models.is_empty() && !incoming_model_inventory_empty {
+        if !incoming_model_inventory_empty {
             capabilities.models = model_inventory
                 .iter()
                 .map(|model| model.id.clone())
@@ -764,20 +764,20 @@ impl WorkerRegistry {
                 e.rss_bytes = req.rss_bytes;
                 // Authoritative capability snapshot from worker heartbeat.
                 // Empty model_ids means the worker currently has no models.
-                let model_ids = if req.model_inventory.is_empty() {
-                    req.model_ids
-                } else {
-                    req.model_inventory
-                        .iter()
-                        .map(|model| model.id.clone())
-                        .collect()
-                };
+                let mut model_ids = req.model_ids;
+                if !req.model_inventory.is_empty() {
+                    model_ids.extend(req.model_inventory.iter().map(|model| model.id.clone()));
+                }
                 e.model_inventory = if req.model_inventory.is_empty() {
                     retain_model_inventory_for_ids(&e.model_inventory, &model_ids)
                 } else {
                     normalize_model_inventory(&model_ids, req.model_inventory)
                 };
-                e.capabilities.models = model_ids;
+                e.capabilities.models = e
+                    .model_inventory
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect();
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
@@ -1649,6 +1649,37 @@ mod tests {
     }
 
     #[test]
+    fn registration_treats_model_inventory_as_additive() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["capability-model".into()],
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "inventory-model".into(),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("capability-model").len(), 1);
+        assert_eq!(r.eligible_workers("inventory-model").len(), 1);
+    }
+
+    #[test]
     fn legacy_worker_explicit_llm_only_operations_are_not_embedding_eligible() {
         let r = WorkerRegistry::new();
         r.register(
@@ -2230,6 +2261,37 @@ mod tests {
             r.eligible_workers("m1").is_empty(),
             "empty model_ids heartbeat must clear stale capabilities"
         );
+    }
+
+    #[test]
+    fn heartbeat_treats_model_inventory_as_additive() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1", "m2"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["m1".into(), "m2".into()],
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("q4".into()),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snapshot.capabilities,
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert_eq!(snapshot.model_inventory.len(), 2);
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+        assert_eq!(r.eligible_workers("m2").len(), 1);
     }
 
     #[test]
