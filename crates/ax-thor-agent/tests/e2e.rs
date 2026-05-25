@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Default)]
@@ -181,6 +182,61 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn thor_proxy_rejects_oversized_runtime_content_length_without_buffering() -> Result<()> {
+    let (runtime_base, _runtime_task) = spawn_raw_oversized_runtime_response().await?;
+
+    let config = ThorConfig {
+        control_plane_url: "http://127.0.0.1:1".into(),
+        worker_token: None,
+        runtime_url: runtime_base,
+        runtime: "sglang".into(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+        max_inflight: 8,
+        worker_pool: None,
+        node_class: "thor".into(),
+        hardware_class: "thor".into(),
+        friendly_name: None,
+        chip_model: None,
+        shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build reqwest client")?;
+    let runtime = SharedRuntime::new();
+    let (proxy_base, _proxy_task) = spawn_server(proxy::router(
+        &config,
+        client.clone(),
+        runtime.inflight.clone(),
+    ))
+    .await?;
+
+    let response = client
+        .post(format!("{proxy_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "qwen2-72b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .context("failed to call thor proxy")?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response
+        .text()
+        .await
+        .context("failed to read proxy error response")?;
+    assert!(body.contains("exceeded 64 MiB limit"));
+
+    Ok(())
+}
+
 fn control_plane_router(state: Arc<ControlPlaneState>) -> Router {
     Router::new()
         .route("/internal/workers/register", post(handle_register))
@@ -300,6 +356,28 @@ async fn spawn_server(app: Router) -> Result<(String, tokio::task::JoinHandle<()
         axum::serve(listener, app)
             .await
             .expect("test server failed");
+    });
+    Ok((format!("http://{}", display_addr(addr)), handle))
+}
+
+async fn spawn_raw_oversized_runtime_response() -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind raw runtime listener")?;
+    let addr = listener.local_addr().context("missing listener addr")?;
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept raw runtime request");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.expect("read proxy request");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            64 * 1024 * 1024 + 1
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write oversized response headers");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     });
     Ok((format!("http://{}", display_addr(addr)), handle))
 }

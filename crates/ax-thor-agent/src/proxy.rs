@@ -15,6 +15,8 @@ use futures::StreamExt as _;
 
 use crate::config::ThorConfig;
 
+const MAX_PROXY_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub client: reqwest::Client,
@@ -24,6 +26,12 @@ pub struct ProxyState {
 }
 
 struct InflightGuard(Arc<AtomicUsize>);
+
+#[derive(Debug)]
+enum ProxyBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
 
 impl InflightGuard {
     /// Try to acquire an inflight slot. Returns `None` if at capacity.
@@ -53,6 +61,43 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
+}
+
+fn response_declares_oversize(content_length: Option<u64>, max_bytes: usize) -> bool {
+    content_length.is_some_and(|len| len > max_bytes as u64)
+}
+
+fn append_limited_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), ProxyBodyError> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(ProxyBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(ProxyBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_response_body_limited(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Bytes, ProxyBodyError> {
+    if response_declares_oversize(resp.content_length(), max_bytes) {
+        return Err(ProxyBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_limited_body_chunk(&mut body, &chunk.map_err(ProxyBodyError::Read)?, max_bytes)?;
+    }
+
+    Ok(Bytes::from(body))
 }
 
 pub fn router(config: &ThorConfig, client: reqwest::Client, inflight: Arc<AtomicUsize>) -> Router {
@@ -171,11 +216,8 @@ async fn proxy_to(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
 
-            // Limit buffered response bodies to 64 MiB to prevent OOM from a
-            // misbehaving upstream (BUG-033).
-            const MAX_RESPONSE_BODY: usize = 64 * 1024 * 1024;
-            match resp.bytes().await {
-                Ok(bytes) if bytes.len() > MAX_RESPONSE_BODY => (
+            match read_response_body_limited(resp, MAX_PROXY_RESPONSE_BODY_BYTES).await {
+                Err(ProxyBodyError::TooLarge) => (
                     StatusCode::BAD_GATEWAY,
                     "upstream response body exceeded 64 MiB limit",
                 )
@@ -189,7 +231,7 @@ async fn proxy_to(
                         .body(axum::body::Body::from(bytes))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 }
-                Err(err) => (
+                Err(ProxyBodyError::Read(err)) => (
                     StatusCode::BAD_GATEWAY,
                     format!("failed to read runtime response: {err}"),
                 )
@@ -209,7 +251,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    use super::InflightGuard;
+    use super::{InflightGuard, append_limited_body_chunk, response_declares_oversize};
 
     #[test]
     fn inflight_guard_stops_at_capacity() {
@@ -230,5 +272,20 @@ mod tests {
         assert!(InflightGuard::try_acquire(&counter, 1).is_none());
         drop(g1);
         assert!(InflightGuard::try_acquire(&counter, 1).is_some());
+    }
+
+    #[test]
+    fn response_declares_oversize_rejects_only_declared_excess() {
+        assert!(response_declares_oversize(Some(11), 10));
+        assert!(!response_declares_oversize(Some(10), 10));
+        assert!(!response_declares_oversize(None, 10));
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_incremental_excess() {
+        let mut body = Vec::new();
+        append_limited_body_chunk(&mut body, b"12345", 8).expect("first chunk fits");
+        assert!(append_limited_body_chunk(&mut body, b"6789", 8).is_err());
+        assert_eq!(body, b"12345");
     }
 }
