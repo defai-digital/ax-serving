@@ -775,11 +775,11 @@ impl WorkerRegistry {
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
-                e.active_sequences = req.active_sequences;
-                e.decode_tok_per_sec = req.decode_tok_per_sec;
+                e.active_sequences = req.active_sequences.min(MAX_WORKER_INFLIGHT);
+                e.decode_tok_per_sec = non_negative_finite(req.decode_tok_per_sec);
                 e.ttft_p95_ms = req.ttft_p95_ms;
-                e.queue_depth = req.queue_depth;
-                e.error_rate = req.error_rate;
+                e.queue_depth = req.queue_depth.min(MAX_WORKER_INFLIGHT);
+                e.error_rate = ratio_or_zero(req.error_rate);
                 e.kv_pages_used = req.kv_pages_used;
                 e.kv_pages_total = req.kv_pages_total;
                 e.kv_utilization = req.kv_utilization.map(|value| value.clamp(0.0, 1.0));
@@ -1203,6 +1203,22 @@ fn normalize_runtime_mode(mode: Option<String>) -> Option<String> {
             Some(normalized)
         }
     })
+}
+
+fn ratio_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn non_negative_finite(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
@@ -2247,6 +2263,37 @@ mod tests {
 
         assert_eq!(r.get_snapshot(id).unwrap().inflight, 2);
         assert_eq!(r.eligible_workers("m1")[0].inflight, 2);
+    }
+
+    #[test]
+    fn heartbeat_clamps_runtime_load_telemetry() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: usize::MAX,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                active_sequences: usize::MAX,
+                decode_tok_per_sec: f64::INFINITY,
+                queue_depth: usize::MAX,
+                error_rate: 2.5,
+                ..Default::default()
+            }
+        ));
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.inflight, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.active_sequences, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.decode_tok_per_sec, 0.0);
+        assert_eq!(snap.queue_depth, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.error_rate, 1.0);
+
+        let worker = r.eligible_workers("m1").remove(0);
+        assert_eq!(worker.active_sequences, MAX_WORKER_INFLIGHT);
     }
 
     #[test]
