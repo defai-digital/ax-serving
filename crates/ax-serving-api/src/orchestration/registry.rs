@@ -639,7 +639,10 @@ impl WorkerRegistry {
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let runtime_mode = normalize_runtime_mode(runtime_mode);
         let (capabilities, capability_source) = capabilities.into_parts();
-        let model_inventory = normalize_model_inventory(&capabilities.models, model_inventory);
+        let incoming_model_inventory = model_inventory;
+        let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
+        let model_inventory =
+            normalize_model_inventory(&capabilities.models, incoming_model_inventory);
         let supported_operations = if supported_operations.is_empty() {
             supported_operations_from_capabilities(&capabilities)
         } else {
@@ -652,11 +655,11 @@ impl WorkerRegistry {
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
                 existing.capabilities = capabilities.clone();
-                // Preserve prior per-model metadata if the new registration omits inventory,
-                // matching the same guard used for runtime_mode below.
-                if !model_inventory.is_empty() {
-                    existing.model_inventory = model_inventory.clone();
-                }
+                existing.model_inventory = if incoming_model_inventory_empty {
+                    retain_model_inventory_for_ids(&existing.model_inventory, &capabilities.models)
+                } else {
+                    model_inventory.clone()
+                };
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();
@@ -1718,6 +1721,82 @@ mod tests {
         assert_eq!(resp2.worker_id, id1);
         assert_eq!(r.eligible_workers("m2").len(), 1);
         assert_eq!(r.list_all().len(), 1); // still one entry
+    }
+
+    #[test]
+    fn reregister_without_inventory_preserves_matching_model_metadata() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    models: vec!["m1".into()],
+                    ..Default::default()
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("Q4_K_M".into()),
+                    artifact_format: Some("gguf".into()),
+                    ..Default::default()
+                }],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let mut req2 = reg_req("127.0.0.1:8081", &["m1"], 8);
+        req2.worker_id = Some(resp.worker_id);
+        r.register(req2, 5000);
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.model_inventory.len(), 1);
+        assert_eq!(snapshot.model_inventory[0].id, "m1");
+        assert_eq!(
+            snapshot.model_inventory[0].quantization.as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            snapshot.model_inventory[0].artifact_format.as_deref(),
+            Some("gguf")
+        );
+    }
+
+    #[test]
+    fn reregister_without_models_clears_stale_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    models: vec!["m1".into()],
+                    ..Default::default()
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("Q4_K_M".into()),
+                    ..Default::default()
+                }],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let mut req2 = reg_req("127.0.0.1:8081", &[], 8);
+        req2.worker_id = Some(resp.worker_id);
+        r.register(req2, 5000);
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert!(snapshot.model_inventory.is_empty());
+        assert!(snapshot.capability_descriptor.models.is_empty());
+        assert!(r.eligible_workers("m1").is_empty());
     }
 
     #[test]
