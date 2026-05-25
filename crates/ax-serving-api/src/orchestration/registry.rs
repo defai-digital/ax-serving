@@ -1236,6 +1236,7 @@ fn dispatch_filter_matches(
         && matches!(entry.health, WorkerHealth::Healthy)
         && entry.capabilities.models.iter().any(|c| c == model_id)
         && supports_request_kind(entry, request_kind)
+        && model_inventory_supports_request_kind(entry, model_id, request_kind)
         && backend_filter.is_none_or(|kind| &entry.backend == kind)
         && runtime_filter.is_none_or(|kind| &entry.runtime == kind)
         && min_context.is_none_or(|required| {
@@ -1243,6 +1244,24 @@ fn dispatch_filter_matches(
                 .capabilities
                 .max_context
                 .is_none_or(|worker_max| worker_max >= required)
+        })
+}
+
+fn model_inventory_supports_request_kind(
+    entry: &WorkerEntry,
+    model_id: &str,
+    request_kind: RequestKind,
+) -> bool {
+    entry
+        .model_inventory
+        .iter()
+        .find(|model| model.id == model_id)
+        .is_none_or(|model| {
+            model.supported_operations.is_empty()
+                || model
+                    .supported_operations
+                    .iter()
+                    .any(|operation| operation == request_kind.as_operation())
         })
 }
 
@@ -1498,6 +1517,57 @@ mod tests {
         assert!(r.eligible_workers("embed-1").is_empty());
         assert_eq!(
             r.eligible_workers_for("embed-1", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_inventory_operations_constrain_mixed_runtime_models() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["chat-model".into(), "embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![
+                    ModelInventoryEntry {
+                        id: "chat-model".into(),
+                        supported_operations: vec!["llm".into()],
+                        ..Default::default()
+                    },
+                    ModelInventoryEntry {
+                        id: "embed-model".into(),
+                        supported_operations: vec!["embedding".into()],
+                        ..Default::default()
+                    },
+                ],
+                supported_operations: vec!["llm".into(), "embedding".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("chat-model").len(), 1);
+        assert!(
+            r.eligible_workers_for("chat-model", RequestKind::Embedding)
+                .is_empty(),
+            "chat-only model inventory must reject embedding requests"
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "embedding-only model inventory must reject llm requests"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
                 .len(),
             1
         );

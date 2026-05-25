@@ -75,10 +75,10 @@ pub struct ThorConfig {
     /// plane. If unset, the agent tries to derive it from the runtime.
     pub max_context: Option<u32>,
     /// env: `AXS_THOR_EMBEDDING` — override embedding capability (true/false).
-    /// If unset, defaults to false (most LLM models are not embedding models).
+    /// If unset, the agent derives the capability from runtime model metadata.
     pub embedding: Option<bool>,
     /// env: `AXS_THOR_VISION` — override vision capability (true/false).
-    /// If unset, defaults to false.
+    /// If unset, the agent derives the capability from runtime model metadata.
     pub vision: Option<bool>,
 }
 

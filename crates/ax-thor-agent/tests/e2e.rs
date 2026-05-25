@@ -94,9 +94,14 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         registrations[0]["model_inventory"][0]["artifact_format"],
         json!("safetensors")
     );
-    // BUG-114: verify capabilities are not blindly hardcoded.
+    // Runtime metadata drives worker-level capabilities unless explicitly overridden.
+    assert_eq!(registrations[0]["capabilities"]["llm"], json!(true));
     assert_eq!(registrations[0]["capabilities"]["embedding"], json!(false));
-    assert_eq!(registrations[0]["capabilities"]["vision"], json!(false));
+    assert_eq!(registrations[0]["capabilities"]["vision"], json!(true));
+    assert_eq!(
+        registrations[0]["supported_operations"],
+        json!(["llm", "vision"])
+    );
     drop(registrations);
 
     let heartbeat_task = tokio::spawn(agent::heartbeat_loop(

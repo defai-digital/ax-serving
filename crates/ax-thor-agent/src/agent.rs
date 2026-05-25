@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 fn current_rss_bytes() -> u64 {
@@ -91,54 +91,7 @@ impl Default for SharedRuntime {
 pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
     let model_info = sglang::get_model_info(client, &config.runtime_url).await?;
     let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
-    let model_inventory = model_info
-        .iter()
-        .map(model_inventory_entry)
-        .collect::<Vec<_>>();
-
-    // BUG-114: derive capabilities from config overrides or runtime metadata
-    // instead of hardcoding them.
-    let max_context: serde_json::Value = config
-        .max_context
-        .or_else(|| {
-            // Use the max context from any loaded model as a best-effort default.
-            model_info.iter().filter_map(|m| m.max_model_len).max()
-        })
-        .map(serde_json::Value::from)
-        .unwrap_or(serde_json::Value::Null);
-
-    let embedding = config.embedding.unwrap_or(false);
-    let vision = config.vision.unwrap_or(false);
-    let mut supported_operations = vec!["llm"];
-    if embedding {
-        supported_operations.push("embedding");
-    }
-    if vision {
-        supported_operations.push("vision");
-    }
-
-    let body = json!({
-        "addr": config.advertised_addr.to_string(),
-        "capabilities": {
-            "llm": true,
-            "embedding": embedding,
-            "vision": vision,
-            "models": models,
-            "max_context": max_context
-        },
-        "model_inventory": model_inventory,
-        "backend": config.runtime.as_str(),
-        "runtime": config.runtime.as_str(),
-        "runtime_mode": "adapter",
-        "hardware_class": config.hardware_class.as_str(),
-        "runtime_endpoint": config.runtime_url.as_str(),
-        "supported_operations": supported_operations,
-        "max_inflight": config.max_inflight,
-        "friendly_name": config.friendly_name,
-        "chip_model": config.chip_model,
-        "worker_pool": config.worker_pool,
-        "node_class": config.node_class,
-    });
+    let body = registration_body(config, &model_info);
 
     let req = with_internal_token(
         client
@@ -176,6 +129,72 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
         },
         models,
     })
+}
+
+fn registration_body(config: &ThorConfig, model_info: &[sglang::ModelInfo]) -> Value {
+    let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
+    let model_inventory = model_info
+        .iter()
+        .map(model_inventory_entry)
+        .collect::<Vec<_>>();
+
+    // BUG-114: derive capabilities from config overrides or runtime metadata
+    // instead of hardcoding them.
+    let max_context: serde_json::Value = config
+        .max_context
+        .or_else(|| {
+            // Use the max context from any loaded model as a best-effort default.
+            model_info.iter().filter_map(|m| m.max_model_len).max()
+        })
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+
+    let llm = model_info.is_empty() || model_info_supports_operation(model_info, "llm");
+    let embedding = config
+        .embedding
+        .unwrap_or_else(|| model_info_supports_operation(model_info, "embedding"));
+    let vision = config
+        .vision
+        .unwrap_or_else(|| model_info_supports_operation(model_info, "vision"));
+    let mut supported_operations = Vec::new();
+    if llm {
+        supported_operations.push("llm");
+    }
+    if embedding {
+        supported_operations.push("embedding");
+    }
+    if vision {
+        supported_operations.push("vision");
+    }
+
+    json!({
+        "addr": config.advertised_addr.to_string(),
+        "capabilities": {
+            "llm": llm,
+            "embedding": embedding,
+            "vision": vision,
+            "models": models,
+            "max_context": max_context
+        },
+        "model_inventory": model_inventory,
+        "backend": config.runtime.as_str(),
+        "runtime": config.runtime.as_str(),
+        "runtime_mode": "adapter",
+        "hardware_class": config.hardware_class.as_str(),
+        "runtime_endpoint": config.runtime_url.as_str(),
+        "supported_operations": supported_operations,
+        "max_inflight": config.max_inflight,
+        "friendly_name": config.friendly_name,
+        "chip_model": config.chip_model,
+        "worker_pool": config.worker_pool,
+        "node_class": config.node_class,
+    })
+}
+
+fn model_info_supports_operation(model_info: &[sglang::ModelInfo], operation: &str) -> bool {
+    model_info
+        .iter()
+        .any(|model| model.supported_operations.iter().any(|op| op == operation))
 }
 
 pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime: SharedRuntime) {
@@ -345,7 +364,33 @@ pub async fn drain_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout};
+    use super::{
+        CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout,
+        registration_body,
+    };
+    use crate::config::ThorConfig;
+    use crate::sglang::ModelInfo;
+
+    fn test_config() -> ThorConfig {
+        ThorConfig {
+            control_plane_url: "http://127.0.0.1:18080".into(),
+            worker_token: None,
+            runtime_url: "http://127.0.0.1:8000".into(),
+            runtime: "vllm".into(),
+            listen_addr: "127.0.0.1:18081".parse().unwrap(),
+            advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+            max_inflight: 8,
+            worker_pool: None,
+            node_class: "thor".into(),
+            hardware_class: "thor".into(),
+            friendly_name: None,
+            chip_model: None,
+            shutdown_timeout_secs: None,
+            max_context: None,
+            embedding: None,
+            vision: None,
+        }
+    }
 
     #[tokio::test]
     async fn shared_runtime_starts_with_empty_model_cache() {
@@ -360,5 +405,49 @@ mod tests {
             std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
         );
         assert!(control_plane_request_timeout() <= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn registration_body_derives_embedding_capability_from_runtime_metadata() {
+        let config = test_config();
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["embedding".into()],
+            }],
+        );
+
+        assert_eq!(body["capabilities"]["llm"], false);
+        assert_eq!(body["capabilities"]["embedding"], true);
+        assert_eq!(body["capabilities"]["vision"], false);
+        assert_eq!(
+            body["supported_operations"],
+            serde_json::json!(["embedding"])
+        );
+    }
+
+    #[test]
+    fn registration_body_env_override_can_disable_metadata_embedding() {
+        let mut config = test_config();
+        config.embedding = Some(false);
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["embedding".into()],
+            }],
+        );
+
+        assert_eq!(body["capabilities"]["embedding"], false);
+        assert_eq!(body["supported_operations"], serde_json::json!([]));
     }
 }
