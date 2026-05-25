@@ -68,8 +68,10 @@ pub(crate) fn slo_pass_gauges(
     // Without this guard all three gauges would be 1 at startup / idle,
     // which is a false positive that masks misconfigured alerting rules.
     let have_data = total_requests > 0;
-    let e2e_pass = u8::from(have_data && e2e_p99_us <= slo_e2e_p99_ms * 1_000);
-    let queue_pass = u8::from(have_data && queue_p99_us <= slo_queue_p99_ms * 1_000);
+    let e2e_threshold_us = slo_e2e_p99_ms.saturating_mul(1_000);
+    let queue_threshold_us = slo_queue_p99_ms.saturating_mul(1_000);
+    let e2e_pass = u8::from(have_data && e2e_p99_us <= e2e_threshold_us);
+    let queue_pass = u8::from(have_data && queue_p99_us <= queue_threshold_us);
     let error_pass = u8::from(have_data && error_rate <= slo_max_error_rate);
     (e2e_pass, queue_pass, error_pass)
 }
@@ -649,5 +651,13 @@ mod tests {
         let (e2e_pass, queue_pass, error_pass) =
             slo_pass_gauges(100, 6, 1_100_000, 1_200_000, 1_000, 1_000, 0.05);
         assert_eq!((e2e_pass, queue_pass, error_pass), (0, 0, 0));
+    }
+
+    #[test]
+    fn slo_pass_gauges_saturate_large_thresholds() {
+        let (e2e_pass, queue_pass, error_pass) =
+            slo_pass_gauges(1, 0, u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0.05);
+
+        assert_eq!((e2e_pass, queue_pass, error_pass), (1, 1, 1));
     }
 }
