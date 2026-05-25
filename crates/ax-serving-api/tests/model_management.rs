@@ -270,6 +270,96 @@ impl InferenceBackend for EmbeddingBackend {
     }
 }
 
+struct BlockingEmbeddingBackend {
+    started: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    started_notify: Arc<Notify>,
+}
+
+impl InferenceBackend for BlockingEmbeddingBackend {
+    fn load_model(
+        &self,
+        _path: &Path,
+        _config: LoadConfig,
+    ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+        Ok((
+            ModelHandle(7),
+            ModelMetadata {
+                architecture: "blocking-embed".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 3,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+                resolved_backend: ax_serving_engine::BackendType::Auto,
+            },
+        ))
+    }
+
+    fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        _handle: ModelHandle,
+        _input: GenerateInput,
+        _params: GenerationParams,
+        _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tokenize(
+        &self,
+        _handle: ModelHandle,
+        _text: &str,
+        _add_bos: bool,
+    ) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![])
+    }
+
+    fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+        Ok(vec![2])
+    }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn recommended_concurrency(&self) -> usize {
+        4
+    }
+
+    fn embed(
+        &self,
+        _handle: ModelHandle,
+        inputs: &EmbedInput<'_>,
+        _config: &EmbedConfig,
+    ) -> anyhow::Result<EmbedResult> {
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        while !self.released.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let count = match inputs {
+            EmbedInput::Strings(texts) => texts.len(),
+            EmbedInput::Tokens(seqs) => seqs.len(),
+        };
+        Ok(EmbedResult {
+            embeddings: vec![vec![0.0, 1.0, 2.0]; count],
+            prompt_tokens: count as u32,
+        })
+    }
+}
+
 struct EmbeddingFailureBackend;
 
 impl InferenceBackend for EmbeddingFailureBackend {
@@ -2586,6 +2676,89 @@ async fn embeddings_success_200() {
     assert!(data[0]["embedding"].is_array());
     assert_eq!(json["usage"]["prompt_tokens"], 10);
     assert_eq!(json["usage"]["total_tokens"], 10);
+}
+
+#[tokio::test]
+async fn embeddings_active_request_keeps_model_busy_for_unload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blocking-embed.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let started_notify = Arc::new(Notify::new());
+    let backend = Arc::new(BlockingEmbeddingBackend {
+        started: Arc::clone(&started),
+        released: Arc::clone(&released),
+        started_notify: Arc::clone(&started_notify),
+    });
+    let layer = make_layer_with_backend(Arc::clone(&backend) as Arc<dyn InferenceBackend>);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "embed-busy", "path": path.to_string_lossy()}).to_string();
+    let load_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let embed_body = serde_json::json!({
+        "model": "embed-busy",
+        "input": "hello",
+        "encoding_format": "float"
+    })
+    .to_string();
+    let embed_layer = Arc::clone(&layer);
+    let embed_keys = Arc::clone(&keys);
+    let embed_task = tokio::spawn(async move {
+        rest::router(embed_layer, embed_keys)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/embeddings")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(embed_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    for _ in 0..100 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        started.load(Ordering::SeqCst),
+        "embedding backend should start before unload is tested"
+    );
+
+    let unload_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/models/embed-busy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unload_resp.status(), StatusCode::CONFLICT);
+    assert!(layer.registry.get("embed-busy").is_some());
+
+    released.store(true, Ordering::SeqCst);
+    let embed_resp = embed_task.await.unwrap();
+    assert_eq!(embed_resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

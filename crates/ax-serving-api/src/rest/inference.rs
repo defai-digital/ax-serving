@@ -2033,14 +2033,17 @@ pub async fn embeddings(
         }
     };
     let queue_wait_us = permit.queue_wait_us();
-    let _model_entry = entry;
+    let model_entry = entry;
     let backend = Arc::clone(&layer.backend);
-    let result = tokio::task::spawn_blocking(move || match (strings_owned, tokens_owned) {
-        (Some(texts), None) => backend.embed(handle, &EmbedInput::Strings(&texts), &config),
-        (None, Some(seqs)) => backend.embed(handle, &EmbedInput::Tokens(&seqs), &config),
-        _ => Err(anyhow::anyhow!(
-            "embedding request payload had unsupported input state"
-        )),
+    let result = tokio::task::spawn_blocking(move || {
+        let _model_entry = model_entry;
+        match (strings_owned, tokens_owned) {
+            (Some(texts), None) => backend.embed(handle, &EmbedInput::Strings(&texts), &config),
+            (None, Some(seqs)) => backend.embed(handle, &EmbedInput::Tokens(&seqs), &config),
+            _ => Err(anyhow::anyhow!(
+                "embedding request payload had unsupported input state"
+            )),
+        }
     })
     .await;
     drop(pm_permit);
