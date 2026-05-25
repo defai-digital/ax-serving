@@ -345,6 +345,9 @@ fn stream_frames_from_nats_response(
         let payload = serde_json::to_string(&serde_json::json!({ "error": err_msg }))
             .unwrap_or_else(|_| "{\"error\":\"serialization failure\"}".to_string());
         frames.push(Bytes::from(format!("event: error\ndata: {payload}\n\n")));
+        if resp.done {
+            frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
+        }
     }
 
     Ok((frames, resp.done))
@@ -874,6 +877,26 @@ mod tests {
         assert!(!done);
         assert_eq!(frames, vec![Bytes::from_static(b"data: hello\n\n")]);
         assert_eq!(total, "data: hello\n\n".len());
+    }
+
+    #[test]
+    fn stream_frames_from_nats_response_closes_error_stream_with_done() {
+        let reroutes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut total = 0usize;
+        let resp = NatsResponse::streaming_done(
+            "req-1".to_string(),
+            502,
+            Some("local stream read failed".to_string()),
+        );
+
+        let (frames, done) =
+            stream_frames_from_nats_response("req-1", resp, &mut total, &reroutes).unwrap();
+
+        assert!(done);
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].starts_with(b"event: error\n"));
+        assert_eq!(frames[1], Bytes::from_static(b"data: [DONE]\n\n"));
+        assert_eq!(reroutes.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
