@@ -854,7 +854,12 @@ fn stream_response(
                         loop {
                             match rx.recv().await {
                                 Some(GenerateEvent::TokenLogprob { .. }) => continue,
-                                ev => break ev.unwrap_or(GenerateEvent::Done(Default::default())),
+                                Some(ev) => break ev,
+                                None => {
+                                    break GenerateEvent::Error(
+                                        "generation ended unexpectedly".to_string(),
+                                    );
+                                }
                             }
                         }
                     };
@@ -1647,7 +1652,12 @@ fn text_stream_response(
                         loop {
                             match rx.recv().await {
                                 Some(GenerateEvent::TokenLogprob { .. }) => continue,
-                                ev => break ev.unwrap_or(GenerateEvent::Done(Default::default())),
+                                Some(ev) => break ev,
+                                None => {
+                                    break GenerateEvent::Error(
+                                        "generation ended unexpectedly".to_string(),
+                                    );
+                                }
                             }
                         }
                     };
@@ -2363,6 +2373,70 @@ mod tests {
 
         assert_eq!(tool_indexes, vec![0, 1]);
         assert_eq!(finish_reason, "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_response_reports_unexpected_channel_close() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let response = stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"generation ended unexpectedly\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[tokio::test]
+    async fn stream_text_response_reports_unexpected_channel_close() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let response = text_stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"generation ended unexpectedly\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]
