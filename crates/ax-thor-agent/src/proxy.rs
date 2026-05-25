@@ -7,7 +7,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderName, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -113,6 +113,38 @@ async fn read_response_body_limited(
     }
 
     Ok(Bytes::from(body))
+}
+
+fn should_forward_runtime_header(name: &HeaderName, include_content_length: bool) -> bool {
+    let name = name.as_str();
+    !matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) && (include_content_length || name != header::CONTENT_LENGTH.as_str())
+}
+
+fn response_builder_with_runtime_headers(
+    status: StatusCode,
+    headers: &HeaderMap,
+    include_content_length: bool,
+) -> axum::http::response::Builder {
+    let mut builder = axum::response::Response::builder().status(status);
+    for (name, value) in headers {
+        if should_forward_runtime_header(name, include_content_length) {
+            builder = builder.header(name, value);
+        }
+    }
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
 }
 
 pub fn router(config: &ThorConfig, client: reqwest::Client, inflight: Arc<AtomicUsize>) -> Router {
@@ -251,11 +283,7 @@ async fn proxy_to(
                     },
                 );
 
-                let mut builder = axum::response::Response::builder().status(status);
-                for (name, value) in &resp_headers {
-                    builder = builder.header(name, value);
-                }
-                return builder
+                return response_builder_with_runtime_headers(status, &resp_headers, false)
                     .body(Body::from_stream(guarded))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
@@ -266,15 +294,9 @@ async fn proxy_to(
                     "upstream response body exceeded 64 MiB limit",
                 )
                     .into_response(),
-                Ok(bytes) => {
-                    let mut builder = axum::response::Response::builder().status(status);
-                    for (name, value) in &resp_headers {
-                        builder = builder.header(name, value);
-                    }
-                    builder
-                        .body(axum::body::Body::from(bytes))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                }
+                Ok(bytes) => response_builder_with_runtime_headers(status, &resp_headers, true)
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 Err(ProxyBodyError::Read(err)) => (
                     StatusCode::BAD_GATEWAY,
                     format!("failed to read runtime response: {err}"),
@@ -295,8 +317,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
+    use axum::http::{HeaderMap, HeaderValue};
+
     use super::{
-        InflightGuard, add_limited_body_len, append_limited_body_chunk, response_declares_oversize,
+        InflightGuard, add_limited_body_len, append_limited_body_chunk,
+        response_builder_with_runtime_headers, response_declares_oversize,
     };
 
     #[test]
@@ -340,5 +365,50 @@ mod tests {
         assert_eq!(add_limited_body_len(5, 3, 8).unwrap(), 8);
         assert!(add_limited_body_len(5, 4, 8).is_err());
         assert!(add_limited_body_len(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn response_builder_strips_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert("x-runtime", HeaderValue::from_static("vllm"));
+
+        let response =
+            response_builder_with_runtime_headers(axum::http::StatusCode::OK, &headers, false)
+                .body(axum::body::Body::empty())
+                .expect("response should build");
+
+        assert_eq!(response.headers().get("x-runtime").unwrap(), "vllm");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("transfer-encoding"));
+        assert!(!response.headers().contains_key("upgrade"));
+    }
+
+    #[test]
+    fn response_builder_omits_content_length_for_streaming_bodies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("content-length", HeaderValue::from_static("999"));
+
+        let streaming =
+            response_builder_with_runtime_headers(axum::http::StatusCode::OK, &headers, false)
+                .body(axum::body::Body::empty())
+                .expect("streaming response should build");
+        assert!(!streaming.headers().contains_key("content-length"));
+
+        let buffered =
+            response_builder_with_runtime_headers(axum::http::StatusCode::OK, &headers, true)
+                .body(axum::body::Body::empty())
+                .expect("buffered response should build");
+        assert_eq!(buffered.headers().get("content-length").unwrap(), "999");
     }
 }
