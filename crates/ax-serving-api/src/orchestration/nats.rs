@@ -15,7 +15,8 @@
 //!   "model_id": "llama3-8b",
 //!   "stream": false,
 //!   "path": "/v1/chat/completions",
-//!   "body_hex": "<hex-encoded request body>"
+//!   "body_hex": "<hex-encoded request body>",
+//!   "authorization": "Bearer <token>"
 //! }
 //! ```
 //!
@@ -46,7 +47,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_nats::jetstream;
 use axum::body::{Body, Bytes};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,9 @@ pub struct NatsRequest {
     pub path: String,
     /// Hex-encoded raw HTTP request body bytes.
     pub body_hex: String,
+    /// Optional client Authorization header forwarded to the local worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
 }
 
 /// Response message sent by the worker via core-NATS to the reply subject.
@@ -396,6 +400,20 @@ impl NatsDispatcher {
 
     /// Forward a client request to a worker via NATS JetStream.
     pub async fn forward(&self, model_id: &str, stream: bool, path: &str, body: Bytes) -> Response {
+        self.forward_with_auth(model_id, stream, path, body, None)
+            .await
+    }
+
+    /// Forward a client request to a worker via NATS JetStream, preserving the
+    /// Authorization header for local workers that also enforce bearer auth.
+    pub async fn forward_with_auth(
+        &self,
+        model_id: &str,
+        stream: bool,
+        path: &str,
+        body: Bytes,
+        auth_header: Option<&HeaderValue>,
+    ) -> Response {
         let request_id = Uuid::new_v4().to_string();
         let reply_subject = format!("axs.replies.{}", request_id);
 
@@ -421,6 +439,10 @@ impl NatsDispatcher {
             stream,
             path: path.to_string(),
             body_hex: hex::encode(&body),
+            authorization: auth_header
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned),
         };
         let payload = match serde_json::to_vec(&req) {
             Ok(v) => v,
@@ -676,7 +698,7 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{
-        NatsBodyDecodeError, NatsConfig, NatsResponse, build_complete_nats_response,
+        NatsBodyDecodeError, NatsConfig, NatsRequest, NatsResponse, build_complete_nats_response,
         decode_body_hex_limited, decode_stream_body_hex_limited, is_event_stream,
         sanitize_subject_component, stream_frames_from_nats_response,
     };
@@ -740,6 +762,40 @@ mod tests {
         let err = decode_stream_body_hex_limited(Some("35"), &mut total, 4).unwrap_err();
         assert!(matches!(err, NatsBodyDecodeError::TooLarge));
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn nats_request_authorization_is_optional_for_backward_compatibility() {
+        let payload = serde_json::json!({
+            "request_id": "req-1",
+            "reply_subject": "axs.replies.req-1",
+            "model_id": "m1",
+            "stream": false,
+            "path": "/v1/chat/completions",
+            "body_hex": "7b7d"
+        });
+
+        let req: NatsRequest = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(req.authorization, None);
+    }
+
+    #[test]
+    fn nats_request_authorization_round_trips() {
+        let req = NatsRequest {
+            request_id: "req-1".into(),
+            reply_subject: "axs.replies.req-1".into(),
+            model_id: "m1".into(),
+            stream: false,
+            path: "/v1/chat/completions".into(),
+            body_hex: "7b7d".into(),
+            authorization: Some("Bearer secret".into()),
+        };
+
+        let encoded = serde_json::to_vec(&req).unwrap();
+        let decoded: NatsRequest = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.authorization.as_deref(), Some("Bearer secret"));
     }
 
     #[test]

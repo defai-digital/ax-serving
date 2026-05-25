@@ -484,13 +484,16 @@ async fn http_post_json(
     client: &Client,
     url: &str,
     body: Vec<u8>,
+    authorization: Option<&str>,
 ) -> reqwest::Result<reqwest::Response> {
-    client
+    let mut request = client
         .post(url)
         .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
+        .body(body);
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    request.send().await
 }
 
 async fn dispatch_non_streaming(
@@ -503,7 +506,7 @@ async fn dispatch_non_streaming(
 ) -> bool {
     let result = match tokio::time::timeout(
         request_timeout,
-        http_post_json(http_client, url, body_bytes),
+        http_post_json(http_client, url, body_bytes, req.authorization.as_deref()),
     )
     .await
     {
@@ -604,7 +607,7 @@ async fn dispatch_streaming(
 ) -> bool {
     let resp = match tokio::time::timeout(
         request_timeout,
-        http_post_json(http_client, url, body_bytes),
+        http_post_json(http_client, url, body_bytes, req.authorization.as_deref()),
     )
     .await
     {
@@ -778,10 +781,15 @@ async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, mess
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::{
         MAX_NATS_RESPONSE_BODY_BYTES, NatsRequestBodyError, NatsRequestPathError,
         add_limited_local_response_len, append_limited_local_response_chunk,
-        decode_request_body_hex_limited, local_response_exceeds_limit, validate_request_path,
+        decode_request_body_hex_limited, http_post_json, local_response_exceeds_limit,
+        validate_request_path,
     };
 
     #[test]
@@ -844,5 +852,44 @@ mod tests {
     #[test]
     fn decode_request_body_hex_limited_accepts_valid_payload() {
         assert_eq!(decode_request_body_hex_limited("6869", 64).unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn http_post_json_forwards_authorization_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_for_task = Arc::clone(&captured);
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            *captured_for_task.lock().unwrap() = String::from_utf8_lossy(&request[..n]).to_string();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = http_post_json(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/v1/chat/completions"),
+            b"{}".to_vec(),
+            Some("Bearer secret"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.contains("authorization: Bearer secret")
+                || captured.contains("Authorization: Bearer secret"),
+            "request did not include Authorization header: {captured}"
+        );
     }
 }
