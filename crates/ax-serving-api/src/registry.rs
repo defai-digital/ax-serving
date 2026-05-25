@@ -79,8 +79,9 @@ impl LoadedModel {
 /// wrapping is reused). Used to hand a reference to background tasks.
 ///
 /// Read lock: many concurrent inference calls.
-/// Write lock: load and unload (rare, and now only held for map mutations —
-/// slow backend calls happen outside the lock).
+/// Write lock: load and unload (rare). Most slow backend calls happen outside
+/// the lock; final warm-pool eviction holds the write lock so an uncommitted
+/// load is never exposed to readers before rollback is impossible.
 #[derive(Clone)]
 pub struct ModelRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<LoadedModel>>>>,
@@ -204,9 +205,11 @@ impl ModelRegistry {
     /// - Total loaded count < MAX_LOADED_MODELS
     ///
     /// The write lock is held only for fast map mutations. The slow backend
-    /// calls (`unload_model` for warm-pool evictions and `load_model` for the
-    /// new model) happen outside the lock so that concurrent `get()` / listing
-    /// calls on other models are not stalled.
+    /// calls happen outside the lock where possible so that concurrent `get()`
+    /// / listing calls on other models are not stalled. Final warm-pool
+    /// eviction is the exception: it holds the write lock until eviction
+    /// succeeds so readers cannot observe a new handle that may still need
+    /// rollback cleanup.
     pub fn load(
         &self,
         model_id: &str,
@@ -313,13 +316,16 @@ impl ModelRegistry {
             last_accessed_ms: Arc::new(AtomicU64::new(unix_now_ms())),
         });
 
-        // Commit: insert under write lock. The LoadingGuard ensures no other
-        // load() for this model_id is concurrently in progress.
+        // Commit: unload required final warm-pool evictions and then insert
+        // under the write lock. The LoadingGuard ensures no other load() for
+        // this model_id is concurrently in progress. Keeping the new entry out
+        // of the map until evictions succeed avoids exposing a handle that may
+        // need to be cleaned up on rollback.
         //
         // Re-apply warm-pool eviction here as well as before the slow load:
         // different model IDs may load concurrently, and each can pass the
         // pre-load warm-pool check before any of them commits.
-        let final_evictions: Vec<Arc<LoadedModel>> = {
+        {
             let mut guard = self.inner_write();
             let mut candidates = Vec::new();
             if let Some(pool_size) = self.warm_pool_size {
@@ -349,48 +355,36 @@ impl ModelRegistry {
                 })?;
                 return Err(RegistryError::CapacityExceeded(self.max_loaded_models).into());
             }
-            guard.insert(model_id.to_string(), Arc::clone(&entry));
-            candidates
-        };
 
-        let mut failed_final_evictions = Vec::new();
-        for evicted in final_evictions {
-            let evict_id = evicted.id.clone();
-            match backend.unload_model(evicted.handle) {
-                Ok(()) => info!(
-                    "warm pool: evicted '{evict_id}' during finalization to load '{model_id}'"
-                ),
-                Err(e) => {
-                    warn!(
-                        "warm pool: failed to finalize eviction of '{evict_id}' for '{model_id}': {e}"
-                    );
-                    failed_final_evictions.push(evicted);
+            let mut failed_final_evictions = Vec::new();
+            for evicted in candidates {
+                let evict_id = evicted.id.clone();
+                match backend.unload_model(evicted.handle) {
+                    Ok(()) => info!(
+                        "warm pool: evicted '{evict_id}' during finalization to load '{model_id}'"
+                    ),
+                    Err(e) => {
+                        warn!(
+                            "warm pool: failed to finalize eviction of '{evict_id}' for '{model_id}': {e}"
+                        );
+                        failed_final_evictions.push(evicted);
+                    }
                 }
             }
-        }
-        if !failed_final_evictions.is_empty() {
-            let new_entry_to_cleanup = {
-                let mut guard = self.inner_write();
+            if !failed_final_evictions.is_empty() {
                 for evicted in failed_final_evictions {
                     guard.insert(evicted.id.clone(), evicted);
                 }
-                if guard
-                    .get(model_id)
-                    .is_some_and(|current| current.handle == handle)
-                {
-                    guard.remove(model_id)
-                } else {
-                    None
+                drop(guard);
+                if let Err(e) = backend.unload_model(handle) {
+                    warn!(
+                        "warm pool: failed to clean up newly loaded '{model_id}' after final eviction failure: {e}"
+                    );
                 }
-            };
-            if let Some(new_entry) = new_entry_to_cleanup
-                && let Err(e) = backend.unload_model(new_entry.handle)
-            {
-                warn!(
-                    "warm pool: failed to clean up newly loaded '{model_id}' after final eviction failure: {e}"
-                );
+                anyhow::bail!("warm-pool final eviction failed; cannot load '{model_id}'");
             }
-            anyhow::bail!("warm-pool final eviction failed; cannot load '{model_id}'");
+
+            guard.insert(model_id.to_string(), Arc::clone(&entry));
         }
 
         // _loading_guard drops here, removing model_id from the loading set.
@@ -736,7 +730,7 @@ fn validate_model_id(id: &str) -> Result<(), RegistryError> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use ax_serving_engine::{
         GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
@@ -1381,6 +1375,83 @@ mod tests {
         }
     }
 
+    struct BlockingFailFirstUnloadBackend {
+        load_started: Arc<std::sync::Barrier>,
+        release_load: Arc<std::sync::Barrier>,
+        next_handle: AtomicU64,
+        unloads: AtomicU64,
+        blocked_once: AtomicBool,
+        unload_started: Arc<std::sync::Barrier>,
+        release_unload: Arc<std::sync::Barrier>,
+    }
+
+    impl InferenceBackend for BlockingFailFirstUnloadBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            self.load_started.wait();
+            self.release_load.wait();
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok((
+                ModelHandle(handle),
+                ModelMetadata {
+                    architecture: "blocking-unload".into(),
+                    n_layers: 1,
+                    n_heads: 1,
+                    n_kv_heads: 1,
+                    embedding_dim: 1,
+                    vocab_size: 1,
+                    context_length: 1,
+                    load_time_ms: 0,
+                    peak_rss_bytes: 0,
+                    resolved_backend: ax_serving_engine::BackendType::Cpu,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            self.unloads.fetch_add(1, Ordering::Relaxed);
+            if !self.blocked_once.swap(true, Ordering::AcqRel) {
+                self.unload_started.wait();
+                self.release_unload.wait();
+                anyhow::bail!("simulated final eviction failure");
+            }
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: ModelHandle,
+            _: GenerateInput,
+            _: GenerationParams,
+            _: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn tokenize(&self, _: ModelHandle, _: &str, _: bool) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn decode_tokens(&self, _: ModelHandle, _: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            1
+        }
+    }
+
     #[test]
     fn concurrent_loads_do_not_exceed_capacity() {
         let dir = tempfile::tempdir().unwrap();
@@ -1586,6 +1657,108 @@ mod tests {
             backend.unloads.load(Ordering::Relaxed) >= 1,
             "backend unload must have been attempted for final eviction"
         );
+    }
+
+    #[test]
+    fn failed_final_warm_pool_eviction_does_not_expose_new_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("m1.gguf");
+        let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&path1, b"dummy").unwrap();
+        std::fs::write(&path2, b"dummy").unwrap();
+
+        let load_started = Arc::new(std::sync::Barrier::new(3));
+        let release_load = Arc::new(std::sync::Barrier::new(3));
+        let unload_started = Arc::new(std::sync::Barrier::new(2));
+        let release_unload = Arc::new(std::sync::Barrier::new(2));
+        let backend = Arc::new(BlockingFailFirstUnloadBackend {
+            load_started: Arc::clone(&load_started),
+            release_load: Arc::clone(&release_load),
+            next_handle: AtomicU64::new(0),
+            unloads: AtomicU64::new(0),
+            blocked_once: AtomicBool::new(false),
+            unload_started: Arc::clone(&unload_started),
+            release_unload: Arc::clone(&release_unload),
+        });
+        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
+
+        let reg_for_first = reg.clone();
+        let backend_for_first = Arc::clone(&backend);
+        let path1_for_load = path1.clone();
+        let first_thread = std::thread::spawn(move || {
+            reg_for_first
+                .load(
+                    "first",
+                    &path1_for_load,
+                    LoadConfig::default(),
+                    backend_for_first.as_ref(),
+                )
+                .map(|_| ())
+        });
+
+        let reg_for_second = reg.clone();
+        let backend_for_second = Arc::clone(&backend);
+        let path2_for_load = path2.clone();
+        let second_thread = std::thread::spawn(move || {
+            reg_for_second
+                .load(
+                    "second",
+                    &path2_for_load,
+                    LoadConfig::default(),
+                    backend_for_second.as_ref(),
+                )
+                .map(|_| ())
+        });
+
+        load_started.wait();
+        release_load.wait();
+        unload_started.wait();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reg_for_get_first = reg.clone();
+        let tx_first = tx.clone();
+        let get_first_thread = std::thread::spawn(move || {
+            tx_first
+                .send(("first", reg_for_get_first.get("first").is_some()))
+                .unwrap();
+        });
+        let reg_for_get_second = reg.clone();
+        let get_second_thread = std::thread::spawn(move || {
+            tx.send(("second", reg_for_get_second.get("second").is_some()))
+                .unwrap();
+        });
+
+        if let Ok(observed) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            panic!("early registry read completed: {observed:?}");
+        }
+
+        release_unload.wait();
+        let first_result = first_thread.join().unwrap();
+        let second_result = second_thread.join().unwrap();
+        assert_eq!(
+            [first_result.is_ok(), second_result.is_ok()]
+                .into_iter()
+                .filter(|ok| *ok)
+                .count(),
+            1,
+            "exactly one concurrent load may survive failed final eviction"
+        );
+
+        let observed_a = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let observed_b = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        get_first_thread.join().unwrap();
+        get_second_thread.join().unwrap();
+        let observed = std::collections::HashMap::from([observed_a, observed_b]);
+
+        assert!(
+            observed.get("first").copied().unwrap_or(false) == first_result.is_ok(),
+            "first visibility must match the successful load result"
+        );
+        assert!(
+            observed.get("second").copied().unwrap_or(false) == second_result.is_ok(),
+            "second visibility must match the successful load result"
+        );
+        assert_eq!(reg.len(), 1);
     }
 
     #[test]
