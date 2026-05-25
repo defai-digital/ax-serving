@@ -198,7 +198,7 @@ jobs:
           print("All release baselines populated — release gate passed.")
           EOF
 
-      - name: Remind: manual bench + soak required
+      - name: "Remind: manual bench + soak required"
         run: |
           echo "Release tag detected: ${{ github.ref_name }}"
           echo ""
