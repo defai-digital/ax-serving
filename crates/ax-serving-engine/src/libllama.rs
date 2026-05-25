@@ -562,7 +562,7 @@ impl InferenceBackend for LibLlamaBackend {
         });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let tokens = unsafe { tokenize_text(vocab, text, add_bos) }?;
-        Ok(tokens.into_iter().map(|t| t as u32).collect())
+        llama_tokens_to_backend_tokens(tokens)
     }
 
     fn decode_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<String> {
@@ -578,7 +578,7 @@ impl InferenceBackend for LibLlamaBackend {
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let mut out = String::new();
         for &tok in tokens {
-            let piece = unsafe { token_to_piece(vocab, tok as i32) };
+            let piece = unsafe { token_to_piece(vocab, backend_token_to_llama_token(tok)?) };
             out.push_str(&piece);
         }
         Ok(out)
@@ -888,6 +888,25 @@ unsafe fn tokenize_text(
     Ok(tokens)
 }
 
+fn backend_token_to_llama_token(token: u32) -> Result<i32> {
+    i32::try_from(token).context("token id exceeds llama_token range")
+}
+
+fn backend_tokens_to_llama_tokens(tokens: &[u32]) -> Result<Vec<i32>> {
+    tokens
+        .iter()
+        .copied()
+        .map(backend_token_to_llama_token)
+        .collect()
+}
+
+fn llama_tokens_to_backend_tokens(tokens: Vec<i32>) -> Result<Vec<u32>> {
+    tokens
+        .into_iter()
+        .map(|token| u32::try_from(token).context("llama tokenizer returned negative token id"))
+        .collect()
+}
+
 /// Build a llama_sampler chain from `GenerationParams`.
 ///
 /// Chain layout (standard path):
@@ -1034,7 +1053,7 @@ fn run_generate(
     // 2. Tokenize input.
     let vocab = unsafe { ffi::llama_model_get_vocab(model) };
     let tokens: Vec<i32> = match input {
-        GenerateInput::Tokens(toks) => toks.iter().map(|&t| t as i32).collect(),
+        GenerateInput::Tokens(toks) => backend_tokens_to_llama_tokens(toks)?,
         GenerateInput::Text(text) => unsafe { tokenize_text(vocab, text, true) }?,
         GenerateInput::Chat(msgs) => {
             let prompt = apply_simple_chat_template(msgs);
@@ -1247,7 +1266,10 @@ mod tests {
 
     use crate::GenerateEvent;
 
-    use super::{flush_stream_token_batch, push_stream_token_piece};
+    use super::{
+        backend_token_to_llama_token, flush_stream_token_batch, llama_tokens_to_backend_tokens,
+        push_stream_token_piece,
+    };
 
     #[test]
     fn first_stream_piece_is_sent_immediately() {
@@ -1332,5 +1354,19 @@ mod tests {
         }
         assert!(buffer.is_empty());
         assert_eq!(buffered_pieces, 0);
+    }
+
+    #[test]
+    fn backend_token_conversion_rejects_ids_outside_llama_range() {
+        let err = backend_token_to_llama_token(i32::MAX as u32 + 1).unwrap_err();
+
+        assert!(err.to_string().contains("llama_token range"));
+    }
+
+    #[test]
+    fn llama_token_conversion_rejects_negative_ids() {
+        let err = llama_tokens_to_backend_tokens(vec![0, -1]).unwrap_err();
+
+        assert!(err.to_string().contains("negative token id"));
     }
 }

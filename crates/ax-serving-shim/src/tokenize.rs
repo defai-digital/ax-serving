@@ -41,6 +41,9 @@ pub unsafe extern "C" fn llama_tokenize(
 
     match result {
         Ok(ids) => {
+            if ids.iter().any(|&id| id > i32::MAX as u32) {
+                return -1;
+            }
             // llama.h contract: return -(n_needed) when buffer is too small.
             // Callers use the negative value to learn the required size and retry.
             if ids.len() > n_tokens_max as usize {
@@ -76,7 +79,7 @@ pub unsafe extern "C" fn llama_token_to_piece(
     buf: *mut libc::c_char,
     length: i32,
 ) -> i32 {
-    if model.is_null() || length < 0 {
+    if model.is_null() || length < 0 || token < 0 {
         return -1;
     }
 
@@ -113,7 +116,10 @@ pub unsafe extern "C" fn llama_token_to_piece(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use ax_serving_engine::{
         GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
@@ -126,6 +132,8 @@ mod tests {
     struct RecordingBackend {
         observed: Arc<Mutex<Option<String>>>,
         decoded: String,
+        token_ids: Vec<u32>,
+        decode_calls: Arc<AtomicUsize>,
     }
 
     impl InferenceBackend for RecordingBackend {
@@ -158,10 +166,11 @@ mod tests {
             _add_bos: bool,
         ) -> anyhow::Result<Vec<u32>> {
             *self.observed.lock().unwrap() = Some(text.to_string());
-            Ok(vec![1, 2])
+            Ok(self.token_ids.clone())
         }
 
         fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+            self.decode_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.decoded.clone())
         }
 
@@ -178,13 +187,22 @@ mod tests {
         }
     }
 
+    fn recording_backend(
+        observed: Arc<Mutex<Option<String>>>,
+        decoded: impl Into<String>,
+    ) -> Arc<RecordingBackend> {
+        Arc::new(RecordingBackend {
+            observed,
+            decoded: decoded.into(),
+            token_ids: vec![1, 2],
+            decode_calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
     #[test]
     fn llama_tokenize_respects_text_len_without_requiring_nul_termination() {
         let observed = Arc::new(Mutex::new(None));
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::clone(&observed),
-            decoded: String::new(),
-        });
+        let backend = recording_backend(Arc::clone(&observed), "");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"helloTRAILING\0";
         let mut out = [0_i32; 4];
@@ -209,10 +227,7 @@ mod tests {
     #[test]
     fn llama_tokenize_rejects_negative_text_len() {
         let observed = Arc::new(Mutex::new(None));
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::clone(&observed),
-            decoded: String::new(),
-        });
+        let backend = recording_backend(Arc::clone(&observed), "");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"hello";
         let mut out = [0_i32; 4];
@@ -236,10 +251,7 @@ mod tests {
     #[test]
     fn llama_tokenize_allows_null_output_size_query() {
         let observed = Arc::new(Mutex::new(None));
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::clone(&observed),
-            decoded: String::new(),
-        });
+        let backend = recording_backend(Arc::clone(&observed), "");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"hello";
 
@@ -261,10 +273,7 @@ mod tests {
 
     #[test]
     fn llama_tokenize_rejects_null_output_when_buffer_is_claimed_large_enough() {
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::new(Mutex::new(None)),
-            decoded: String::new(),
-        });
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"hello";
 
@@ -284,11 +293,36 @@ mod tests {
     }
 
     #[test]
-    fn llama_token_to_piece_accepts_exact_size_buffer() {
+    fn llama_tokenize_rejects_ids_that_do_not_fit_llama_token() {
         let backend = Arc::new(RecordingBackend {
             observed: Arc::new(Mutex::new(None)),
-            decoded: "hello".to_string(),
+            decoded: String::new(),
+            token_ids: vec![i32::MAX as u32 + 1],
+            decode_calls: Arc::new(AtomicUsize::new(0)),
         });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+        let mut out = [0_i32; 4];
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -1);
+        assert_eq!(out, [0_i32; 4]);
+    }
+
+    #[test]
+    fn llama_token_to_piece_accepts_exact_size_buffer() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let mut out = [0_i8; 5];
 
@@ -303,10 +337,7 @@ mod tests {
 
     #[test]
     fn llama_token_to_piece_reports_required_size_when_buffer_too_small() {
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::new(Mutex::new(None)),
-            decoded: "hello".to_string(),
-        });
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let mut out = [0_i8; 4];
 
@@ -318,10 +349,7 @@ mod tests {
 
     #[test]
     fn llama_token_to_piece_allows_null_output_size_query() {
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::new(Mutex::new(None)),
-            decoded: "hello".to_string(),
-        });
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
 
         let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 0) };
@@ -331,14 +359,30 @@ mod tests {
 
     #[test]
     fn llama_token_to_piece_rejects_null_output_when_buffer_is_claimed_large_enough() {
-        let backend = Arc::new(RecordingBackend {
-            observed: Arc::new(Mutex::new(None)),
-            decoded: "hello".to_string(),
-        });
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
 
         let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 8) };
 
         assert_eq!(n, -1);
+    }
+
+    #[test]
+    fn llama_token_to_piece_rejects_negative_token_without_backend_call() {
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+            token_ids: vec![1, 2],
+            decode_calls: Arc::clone(&decode_calls),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 5];
+
+        let n = unsafe { llama_token_to_piece(&model, -1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, -1);
+        assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(out, [0_i8; 5]);
     }
 }
