@@ -180,7 +180,10 @@ impl InferenceBackend for CriticalBackend {
     }
 }
 
-struct EmbeddingBackend;
+#[derive(Default)]
+struct EmbeddingBackend {
+    returned_count_offset: isize,
+}
 
 impl InferenceBackend for EmbeddingBackend {
     fn load_model(
@@ -261,8 +264,12 @@ impl InferenceBackend for EmbeddingBackend {
             ),
         };
 
+        let returned_count = count
+            .checked_add_signed(self.returned_count_offset)
+            .unwrap_or(0);
+
         Ok(EmbedResult {
-            embeddings: (0..count)
+            embeddings: (0..returned_count)
                 .map(|i| vec![i as f32, i as f32 + 0.5, i as f32 + 1.0])
                 .collect(),
             prompt_tokens,
@@ -540,7 +547,13 @@ fn make_app_with_backend_no_auth(backend: Arc<dyn InferenceBackend>) -> axum::Ro
 }
 
 fn make_embedding_layer() -> Arc<ServingLayer> {
-    make_layer_with_backend(Arc::new(EmbeddingBackend))
+    make_layer_with_backend(Arc::new(EmbeddingBackend::default()))
+}
+
+fn make_mismatched_embedding_layer() -> Arc<ServingLayer> {
+    make_layer_with_backend(Arc::new(EmbeddingBackend {
+        returned_count_offset: -1,
+    }))
 }
 
 fn make_embedding_failure_layer() -> Arc<ServingLayer> {
@@ -2676,6 +2689,55 @@ async fn embeddings_success_200() {
     assert!(data[0]["embedding"].is_array());
     assert_eq!(json["usage"]["prompt_tokens"], 10);
     assert_eq!(json["usage"]["total_tokens"], 10);
+}
+
+#[tokio::test]
+async fn embeddings_backend_result_count_mismatch_500() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embed-model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_mismatched_embedding_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+    let load_body =
+        serde_json::json!({"model_id": "embed-short", "path": path.to_string_lossy()}).to_string();
+    let load_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let embed_body = serde_json::json!({
+        "model": "embed-short",
+        "input": ["hello", "world"],
+        "encoding_format": "float"
+    })
+    .to_string();
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(embed_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let text = body_text(resp).await;
+    assert!(
+        text.contains("embedding backend returned 1 vectors for 2 inputs"),
+        "unexpected response body: {text}"
+    );
 }
 
 #[tokio::test]

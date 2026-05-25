@@ -296,6 +296,7 @@ impl EmbeddingBatcher {
         let model = request.model.clone();
         let handle = request.handle;
         let config = request.config.clone();
+        let expected_embeddings = request.input_len();
 
         let pm_permit = self
             .per_model_scheduler
@@ -320,6 +321,12 @@ impl EmbeddingBatcher {
 
         let result = join_result.context("direct embedding task panicked")?;
         let result = result?;
+        if result.embeddings.len() != expected_embeddings {
+            return Err(anyhow!(
+                "embedding result count mismatch: expected {expected_embeddings}, got {}",
+                result.embeddings.len()
+            ));
+        }
         Ok(EmbeddingBatchResult {
             embeddings: result.embeddings,
             prompt_tokens: result.prompt_tokens,
@@ -561,6 +568,7 @@ mod tests {
         embed_calls: Arc<AtomicUsize>,
         /// Dimension of each returned embedding vector.
         dim: usize,
+        returned_count_offset: isize,
     }
 
     impl EchoEmbedBackend {
@@ -568,6 +576,15 @@ mod tests {
             Arc::new(Self {
                 embed_calls: Arc::new(AtomicUsize::new(0)),
                 dim,
+                returned_count_offset: 0,
+            })
+        }
+
+        fn new_with_count_offset(dim: usize, returned_count_offset: isize) -> Arc<Self> {
+            Arc::new(Self {
+                embed_calls: Arc::new(AtomicUsize::new(0)),
+                dim,
+                returned_count_offset,
             })
         }
     }
@@ -695,7 +712,12 @@ mod tests {
                 EmbedInput::Strings(texts) => texts.len(),
                 EmbedInput::Tokens(seqs) => seqs.len(),
             };
-            let embeddings = (0..count).map(|_| vec![0.0f32; self.dim]).collect();
+            let returned_count = count
+                .checked_add_signed(self.returned_count_offset)
+                .unwrap_or(0);
+            let embeddings = (0..returned_count)
+                .map(|_| vec![0.0f32; self.dim])
+                .collect();
             Ok(EmbedResult {
                 embeddings,
                 prompt_tokens: count as u32 * 4,
@@ -784,6 +806,21 @@ mod tests {
         assert_eq!(r.embeddings.len(), 2);
         assert_eq!(r.embeddings[0].len(), 4);
         assert_eq!(embed_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_batcher_rejects_mismatched_embedding_count() {
+        let backend = EchoEmbedBackend::new_with_count_offset(4, -1);
+        let sched = make_scheduler();
+        let pm = Arc::new(PerModelScheduler::new(4));
+        let batcher = EmbeddingBatcher::new(backend, sched, pm, 1, 50);
+
+        let result = batcher.submit(make_request(vec!["hello", "world"])).await;
+
+        assert!(
+            result.is_err_and(|err| err.message.contains("embedding result count mismatch")),
+            "direct embed should reject mismatched result count"
+        );
     }
 
     // ── large request bypasses batching ───────────────────────────────────────

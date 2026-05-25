@@ -2002,11 +2002,11 @@ pub async fn embeddings(
     };
 
     // Resolve input into owned containers so they can cross the spawn_blocking boundary.
-    let (strings_owned, tokens_owned) = match req.input {
-        EmbeddingsInput::One(s) => (Some(vec![s]), None),
-        EmbeddingsInput::Many(v) => (Some(v), None),
-        EmbeddingsInput::OneTokens(t) => (None, Some(vec![t])),
-        EmbeddingsInput::ManyTokens(t) => (None, Some(t)),
+    let (expected_embeddings, strings_owned, tokens_owned) = match req.input {
+        EmbeddingsInput::One(s) => (1, Some(vec![s]), None),
+        EmbeddingsInput::Many(v) => (v.len(), Some(v), None),
+        EmbeddingsInput::OneTokens(t) => (1, None, Some(vec![t])),
+        EmbeddingsInput::ManyTokens(t) => (t.len(), None, Some(t)),
     };
 
     let pm_permit = match layer
@@ -2057,6 +2057,21 @@ pub async fn embeddings(
 
     match result {
         Ok(Ok(embed_result)) => {
+            if embed_result.embeddings.len() != expected_embeddings {
+                return with_timing(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "embedding backend returned {} vectors for {expected_embeddings} inputs",
+                                embed_result.embeddings.len()
+                            )
+                        })),
+                    )
+                        .into_response(),
+                    queue_wait_us,
+                );
+            }
             let data: Vec<EmbeddingObject> = embed_result
                 .embeddings
                 .into_iter()
