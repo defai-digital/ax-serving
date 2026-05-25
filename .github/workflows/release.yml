@@ -75,6 +75,8 @@ jobs:
           mkdir -p "$STAGEDIR/bin" "$STAGEDIR/config"
           cp target/release/ax-serving     "$STAGEDIR/bin/"
           cp target/release/ax-serving-api "$STAGEDIR/bin/"
+          cp target/release/ax-runtime-agent "$STAGEDIR/bin/"
+          cp target/release/ax-thor-agent "$STAGEDIR/bin/"
           cp config/backends.yaml          "$STAGEDIR/config/"
           cp config/serving.yaml           "$STAGEDIR/config/"
           cp README.md                     "$STAGEDIR/"
@@ -91,9 +93,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           PAYLOAD="packaging/payload/usr/local/bin"
+          rm -rf packaging/payload
           mkdir -p "$PAYLOAD"
           cp target/release/ax-serving     "$PAYLOAD/"
           cp target/release/ax-serving-api "$PAYLOAD/"
+          cp target/release/ax-runtime-agent "$PAYLOAD/"
+          cp target/release/ax-thor-agent "$PAYLOAD/"
 
           pkgbuild \
             --root packaging/payload \
@@ -144,6 +149,9 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: actions/checkout@v4
+        if: ${{ steps.tap-token.outputs.present == 'true' }}
+
       - name: Download release metadata
         if: ${{ steps.tap-token.outputs.present == 'true' }}
         uses: actions/download-artifact@v4
@@ -164,6 +172,7 @@ jobs:
           # Clone the tap repo
           git clone "https://x-access-token:${GH_TOKEN}@github.com/defai-digital/homebrew-ax-serving.git" tap
           cd tap
+          cp ../packaging/homebrew/ax-serving.rb Formula/ax-serving.rb
 
           # Rewrite the version, url, and sha256 in the formula
           sed -i "s|version \".*\"|version \"${VERSION}\"|" Formula/ax-serving.rb

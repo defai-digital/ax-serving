@@ -29,7 +29,7 @@ DIST_XML="${REPO_ROOT}/packaging/distribution.xml"
 # ── 1. Build release binaries ───────────────────────────────────────────────
 echo "==> Building release binaries…"
 cd "$REPO_ROOT"
-cargo build --workspace --release
+cargo build --workspace --release --exclude ax-serving-py
 
 # ── 2. Stage payload ─────────────────────────────────────────────────────────
 echo "==> Staging payload…"
@@ -37,6 +37,8 @@ rm -rf "$STAGING"
 mkdir -p "$STAGING/usr/local/bin"
 cp target/release/ax-serving     "$STAGING/usr/local/bin/"
 cp target/release/ax-serving-api "$STAGING/usr/local/bin/"
+cp target/release/ax-runtime-agent "$STAGING/usr/local/bin/"
+cp target/release/ax-thor-agent "$STAGING/usr/local/bin/"
 
 # Copy default config to /etc/ax-serving (postinstall script can do this too)
 mkdir -p "$STAGING/etc/ax-serving"
