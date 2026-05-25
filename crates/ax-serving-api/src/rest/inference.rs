@@ -1027,10 +1027,15 @@ async fn blocking_response(
     let mut token_texts: Vec<String> = Vec::new();
     let mut logprob_entries: Vec<(f32, Vec<(String, f32)>)> = Vec::new();
     let mut pending_token: Option<String> = None;
+    let mut first_token = true;
 
     while let Some(event) = rx.recv().await {
         match event {
             GenerateEvent::Token(text) => {
+                if first_token {
+                    permit.record_ttft_now();
+                    first_token = false;
+                }
                 content.push_str(&text);
                 if collect_logprobs {
                     pending_token = Some(text);
@@ -1725,10 +1730,15 @@ async fn text_blocking_response(
     let mut token_texts: Vec<String> = Vec::new();
     let mut logprob_entries: Vec<(f32, Vec<(String, f32)>)> = Vec::new();
     let mut pending_token: Option<String> = None;
+    let mut first_token = true;
 
     while let Some(event) = rx.recv().await {
         match event {
             GenerateEvent::Token(t) => {
+                if first_token {
+                    permit.record_ttft_now();
+                    first_token = false;
+                }
                 text.push_str(&t);
                 if collect_logprobs {
                     pending_token = Some(t);
@@ -2104,5 +2114,166 @@ fn estimate_embedding_prompt_tokens_u64(input: &EmbeddingsInput) -> u64 {
             .iter()
             .map(|tokens| tokens.len() as u64)
             .fold(0u64, u64::saturating_add),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use ax_serving_engine::{GenerateEvent, GenerationStats, ThermalMonitor};
+    use axum::http::StatusCode;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::cache::CacheMetrics;
+    use crate::metrics::MetricsStore;
+    use crate::scheduler::{OverloadPolicy, PerModelScheduler, Scheduler, SchedulerConfig};
+
+    fn split_scheduler() -> Arc<Scheduler> {
+        let mut scheduler = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 100,
+                overload_policy: OverloadPolicy::Queue,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+        scheduler.split_enabled = true;
+        Arc::new(scheduler)
+    }
+
+    fn done_stats() -> GenerationStats {
+        GenerationStats {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            stop_reason: "stop".into(),
+            ..GenerationStats::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_chat_response_records_first_token_for_split_scheduler() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire_with_tokens(32).await.unwrap();
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            32
+        );
+        let queue_wait_us = permit.queue_wait_us();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tx.send(GenerateEvent::Token("hello".into())).await.unwrap();
+        tx.send(GenerateEvent::Done(done_stats())).await.unwrap();
+        drop(tx);
+
+        let cache_metrics = CacheMetrics::default();
+        let metrics = MetricsStore::new();
+        let response = blocking_response(
+            rx,
+            "model".into(),
+            None,
+            None,
+            None,
+            &cache_metrics,
+            &metrics,
+            None,
+            permit,
+            pm_permit,
+            queue_wait_us,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            scheduler.metrics.ttft_p50_us() > 0,
+            "non-streaming first token must be recorded for split scheduling"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .decode_sequences_active
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_text_response_records_first_token_for_split_scheduler() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire_with_tokens(24).await.unwrap();
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            24
+        );
+        let queue_wait_us = permit.queue_wait_us();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tx.send(GenerateEvent::Token("hello".into())).await.unwrap();
+        tx.send(GenerateEvent::Done(done_stats())).await.unwrap();
+        drop(tx);
+
+        let cache_metrics = CacheMetrics::default();
+        let metrics = MetricsStore::new();
+        let response = text_blocking_response(
+            rx,
+            "model".into(),
+            false,
+            None,
+            None,
+            None,
+            &cache_metrics,
+            &metrics,
+            None,
+            permit,
+            pm_permit,
+            queue_wait_us,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            scheduler.metrics.ttft_p50_us() > 0,
+            "non-streaming first token must be recorded for split scheduling"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .decode_sequences_active
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }
