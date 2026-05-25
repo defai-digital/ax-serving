@@ -40,6 +40,7 @@
 //! `"status": 5xx` and `"done": true`.  The orchestrator observes this and
 //! may retry (nack triggers JetStream redelivery up to `AXS_NATS_MAX_DELIVER`).
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -49,7 +50,7 @@ use async_nats::jetstream;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{SinkExt as _, Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
@@ -349,6 +350,81 @@ fn stream_frames_from_nats_response(
     Ok((frames, resp.done))
 }
 
+fn subscriber_response_stream(
+    sub: async_nats::Subscriber,
+) -> Pin<Box<dyn Stream<Item = Result<NatsResponse, std::io::Error>> + Send>> {
+    Box::pin(futures::stream::unfold(sub, |mut sub| async move {
+        let msg = sub.next().await?;
+        let response = serde_json::from_slice(&msg.payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        Some((response, sub))
+    }))
+}
+
+async fn relay_streaming_nats_responses<S>(
+    first: NatsResponse,
+    mut rest: S,
+    idle_timeout: Duration,
+    request_id: String,
+    reroute_total: Arc<AtomicU64>,
+    mut tx: futures::channel::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) where
+    S: Stream<Item = Result<NatsResponse, std::io::Error>> + Unpin,
+{
+    let mut total_bytes = 0usize;
+    let mut pending = Some(first);
+
+    loop {
+        let resp = if let Some(resp) = pending.take() {
+            resp
+        } else {
+            match tokio::time::timeout(idle_timeout, rest.next()).await {
+                Ok(Some(Ok(resp))) => resp,
+                Ok(Some(Err(error))) => {
+                    let _ = tx.send(Err(error)).await;
+                    break;
+                }
+                Ok(None) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "NATS streaming response closed before done",
+                        )))
+                        .await;
+                    break;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "NATS streaming response timed out waiting for next frame",
+                        )))
+                        .await;
+                    break;
+                }
+            }
+        };
+
+        match stream_frames_from_nats_response(&request_id, resp, &mut total_bytes, &reroute_total)
+        {
+            Ok((frames, done)) => {
+                for frame in frames {
+                    if tx.send(Ok(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                break;
+            }
+        }
+    }
+}
+
 // ── NatsDispatcher ────────────────────────────────────────────────────────────
 
 /// Orchestrator-side NATS dispatcher.
@@ -620,54 +696,11 @@ impl NatsDispatcher {
         let (tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         let reroute_total = Arc::clone(&self.reroute_total);
         let request_id = request_id.to_string();
+        let rest = subscriber_response_stream(sub);
 
         tokio::spawn(async move {
-            let mut tx = tx;
-            let deadline = tokio::time::Instant::now() + timeout;
-            let mut total_bytes = 0usize;
-            let mut pending = Some(first);
-            while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
-            {
-                let resp = if let Some(resp) = pending.take() {
-                    resp
-                } else {
-                    let msg = match tokio::time::timeout(remaining, sub.next()).await {
-                        Ok(Some(msg)) => msg,
-                        _ => break,
-                    };
-                    match serde_json::from_slice(&msg.payload) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
-                                .await;
-                            break;
-                        }
-                    }
-                };
-
-                match stream_frames_from_nats_response(
-                    &request_id,
-                    resp,
-                    &mut total_bytes,
-                    &reroute_total,
-                ) {
-                    Ok((frames, done)) => {
-                        for frame in frames {
-                            if tx.send(Ok(frame)).await.is_err() {
-                                return;
-                            }
-                        }
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        break;
-                    }
-                }
-            }
+            relay_streaming_nats_responses(first, rest, timeout, request_id, reroute_total, tx)
+                .await;
         });
 
         axum::response::Response::builder()
@@ -696,11 +729,13 @@ impl std::fmt::Debug for NatsDispatcher {
 mod tests {
     use axum::body::{self, Bytes};
     use axum::http::StatusCode;
+    use futures::StreamExt as _;
 
     use super::{
         NatsBodyDecodeError, NatsConfig, NatsRequest, NatsResponse, build_complete_nats_response,
         decode_body_hex_limited, decode_stream_body_hex_limited, is_event_stream,
-        sanitize_subject_component, stream_frames_from_nats_response,
+        relay_streaming_nats_responses, sanitize_subject_component,
+        stream_frames_from_nats_response,
     };
 
     #[test]
@@ -839,5 +874,89 @@ mod tests {
         assert!(!done);
         assert_eq!(frames, vec![Bytes::from_static(b"data: hello\n\n")]);
         assert_eq!(total, "data: hello\n\n".len());
+    }
+
+    #[tokio::test]
+    async fn relay_streaming_nats_responses_uses_idle_timeout_not_total_deadline() {
+        let first = NatsResponse::streaming_chunk("req-1".to_string(), 200, b"data: one\n\n");
+        let rest = futures::stream::unfold(0usize, |index| async move {
+            match index {
+                0 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Some((
+                        Ok(NatsResponse::streaming_chunk(
+                            "req-1".to_string(),
+                            200,
+                            b"data: two\n\n",
+                        )),
+                        1,
+                    ))
+                }
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Some((
+                        Ok(NatsResponse::streaming_done("req-1".to_string(), 200, None)),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .boxed();
+        let (tx, mut rx) = futures::channel::mpsc::channel(8);
+        let reroutes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        relay_streaming_nats_responses(
+            first,
+            rest,
+            std::time::Duration::from_millis(30),
+            "req-1".to_string(),
+            reroutes,
+            tx,
+        )
+        .await;
+
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.next().await {
+            frames.push(frame.unwrap());
+        }
+        assert_eq!(
+            frames,
+            vec![
+                Bytes::from_static(b"data: one\n\n"),
+                Bytes::from_static(b"data: two\n\n")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_streaming_nats_responses_reports_idle_timeout_before_done() {
+        let first = NatsResponse::streaming_chunk("req-1".to_string(), 200, b"data: one\n\n");
+        let rest = futures::stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            Some((
+                Ok(NatsResponse::streaming_done("req-1".to_string(), 200, None)),
+                (),
+            ))
+        })
+        .boxed();
+        let (tx, mut rx) = futures::channel::mpsc::channel(8);
+        let reroutes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        relay_streaming_nats_responses(
+            first,
+            rest,
+            std::time::Duration::from_millis(10),
+            "req-1".to_string(),
+            reroutes,
+            tx,
+        )
+        .await;
+
+        let first = rx.next().await.unwrap().unwrap();
+        assert_eq!(first, Bytes::from_static(b"data: one\n\n"));
+        let err = rx.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(rx.next().await.is_none());
     }
 }

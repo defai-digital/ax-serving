@@ -702,15 +702,14 @@ async fn dispatch_streaming(
         }
     }
 
-    // Stream chunks to the reply subject using a sliding deadline so a slow
-    // generator cannot run forever after the orchestrator has timed out.
+    // Stream chunks to the reply subject using an idle timeout between chunks.
+    // Long generations remain valid while data keeps flowing, but a stalled
+    // local stream is cut off.
     let mut byte_stream = resp.bytes_stream();
     let mut stream_error = None;
-    let deadline = tokio::time::Instant::now() + request_timeout;
     let mut total_bytes = 0usize;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, byte_stream.next()).await {
+        match tokio::time::timeout(request_timeout, byte_stream.next()).await {
             Err(_) => {
                 warn!(
                     request_id = %req.request_id,
