@@ -9,6 +9,7 @@
 mod doctor;
 mod logging;
 mod serve;
+mod support;
 mod thor;
 mod tune;
 
@@ -144,9 +145,67 @@ enum Command {
         /// Print recommendation without writing a file.
         #[arg(long)]
         dry_run: bool,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
     },
     /// Validate serving configuration and environment.
-    Doctor,
+    Doctor {
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and inspect local AX Serving configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Query a running worker or API gateway.
+    Status {
+        /// Base URL of the worker or gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a minimal OpenAI-compatible chat completion request.
+    SmokeTest {
+        /// Base URL of the worker or gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Model ID to use for the request.
+        #[arg(long, default_value = "default")]
+        model: String,
+        /// Prompt sent to the model.
+        #[arg(long, default_value = "Reply with ok.")]
+        prompt: String,
+        /// Max tokens requested from the model.
+        #[arg(long, default_value_t = 8)]
+        max_tokens: u32,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Validate the resolved serving configuration.
+    Validate {
+        /// Config file to validate. Defaults to the normal AXS_CONFIG/search path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -283,8 +342,24 @@ fn main() -> Result<()> {
                 orchestrator,
             )
         }
-        Some(Command::Tune { output, dry_run }) => tune::run_tune(output, dry_run),
-        Some(Command::Doctor) => doctor::run_doctor(),
+        Some(Command::Tune {
+            output,
+            dry_run,
+            json,
+        }) => tune::run_tune(output, dry_run, json),
+        Some(Command::Doctor { json }) => doctor::run_doctor(json),
+        Some(Command::Config { command }) => match command {
+            ConfigCommand::Validate { config, json } => support::run_config_validate(config, json),
+        },
+        Some(Command::Status { url, api_key, json }) => support::run_status(url, api_key, json),
+        Some(Command::SmokeTest {
+            url,
+            model,
+            prompt,
+            max_tokens,
+            api_key,
+            json,
+        }) => support::run_smoke_test(url, model, prompt, max_tokens, api_key, json),
         Some(Command::Thor { command }) => {
             if let ThorCommand::WaitReady {
                 config,

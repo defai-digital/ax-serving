@@ -13,8 +13,7 @@ libllama = []
 
 [dependencies]
 # ax-engine native backend.
-ax-engine-core = { git = "https://github.com/defai-digital/ax-engine.git", rev = "e0f1b81c3b30e2ff9a778aa92a0a71373f657573" }
-ax-engine-metal = { git = "https://github.com/defai-digital/ax-engine.git", rev = "e0f1b81c3b30e2ff9a778aa92a0a71373f657573" }
+ax-engine-sdk = { git = "https://github.com/defai-digital/ax-engine.git", tag = "v4.10.0", features = ["mlx-native"] }
 # Async runtime
 tokio = { workspace = true }
 # Error handling
@@ -29,6 +28,7 @@ serde = { workspace = true }
 libc = "0.2"
 # Serialization
 serde_json = { workspace = true }
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "esaxx_fast"] }
 # YAML config for backends.yaml
 serde_yaml = { workspace = true }
 # HTTP client for llama.cpp subprocess proxy

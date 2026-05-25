@@ -1,13 +1,14 @@
 # AX Serving backend routing configuration
 #
 # CURRENT POLICY: route all models through llama.cpp by default.
-# ax-engine remains available only as an explicit per-load override (`native`).
+# ax-engine remains available for AX MLX artifact directories or explicit
+# per-load override (`native`).
 #
 # Backends:
-#   native    — ax-engine (explicit opt-in; requires Xcode Metal toolchain)
+#   native    — ax-engine SDK v4 session (requires AX MLX artifacts + Metal)
 #   llama_cpp — llama-server subprocess (requires llama-server on PATH via brew install llama.cpp)
 #   lib_llama — direct libllama C API, no subprocess (requires `libllama` feature; Phase 2)
-#   auto      — try native first; fall back to llama_cpp on unsupported arch
+#   auto      — AX MLX artifact directories use native; GGUF uses llama_cpp
 #
 # Family detection:
 #   Primary:  reads `general.architecture` from the GGUF header (authoritative).

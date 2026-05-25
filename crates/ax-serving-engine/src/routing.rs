@@ -1,24 +1,21 @@
-//! Backend routing: dispatches inference to ax-engine (native) or llama.cpp.
+//! Backend routing: dispatches inference to ax-engine (native), MLX, or llama.cpp.
 //!
-//! **Routing model**: ax-serving owns all routing decisions.  ax-engine is
-//! never asked to load a model and then fall back on failure.  Instead,
-//! `RoutingConfig` maintains a `native_families` allowlist of architectures
-//! known to be supported by the current ax-engine version.  Any model whose
-//! architecture is not in that list is sent directly to llama.cpp without
-//! attempting a native load.
+//! **Routing model**: ax-serving owns all routing decisions. AX Engine v4's
+//! native SDK path loads AX MLX artifact directories (`model-manifest.json` +
+//! `tokenizer.json`). GGUF files default to llama.cpp unless a caller explicitly
+//! forces `backend = "native"`.
 //!
 //! # Config file (`backends.yaml`)
 //!
 //! ```yaml
-//! # Default routing: consult native_families (see below).
+//! # Default routing: native for AX artifact directories, llama.cpp otherwise.
 //! # Options: native | llama_cpp | auto
-//! #   native    — ax-engine only (fail if not supported)
+//! #   native    — ax-engine SDK only (requires AX MLX artifacts)
 //! #   llama_cpp — llama.cpp only (requires llama-server on PATH)
-//! #   auto      — check native_families; route native if matched, else llama.cpp
+//! #   auto      — AX artifact directory → native, else llama.cpp
 //! default_backend: auto
 //!
-//! # Architectures ax-engine natively supports (prefix matching).
-//! # Used only when routing to `auto`.  Override to add/remove families.
+//! # Legacy architecture allowlist for explicit family policies.
 //! native_families:
 //!   - llama
 //!   - mistral
@@ -27,7 +24,7 @@
 //!   - gemma3
 //!   - gemma4
 //!
-//! # Per-family overrides.  Keys match `general.architecture` from GGUF metadata.
+//! # Per-family overrides. Keys match `general.architecture` from GGUF metadata.
 //! # Prefix matching: "qwen" matches "qwen35", etc.
 //! # Exact match takes priority over prefix match.
 //! # An explicit entry here overrides native_families for that family.
@@ -41,9 +38,8 @@
 //!
 //! # Model architecture detection (primary)
 //!
-//! The `general.architecture` key from the GGUF file header is read before
-//! any backend is invoked.  This is authoritative and does not depend on the
-//! filename.
+//! For GGUF files, the `general.architecture` key is read before backend
+//! selection. This is authoritative and does not depend on the filename.
 //!
 //! # Filename fallback (secondary)
 //!
@@ -68,7 +64,7 @@ use crate::libllama::LibLlamaBackend;
 use crate::{
     CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
     GenerationParams, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalState,
-    ax_engine::AxEngineBackend,
+    ax_engine::{AxEngineBackend, is_ax_engine_model_artifacts},
     llamacpp::{LlamaCppBackend, LlamaCppConfig},
     mlx::{MlxBackend, MlxConfig, is_mlx_model},
 };
@@ -85,8 +81,7 @@ pub enum BackendChoice {
     LlamaCpp,
     /// Use libllama C API directly (no subprocess, requires `libllama` feature).
     LibLlama,
-    /// Consult `RoutingConfig::native_families`: if the model's architecture
-    /// prefix-matches an entry, route to native ax-engine; otherwise llama.cpp.
+    /// Route AX Engine artifact directories to native; route other paths to llama.cpp.
     /// No speculative probing — the decision is made before any load attempt.
     #[default]
     Auto,
@@ -104,7 +99,7 @@ pub struct RoutingConfig {
     pub default_backend: BackendChoice,
     /// Per-family overrides.  Keys are lowercase family names.
     pub families: HashMap<String, BackendChoice>,
-    /// Architectures natively supported by ax-engine (used by `Auto` routing).
+    /// Legacy architecture allowlist used by explicit family policies.
     /// Prefix matching applies — `"llama"` matches `"llama3"`, `"llama2"`, etc.
     /// An explicit `families` entry for the same arch takes priority.
     #[serde(default = "RoutingConfig::default_native_families")]
@@ -114,7 +109,7 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            // Default: auto — deterministic routing via native_families list.
+            // Default: auto — AX artifact directories use native, GGUF uses llama.cpp.
             default_backend: BackendChoice::Auto,
             families: HashMap::new(),
             native_families: Self::default_native_families(),
@@ -123,9 +118,7 @@ impl Default for RoutingConfig {
 }
 
 impl RoutingConfig {
-    /// Built-in ax-engine v3.x native architecture support list.
-    /// qwen35 = Qwen 3.5 (hybrid attention+SSM); qwen2/qwen3 dense removed in v3.x.
-    /// gemma3/gemma4 supported; gemma/gemma2 removed in v3.x.
+    /// Built-in legacy ax-engine native architecture support list.
     pub fn default_native_families() -> Vec<String> {
         ["llama", "mistral", "mixtral", "qwen35", "gemma3", "gemma4"]
             .iter()
@@ -133,9 +126,16 @@ impl RoutingConfig {
             .collect()
     }
 
-    /// Expand `Auto` to `Native` or `LlamaCpp` by checking `native_families`.
+    /// Expand `Auto` to `Native` or `LlamaCpp` for a concrete path.
     /// Uses prefix matching on normalized (alphanumeric-only) arch strings.
-    fn resolve_auto(&self, arch: &str) -> BackendChoice {
+    fn resolve_auto(&self, path: &Path, arch: &str) -> BackendChoice {
+        if is_ax_engine_model_artifacts(path) {
+            return BackendChoice::Native;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("gguf") {
+            return BackendChoice::LlamaCpp;
+        }
+
         let arch_norm = normalize_family_key(arch);
         for family in &self.native_families {
             let family_norm = normalize_family_key(family);
@@ -185,11 +185,18 @@ impl RoutingConfig {
     /// Resolve the `BackendChoice` for the model at `path`.
     ///
     /// Detection order:
-    /// 1. Read `general.architecture` from GGUF header (authoritative).
-    /// 2. Fall back to lowercase filename substring match on I/O failure.
+    /// 1. AX Engine artifact directory (`model-manifest.json` + `tokenizer.json`).
+    /// 2. Read `general.architecture` from GGUF header (authoritative).
+    /// 3. Fall back to lowercase filename substring match on I/O failure.
     ///
     /// Family lookup: exact match first, then prefix match.
     pub fn resolve(&self, path: &Path) -> BackendChoice {
+        if is_ax_engine_model_artifacts(path) && matches!(self.default_backend, BackendChoice::Auto)
+        {
+            info!("AX Engine model artifacts detected for {}", path.display());
+            return BackendChoice::Native;
+        }
+
         let arch = match crate::gguf_meta::read_gguf_meta(path) {
             Ok(meta) if !meta.architecture.is_empty() => {
                 info!("GGUF arch='{}' for {}", meta.architecture, path.display());
@@ -217,7 +224,7 @@ impl RoutingConfig {
         if let Some(&choice) = self.families.get(&arch) {
             // Expand Auto here too — resolve() must never return Auto.
             return if matches!(choice, BackendChoice::Auto) {
-                self.resolve_auto(&arch)
+                self.resolve_auto(path, &arch)
             } else {
                 choice
             };
@@ -238,7 +245,7 @@ impl RoutingConfig {
             let choice = exact_matches[0].1;
             // Expand Auto — resolve() must never return Auto.
             return if matches!(choice, BackendChoice::Auto) {
-                self.resolve_auto(&arch)
+                self.resolve_auto(path, &arch)
             } else {
                 choice
             };
@@ -267,10 +274,10 @@ impl RoutingConfig {
             self.default_backend
         };
 
-        // Expand Auto → Native or LlamaCpp using the native_families list.
+        // Expand Auto → Native or LlamaCpp for this concrete path.
         // resolve() never returns Auto so callers always get a concrete backend.
         if matches!(choice, BackendChoice::Auto) {
-            return self.resolve_auto(&arch);
+            return self.resolve_auto(path, &arch);
         }
         choice
     }
@@ -963,19 +970,18 @@ mod tests {
         assert_eq!(choice, BackendChoice::LlamaCpp);
     }
 
-    // Auto routing: arch in native_families → Native; unknown → LlamaCpp.
+    // Auto routing: AX Engine artifact directories → Native; GGUF → LlamaCpp.
     #[test]
-    fn test_auto_routes_native_arch_to_native() {
+    fn test_auto_routes_ax_artifacts_to_native() {
         let cfg = make_config_with_native(&[], BackendChoice::Auto, &["llama", "gemma3", "gemma4"]);
-        // Filename detection: "llama3-8b.gguf" → family "llama" → in native_families → Native.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model-manifest.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+
+        assert_eq!(cfg.resolve(dir.path()), BackendChoice::Native);
         assert_eq!(
             cfg.resolve(Path::new("llama3-8b.gguf")),
-            BackendChoice::Native
-        );
-        // "gemma3-4b.gguf" → family "gemma" which prefix-matches "gemma3" → Native.
-        assert_eq!(
-            cfg.resolve(Path::new("gemma3-4b.gguf")),
-            BackendChoice::Native
+            BackendChoice::LlamaCpp
         );
     }
 

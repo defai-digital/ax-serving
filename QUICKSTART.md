@@ -28,9 +28,9 @@ python3 -c "import sys; print('Python', sys.version); import httpx, grpcio; prin
 ```
 
 Backend model:
-- `native` = explicit `ax-engine`
+- `native` = explicit `ax-engine` SDK session over AX MLX artifacts
 - `llama_cpp` = `llama-server` from `llama.cpp`
-- `auto` = try `native` first, then fallback to `llama.cpp` on unsupported architectures
+- `auto` = AX MLX artifact directories use native; GGUF uses `llama.cpp`
 
 ---
 
@@ -44,9 +44,10 @@ One process handles:
 - scheduler/admission control
 - metrics, dashboard, and admin endpoints
 
-By default, AX Serving routes all model loads through `llama.cpp`.
+By default, AX Serving routes GGUF model loads through `llama.cpp`.
 Use `backend: "native"` in `POST /v1/models` (or equivalent internal controls)
-to force `ax-engine` for a specific model.
+to force `ax-engine` for a specific AX MLX artifact directory containing
+`model-manifest.json` and `tokenizer.json`.
 
 Best for:
 - OSS usage

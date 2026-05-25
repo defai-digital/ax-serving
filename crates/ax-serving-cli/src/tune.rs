@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 /// Hardware profile detected from the local machine.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct HardwareProfile {
     pub chip_model: String,
     pub performance_cores: usize,
@@ -46,7 +47,8 @@ impl HardwareProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkuClass {
     Base,
     Pro,
@@ -66,7 +68,7 @@ impl SkuClass {
 }
 
 /// Recommended serving configuration derived from hardware profile.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct TuneRecommendation {
     pub sched_max_inflight: usize,
     pub sched_max_queue: usize,
@@ -181,44 +183,95 @@ sched_overload_policy = "queue"
     }
 }
 
-pub fn run_tune(output: Option<PathBuf>, dry_run: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct TuneReport {
+    command: &'static str,
+    status: &'static str,
+    dry_run: bool,
+    wrote_file: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<PathBuf>,
+    hardware: HardwareProfile,
+    recommendation: TuneRecommendation,
+    config_toml: String,
+}
+
+pub fn run_tune(output: Option<PathBuf>, dry_run: bool, json: bool) -> Result<()> {
     let profile = HardwareProfile::detect()?;
-    eprintln!("Hardware detected:");
-    eprintln!("  Chip:    {}", profile.chip_model);
-    eprintln!(
-        "  Cores:   {}P + {}E",
-        profile.performance_cores, profile.efficiency_cores
-    );
-    eprintln!("  Memory:  {} GB", profile.total_memory_gb);
-    eprintln!("  OS:      {}", profile.os_version);
-    eprintln!("  SKU:     {}", profile.sku_class().as_str());
-    eprintln!();
+    if !json {
+        eprintln!("Hardware detected:");
+        eprintln!("  Chip:    {}", profile.chip_model);
+        eprintln!(
+            "  Cores:   {}P + {}E",
+            profile.performance_cores, profile.efficiency_cores
+        );
+        eprintln!("  Memory:  {} GB", profile.total_memory_gb);
+        eprintln!("  OS:      {}", profile.os_version);
+        eprintln!("  SKU:     {}", profile.sku_class().as_str());
+        eprintln!();
+    }
 
     let rec = TuneRecommendation::from_profile(&profile);
     let toml = rec.to_toml(&profile);
 
     if dry_run {
-        eprintln!("Recommended configuration (dry-run, not writing):\n");
-        println!("{toml}");
+        if json {
+            print_tune_json(profile, rec, dry_run, false, None, toml)?;
+        } else {
+            eprintln!("Recommended configuration (dry-run, not writing):\n");
+            println!("{toml}");
+        }
         return Ok(());
     }
 
     let explicit_output = output.is_some();
     let path = output.unwrap_or_else(|| PathBuf::from("serving.toml"));
-    if path.exists() && !explicit_output {
-        eprintln!(
-            "Warning: {} already exists. Writing to serving.tune.toml instead.",
-            path.display()
-        );
+    let written_path = if path.exists() && !explicit_output {
         let alt = PathBuf::from("serving.tune.toml");
         std::fs::write(&alt, &toml).context("failed to write serving.tune.toml")?;
-        eprintln!("Wrote recommended config to {}", alt.display());
+        if !json {
+            eprintln!(
+                "Warning: {} already exists. Writing to serving.tune.toml instead.",
+                path.display()
+            );
+            eprintln!("Wrote recommended config to {}", alt.display());
+        }
+        alt
     } else {
         std::fs::write(&path, &toml)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        eprintln!("Wrote recommended config to {}", path.display());
+        if !json {
+            eprintln!("Wrote recommended config to {}", path.display());
+        }
+        path
+    };
+
+    if json {
+        print_tune_json(profile, rec, dry_run, true, Some(written_path), toml)?;
     }
 
+    Ok(())
+}
+
+fn print_tune_json(
+    profile: HardwareProfile,
+    rec: TuneRecommendation,
+    dry_run: bool,
+    wrote_file: bool,
+    output_path: Option<PathBuf>,
+    config_toml: String,
+) -> Result<()> {
+    let report = TuneReport {
+        command: "ax-serving tune",
+        status: "ok",
+        dry_run,
+        wrote_file,
+        output_path,
+        hardware: profile,
+        recommendation: rec,
+        config_toml,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -361,5 +414,21 @@ mod tests {
         assert!(toml.contains("sched_max_inflight = 8"));
         assert!(toml.contains("sched_max_queue = 64"));
         assert!(toml.contains("Apple M3 Pro"));
+    }
+
+    #[test]
+    fn recommendation_serializes_for_automation() {
+        let profile = HardwareProfile {
+            chip_model: "Apple M3 Pro".into(),
+            performance_cores: 6,
+            efficiency_cores: 6,
+            total_memory_gb: 36,
+            os_version: "15.3".into(),
+        };
+        let rec = TuneRecommendation::from_profile(&profile);
+        let json = serde_json::to_string(&rec).unwrap();
+
+        assert!(json.contains("\"sku_class\":\"pro\""));
+        assert!(json.contains("\"sched_max_inflight\":8"));
     }
 }

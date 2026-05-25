@@ -216,9 +216,9 @@ Positioning:
 AX Serving is not itself the token-generation engine. It is the serving layer that routes requests into lower-level runtimes.
 
 - `llama.cpp` is the default backend for model loading across families.
-- `ax-engine` remains an explicit opt-in path for environments that can benefit from native execution.
+- `ax-engine` remains an explicit opt-in path for AX MLX model artifact directories.
 - routing between those backends is controlled through [`config/backends.yaml`](config/backends.yaml)
-- `ax-engine` is pinned to v1.2.2-compatible `0959a65` because `v1.3.1` regressed the shipped `gdn.metal` file and the `v1.3.2` commit path does not currently compile cleanly in this workspace snapshot.
+- `ax-engine` is integrated through `ax-engine-sdk` v4.10.0 and its session-based API. Native loads now expect an artifact directory containing `model-manifest.json` and `tokenizer.json`; GGUF files continue to route to `llama.cpp` by default.
 
 In practice, this means AX Serving owns the APIs, scheduling, orchestration, health, metrics, and model lifecycle, while model execution defaults to `llama.cpp` with `ax-engine` as an explicit override.
 
@@ -477,6 +477,7 @@ Other benchmark modes:
 - [docs/market-positioning.md](docs/market-positioning.md)
 - [docs/competitive-landscape.md](docs/competitive-landscape.md)
 - [docs/icp-and-demand.md](docs/icp-and-demand.md)
+- [docs/ax-code-integration.md](docs/ax-code-integration.md)
 - [docs/prd/PRD-AX-SERVING-v3.0.md](docs/prd/PRD-AX-SERVING-v3.0.md)
 - [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
 - [docs/adr/README.md](docs/adr/README.md)

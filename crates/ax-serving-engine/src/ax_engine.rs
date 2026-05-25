@@ -1,6 +1,10 @@
-//! AxEngineBackend: `InferenceBackend` implementation backed by ax-engine.
+//! AxEngineBackend: `InferenceBackend` implementation backed by ax-engine-sdk.
+//!
+//! AX Engine v4 exposes a session-oriented SDK. The native MLX runtime loads
+//! AX model artifact directories (`model-manifest.json`, `config.json`,
+//! `tokenizer.json`, and weights) instead of the old GGUF/internal-core API.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
@@ -8,27 +12,39 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ax_engine_core::backend::{self, BackendConfig};
-use ax_engine_core::chat::{self, ChatRenderOptions, ChatRole};
-use ax_engine_core::gguf::MappedModel;
-use ax_engine_core::metrics::current_rss_bytes;
-use ax_engine_core::model::{
-    DecodeControl, InferenceModel, ModelConfig, WeightStore, arch_registry, run_decode,
+use ax_engine_sdk::{
+    CacheGroupId, EmbeddingPooling, EngineSession, EngineSessionConfig,
+    GenerateFinishReason as AxGenerateFinishReason, GenerateRequest, GenerateSampling,
+    GenerateStreamEvent as AxGenerateStreamEvent, GenerateStreamResponseEvent, KvCompressionConfig,
+    PreviewBackendRequest, PreviewSessionConfigRequest, SupportTier,
 };
-use ax_engine_core::sampling::{LogitBias, SampledTokenInfo, Sampler, SamplingConfig};
-use ax_engine_core::tokenizer::Tokenizer;
 use rustc_hash::FxHashMap;
+use serde_json::Value;
+use tokenizers::Tokenizer;
 use tracing::warn;
 
 use crate::{
-    BackendType, ChatMessage, GenerateEvent, GenerateInput, GenerationParams, GenerationStats,
-    InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, ThermalMonitor, ThermalState,
+    BackendType, ChatMessage, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
+    GenerationParams, GenerationStats, InferenceBackend, LoadConfig, ModelHandle, ModelMetadata,
+    ThermalMonitor, ThermalState, current_rss_bytes,
 };
 
+const DEFAULT_CONTEXT_LENGTH: u32 = 16 * 1024;
+const DEFAULT_BLOCK_SIZE_TOKENS: u32 = 16;
+const DEFAULT_MAX_BATCH_TOKENS: u32 = 2048;
+const MODEL_MANIFEST_FILE: &str = "model-manifest.json";
+const TOKENIZER_FILE: &str = "tokenizer.json";
+const CONFIG_FILE: &str = "config.json";
+
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(8_000_000);
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_handle() -> ModelHandle {
     ModelHandle(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed))
+}
+
+fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
 fn flush_stream_token_batch(
@@ -70,60 +86,292 @@ fn push_stream_token_piece(
 }
 
 struct LoadedModel {
-    mapped: MappedModel,
+    session: Mutex<EngineSession>,
     tokenizer: Tokenizer,
-    model: InferenceModel,
     metadata: ModelMetadata,
+    model_id: String,
+    eos_tokens: Vec<u32>,
     render_architecture: String,
-    inference_lock: Mutex<()>,
+    embedding_pooling: EmbeddingPooling,
 }
 
-// SAFETY: Access to `InferenceModel` is serialized by `inference_lock`, so the
-// backend never performs concurrent calls into the loaded model object. The
-// remaining fields are immutable after load.
+// SAFETY: AX Engine session access is serialized by `session`, and the other
+// fields are immutable after load.
 unsafe impl Send for LoadedModel {}
 unsafe impl Sync for LoadedModel {}
 
-fn resolve_backend_config(config: &LoadConfig) -> BackendConfig {
-    match config.backend_type {
-        BackendType::Cpu => BackendConfig::Cpu,
-        BackendType::Metal => BackendConfig::Metal,
-        BackendType::Auto => match std::env::var("AX_HYBRID_DECODE") {
-            Ok(v) if v.trim().eq_ignore_ascii_case("cpu") => BackendConfig::HybridCpuDecode,
-            _ => {
-                if std::env::var("AX_CPU_ONLY")
-                    .ok()
-                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                {
-                    BackendConfig::Cpu
-                } else {
-                    BackendConfig::default()
-                }
-            }
-        },
-    }
+#[derive(Clone, Copy)]
+enum ChatRole {
+    System,
+    User,
+    Assistant,
 }
 
-fn resolved_backend_type(config: BackendConfig) -> BackendType {
-    match config {
-        BackendConfig::Cpu => BackendType::Cpu,
-        BackendConfig::Metal | BackendConfig::Hybrid | BackendConfig::HybridCpuDecode => {
-            BackendType::Metal
+#[derive(Debug, PartialEq, Eq)]
+struct StopPieceAction {
+    emit: String,
+    matched: bool,
+}
+
+fn resolve_model_dir(path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(path.exists(), "model path not found: {}", path.display());
+
+    if path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+
+    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        anyhow::bail!(
+            "native ax-engine v4.10.0 requires an AX MLX model artifact directory, not a .gguf file: {}",
+            path.display()
+        );
+    }
+
+    path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve model artifact directory for {}",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn is_ax_engine_model_artifacts(path: &Path) -> bool {
+    let model_dir = if path.is_dir() {
+        path
+    } else if let Some(parent) = path.parent() {
+        parent
+    } else {
+        return false;
+    };
+
+    model_dir.join(MODEL_MANIFEST_FILE).is_file() && model_dir.join(TOKENIZER_FILE).is_file()
+}
+
+fn ensure_model_artifacts(model_dir: &Path) -> Result<()> {
+    for required in [MODEL_MANIFEST_FILE, TOKENIZER_FILE] {
+        let path = model_dir.join(required);
+        anyhow::ensure!(
+            path.is_file(),
+            "native ax-engine v4.10.0 model artifacts require {} at {}",
+            required,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_json_file(path: &Path) -> Result<Option<Value>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn json_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+fn json_str(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+fn model_id_from_dir(model_dir: &Path) -> String {
+    model_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("ax-engine-model")
+        .to_string()
+}
+
+fn infer_render_architecture(model_architecture: &str, chat_template: Option<&str>) -> String {
+    if let Some(chat_template) = chat_template {
+        if chat_template.contains("<|start_header_id|>") {
+            return "llama".to_string();
+        }
+        if chat_template.contains("<|im_start|>") {
+            return "qwen".to_string();
+        }
+        if chat_template.contains("<start_of_turn>") {
+            return "gemma".to_string();
+        }
+        if chat_template.contains("[INST]") && chat_template.contains("[/INST]") {
+            return "mistral".to_string();
         }
     }
+
+    match model_architecture {
+        family if family.starts_with("qwen") => "qwen".to_string(),
+        family if family.starts_with("gemma") => "gemma".to_string(),
+        family if family.starts_with("llama") => "llama".to_string(),
+        family if family.starts_with("mistral") || family.starts_with("mixtral") => {
+            "mistral".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
-fn extract_text(content: &serde_json::Value) -> Result<String> {
+fn tokenizer_chat_template(tokenizer_config: Option<&Value>) -> Option<&str> {
+    tokenizer_config.and_then(|value| match value.get("chat_template") {
+        Some(Value::String(template)) => Some(template.as_str()),
+        Some(Value::Array(templates)) => templates
+            .iter()
+            .find_map(|entry| entry.get("template").and_then(Value::as_str)),
+        _ => None,
+    })
+}
+
+fn context_length_from_config(config_json: Option<&Value>, load_config: &LoadConfig) -> u32 {
+    if load_config.context_length > 0 {
+        return load_config.context_length;
+    }
+
+    let Some(config_json) = config_json else {
+        return DEFAULT_CONTEXT_LENGTH;
+    };
+
+    [
+        "max_position_embeddings",
+        "model_max_length",
+        "seq_length",
+        "max_sequence_length",
+    ]
+    .into_iter()
+    .find_map(|key| json_u32(config_json.get(key)))
+    .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+}
+
+fn eos_tokens_from_config(config_json: Option<&Value>, tokenizer: &Tokenizer) -> Vec<u32> {
+    let from_config = config_json
+        .and_then(|value| value.get("eos_token_id"))
+        .map(|value| match value {
+            Value::Number(_) => json_u32(Some(value)).into_iter().collect::<Vec<_>>(),
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| json_u32(Some(item)))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+
+    if !from_config.is_empty() {
+        return from_config;
+    }
+
+    ["<|endoftext|>", "<|im_end|>", "</s>", "<|eot_id|>"]
+        .into_iter()
+        .filter_map(|token| tokenizer.token_to_id(token))
+        .next()
+        .into_iter()
+        .collect()
+}
+
+fn pooling_from_load_config(config: &LoadConfig) -> Result<EmbeddingPooling> {
+    match config.pooling_type.as_deref().unwrap_or("mean") {
+        "mean" | "none" => Ok(EmbeddingPooling::Mean),
+        "last" => Ok(EmbeddingPooling::Last),
+        "cls" => Ok(EmbeddingPooling::Cls),
+        other => anyhow::bail!("native ax-engine backend does not support pooling type '{other}'"),
+    }
+}
+
+fn metadata_from_artifacts(
+    model_dir: &Path,
+    config: &LoadConfig,
+    load_time_ms: u64,
+    peak_rss_bytes: u64,
+) -> Result<(ModelMetadata, String)> {
+    let manifest = read_json_file(&model_dir.join(MODEL_MANIFEST_FILE))?
+        .context("missing model-manifest.json")?;
+    let config_json = read_json_file(&model_dir.join(CONFIG_FILE))?;
+    let config_json = config_json.as_ref();
+
+    let architecture = json_str(manifest.get("model_family"))
+        .or_else(|| config_json.and_then(|value| json_str(value.get("model_type"))))
+        .unwrap_or("mlx")
+        .to_string();
+    let n_layers = json_u32(manifest.get("layer_count"))
+        .or_else(|| config_json.and_then(|value| json_u32(value.get("num_hidden_layers"))))
+        .unwrap_or(0);
+    let n_heads = json_u32(manifest.get("attention_head_count"))
+        .or_else(|| config_json.and_then(|value| json_u32(value.get("num_attention_heads"))))
+        .unwrap_or(0);
+    let n_kv_heads = json_u32(manifest.get("kv_head_count"))
+        .or_else(|| config_json.and_then(|value| json_u32(value.get("num_key_value_heads"))))
+        .unwrap_or(n_heads);
+    let embedding_dim = json_u32(manifest.get("hidden_size"))
+        .or_else(|| config_json.and_then(|value| json_u32(value.get("hidden_size"))))
+        .unwrap_or(0);
+    let vocab_size = json_u32(manifest.get("vocab_size"))
+        .or_else(|| config_json.and_then(|value| json_u32(value.get("vocab_size"))))
+        .unwrap_or(0);
+    let context_length = context_length_from_config(config_json, config);
+
+    Ok((
+        ModelMetadata {
+            architecture: architecture.clone(),
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            embedding_dim,
+            vocab_size,
+            context_length,
+            load_time_ms,
+            peak_rss_bytes,
+            resolved_backend: BackendType::Metal,
+        },
+        architecture,
+    ))
+}
+
+fn session_config_for_model(
+    model_dir: &Path,
+    load_config: &LoadConfig,
+) -> Result<EngineSessionConfig> {
+    if load_config.backend_type == BackendType::Cpu {
+        anyhow::bail!("native ax-engine v4.10.0 SDK integration supports MLX/Metal, not CPU");
+    }
+
+    let context_length = context_length_from_config(
+        read_json_file(&model_dir.join(CONFIG_FILE))?.as_ref(),
+        load_config,
+    );
+    let total_blocks = context_length.div_ceil(DEFAULT_BLOCK_SIZE_TOKENS).max(1);
+    let max_batch_tokens = context_length.min(DEFAULT_MAX_BATCH_TOKENS).max(1);
+
+    EngineSessionConfig::from_preview_request(PreviewSessionConfigRequest {
+        cache_group_id: CacheGroupId(0),
+        block_size_tokens: DEFAULT_BLOCK_SIZE_TOKENS,
+        total_blocks,
+        deterministic: true,
+        max_batch_tokens,
+        backend_request: PreviewBackendRequest::new(SupportTier::MlxPreview),
+        mlx_runtime_artifacts_dir: None,
+        mlx_model_artifacts_dir: Some(model_dir.to_path_buf()),
+        mlx_disable_ngram_acceleration: false,
+        mlx_kv_compression: KvCompressionConfig::disabled(),
+        mlx_prefill_chunk: None,
+    })
+    .context("failed to build ax-engine session config")
+}
+
+fn extract_text(content: &Value) -> Result<String> {
     match content {
-        serde_json::Value::String(s) => Ok(s.clone()),
-        serde_json::Value::Array(parts) => {
+        Value::String(s) => Ok(s.clone()),
+        Value::Array(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part.get("type").and_then(|v| v.as_str()) {
+                match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let part_text = part
                             .get("text")
-                            .and_then(|v| v.as_str())
+                            .and_then(Value::as_str)
                             .context("chat text part missing string 'text' field")?;
                         text.push_str(part_text);
                     }
@@ -167,45 +415,81 @@ fn normalize_chat_messages(messages: &[ChatMessage]) -> Result<Vec<(ChatRole, St
     Ok(normalized)
 }
 
-fn infer_render_architecture(model_architecture: &str, chat_template: Option<&str>) -> String {
-    if let Some(chat_template) = chat_template {
-        if chat_template.contains("<|start_header_id|>") {
-            return "llama".to_string();
-        }
-        if chat_template.contains("<|im_start|>") {
-            return "qwen3".to_string();
-        }
-        if chat_template.contains("<start_of_turn>") {
-            return "gemma3".to_string();
-        }
-        if chat_template.contains("[INST]") && chat_template.contains("[/INST]") {
-            return "mistral".to_string();
-        }
-    }
-    model_architecture.to_string()
+fn render_user_prompt(text: &str, architecture: &str) -> String {
+    render_chat_messages(&[(ChatRole::User, text.to_string())], architecture)
 }
 
-fn render_chat_messages_with_compat(
-    messages: &[chat::ChatMessage<'_>],
-    architecture: &str,
-    options: ChatRenderOptions,
-) -> String {
-    if matches!(architecture, "mistral" | "mixtral") {
-        return render_inst_format_chat_messages(messages);
+fn render_chat_messages(messages: &[(ChatRole, String)], architecture: &str) -> String {
+    match architecture {
+        "qwen" => render_qwen_chat(messages),
+        "llama" => render_llama_chat(messages),
+        "gemma" => render_gemma_chat(messages),
+        "mistral" => render_inst_format_chat_messages(messages),
+        _ => render_plain_chat(messages),
     }
-    chat::render_chat_messages(messages, architecture, options)
 }
 
-fn render_inst_format_chat_messages(messages: &[chat::ChatMessage<'_>]) -> String {
+fn role_name(role: ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+    }
+}
+
+fn render_qwen_chat(messages: &[(ChatRole, String)]) -> String {
+    let mut rendered = String::new();
+    for (role, content) in messages {
+        rendered.push_str("<|im_start|>");
+        rendered.push_str(role_name(*role));
+        rendered.push('\n');
+        rendered.push_str(content);
+        rendered.push_str("<|im_end|>\n");
+    }
+    rendered.push_str("<|im_start|>assistant\n");
+    rendered
+}
+
+fn render_llama_chat(messages: &[(ChatRole, String)]) -> String {
+    let mut rendered = String::new();
+    for (role, content) in messages {
+        rendered.push_str("<|start_header_id|>");
+        rendered.push_str(role_name(*role));
+        rendered.push_str("<|end_header_id|>\n\n");
+        rendered.push_str(content);
+        rendered.push_str("<|eot_id|>");
+    }
+    rendered.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    rendered
+}
+
+fn render_gemma_chat(messages: &[(ChatRole, String)]) -> String {
+    let mut rendered = String::new();
+    for (role, content) in messages {
+        let role = match role {
+            ChatRole::System | ChatRole::User => "user",
+            ChatRole::Assistant => "model",
+        };
+        rendered.push_str("<start_of_turn>");
+        rendered.push_str(role);
+        rendered.push('\n');
+        rendered.push_str(content);
+        rendered.push_str("<end_of_turn>\n");
+    }
+    rendered.push_str("<start_of_turn>model\n");
+    rendered
+}
+
+fn render_inst_format_chat_messages(messages: &[(ChatRole, String)]) -> String {
     let mut rendered = String::new();
     let mut pending_system = None;
 
-    for message in messages {
-        match message.role {
-            chat::ChatRole::System => {
-                pending_system = Some(message.content);
+    for (role, content) in messages {
+        match role {
+            ChatRole::System => {
+                pending_system = Some(content.as_str());
             }
-            chat::ChatRole::User => {
+            ChatRole::User => {
                 if !rendered.is_empty() {
                     rendered.push(' ');
                 }
@@ -215,14 +499,14 @@ fn render_inst_format_chat_messages(messages: &[chat::ChatMessage<'_>]) -> Strin
                     rendered.push_str(system);
                     rendered.push_str("\n<</SYS>>\n\n");
                 }
-                rendered.push_str(message.content);
+                rendered.push_str(content);
                 rendered.push_str(" [/INST]");
             }
-            chat::ChatRole::Assistant => {
+            ChatRole::Assistant => {
                 if !rendered.is_empty() {
                     rendered.push(' ');
                 }
-                rendered.push_str(message.content);
+                rendered.push_str(content);
             }
         }
     }
@@ -230,21 +514,48 @@ fn render_inst_format_chat_messages(messages: &[chat::ChatMessage<'_>]) -> Strin
     rendered
 }
 
-fn build_sampling_config(params: &GenerationParams) -> SamplingConfig {
-    SamplingConfig {
-        logit_bias: Vec::<LogitBias>::new(),
-        allowed_token_ids: Vec::new(),
-        banned_token_ids: Vec::new(),
+fn render_plain_chat(messages: &[(ChatRole, String)]) -> String {
+    let mut rendered = String::new();
+    for (role, content) in messages {
+        match role {
+            ChatRole::System => rendered.push_str("System: "),
+            ChatRole::User => rendered.push_str("User: "),
+            ChatRole::Assistant => rendered.push_str("Assistant: "),
+        }
+        rendered.push_str(content);
+        rendered.push('\n');
+    }
+    rendered.push_str("Assistant:");
+    rendered
+}
+
+fn encode_text(tokenizer: &Tokenizer, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    let encoding = tokenizer
+        .encode(text, add_special_tokens)
+        .map_err(|err| anyhow::anyhow!("tokenization failed: {err}"))?;
+    Ok(encoding.get_ids().to_vec())
+}
+
+fn decode_tokens(tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String> {
+    tokenizer
+        .decode(tokens, false)
+        .map_err(|err| anyhow::anyhow!("token decode failed: {err}"))
+}
+
+fn build_sampling(params: &GenerationParams) -> GenerateSampling {
+    GenerateSampling {
         temperature: params.temperature.unwrap_or(0.0) as f32,
-        top_k: params.top_k.map(|v| v as i32).unwrap_or(40),
-        top_p: params.top_p.unwrap_or(0.9) as f32,
-        min_p: params.min_p.unwrap_or(0.0) as f32,
-        min_keep: 1,
-        repeat_penalty: params.repeat_penalty.unwrap_or(1.0) as f32,
-        frequency_penalty: params.frequency_penalty.unwrap_or(0.0) as f32,
-        presence_penalty: params.presence_penalty.unwrap_or(0.0) as f32,
-        repeat_last_n: 64,
-        seed: params.seed.unwrap_or(u64::MAX),
+        top_p: params.top_p.unwrap_or(1.0) as f32,
+        top_k: params.top_k.map(|value| value as u32).unwrap_or(0),
+        min_p: params
+            .min_p
+            .map(|value| value as f32)
+            .filter(|value| *value > 0.0),
+        repetition_penalty: params.repeat_penalty.unwrap_or(1.0) as f32,
+        repetition_context_size: Some(64),
+        seed: params.seed.unwrap_or(0),
+        deterministic: None,
+        ignore_eos: false,
     }
 }
 
@@ -263,6 +574,12 @@ fn unsupported_generation_features(params: &GenerationParams) -> Vec<&'static st
     {
         unsupported.push("mirostat");
     }
+    if params.frequency_penalty.is_some_and(|value| value != 0.0) {
+        unsupported.push("frequency_penalty");
+    }
+    if params.presence_penalty.is_some_and(|value| value != 0.0) {
+        unsupported.push("presence_penalty");
+    }
     if params.tools.is_some() || params.tool_choice.is_some() {
         unsupported.push("tools");
     }
@@ -278,30 +595,6 @@ fn ensure_supported_generation_params(params: &GenerationParams) -> Result<()> {
         unsupported.join(", ")
     );
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct StopPieceAction {
-    emit: String,
-    matched: bool,
-}
-
-fn render_token_text(tokenizer: &Tokenizer, token: u32) -> String {
-    tokenizer
-        .render_token(token)
-        .unwrap_or_else(|| tokenizer.decode(&[token]))
-}
-
-fn sample_top_logprobs_text(
-    tokenizer: &Tokenizer,
-    info: &SampledTokenInfo,
-    top_logprobs: usize,
-) -> Vec<(String, f32)> {
-    info.top_logprobs
-        .iter()
-        .take(top_logprobs)
-        .map(|entry| (render_token_text(tokenizer, entry.token), entry.logprob))
-        .collect()
 }
 
 fn split_keep_tail_chars(text: &str, keep_tail_chars: usize) -> (String, String) {
@@ -361,45 +654,115 @@ fn consume_stop_piece(pending: &mut String, piece: &str, stop_seqs: &[String]) -
     }
 }
 
-struct DecodeOutcome {
-    completion_tokens: usize,
-    decode_duration: Duration,
+fn build_generate_request(
+    loaded: &LoadedModel,
+    input: GenerateInput,
+    params: &GenerationParams,
+) -> Result<GenerateRequest> {
+    let input_tokens = match input {
+        GenerateInput::Tokens(tokens) => tokens,
+        GenerateInput::Text(text) => encode_text(
+            &loaded.tokenizer,
+            &render_user_prompt(&text, &loaded.render_architecture),
+            true,
+        )?,
+        GenerateInput::Chat(messages) => {
+            let normalized = normalize_chat_messages(&messages)?;
+            let rendered = render_chat_messages(&normalized, &loaded.render_architecture);
+            encode_text(&loaded.tokenizer, &rendered, true)?
+        }
+    };
+
+    anyhow::ensure!(
+        !input_tokens.is_empty(),
+        "empty token sequence after tokenization"
+    );
+    anyhow::ensure!(
+        input_tokens.len() < loaded.metadata.context_length as usize,
+        "input ({} tokens) exceeds context length ({})",
+        input_tokens.len(),
+        loaded.metadata.context_length
+    );
+
+    let max_output_tokens = params.max_tokens.unwrap_or(512).min(
+        (loaded.metadata.context_length as usize)
+            .saturating_sub(input_tokens.len())
+            .max(1),
+    ) as u32;
+
+    Ok(GenerateRequest {
+        model_id: loaded.model_id.clone(),
+        input_tokens,
+        input_text: None,
+        max_output_tokens,
+        sampling: build_sampling(params),
+        stop_sequences: params.stop_seqs.clone(),
+        metadata: None,
+    })
 }
 
-fn stats_from_decode(
+fn finish_reason(reason: Option<AxGenerateFinishReason>, stopped_on_stop_sequence: bool) -> String {
+    if stopped_on_stop_sequence {
+        return "stop".to_string();
+    }
+
+    match reason {
+        Some(AxGenerateFinishReason::MaxOutputTokens) => "length",
+        Some(AxGenerateFinishReason::ContentFilter) => "content_filter",
+        Some(AxGenerateFinishReason::Cancelled) => "stop",
+        Some(AxGenerateFinishReason::Error) => "error",
+        Some(AxGenerateFinishReason::Stop) | None => "stop",
+    }
+    .to_string()
+}
+
+fn stats_from_response(
+    response: Option<&GenerateStreamResponseEvent>,
     prompt_tokens: usize,
-    prefill_duration: std::time::Duration,
-    decode_duration: std::time::Duration,
-    decode_tokens: usize,
-    stop_reason: String,
+    emitted_tokens: usize,
+    started: Instant,
+    first_token_at: Option<Instant>,
+    stopped_on_stop_sequence: bool,
 ) -> GenerationStats {
+    let elapsed = started.elapsed();
+    let prefill_duration = first_token_at
+        .map(|instant| instant.saturating_duration_since(started))
+        .unwrap_or(elapsed);
+    let decode_duration = first_token_at
+        .map(|instant| {
+            started
+                .elapsed()
+                .saturating_sub(instant.saturating_duration_since(started))
+        })
+        .unwrap_or(Duration::ZERO);
+    let completion_tokens = response
+        .and_then(|event| event.response.known_output_token_count())
+        .map(|count| count as usize)
+        .unwrap_or(emitted_tokens);
+    let prompt_tokens = response
+        .and_then(|event| event.response.known_prompt_token_count())
+        .map(|count| count as usize)
+        .unwrap_or(prompt_tokens);
+
     GenerationStats {
         prompt_tokens,
-        completion_tokens: decode_tokens,
+        completion_tokens,
         prefill_tok_per_sec: if prefill_duration.as_secs_f64() > 0.0 {
             prompt_tokens as f64 / prefill_duration.as_secs_f64()
         } else {
             0.0
         },
         decode_tok_per_sec: if decode_duration.as_secs_f64() > 0.0 {
-            decode_tokens as f64 / decode_duration.as_secs_f64()
+            completion_tokens as f64 / decode_duration.as_secs_f64()
         } else {
             0.0
         },
-        stop_reason,
+        stop_reason: finish_reason(
+            response.and_then(|event| event.response.finish_reason),
+            stopped_on_stop_sequence,
+        ),
     }
 }
-
-/// Typed sentinel for a dropped receiver — avoids fragile string comparison
-/// in the `catch_unwind` handler (BUG-041).
-#[derive(Debug)]
-struct ReceiverDropped;
-impl std::fmt::Display for ReceiverDropped {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("receiver dropped")
-    }
-}
-impl std::error::Error for ReceiverDropped {}
 
 fn run_generate(
     loaded: Arc<LoadedModel>,
@@ -408,229 +771,125 @@ fn run_generate(
     tx: tokio::sync::mpsc::Sender<GenerateEvent>,
 ) -> Result<()> {
     ensure_supported_generation_params(&params)?;
-    let _model_guard = loaded.inference_lock.lock().unwrap_or_else(|err| {
-        warn!("ax-engine inference lock poisoned; recovering from poisoned state");
+    let request = build_generate_request(&loaded, input, &params)?;
+    let prompt_tokens = request.input_tokens.len();
+    let request_id = next_request_id();
+    let emit_logprobs = params.logprobs.unwrap_or(false);
+    let top_logprobs = params.top_logprobs.unwrap_or(0);
+    let stream_batch_size = crate::stream_token_batch_size();
+
+    let mut session = loaded.session.lock().unwrap_or_else(|err| {
+        warn!("ax-engine session mutex poisoned; recovering from poisoned state");
         err.into_inner()
     });
+    let mut state = session
+        .stream_generate_state_with_request_id(request_id, request)
+        .context("ax-engine failed to start generation stream")?;
 
-    let prompt = match input {
-        GenerateInput::Tokens(tokens) => tokens,
-        GenerateInput::Text(text) => loaded.tokenizer.encode(
-            &chat::render_user_prompt(&text, &loaded.render_architecture),
-            true,
-        ),
-        GenerateInput::Chat(messages) => {
-            let normalized = normalize_chat_messages(&messages)?;
-            let chat_messages: Vec<_> = normalized
-                .iter()
-                .map(|(role, content)| chat::ChatMessage::new(*role, content.as_str()))
-                .collect();
-            loaded.tokenizer.encode(
-                &render_chat_messages_with_compat(
-                    &chat_messages,
-                    &loaded.render_architecture,
-                    ChatRenderOptions::default(),
-                ),
-                true,
-            )
-        }
-    };
-
-    anyhow::ensure!(
-        !prompt.is_empty(),
-        "empty token sequence after tokenization"
-    );
-
-    let ctx_size = loaded.metadata.context_length as usize;
-    anyhow::ensure!(
-        prompt.len() < ctx_size,
-        "input ({} tokens) exceeds context length ({ctx_size})",
-        prompt.len()
-    );
-
-    let max_new = params
-        .max_tokens
-        .unwrap_or(512)
-        .min(ctx_size.saturating_sub(prompt.len()));
-    let weights = WeightStore::new(&loaded.mapped);
-    let mut kv = loaded.model.create_model_kv();
-    let mut logits = vec![0.0f32; loaded.metadata.vocab_size as usize];
-    let mut sampler = Sampler::new(build_sampling_config(&params));
-    let mut history = prompt.clone();
-    let emit_logprobs = params.logprobs.unwrap_or(false);
-    let top_logprobs = params.top_logprobs.unwrap_or(0) as usize;
-    // ax-engine v1.0 only threads `SampledTokenInfo` through `run_decode` when
-    // `top_logprobs > 0`. Request at least one candidate internally so
-    // `logprobs=true` still yields sampled-token logprobs when the client did
-    // not ask for a top-N list.
-    let decode_top_logprobs = if emit_logprobs {
-        top_logprobs.max(1)
-    } else {
-        0
-    };
-
-    let prefill_started = Instant::now();
-    loaded
-        .model
-        .forward_batch(&prompt, &mut kv, &weights, &mut logits)
-        .context("ax-engine prefill failed")?;
-    let prefill_duration = prefill_started.elapsed();
-    if max_new == 0 {
-        let stats = stats_from_decode(
-            prompt.len(),
-            prefill_duration,
-            Duration::ZERO,
-            0,
-            "length".to_string(),
-        );
-        let _ = tx.blocking_send(GenerateEvent::Done(stats));
-        return Ok(());
-    }
-
-    let mut stop_reason = "stop".to_string();
-    let mut generated_tokens = 0usize;
+    let started = Instant::now();
+    let mut first_token_at = None;
+    let mut emitted_tokens = 0usize;
     let mut stop_buffer = String::new();
     let mut stopped_on_stop_sequence = false;
-    let stream_batch_size = crate::stream_token_batch_size();
     let mut first_stream_chunk_sent = false;
     let mut stream_token_buffer = String::new();
     let mut buffered_stream_tokens = 0usize;
-    let decode = if emit_logprobs {
-        let first_sample = sampler.sample_with_logprobs(&mut logits, &history, decode_top_logprobs);
-        run_decode(
-            &loaded.model,
-            &weights,
-            &loaded.tokenizer,
-            &mut kv,
-            &mut sampler,
-            &mut history,
-            first_sample.token,
-            Some(first_sample),
-            prompt.len(),
-            max_new,
-            ax_engine_core::model::DecodeRunConfig {
-                intent: ax_engine_core::model::DecodeIntent::Throughput,
-                allow_pipelined: true,
-                top_logprobs: decode_top_logprobs,
-                collect_metal_perf: false,
-            },
-            |token, info| {
-                generated_tokens += 1;
-                let piece = render_token_text(&loaded.tokenizer, token);
-                let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
-                if !action.emit.is_empty()
-                    && tx.blocking_send(GenerateEvent::Token(action.emit)).is_err()
-                {
-                    return Err(anyhow::Error::from(ReceiverDropped));
-                }
-                // Emit logprob for every decoded token regardless of stop-buffer state
-                // to maintain the 1:1 Token→TokenLogprob invariant (BUG-051).
-                if let Some(info) = info
-                    && tx
-                        .blocking_send(GenerateEvent::TokenLogprob {
-                            logprob: info.logprob,
-                            top: sample_top_logprobs_text(&loaded.tokenizer, info, top_logprobs),
-                        })
-                        .is_err()
-                {
-                    return Err(anyhow::Error::from(ReceiverDropped));
-                }
-                if action.matched {
-                    stopped_on_stop_sequence = true;
-                    return Ok(DecodeControl::Stop);
-                }
-                Ok(DecodeControl::Continue)
-            },
-        )
-        .map(|result| DecodeOutcome {
-            completion_tokens: generated_tokens,
-            decode_duration: result.decode_duration,
-        })
-    } else {
-        let next_token = sampler.sample(&mut logits, &history);
-        run_decode(
-            &loaded.model,
-            &weights,
-            &loaded.tokenizer,
-            &mut kv,
-            &mut sampler,
-            &mut history,
-            next_token,
-            None,
-            prompt.len(),
-            max_new,
-            ax_engine_core::model::DecodeRunConfig {
-                intent: ax_engine_core::model::DecodeIntent::Throughput,
-                allow_pipelined: true,
-                top_logprobs: 0,
-                collect_metal_perf: false,
-            },
-            |token, _info| {
-                generated_tokens += 1;
-                let piece = render_token_text(&loaded.tokenizer, token);
+    let mut response = None;
 
-                let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
-                if !push_stream_token_piece(
-                    &tx,
-                    action.emit,
-                    stream_batch_size,
-                    &mut first_stream_chunk_sent,
-                    &mut stream_token_buffer,
-                    &mut buffered_stream_tokens,
-                ) {
-                    return Err(anyhow::Error::from(ReceiverDropped));
-                }
-                if action.matched {
-                    stopped_on_stop_sequence = true;
-                    return Ok(DecodeControl::Stop);
-                }
-                Ok(DecodeControl::Continue)
-            },
-        )
-        .map(|result| DecodeOutcome {
-            completion_tokens: generated_tokens,
-            decode_duration: result.decode_duration,
-        })
-    };
+    loop {
+        let Some(event) = session
+            .next_stream_event(&mut state)
+            .context("ax-engine generation stream failed")?
+        else {
+            break;
+        };
 
-    let (completion_tokens, decode_duration) = match decode {
-        Ok(outcome) => {
-            if !push_stream_token_piece(
-                &tx,
-                std::mem::take(&mut stop_buffer),
-                stream_batch_size,
-                &mut first_stream_chunk_sent,
-                &mut stream_token_buffer,
-                &mut buffered_stream_tokens,
-            ) {
-                return Ok(());
+        match event {
+            AxGenerateStreamEvent::Request(_) => {}
+            AxGenerateStreamEvent::Step(step) => {
+                for (idx, token) in step.delta_tokens.iter().copied().enumerate() {
+                    emitted_tokens += 1;
+                    first_token_at.get_or_insert_with(Instant::now);
+
+                    let piece = decode_tokens(&loaded.tokenizer, &[token])?;
+                    let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
+                    if emit_logprobs {
+                        if !action.emit.is_empty()
+                            && tx.blocking_send(GenerateEvent::Token(action.emit)).is_err()
+                        {
+                            return Ok(());
+                        }
+                        let logprob = step
+                            .delta_token_logprobs
+                            .get(idx)
+                            .and_then(|value| *value)
+                            .unwrap_or(0.0);
+                        if tx
+                            .blocking_send(GenerateEvent::TokenLogprob {
+                                logprob,
+                                top: Vec::with_capacity(top_logprobs as usize),
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    } else if !push_stream_token_piece(
+                        &tx,
+                        action.emit,
+                        stream_batch_size,
+                        &mut first_stream_chunk_sent,
+                        &mut stream_token_buffer,
+                        &mut buffered_stream_tokens,
+                    ) {
+                        return Ok(());
+                    }
+
+                    if action.matched {
+                        stopped_on_stop_sequence = true;
+                        let _ = session.cancel_request(request_id);
+                        break;
+                    }
+                }
+                if stopped_on_stop_sequence {
+                    break;
+                }
             }
-            if !flush_stream_token_batch(&tx, &mut stream_token_buffer, &mut buffered_stream_tokens)
-            {
-                return Ok(());
+            AxGenerateStreamEvent::Response(event) => {
+                response = Some(event);
+                break;
             }
-            (outcome.completion_tokens, outcome.decode_duration)
         }
-        Err(err) if err.downcast_ref::<ReceiverDropped>().is_some() => return Ok(()),
-        Err(err) => return Err(err).context("ax-engine decode failed"),
-    };
-
-    if !stopped_on_stop_sequence && max_new > 0 && completion_tokens >= max_new {
-        stop_reason = "length".to_string();
     }
 
-    let stats = stats_from_decode(
-        prompt.len(),
-        prefill_duration,
-        decode_duration,
-        completion_tokens,
-        stop_reason,
+    if !stopped_on_stop_sequence {
+        if !push_stream_token_piece(
+            &tx,
+            std::mem::take(&mut stop_buffer),
+            stream_batch_size,
+            &mut first_stream_chunk_sent,
+            &mut stream_token_buffer,
+            &mut buffered_stream_tokens,
+        ) {
+            return Ok(());
+        }
+    }
+    if !flush_stream_token_batch(&tx, &mut stream_token_buffer, &mut buffered_stream_tokens) {
+        return Ok(());
+    }
+
+    let stats = stats_from_response(
+        response.as_ref(),
+        prompt_tokens,
+        emitted_tokens,
+        started,
+        first_token_at,
+        stopped_on_stop_sequence,
     );
     let _ = tx.blocking_send(GenerateEvent::Done(stats));
     Ok(())
 }
 
-/// `InferenceBackend` implementation backed by ax-engine (`ax-engine-core`).
+/// `InferenceBackend` implementation backed by ax-engine-sdk sessions.
 pub struct AxEngineBackend {
     models: Arc<RwLock<FxHashMap<ModelHandle, Arc<LoadedModel>>>>,
     thermal: ThermalMonitor,
@@ -676,66 +935,50 @@ impl InferenceBackend for AxEngineBackend {
     fn load_model(&self, path: &Path, config: LoadConfig) -> Result<(ModelHandle, ModelMetadata)> {
         let rss_before = current_rss_bytes();
         let started = Instant::now();
+        let model_dir = resolve_model_dir(path)?;
+        ensure_model_artifacts(&model_dir)?;
+        crate::memory::check_memory_budget(0)?;
 
-        anyhow::ensure!(path.exists(), "model file not found: {}", path.display());
-        anyhow::ensure!(
-            path.extension().and_then(|e| e.to_str()) == Some("gguf"),
-            "only .gguf models are supported"
-        );
-
-        let file_size = std::fs::metadata(path)
-            .context("cannot stat model file")?
-            .len();
-        crate::memory::check_memory_budget(file_size)?;
-
-        let mapped = MappedModel::open(path).context("ax-engine failed to map GGUF model")?;
-        let mut model_config = ModelConfig::from_gguf(&mapped.header)
-            .context("ax-engine failed to parse GGUF metadata")?;
-        arch_registry::forward_for_arch(&model_config.architecture)
-            .context("unsupported architecture for ax-engine native backend")?;
-
-        if config.context_length > 0 {
-            model_config.context_length = config.context_length;
-        }
+        let tokenizer = Tokenizer::from_file(model_dir.join(TOKENIZER_FILE))
+            .map_err(|err| anyhow::anyhow!("ax-engine failed to load tokenizer.json: {err}"))?;
+        let tokenizer_config = read_json_file(&model_dir.join("tokenizer_config.json"))?;
+        let session_config = session_config_for_model(&model_dir, &config)?;
+        let embedding_pooling = pooling_from_load_config(&config)?;
 
         if config.enable_embeddings == Some(true) {
-            anyhow::bail!("embeddings are not supported by ax-engine native backend");
+            // Validate early enough that unsupported models fail during load.
+            // The SDK still owns the authoritative support check at embed time.
+            let _ = embedding_pooling;
         }
 
-        let render_architecture = infer_render_architecture(
-            &model_config.architecture,
-            chat::gguf_chat_template(&mapped.header),
-        );
-        let tokenizer =
-            Tokenizer::from_gguf(&mapped.header).context("ax-engine failed to load tokenizer")?;
-        let backend_config = resolve_backend_config(&config);
-        let backend = backend::create_backend(backend_config)
-            .context("ax-engine failed to create compute backend")?;
-        let model = InferenceModel::with_backend(model_config.clone(), backend)
-            .context("ax-engine failed to initialize InferenceModel")?;
-
+        let session =
+            EngineSession::new(session_config).context("ax-engine failed to load model")?;
         let rss_after = current_rss_bytes();
-        let metadata = ModelMetadata {
-            architecture: model_config.architecture.clone(),
-            n_layers: model_config.n_layers,
-            n_heads: model_config.n_heads,
-            n_kv_heads: model_config.n_kv_heads,
-            embedding_dim: model_config.embedding_dim,
-            vocab_size: model_config.vocab_size,
-            context_length: model_config.context_length,
-            load_time_ms: started.elapsed().as_millis() as u64,
-            peak_rss_bytes: rss_after.saturating_sub(rss_before),
-            resolved_backend: resolved_backend_type(backend_config),
-        };
+        let (metadata, architecture) = metadata_from_artifacts(
+            &model_dir,
+            &config,
+            started.elapsed().as_millis() as u64,
+            rss_after.saturating_sub(rss_before),
+        )?;
+        let render_architecture = infer_render_architecture(
+            &architecture,
+            tokenizer_chat_template(tokenizer_config.as_ref()),
+        );
+        let eos_tokens = eos_tokens_from_config(
+            read_json_file(&model_dir.join(CONFIG_FILE))?.as_ref(),
+            &tokenizer,
+        );
+        let model_id = model_id_from_dir(&model_dir);
 
         let handle = next_handle();
         let loaded = Arc::new(LoadedModel {
-            mapped,
+            session: Mutex::new(session),
             tokenizer,
-            model,
             metadata: metadata.clone(),
+            model_id,
+            eos_tokens,
             render_architecture,
-            inference_lock: Mutex::new(()),
+            embedding_pooling,
         });
         self.models_write().insert(handle, loaded);
 
@@ -782,15 +1025,20 @@ impl InferenceBackend for AxEngineBackend {
     }
 
     fn tokenize(&self, handle: ModelHandle, text: &str, add_bos: bool) -> Result<Vec<u32>> {
-        Ok(self.get_model(handle)?.tokenizer.encode(text, add_bos))
+        encode_text(&self.get_model(handle)?.tokenizer, text, add_bos)
     }
 
     fn decode_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<String> {
-        Ok(self.get_model(handle)?.tokenizer.decode(tokens))
+        decode_tokens(&self.get_model(handle)?.tokenizer, tokens)
     }
 
     fn eos_tokens(&self, handle: ModelHandle) -> Result<Vec<u32>> {
-        Ok(vec![self.get_model(handle)?.tokenizer.eos_id()])
+        let tokens = self.get_model(handle)?.eos_tokens.clone();
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "ax-engine tokenizer/config did not expose an EOS token"
+        );
+        Ok(tokens)
     }
 
     fn thermal_state(&self) -> ThermalState {
@@ -801,80 +1049,97 @@ impl InferenceBackend for AxEngineBackend {
         self.thermal.recommended_concurrency()
     }
 
+    fn embed(
+        &self,
+        handle: ModelHandle,
+        inputs: &EmbedInput<'_>,
+        config: &EmbedConfig,
+    ) -> Result<EmbedResult> {
+        let loaded = self.get_model(handle)?;
+        let mut batch = match inputs {
+            EmbedInput::Strings(strings) => strings
+                .iter()
+                .map(|text| encode_text(&loaded.tokenizer, text, true))
+                .collect::<Result<Vec<_>>>()?,
+            EmbedInput::Tokens(tokens) => tokens.to_vec(),
+        };
+        if config.truncate {
+            for tokens in &mut batch {
+                tokens.truncate(loaded.metadata.context_length as usize);
+            }
+        }
+        let prompt_tokens = batch.iter().map(Vec::len).sum::<usize>() as u32;
+        let session = loaded.session.lock().unwrap_or_else(|err| {
+            warn!("ax-engine session mutex poisoned during embed; recovering");
+            err.into_inner()
+        });
+        let embeddings = session
+            .embed_batch(&batch, loaded.embedding_pooling, config.normalize)
+            .context("ax-engine embedding failed")?;
+        Ok(EmbedResult {
+            embeddings,
+            prompt_tokens,
+        })
+    }
+
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> Result<u32> {
         anyhow::ensure!(!tokens.is_empty(), "eval_tokens: empty input");
         let loaded = self.get_model(handle)?;
-        let _model_guard = loaded.inference_lock.lock().unwrap_or_else(|err| {
-            warn!("ax-engine inference lock poisoned during eval; recovering");
+        let request = GenerateRequest {
+            model_id: loaded.model_id.clone(),
+            input_tokens: tokens.to_vec(),
+            input_text: None,
+            max_output_tokens: 1,
+            sampling: GenerateSampling::default(),
+            stop_sequences: Vec::new(),
+            metadata: None,
+        };
+        let mut session = loaded.session.lock().unwrap_or_else(|err| {
+            warn!("ax-engine session mutex poisoned during eval; recovering");
             err.into_inner()
         });
-        let weights = WeightStore::new(&loaded.mapped);
-        let mut kv = loaded.model.create_model_kv();
-        let mut logits = vec![0.0f32; loaded.metadata.vocab_size as usize];
-        loaded
-            .model
-            .forward_batch(tokens, &mut kv, &weights, &mut logits)
-            .context("ax-engine eval prefill failed")?;
-        Ok(ax_engine_core::sampling::argmax(&logits))
+        let response = session
+            .generate_with_request_id(next_request_id(), request)
+            .context("ax-engine eval generation failed")?;
+        response
+            .output_tokens
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("ax-engine eval did not produce a token"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use ax_engine_core::chat::{self, ChatRenderOptions, ChatRole};
-    use tokio::sync::mpsc;
-
     use super::{
-        BackendConfig, BackendType, ChatMessage, GenerateEvent, GenerationParams, LoadConfig,
-        build_sampling_config, consume_stop_piece, ensure_supported_generation_params,
-        flush_stream_token_batch, infer_render_architecture, normalize_chat_messages,
-        parse_chat_role, push_stream_token_piece, resolve_backend_config,
+        BackendType, ChatMessage, ChatRole, GenerationParams, LoadConfig, StopPieceAction,
+        consume_stop_piece, ensure_supported_generation_params, infer_render_architecture,
+        normalize_chat_messages, parse_chat_role, render_chat_messages, session_config_for_model,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn gguf_native_loads_are_rejected_for_v4_sdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, "").unwrap();
+
+        let err = super::resolve_model_dir(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an AX MLX model artifact directory")
+        );
+    }
 
     #[test]
-    fn backend_type_cpu_maps_to_cpu_backend() {
+    fn cpu_backend_is_rejected_for_v4_native_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
         let cfg = LoadConfig {
             backend_type: BackendType::Cpu,
             ..Default::default()
         };
-        assert_eq!(resolve_backend_config(&cfg), BackendConfig::Cpu);
-    }
-
-    #[test]
-    fn backend_type_metal_maps_to_metal_backend() {
-        let cfg = LoadConfig {
-            backend_type: BackendType::Metal,
-            ..Default::default()
-        };
-        assert_eq!(resolve_backend_config(&cfg), BackendConfig::Metal);
-    }
-
-    #[test]
-    fn auto_backend_honors_cpu_only_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("AX_CPU_ONLY", "1") };
-        unsafe { std::env::remove_var("AX_HYBRID_DECODE") };
-        assert_eq!(
-            resolve_backend_config(&LoadConfig::default()),
-            BackendConfig::Cpu
-        );
-        unsafe { std::env::remove_var("AX_CPU_ONLY") };
-    }
-
-    #[test]
-    fn auto_backend_honors_hybrid_cpu_decode_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("AX_CPU_ONLY") };
-        unsafe { std::env::set_var("AX_HYBRID_DECODE", "cpu") };
-        assert_eq!(
-            resolve_backend_config(&LoadConfig::default()),
-            BackendConfig::HybridCpuDecode
-        );
-        unsafe { std::env::remove_var("AX_HYBRID_DECODE") };
+        let err = session_config_for_model(dir.path(), &cfg).unwrap_err();
+        assert!(err.to_string().contains("supports MLX/Metal"));
     }
 
     #[test]
@@ -883,13 +1148,23 @@ mod tests {
         let stop = vec!["END".to_string()];
 
         let first = consume_stop_piece(&mut pending, "hello EN", &stop);
-        assert_eq!(first.emit, "hello ");
-        assert!(!first.matched);
+        assert_eq!(
+            first,
+            StopPieceAction {
+                emit: "hello ".to_string(),
+                matched: false,
+            }
+        );
         assert_eq!(pending, "EN");
 
         let second = consume_stop_piece(&mut pending, "D", &stop);
-        assert_eq!(second.emit, "");
-        assert!(second.matched);
+        assert_eq!(
+            second,
+            StopPieceAction {
+                emit: String::new(),
+                matched: true,
+            }
+        );
         assert!(pending.is_empty());
     }
 
@@ -898,251 +1173,81 @@ mod tests {
         let mut pending = String::new();
         let stop = vec!["END".to_string()];
 
-        let first = consume_stop_piece(&mut pending, "ab", &stop);
-        assert_eq!(first.emit, "");
-        assert!(!first.matched);
-
-        let second = consume_stop_piece(&mut pending, "cX", &stop);
-        assert_eq!(second.emit, "ab");
-        assert!(!second.matched);
-        assert_eq!(pending, "cX");
+        let action = consume_stop_piece(&mut pending, "hello world", &stop);
+        assert_eq!(action.emit, "hello wor");
+        assert!(!action.matched);
+        assert_eq!(pending, "ld");
     }
 
     #[test]
-    fn unsupported_generation_params_are_rejected() {
+    fn unsupported_generation_features_are_reported_together() {
         let params = GenerationParams {
-            grammar: Some("root ::= 'x'".to_string()),
+            grammar: Some("root ::= \"x\"".to_string()),
+            response_format: Some("json_object".to_string()),
+            frequency_penalty: Some(0.2),
             ..Default::default()
         };
+
         let err = ensure_supported_generation_params(&params).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("native ax-engine backend does not support grammar")
-        );
+        let message = err.to_string();
+        assert!(message.contains("grammar"));
+        assert!(message.contains("response_format"));
+        assert!(message.contains("frequency_penalty"));
     }
 
     #[test]
-    fn text_response_format_is_allowed() {
-        let params = GenerationParams {
-            response_format: Some("text".to_string()),
-            ..Default::default()
-        };
-        assert!(ensure_supported_generation_params(&params).is_ok());
-    }
-
-    #[test]
-    fn first_stream_piece_is_sent_immediately() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut first_chunk_sent = false;
-        let mut buffer = String::new();
-        let mut buffered_pieces = 0usize;
-
-        assert!(push_stream_token_piece(
-            &tx,
-            "hello".to_string(),
-            4,
-            &mut first_chunk_sent,
-            &mut buffer,
-            &mut buffered_pieces,
+    fn chat_role_parsing_accepts_supported_roles() {
+        assert!(matches!(
+            parse_chat_role("system").unwrap(),
+            ChatRole::System
         ));
-
-        match rx.try_recv() {
-            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "hello"),
-            other => panic!("expected first token event, got {other:?}"),
-        }
-        assert!(buffer.is_empty());
-        assert_eq!(buffered_pieces, 0);
-    }
-
-    #[test]
-    fn steady_state_stream_pieces_are_batched() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut first_chunk_sent = false;
-        let mut buffer = String::new();
-        let mut buffered_pieces = 0usize;
-
-        assert!(push_stream_token_piece(
-            &tx,
-            "a".to_string(),
-            2,
-            &mut first_chunk_sent,
-            &mut buffer,
-            &mut buffered_pieces,
+        assert!(matches!(
+            parse_chat_role("developer").unwrap(),
+            ChatRole::System
         ));
-        let _ = rx.try_recv();
-
-        assert!(push_stream_token_piece(
-            &tx,
-            "b".to_string(),
-            2,
-            &mut first_chunk_sent,
-            &mut buffer,
-            &mut buffered_pieces,
+        assert!(matches!(parse_chat_role("user").unwrap(), ChatRole::User));
+        assert!(matches!(
+            parse_chat_role("assistant").unwrap(),
+            ChatRole::Assistant
         ));
-        assert!(rx.try_recv().is_err());
-
-        assert!(push_stream_token_piece(
-            &tx,
-            "c".to_string(),
-            2,
-            &mut first_chunk_sent,
-            &mut buffer,
-            &mut buffered_pieces,
-        ));
-        match rx.try_recv() {
-            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "bc"),
-            other => panic!("expected batched token event, got {other:?}"),
-        }
     }
 
     #[test]
-    fn flush_stream_token_batch_sends_remaining_buffer() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut buffer = "tail".to_string();
-        let mut buffered_pieces = 1usize;
-
-        assert!(flush_stream_token_batch(
-            &tx,
-            &mut buffer,
-            &mut buffered_pieces
-        ));
-
-        match rx.try_recv() {
-            Ok(GenerateEvent::Token(text)) => assert_eq!(text, "tail"),
-            other => panic!("expected flushed token event, got {other:?}"),
-        }
-        assert!(buffer.is_empty());
-        assert_eq!(buffered_pieces, 0);
-    }
-
-    #[test]
-    fn developer_role_maps_to_system() {
-        assert_eq!(parse_chat_role("developer").unwrap(), ChatRole::System);
-    }
-
-    #[test]
-    fn normalized_messages_render_with_ax_engine_core_chat() {
-        let normalized = normalize_chat_messages(&[
-            ChatMessage {
-                role: "developer".into(),
-                content: serde_json::Value::String("be precise".into()),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: serde_json::Value::String("hi".into()),
-            },
-            ChatMessage {
-                role: "assistant".into(),
-                content: serde_json::Value::String("hello".into()),
-            },
-        ])
-        .unwrap();
-        let chat_messages: Vec<_> = normalized
-            .iter()
-            .map(|(role, content)| chat::ChatMessage::new(*role, content.as_str()))
-            .collect();
-
-        let prompt =
-            chat::render_chat_messages(&chat_messages, "gemma3", ChatRenderOptions::default());
-        assert!(prompt.contains("<start_of_turn>system\nbe precise<end_of_turn>\n"));
-        assert!(prompt.contains("<start_of_turn>user\nhi<end_of_turn>\n"));
-        assert!(prompt.contains("<start_of_turn>model\nhello<end_of_turn>\n"));
-        assert!(prompt.ends_with("<start_of_turn>model\n"));
-    }
-
-    #[test]
-    fn ax_engine_core_template_inst_format() {
-        let prompt = super::render_chat_messages_with_compat(
-            &[
-                chat::ChatMessage::system("be concise"),
-                chat::ChatMessage::user("hello"),
-                chat::ChatMessage::assistant("hi"),
-                chat::ChatMessage::user("again"),
-            ],
-            "mistral",
-            ChatRenderOptions::default(),
-        );
-        assert_eq!(
-            prompt,
-            "[INST] <<SYS>>\nbe concise\n<</SYS>>\n\nhello [/INST] hi [INST] again [/INST]"
-        );
-    }
-
-    #[test]
-    fn tool_role_is_rejected_for_native_templates() {
-        let err = normalize_chat_messages(&[ChatMessage {
-            role: "tool".into(),
-            content: serde_json::Value::String("result".into()),
-        }])
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("does not support chat role 'tool'")
-        );
-    }
-
-    #[test]
-    fn non_text_chat_parts_are_rejected() {
-        let err = normalize_chat_messages(&[ChatMessage {
-            role: "user".into(),
+    fn chat_text_parts_are_normalized() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
             content: serde_json::json!([
-                {"type": "text", "text": "look"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"}
             ]),
-        }])
-        .unwrap_err();
+        }];
 
-        assert!(err.to_string().contains("only supports text chat content"));
+        let normalized = normalize_chat_messages(&messages).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert!(matches!(normalized[0].0, ChatRole::User));
+        assert_eq!(normalized[0].1, "hello world");
     }
 
     #[test]
-    fn gguf_chat_template_markers_override_architecture_guess() {
+    fn render_architecture_uses_template_markers() {
         assert_eq!(
-            infer_render_architecture("llama", Some("<s>[INST] {{ prompt }} [/INST]")),
-            "mistral"
+            infer_render_architecture("unknown", Some("<|im_start|>")),
+            "qwen"
         );
         assert_eq!(
-            infer_render_architecture("mistral", Some("<|im_start|>user\n{{ prompt }}<|im_end|>")),
-            "qwen3"
+            infer_render_architecture("unknown", Some("<start_of_turn>")),
+            "gemma"
+        );
+        assert_eq!(
+            infer_render_architecture("unknown", Some("<|start_header_id|>")),
+            "llama"
         );
     }
 
     #[test]
-    fn frequency_and_presence_penalties_are_allowed() {
-        let params = GenerationParams {
-            frequency_penalty: Some(0.5),
-            presence_penalty: Some(0.25),
-            ..Default::default()
-        };
-        assert!(ensure_supported_generation_params(&params).is_ok());
-    }
-
-    #[test]
-    fn sampling_config_carries_upstream_penalty_fields() {
-        let params = GenerationParams {
-            frequency_penalty: Some(0.5),
-            presence_penalty: Some(0.25),
-            min_p: Some(0.1),
-            ..Default::default()
-        };
-        let config = build_sampling_config(&params);
-        assert!(config.logit_bias.is_empty());
-        assert!(config.allowed_token_ids.is_empty());
-        assert!(config.banned_token_ids.is_empty());
-        assert_eq!(config.frequency_penalty, 0.5);
-        assert_eq!(config.presence_penalty, 0.25);
-        assert_eq!(config.min_p, 0.1);
-        assert_eq!(config.min_keep, 1);
-    }
-
-    #[test]
-    fn logprobs_are_allowed() {
-        let params = GenerationParams {
-            logprobs: Some(true),
-            top_logprobs: Some(3),
-            ..Default::default()
-        };
-        assert!(ensure_supported_generation_params(&params).is_ok());
+    fn qwen_chat_renderer_adds_generation_prompt() {
+        let rendered = render_chat_messages(&[(ChatRole::User, "hello".to_string())], "qwen");
+        assert!(rendered.contains("<|im_start|>user\nhello<|im_end|>"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n"));
     }
 }

@@ -29,7 +29,6 @@ pub mod thermal;
 use std::path::Path;
 
 pub use ax_engine::AxEngineBackend;
-pub use ax_engine_core::metrics::current_rss_bytes;
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
@@ -46,6 +45,37 @@ pub(crate) fn stream_token_batch_size() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
         .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
+}
+
+/// Return the current process resident set size in bytes.
+///
+/// This intentionally degrades to 0 on failure because it is used for
+/// telemetry and load-time deltas, not correctness.
+pub fn current_rss_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn getpid() -> i32;
+        }
+
+        // SAFETY: `getpid` has no preconditions and does not dereference pointers.
+        let pid = unsafe { getpid() };
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output();
+        if let Ok(out) = output
+            && let Ok(s) = std::str::from_utf8(&out.stdout)
+            && let Ok(kb) = s.trim().parse::<u64>()
+        {
+            return kb.saturating_mul(1024);
+        }
+        0
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────

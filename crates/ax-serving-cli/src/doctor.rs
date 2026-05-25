@@ -4,17 +4,21 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::tune::HardwareProfile;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct CheckResult {
     pub name: &'static str,
     pub status: CheckStatus,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Pass,
     Warn,
@@ -31,28 +35,50 @@ impl CheckStatus {
     }
 }
 
-pub fn run_doctor() -> Result<()> {
-    let results = vec![
+#[derive(Debug, Serialize)]
+struct DoctorSummary {
+    pass: usize,
+    warn: usize,
+    fail: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    command: &'static str,
+    status: CheckStatus,
+    summary: DoctorSummary,
+    checks: Vec<CheckResult>,
+}
+
+pub fn run_doctor(json: bool) -> Result<()> {
+    let results = run_checks();
+    let report = build_report(results);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_human_report(&report);
+    }
+
+    if report.status == CheckStatus::Fail {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn run_checks() -> Vec<CheckResult> {
+    vec![
         check_platform(),
         check_hardware(),
         check_llama_server(),
         check_api_key(),
         check_config_file(),
         check_thermal(),
-    ];
+    ]
+}
 
-    eprintln!("AX Serving Doctor\n");
-
-    let mut has_fail = false;
-    for r in &results {
-        let symbol = r.status.symbol();
-        eprintln!("  [{symbol}] {}: {}", r.name, r.detail);
-        if r.status == CheckStatus::Fail {
-            has_fail = true;
-        }
-    }
-
-    eprintln!();
+fn build_report(results: Vec<CheckResult>) -> DoctorReport {
     let pass_count = results
         .iter()
         .filter(|r| r.status == CheckStatus::Pass)
@@ -65,13 +91,42 @@ pub fn run_doctor() -> Result<()> {
         .iter()
         .filter(|r| r.status == CheckStatus::Fail)
         .count();
-    eprintln!("{pass_count} passed, {warn_count} warnings, {fail_count} failures");
+    let status = if fail_count > 0 {
+        CheckStatus::Fail
+    } else if warn_count > 0 {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Pass
+    };
 
-    if has_fail {
-        std::process::exit(1);
+    DoctorReport {
+        command: "ax-serving doctor",
+        status,
+        summary: DoctorSummary {
+            pass: pass_count,
+            warn: warn_count,
+            fail: fail_count,
+        },
+        checks: results,
+    }
+}
+
+fn print_human_report(report: &DoctorReport) {
+    eprintln!("AX Serving Doctor\n");
+
+    for r in &report.checks {
+        let symbol = r.status.symbol();
+        eprintln!("  [{symbol}] {}: {}", r.name, r.detail);
+        if let Some(remediation) = r.remediation {
+            eprintln!("         remediation: {remediation}");
+        }
     }
 
-    Ok(())
+    eprintln!();
+    eprintln!(
+        "{} passed, {} warnings, {} failures",
+        report.summary.pass, report.summary.warn, report.summary.fail,
+    );
 }
 
 fn check_platform() -> CheckResult {
@@ -82,12 +137,14 @@ fn check_platform() -> CheckResult {
             name: "Platform",
             status: CheckStatus::Pass,
             detail: format!("{os}/{arch} (Apple Silicon)"),
+            remediation: None,
         }
     } else {
         CheckResult {
             name: "Platform",
             status: CheckStatus::Fail,
             detail: format!("{os}/{arch} — ax-serving requires aarch64-apple-darwin"),
+            remediation: Some("Run AX Serving on Apple Silicon macOS."),
         }
     }
 }
@@ -103,11 +160,13 @@ fn check_hardware() -> CheckResult {
                 profile.total_memory_gb,
                 profile.sku_class().as_str(),
             ),
+            remediation: None,
         },
         Err(e) => CheckResult {
             name: "Hardware",
             status: CheckStatus::Warn,
             detail: format!("could not detect hardware: {e}"),
+            remediation: Some("Verify system_profiler and sysctl are available on this host."),
         },
     }
 }
@@ -125,6 +184,7 @@ fn check_llama_server() -> CheckResult {
                 name: "llama-server",
                 status: CheckStatus::Pass,
                 detail: format!("found at {path}"),
+                remediation: None,
             }
         }
         _ => CheckResult {
@@ -132,6 +192,9 @@ fn check_llama_server() -> CheckResult {
             status: CheckStatus::Warn,
             detail: format!(
                 "'{bin}' not found on PATH. Set AXS_LLAMA_CPP_BIN or install llama.cpp."
+            ),
+            remediation: Some(
+                "Install llama.cpp or set AXS_LLAMA_CPP_BIN to the llama-server path.",
             ),
         },
     }
@@ -148,12 +211,14 @@ fn check_api_key() -> CheckResult {
             name: "Auth",
             status: CheckStatus::Pass,
             detail: "AXS_API_KEY is set".into(),
+            remediation: None,
         }
     } else if allow_no_auth {
         CheckResult {
             name: "Auth",
             status: CheckStatus::Warn,
             detail: "AXS_API_KEY is empty but AXS_ALLOW_NO_AUTH=true (dev mode)".into(),
+            remediation: Some("Set AXS_API_KEY before production use."),
         }
     } else {
         CheckResult {
@@ -162,6 +227,7 @@ fn check_api_key() -> CheckResult {
             detail:
                 "AXS_API_KEY is empty and AXS_ALLOW_NO_AUTH is not set. Server will refuse to start."
                     .into(),
+            remediation: Some("Set AXS_API_KEY or set AXS_ALLOW_NO_AUTH=true for local development."),
         }
     }
 }
@@ -181,6 +247,7 @@ fn check_config_file() -> CheckResult {
                 name: "Config file",
                 status: CheckStatus::Pass,
                 detail: format!("found {path}"),
+                remediation: None,
             };
         }
     }
@@ -193,6 +260,7 @@ fn check_config_file() -> CheckResult {
                 name: "Config file",
                 status: CheckStatus::Pass,
                 detail: format!("found {xdg}"),
+                remediation: None,
             };
         }
     }
@@ -203,6 +271,7 @@ fn check_config_file() -> CheckResult {
         detail:
             "no serving.toml found; using built-in defaults. Run `ax-serving tune` to generate one."
                 .into(),
+        remediation: Some("Run `ax-serving tune` to generate a serving.toml tuned for this host."),
     }
 }
 
@@ -228,6 +297,7 @@ fn check_thermal() -> CheckResult {
                                     name: "Thermal",
                                     status: CheckStatus::Pass,
                                     detail: format!("CPU speed limit: {limit}% (nominal)"),
+                                    remediation: None,
                                 }
                             } else if limit >= 70 {
                                 CheckResult {
@@ -236,6 +306,9 @@ fn check_thermal() -> CheckResult {
                                     detail: format!(
                                         "CPU speed limit: {limit}% (throttled). Performance may be reduced."
                                     ),
+                                    remediation: Some(
+                                        "Reduce load or let the machine cool before benchmarking.",
+                                    ),
                                 }
                             } else {
                                 CheckResult {
@@ -243,6 +316,9 @@ fn check_thermal() -> CheckResult {
                                     status: CheckStatus::Fail,
                                     detail: format!(
                                         "CPU speed limit: {limit}% (severe throttling). Cool down before serving."
+                                    ),
+                                    remediation: Some(
+                                        "Cool down the machine before starting production serving.",
                                     ),
                                 }
                             };
@@ -254,12 +330,16 @@ fn check_thermal() -> CheckResult {
                 name: "Thermal",
                 status: CheckStatus::Pass,
                 detail: "no thermal throttling detected".into(),
+                remediation: None,
             }
         }
         _ => CheckResult {
             name: "Thermal",
             status: CheckStatus::Warn,
             detail: "could not read thermal state via pmset".into(),
+            remediation: Some(
+                "Run `pmset -g therm` manually if thermal state matters for this run.",
+            ),
         },
     }
 }
@@ -280,5 +360,28 @@ mod tests {
         assert_eq!(CheckStatus::Pass.symbol(), "PASS");
         assert_eq!(CheckStatus::Warn.symbol(), "WARN");
         assert_eq!(CheckStatus::Fail.symbol(), "FAIL");
+    }
+
+    #[test]
+    fn report_summary_reflects_worst_status() {
+        let report = build_report(vec![
+            CheckResult {
+                name: "ok",
+                status: CheckStatus::Pass,
+                detail: "ready".into(),
+                remediation: None,
+            },
+            CheckResult {
+                name: "missing",
+                status: CheckStatus::Fail,
+                detail: "not ready".into(),
+                remediation: Some("fix it"),
+            },
+        ]);
+
+        assert_eq!(report.status, CheckStatus::Fail);
+        assert_eq!(report.summary.pass, 1);
+        assert_eq!(report.summary.warn, 0);
+        assert_eq!(report.summary.fail, 1);
     }
 }
