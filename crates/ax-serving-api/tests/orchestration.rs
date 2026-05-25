@@ -2326,6 +2326,99 @@ async fn test_proxy_embeddings_does_not_route_to_legacy_llm_only_worker() {
 }
 
 #[tokio::test]
+async fn test_proxy_embeddings_routes_by_input_context() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let small_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.1],"index":0}],"model":"small"}"#
+        )
+        .await
+    );
+    let large_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.2],"index":0}],"model":"large"}"#
+        )
+        .await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: small_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: false,
+                embedding: true,
+                vision: false,
+                models: vec!["embed-main".into()],
+                max_context: Some(8),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            worker_pool: Some("small".into()),
+            ..Default::default()
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: large_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: false,
+                embedding: true,
+                vision: false,
+                models: vec!["embed-main".into()],
+                max_context: Some(4096),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/embeddings")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-ax-worker-pool", "small")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "embed-main",
+                        "input": "x".repeat(128),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["model"], "large",
+        "embedding input context should filter the preferred small worker"
+    );
+}
+
+#[tokio::test]
 async fn test_structured_embedding_worker_is_not_used_for_chat() {
     let worker_addr = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#).await

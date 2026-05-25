@@ -4,7 +4,7 @@
 use axum::extract::Extension;
 
 use crate::auth::RequestId;
-use crate::rest::schema::InputMessage;
+use crate::rest::schema::{EmbeddingsInput, InputMessage};
 
 /// Characters per token for the heuristic fallback estimator.
 const CHARS_PER_TOKEN: u64 = 4;
@@ -42,6 +42,24 @@ pub fn estimate_text_prompt_tokens_u64(prompt: &str) -> u64 {
     estimated_tokens_from_text(prompt).max(1)
 }
 
+/// Estimate the largest per-item context requirement for an embedding request.
+pub fn estimate_embedding_input_max_tokens_u64(input: &EmbeddingsInput) -> u64 {
+    match input {
+        EmbeddingsInput::One(text) => estimate_text_prompt_tokens_u64(text),
+        EmbeddingsInput::Many(texts) => texts
+            .iter()
+            .map(|text| estimate_text_prompt_tokens_u64(text))
+            .max()
+            .unwrap_or(0),
+        EmbeddingsInput::OneTokens(tokens) => tokens.len() as u64,
+        EmbeddingsInput::ManyTokens(seqs) => seqs
+            .iter()
+            .map(|tokens| tokens.len() as u64)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
 /// `u32` variant used by orchestrator request routing.
 pub fn estimate_chat_prompt_tokens_u32(messages: &[InputMessage]) -> u32 {
     estimate_chat_prompt_tokens_u64(messages).min(u32::MAX as u64) as u32
@@ -50,6 +68,11 @@ pub fn estimate_chat_prompt_tokens_u32(messages: &[InputMessage]) -> u32 {
 /// `u32` variant used by orchestrator request routing.
 pub fn estimate_text_prompt_tokens_u32(prompt: &str) -> u32 {
     estimate_text_prompt_tokens_u64(prompt).min(u32::MAX as u64) as u32
+}
+
+/// `u32` variant used by orchestrator request routing.
+pub fn estimate_embedding_input_max_tokens_u32(input: &EmbeddingsInput) -> u32 {
+    estimate_embedding_input_max_tokens_u64(input).min(u32::MAX as u64) as u32
 }
 
 /// Default audit listing limit shared by serving and orchestrator admin paths.
@@ -67,7 +90,7 @@ pub fn audit_actor(req_id: Option<Extension<RequestId>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rest::schema::{InputMessage, MessageContent};
+    use crate::rest::schema::{EmbeddingsInput, InputMessage, MessageContent};
 
     fn msg(role: &str, content: &str) -> InputMessage {
         InputMessage {
@@ -91,6 +114,24 @@ mod tests {
     #[test]
     fn text_prompt_estimate_is_at_least_one() {
         assert_eq!(estimate_text_prompt_tokens_u64(""), 1);
+    }
+
+    #[test]
+    fn embedding_input_estimate_uses_largest_item() {
+        assert_eq!(
+            estimate_embedding_input_max_tokens_u64(&EmbeddingsInput::Many(vec![
+                "abcd".to_string(),
+                "a".repeat(20)
+            ])),
+            5
+        );
+        assert_eq!(
+            estimate_embedding_input_max_tokens_u64(&EmbeddingsInput::ManyTokens(vec![
+                vec![1, 2],
+                vec![1, 2, 3, 4],
+            ])),
+            4
+        );
     }
 
     #[test]

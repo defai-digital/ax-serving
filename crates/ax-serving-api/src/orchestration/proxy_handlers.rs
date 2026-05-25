@@ -19,10 +19,10 @@ use super::queue::AcquireResult;
 use super::registry::{BackendKind, RequestKind, RuntimeKind};
 use crate::auth::RequestId;
 use crate::project_policy;
-use crate::rest::schema::{InputMessage, MAX_MODEL_ID_BYTES};
+use crate::rest::schema::{EmbeddingsInput, InputMessage, MAX_MODEL_ID_BYTES};
 use crate::utils::request_meta::{
     audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u32,
-    estimate_text_prompt_tokens_u32,
+    estimate_embedding_input_max_tokens_u32, estimate_text_prompt_tokens_u32,
 };
 
 // ── Shared inference proxy ────────────────────────────────────────────────────
@@ -50,6 +50,8 @@ async fn proxy_inference(
         messages: Vec<InputMessage>,
         #[serde(default)]
         prompt: Option<String>,
+        #[serde(default)]
+        input: Option<serde_json::Value>,
     }
 
     let auth_header = req_headers.get(header::AUTHORIZATION);
@@ -81,7 +83,11 @@ async fn proxy_inference(
                 },
                 v.stream,
                 v.max_tokens,
-                if !v.messages.is_empty() {
+                if worker_path == "/v1/embeddings" {
+                    v.input
+                        .and_then(|input| serde_json::from_value::<EmbeddingsInput>(input).ok())
+                        .map(|input| estimate_embedding_input_max_tokens_u32(&input))
+                } else if !v.messages.is_empty() {
                     Some(estimate_chat_prompt_tokens_u32(&v.messages))
                 } else {
                     v.prompt.as_deref().map(estimate_text_prompt_tokens_u32)
