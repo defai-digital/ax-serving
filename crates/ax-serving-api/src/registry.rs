@@ -729,7 +729,7 @@ fn validate_model_id(id: &str) -> Result<(), RegistryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use ax_serving_engine::{
@@ -1377,22 +1377,31 @@ mod tests {
 
     struct BlockingFailFirstUnloadBackend {
         load_started: Arc<std::sync::Barrier>,
-        release_load: Arc<std::sync::Barrier>,
+        release_first_load: Arc<std::sync::Barrier>,
+        release_second_load: Arc<std::sync::Barrier>,
         next_handle: AtomicU64,
         unloads: AtomicU64,
         blocked_once: AtomicBool,
         unload_started: Arc<std::sync::Barrier>,
         release_unload: Arc<std::sync::Barrier>,
+        immediate_path: PathBuf,
+        first_path: PathBuf,
     }
 
     impl InferenceBackend for BlockingFailFirstUnloadBackend {
         fn load_model(
             &self,
-            _path: &Path,
+            path: &Path,
             _config: LoadConfig,
         ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
-            self.load_started.wait();
-            self.release_load.wait();
+            if path != self.immediate_path {
+                self.load_started.wait();
+                if path == self.first_path {
+                    self.release_first_load.wait();
+                } else {
+                    self.release_second_load.wait();
+                }
+            }
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
             Ok((
                 ModelHandle(handle),
@@ -1662,25 +1671,41 @@ mod tests {
     #[test]
     fn failed_final_warm_pool_eviction_does_not_expose_new_entry() {
         let dir = tempfile::tempdir().unwrap();
+        let initial_path = dir.path().join("initial.gguf");
         let path1 = dir.path().join("m1.gguf");
         let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&initial_path, b"dummy").unwrap();
         std::fs::write(&path1, b"dummy").unwrap();
         std::fs::write(&path2, b"dummy").unwrap();
 
         let load_started = Arc::new(std::sync::Barrier::new(3));
-        let release_load = Arc::new(std::sync::Barrier::new(3));
+        let release_first_load = Arc::new(std::sync::Barrier::new(2));
+        let release_second_load = Arc::new(std::sync::Barrier::new(2));
         let unload_started = Arc::new(std::sync::Barrier::new(2));
         let release_unload = Arc::new(std::sync::Barrier::new(2));
         let backend = Arc::new(BlockingFailFirstUnloadBackend {
             load_started: Arc::clone(&load_started),
-            release_load: Arc::clone(&release_load),
+            release_first_load: Arc::clone(&release_first_load),
+            release_second_load: Arc::clone(&release_second_load),
             next_handle: AtomicU64::new(0),
             unloads: AtomicU64::new(0),
             blocked_once: AtomicBool::new(false),
             unload_started: Arc::clone(&unload_started),
             release_unload: Arc::clone(&release_unload),
+            immediate_path: std::fs::canonicalize(&initial_path).unwrap(),
+            first_path: std::fs::canonicalize(&path1).unwrap(),
         });
-        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
+        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(2));
+
+        let initial = reg
+            .load(
+                "initial",
+                &initial_path,
+                LoadConfig::default(),
+                backend.as_ref(),
+            )
+            .unwrap();
+        drop(initial);
 
         let reg_for_first = reg.clone();
         let backend_for_first = Arc::clone(&backend);
@@ -1711,54 +1736,33 @@ mod tests {
         });
 
         load_started.wait();
-        release_load.wait();
+        release_first_load.wait();
+        let first_result = first_thread.join().unwrap();
+        assert!(first_result.is_ok());
+
+        release_second_load.wait();
         unload_started.wait();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let reg_for_get_first = reg.clone();
-        let tx_first = tx.clone();
-        let get_first_thread = std::thread::spawn(move || {
-            tx_first
-                .send(("first", reg_for_get_first.get("first").is_some()))
-                .unwrap();
-        });
         let reg_for_get_second = reg.clone();
         let get_second_thread = std::thread::spawn(move || {
-            tx.send(("second", reg_for_get_second.get("second").is_some()))
-                .unwrap();
+            tx.send(reg_for_get_second.get("second").is_some()).unwrap();
         });
 
         if let Ok(observed) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            panic!("early registry read completed: {observed:?}");
+            panic!("early registry read completed for uncommitted second load: {observed}");
         }
 
         release_unload.wait();
-        let first_result = first_thread.join().unwrap();
         let second_result = second_thread.join().unwrap();
-        assert_eq!(
-            [first_result.is_ok(), second_result.is_ok()]
-                .into_iter()
-                .filter(|ok| *ok)
-                .count(),
-            1,
-            "exactly one concurrent load may survive failed final eviction"
+        assert!(
+            second_result.is_err(),
+            "second load must fail when final eviction fails"
         );
-
-        let observed_a = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-        let observed_b = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-        get_first_thread.join().unwrap();
+        let observed = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         get_second_thread.join().unwrap();
-        let observed = std::collections::HashMap::from([observed_a, observed_b]);
-
-        assert!(
-            observed.get("first").copied().unwrap_or(false) == first_result.is_ok(),
-            "first visibility must match the successful load result"
-        );
-        assert!(
-            observed.get("second").copied().unwrap_or(false) == second_result.is_ok(),
-            "second visibility must match the successful load result"
-        );
-        assert_eq!(reg.len(), 1);
+        assert!(!observed, "failed second load must not become visible");
+        assert_eq!(reg.len(), 2);
     }
 
     #[test]
