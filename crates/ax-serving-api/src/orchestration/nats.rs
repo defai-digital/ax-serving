@@ -233,6 +233,118 @@ fn decode_stream_body_hex_limited(
     Ok(body)
 }
 
+fn nats_status(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn build_complete_nats_response(request_id: &str, resp: NatsResponse) -> Response {
+    let status = nats_status(resp.status);
+    let content_type = resp.content_type.clone();
+    let body_bytes =
+        match decode_body_hex_limited(resp.data_hex.as_deref(), MAX_NATS_RESPONSE_BODY_BYTES) {
+            Ok(body) => body,
+            Err(NatsBodyDecodeError::InvalidHex(e)) => {
+                error!(%request_id, %e, "NATS: failed to decode response body hex");
+                return (StatusCode::BAD_GATEWAY, "NATS: bad response body encoding")
+                    .into_response();
+            }
+            Err(NatsBodyDecodeError::TooLarge) => {
+                error!(
+                    %request_id,
+                    limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                    "NATS: response body exceeded size limit"
+                );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "NATS response body exceeded size limit",
+                )
+                    .into_response();
+            }
+        };
+
+    let body = if let Some(error) = resp.error {
+        if body_bytes.is_empty() {
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "error": error }))
+                    .unwrap_or_else(|_| b"{\"error\":\"worker error\"}".to_vec()),
+            )
+        } else {
+            Bytes::from(body_bytes)
+        }
+    } else {
+        Bytes::from(body_bytes)
+    };
+
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn stream_frames_from_nats_response(
+    request_id: &str,
+    resp: NatsResponse,
+    total_bytes: &mut usize,
+    reroute_total: &Arc<AtomicU64>,
+) -> Result<(Vec<Bytes>, bool), std::io::Error> {
+    if resp.request_id != request_id {
+        let err = format!(
+            "NATS: response ID mismatch (want {request_id}, got {})",
+            resp.request_id
+        );
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+    }
+
+    if resp.status >= 500 {
+        reroute_total.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(ref err_msg) = resp.error {
+        warn!(
+            request_id = %resp.request_id,
+            %err_msg,
+            status = resp.status,
+            "NATS: worker returned streaming error"
+        );
+    }
+
+    let chunk = match decode_stream_body_hex_limited(
+        resp.data_hex.as_deref(),
+        total_bytes,
+        MAX_NATS_RESPONSE_BODY_BYTES,
+    ) {
+        Ok(b) => b,
+        Err(NatsBodyDecodeError::InvalidHex(e)) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+        Err(NatsBodyDecodeError::TooLarge) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "NATS streaming response body exceeded size limit",
+            ));
+        }
+    };
+
+    let mut frames = Vec::new();
+    if !chunk.is_empty() {
+        frames.push(Bytes::from(chunk));
+    }
+    if let Some(err_msg) = resp.error.as_deref() {
+        let payload = serde_json::to_string(&serde_json::json!({ "error": err_msg }))
+            .unwrap_or_else(|_| "{\"error\":\"serialization failure\"}".to_string());
+        frames.push(Bytes::from(format!("event: error\ndata: {payload}\n\n")));
+    }
+
+    Ok((frames, resp.done))
+}
+
 // ── NatsDispatcher ────────────────────────────────────────────────────────────
 
 /// Orchestrator-side NATS dispatcher.
@@ -439,101 +551,99 @@ impl NatsDispatcher {
     /// Receive a streaming response — collect chunks until `done = true`.
     async fn recv_streaming(
         &self,
-        sub: async_nats::Subscriber,
+        mut sub: async_nats::Subscriber,
         timeout: Duration,
         request_id: &str,
     ) -> Response {
+        let first = match tokio::time::timeout(timeout, sub.next()).await {
+            Err(_) => {
+                warn!(%request_id, "NATS: timed out waiting for first streaming response");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "NATS request timed out waiting for worker response",
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                warn!(%request_id, "NATS: reply subscription closed unexpectedly");
+                return (StatusCode::BAD_GATEWAY, "NATS reply subscription closed").into_response();
+            }
+            Ok(Some(msg)) => {
+                let resp: NatsResponse = match serde_json::from_slice(&msg.payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!(%request_id, %e, "NATS: failed to deserialize response");
+                        return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                    }
+                };
+                if resp.request_id != request_id {
+                    error!(
+                        %request_id,
+                        got = %resp.request_id,
+                        "NATS: response request_id mismatch"
+                    );
+                    return (StatusCode::BAD_GATEWAY, "NATS: response ID mismatch").into_response();
+                }
+                resp
+            }
+        };
+
+        if first.done && (first.error.is_some() || !is_event_stream(&first.content_type)) {
+            if first.status >= 500 {
+                self.reroute_total.fetch_add(1, Ordering::Relaxed);
+            }
+            return build_complete_nats_response(request_id, first);
+        }
+
         let (tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         let reroute_total = Arc::clone(&self.reroute_total);
         let request_id = request_id.to_string();
 
         tokio::spawn(async move {
-            let mut sub = sub;
             let mut tx = tx;
             let deadline = tokio::time::Instant::now() + timeout;
             let mut total_bytes = 0usize;
+            let mut pending = Some(first);
             while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             {
-                let msg = match tokio::time::timeout(remaining, sub.next()).await {
-                    Ok(Some(msg)) => msg,
-                    _ => break,
-                };
-                let resp: NatsResponse = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
-                            .await;
-                        break;
+                let resp = if let Some(resp) = pending.take() {
+                    resp
+                } else {
+                    let msg = match tokio::time::timeout(remaining, sub.next()).await {
+                        Ok(Some(msg)) => msg,
+                        _ => break,
+                    };
+                    match serde_json::from_slice(&msg.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+                                .await;
+                            break;
+                        }
                     }
                 };
 
-                if resp.request_id != request_id {
-                    let err = format!(
-                        "NATS: response ID mismatch (want {request_id}, got {})",
-                        resp.request_id
-                    );
-                    let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            err,
-                        )))
-                        .await;
-                    break;
-                }
-
-                if resp.status >= 500 {
-                    reroute_total.fetch_add(1, Ordering::Relaxed);
-                }
-                // Log worker-side errors so they are not silently dropped.
-                // (HTTP headers are already sent as 200 for streaming, so we
-                // cannot change the status code — at minimum we surface the error
-                // in logs for operator visibility.)
-                if let Some(ref err_msg) = resp.error {
-                    warn!(
-                        request_id = %resp.request_id,
-                        %err_msg,
-                        status = resp.status,
-                        "NATS: worker returned streaming error"
-                    );
-                }
-
-                let chunk: Vec<u8> = match decode_stream_body_hex_limited(
-                    resp.data_hex.as_deref(),
+                match stream_frames_from_nats_response(
+                    &request_id,
+                    resp,
                     &mut total_bytes,
-                    MAX_NATS_RESPONSE_BODY_BYTES,
+                    &reroute_total,
                 ) {
-                    Ok(b) => b,
-                    Err(NatsBodyDecodeError::InvalidHex(e)) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
-                            .await;
+                    Ok((frames, done)) => {
+                        for frame in frames {
+                            if tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
                         break;
                     }
-                    Err(NatsBodyDecodeError::TooLarge) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "NATS streaming response body exceeded size limit",
-                            )))
-                            .await;
-                        break;
-                    }
-                };
-
-                if !chunk.is_empty() && tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                    break;
-                }
-                if let Some(err_msg) = resp.error.as_deref() {
-                    let payload = serde_json::to_string(&serde_json::json!({ "error": err_msg }))
-                        .unwrap_or_else(|_| "{\"error\":\"serialization failure\"}".to_string());
-                    let sse = format!("event: error\ndata: {payload}\n\n");
-                    if tx.send(Ok(Bytes::from(sse))).await.is_err() {
-                        break;
-                    }
-                }
-                if resp.done {
-                    break;
                 }
             }
         });
@@ -562,9 +672,13 @@ impl std::fmt::Debug for NatsDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::{self, Bytes};
+    use axum::http::StatusCode;
+
     use super::{
-        NatsBodyDecodeError, NatsConfig, decode_body_hex_limited, decode_stream_body_hex_limited,
-        sanitize_subject_component,
+        NatsBodyDecodeError, NatsConfig, NatsResponse, build_complete_nats_response,
+        decode_body_hex_limited, decode_stream_body_hex_limited, is_event_stream,
+        sanitize_subject_component, stream_frames_from_nats_response,
     };
 
     #[test]
@@ -626,5 +740,48 @@ mod tests {
         let err = decode_stream_body_hex_limited(Some("35"), &mut total, 4).unwrap_err();
         assert!(matches!(err, NatsBodyDecodeError::TooLarge));
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn event_stream_content_type_allows_parameters() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("text/event-stream; charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
+    }
+
+    #[tokio::test]
+    async fn complete_nats_response_preserves_pre_stream_error_status() {
+        let resp = NatsResponse::complete(
+            "req-1".to_string(),
+            400,
+            "application/json".to_string(),
+            br#"{"error":"bad request"}"#,
+        );
+
+        let response = build_complete_nats_response("req-1", resp);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], br#"{"error":"bad request"}"#);
+    }
+
+    #[test]
+    fn stream_frames_from_nats_response_emits_initial_chunk() {
+        let reroutes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut total = 0usize;
+        let resp = NatsResponse::streaming_chunk("req-1".to_string(), 200, b"data: hello\n\n");
+
+        let (frames, done) =
+            stream_frames_from_nats_response("req-1", resp, &mut total, &reroutes).unwrap();
+
+        assert!(!done);
+        assert_eq!(frames, vec![Bytes::from_static(b"data: hello\n\n")]);
+        assert_eq!(total, "data: hello\n\n".len());
     }
 }
