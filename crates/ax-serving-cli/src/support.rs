@@ -416,14 +416,8 @@ pub fn run_worker_get(
     api_key: Option<String>,
     json: bool,
 ) -> Result<()> {
-    run_worker_get_like(
-        url,
-        Some(worker_id.clone()),
-        api_key,
-        "get",
-        worker_path(&worker_id, ""),
-        json,
-    )
+    let path = worker_path(&worker_id, "")?;
+    run_worker_get_like(url, Some(worker_id.clone()), api_key, "get", path, json)
 }
 
 pub fn run_worker_drain(
@@ -435,15 +429,17 @@ pub fn run_worker_drain(
     poll_interval_ms: u64,
     json: bool,
 ) -> Result<()> {
+    validate_worker_id(&worker_id)?;
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
     let token = effective_api_key(api_key);
     let mut steps = Vec::new();
+    let drain_path = worker_path_unchecked(&worker_id, "/drain");
 
     steps.push(send_worker_step(
         &client,
         &base_url,
-        &worker_path(&worker_id, "/drain"),
+        &drain_path,
         token.as_deref(),
         "drain",
         WorkerHttpMethod::Post,
@@ -546,10 +542,11 @@ fn run_worker_mutation(
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
     let token = effective_api_key(api_key);
+    let path = worker_path(&worker_id, suffix)?;
     let steps = vec![send_worker_step(
         &client,
         &base_url,
-        &worker_path(&worker_id, suffix),
+        &path,
         token.as_deref(),
         operation,
         method,
@@ -659,7 +656,7 @@ fn wait_for_worker_idle_and_complete(
         let inspect = send_worker_step(
             client,
             base_url,
-            &worker_path(worker_id, ""),
+            &worker_path_unchecked(worker_id, ""),
             token,
             "wait-idle",
             WorkerHttpMethod::Get,
@@ -675,7 +672,7 @@ fn wait_for_worker_idle_and_complete(
             let step = send_worker_step(
                 client,
                 base_url,
-                &worker_path(worker_id, "/drain-complete"),
+                &worker_path_unchecked(worker_id, "/drain-complete"),
                 token,
                 "drain-complete",
                 WorkerHttpMethod::Post,
@@ -1477,7 +1474,27 @@ fn current_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn worker_path(worker_id: &str, suffix: &str) -> String {
+fn validate_worker_id(worker_id: &str) -> Result<()> {
+    if worker_id.is_empty() {
+        anyhow::bail!("worker_id is empty");
+    }
+    if !worker_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "worker_id '{worker_id}' contains characters that are not safe for URL path segments"
+        );
+    }
+    Ok(())
+}
+
+fn worker_path(worker_id: &str, suffix: &str) -> Result<String> {
+    validate_worker_id(worker_id)?;
+    Ok(worker_path_unchecked(worker_id, suffix))
+}
+
+fn worker_path_unchecked(worker_id: &str, suffix: &str) -> String {
     format!("/v1/workers/{worker_id}{suffix}")
 }
 
@@ -1869,11 +1886,19 @@ mod tests {
 
     #[test]
     fn worker_paths_target_public_worker_api() {
-        assert_eq!(worker_path("worker-1", ""), "/v1/workers/worker-1");
+        assert_eq!(worker_path("worker-1", "").unwrap(), "/v1/workers/worker-1");
         assert_eq!(
-            worker_path("worker-1", "/drain-complete"),
+            worker_path("worker-1", "/drain-complete").unwrap(),
             "/v1/workers/worker-1/drain-complete"
         );
+    }
+
+    #[test]
+    fn worker_path_rejects_unsafe_worker_id_segments() {
+        assert!(worker_path("", "").is_err());
+        assert!(worker_path("../workers/other", "").is_err());
+        assert!(worker_path("worker-1/drain-complete", "").is_err());
+        assert!(worker_path("worker?x=1", "").is_err());
     }
 
     #[test]
