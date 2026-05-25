@@ -31,16 +31,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-          brew link --overwrite mlx || true
-          brew link --overwrite mlx-c || true
-          test -f /opt/homebrew/include/mlx/c/array.h
+        run: bash scripts/ci-install-native-deps.sh
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -114,16 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-          brew link --overwrite mlx || true
-          brew link --overwrite mlx-c || true
-          test -f /opt/homebrew/include/mlx/c/array.h
+        run: bash scripts/ci-install-native-deps.sh
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -248,16 +230,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-          brew link --overwrite mlx || true
-          brew link --overwrite mlx-c || true
-          test -f /opt/homebrew/include/mlx/c/array.h
+        run: bash scripts/ci-install-native-deps.sh
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -279,16 +252,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-          brew link --overwrite mlx || true
-          brew link --overwrite mlx-c || true
-          test -f /opt/homebrew/include/mlx/c/array.h
+        run: bash scripts/ci-install-native-deps.sh
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
