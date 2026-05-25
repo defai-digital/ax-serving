@@ -206,6 +206,14 @@ fn usage_from_generation_stats(stats: &ax_serving_engine::GenerationStats) -> Us
     }
 }
 
+fn stream_usage_from_generation_stats(stats: &ax_serving_engine::GenerationStats) -> StreamUsage {
+    StreamUsage {
+        prompt_tokens: stats.prompt_tokens,
+        completion_tokens: stats.completion_tokens,
+        total_tokens: stats.prompt_tokens.saturating_add(stats.completion_tokens),
+    }
+}
+
 fn usize_to_u32_saturating(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
@@ -968,11 +976,7 @@ fn stream_response(
                                     finish_reason: Some(map_stop_reason(&stats.stop_reason)),
                                     logprobs: None,
                                 }],
-                                usage: Some(StreamUsage {
-                                    prompt_tokens: stats.prompt_tokens,
-                                    completion_tokens: stats.completion_tokens,
-                                    total_tokens: stats.prompt_tokens + stats.completion_tokens,
-                                }),
+                                usage: Some(stream_usage_from_generation_stats(&stats)),
                             };
                             let ev = sse_json_event(&chunk);
                             // Drop both permits; next phase emits [DONE] then ends.
@@ -1694,11 +1698,7 @@ fn text_stream_response(
                                     finish_reason: Some(map_stop_reason(&stats.stop_reason)),
                                     logprobs: None,
                                 }],
-                                usage: Some(StreamUsage {
-                                    prompt_tokens: stats.prompt_tokens,
-                                    completion_tokens: stats.completion_tokens,
-                                    total_tokens: stats.prompt_tokens + stats.completion_tokens,
-                                }),
+                                usage: Some(stream_usage_from_generation_stats(&stats)),
                             };
                             let ev = sse_json_event(&chunk);
                             Some((
@@ -2269,6 +2269,21 @@ mod tests {
         assert_eq!(usage.prompt_tokens, u32::MAX);
         assert_eq!(usage.completion_tokens, u32::MAX);
         assert_eq!(usage.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn stream_usage_from_generation_stats_saturates_total() {
+        let stats = GenerationStats {
+            prompt_tokens: usize::MAX,
+            completion_tokens: 1,
+            ..GenerationStats::default()
+        };
+
+        let usage = stream_usage_from_generation_stats(&stats);
+
+        assert_eq!(usage.prompt_tokens, usize::MAX);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, usize::MAX);
     }
 
     fn dummy_model_entry() -> Arc<LoadedModel> {
