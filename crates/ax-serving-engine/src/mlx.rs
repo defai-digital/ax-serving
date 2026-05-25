@@ -1203,6 +1203,7 @@ struct MlxSseUsage {
 
 #[derive(Deserialize)]
 struct MlxSseChunk {
+    #[serde(default)]
     choices: Vec<MlxSseChoice>,
     usage: Option<MlxSseUsage>,
 }
@@ -1216,7 +1217,7 @@ fn mlx_stream_chat(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_mlx(http, port, "/v1/chat/completions", body)?;
-    parse_mlx_sse(resp, tx, batch_size, emit_logprobs)
+    parse_mlx_sse_reader(resp, tx, batch_size, emit_logprobs)
 }
 
 fn mlx_stream_completions(
@@ -1228,11 +1229,11 @@ fn mlx_stream_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_mlx(http, port, "/v1/completions", body)?;
-    parse_mlx_sse(resp, tx, batch_size, emit_logprobs)
+    parse_mlx_sse_reader(resp, tx, batch_size, emit_logprobs)
 }
 
-fn parse_mlx_sse(
-    resp: reqwest::blocking::Response,
+fn parse_mlx_sse_reader<R: std::io::Read>(
+    resp: R,
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
     batch_size: usize,
     emit_logprobs: bool,
@@ -1344,6 +1345,9 @@ fn parse_mlx_sse(
         let _ = tx.blocking_send(GenerateEvent::Token(buf));
     }
 
+    if stop_reason.is_empty() {
+        stop_reason = "stop".to_string();
+    }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens: prompt_tokens as usize,
         completion_tokens: completion_tokens as usize,
@@ -1547,5 +1551,32 @@ mod tests {
 
         unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
         unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+    }
+
+    #[test]
+    fn parse_mlx_sse_reads_usage_only_chunk_without_choices() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_mlx_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "hello"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 4);
+                assert_eq!(stats.completion_tokens, 6);
+                assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
     }
 }
