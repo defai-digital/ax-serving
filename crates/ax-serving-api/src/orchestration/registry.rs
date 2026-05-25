@@ -652,7 +652,11 @@ impl WorkerRegistry {
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
                 existing.capabilities = capabilities.clone();
-                existing.model_inventory = model_inventory.clone();
+                // Preserve prior per-model metadata if the new registration omits inventory,
+                // matching the same guard used for runtime_mode below.
+                if !model_inventory.is_empty() {
+                    existing.model_inventory = model_inventory.clone();
+                }
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();

@@ -1087,14 +1087,20 @@ fn migration_runtime_summary(runtime: &str, value: &Value) -> MigrationRuntimeSu
         .cloned()
         .unwrap_or_default();
     let adapter_workers = count_runtime_mode(&runtime_modes, "adapter");
-    let mut embedded_workers = count_runtime_mode(&runtime_modes, "embedded");
-    embedded_workers = embedded_workers.max(embedded_workers_from_issues(value));
+    let embedded_from_mode = count_runtime_mode(&runtime_modes, "embedded");
+    let embedded_from_issues = embedded_workers_from_issues(value);
+    let embedded_workers = embedded_from_mode.max(embedded_from_issues);
+    // Workers promoted to embedded via issue heuristics were previously counted
+    // as unknown-mode; reduce unknown_mode_workers to avoid double-counting.
+    let extra_from_issues = embedded_workers.saturating_sub(embedded_from_mode);
     let known_mode_workers = runtime_modes
         .values()
         .filter_map(Value::as_u64)
         .map(|value| value as usize)
         .sum::<usize>();
-    let unknown_mode_workers = workers.saturating_sub(known_mode_workers);
+    let unknown_mode_workers = workers
+        .saturating_sub(known_mode_workers)
+        .saturating_sub(extra_from_issues);
     let models = value
         .get("models")
         .and_then(Value::as_array)

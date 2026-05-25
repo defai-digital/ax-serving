@@ -197,7 +197,13 @@ pub async fn get_runtime_telemetry(
 ) -> Result<RuntimeTelemetry> {
     let prometheus = get_prometheus_runtime_telemetry(client, base_url).await;
     match prometheus {
-        Ok(telemetry) if telemetry != RuntimeTelemetry::default() => Ok(telemetry),
+        // Prometheus gave us the critical routing fields — use it as-is.
+        Ok(telemetry)
+            if telemetry.active_sequences.is_some() || telemetry.queue_depth.is_some() =>
+        {
+            Ok(telemetry)
+        }
+        // Prometheus succeeded but is missing critical fields; try JSON to fill them in.
         Ok(telemetry) => match get_json_runtime_telemetry(client, base_url).await {
             Ok(json_telemetry) => Ok(json_telemetry),
             Err(_) => Ok(telemetry),
@@ -260,7 +266,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
     )
     .map(seconds_to_ms);
     RuntimeTelemetry {
-        active_sequences: max_usize(
+        active_sequences: sum_usize(
             &samples,
             &[
                 "ax_runtime_active_sequences",
@@ -296,7 +302,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
             ],
         )
         .or(ttft_bucket_p95_ms),
-        queue_depth: max_usize(
+        queue_depth: sum_usize(
             &samples,
             &[
                 "ax_runtime_queue_depth",
@@ -339,7 +345,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
                 "vllm_num_requests_running",
             ],
         ),
-        max_batch_size: sum_u32(
+        max_batch_size: max_u32(
             &samples,
             &["ax_runtime_max_batch_size", "axs_scheduler_max_inflight"],
         ),
@@ -486,7 +492,9 @@ fn parse_bucket_upper_bound(line: &str) -> Option<f64> {
     parts.next()?.parse::<f64>().ok()?;
     let labels = metric.split_once('{')?.1.trim_end_matches('}');
     for label in labels.split(',') {
-        let (key, value) = label.split_once('=')?;
+        let Some((key, value)) = label.split_once('=') else {
+            continue;
+        };
         if key.trim() != "le" {
             continue;
         }
@@ -620,12 +628,21 @@ fn max_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64
     max_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
 }
 
-fn sum_u32(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u32> {
-    sum_u64(samples, aliases).map(|v| v.min(u32::MAX as u64) as u32)
+/// Sums per-label samples within each alias (label stripping collapses per-model values
+/// into one Vec), then takes the max across aliases (different metric names for the same
+/// concept must not be summed together — they'd double-count).
+fn sum_per_alias_max_across(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
+    aliases
+        .iter()
+        .filter_map(|alias| {
+            let values = samples.get(*alias)?;
+            if values.is_empty() { None } else { Some(values.iter().sum::<f64>()) }
+        })
+        .reduce(f64::max)
 }
 
-fn max_usize(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<usize> {
-    max_u64(samples, aliases).map(|v| v as usize)
+fn sum_usize(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<usize> {
+    sum_per_alias_max_across(samples, aliases).map(|v| v.max(0.0).round() as usize)
 }
 
 fn max_u32(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u32> {
