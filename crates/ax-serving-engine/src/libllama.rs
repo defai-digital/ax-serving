@@ -681,8 +681,8 @@ impl InferenceBackend for LibLlamaBackend {
                     tokens.truncate(n_ctx);
                 }
 
-                total_tokens += tokens.len() as u32;
-                let n = tokens.len() as i32;
+                total_tokens = total_tokens.saturating_add(saturating_usize_to_u32(tokens.len()));
+                let n = llama_batch_token_count(tokens.len())?;
 
                 unsafe {
                     let mut batch = ffi::llama_batch_init(n, 0, 1);
@@ -898,6 +898,14 @@ fn backend_tokens_to_llama_tokens(tokens: &[u32]) -> Result<Vec<i32>> {
         .copied()
         .map(backend_token_to_llama_token)
         .collect()
+}
+
+fn saturating_usize_to_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
+fn llama_batch_token_count(len: usize) -> Result<i32> {
+    i32::try_from(len).context("embedding input length exceeds llama_batch range")
 }
 
 fn llama_token_to_backend_token(token: i32) -> Result<u32> {
@@ -1272,7 +1280,8 @@ mod tests {
 
     use super::{
         backend_token_to_llama_token, backend_tokens_to_llama_tokens, flush_stream_token_batch,
-        llama_token_to_backend_token, llama_tokens_to_backend_tokens, push_stream_token_piece,
+        llama_batch_token_count, llama_token_to_backend_token, llama_tokens_to_backend_tokens,
+        push_stream_token_piece, saturating_usize_to_u32,
     };
 
     #[test]
@@ -1372,6 +1381,18 @@ mod tests {
         let err = backend_tokens_to_llama_tokens(&[0, i32::MAX as u32 + 1]).unwrap_err();
 
         assert!(err.to_string().contains("llama_token range"));
+    }
+
+    #[test]
+    fn embedding_token_count_saturates_for_usage() {
+        assert_eq!(saturating_usize_to_u32(u32::MAX as usize + 1), u32::MAX);
+    }
+
+    #[test]
+    fn embedding_batch_count_rejects_values_outside_llama_range() {
+        let err = llama_batch_token_count(i32::MAX as usize + 1).unwrap_err();
+
+        assert!(err.to_string().contains("llama_batch range"));
     }
 
     #[test]

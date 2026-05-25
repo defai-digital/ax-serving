@@ -1068,7 +1068,7 @@ impl InferenceBackend for AxEngineBackend {
                 tokens.truncate(loaded.metadata.context_length as usize);
             }
         }
-        let prompt_tokens = batch.iter().map(Vec::len).sum::<usize>() as u32;
+        let prompt_tokens = saturating_token_count(batch.iter().map(Vec::len));
         let session = loaded.session.lock().unwrap_or_else(|err| {
             warn!("ax-engine session mutex poisoned during embed; recovering");
             err.into_inner()
@@ -1109,12 +1109,20 @@ impl InferenceBackend for AxEngineBackend {
     }
 }
 
+fn saturating_token_count(lengths: impl IntoIterator<Item = usize>) -> u32 {
+    lengths
+        .into_iter()
+        .map(|len| len.min(u32::MAX as usize) as u32)
+        .fold(0u32, u32::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BackendType, ChatMessage, ChatRole, GenerationParams, LoadConfig, StopPieceAction,
         consume_stop_piece, ensure_supported_generation_params, infer_render_architecture,
-        normalize_chat_messages, parse_chat_role, render_chat_messages, session_config_for_model,
+        normalize_chat_messages, parse_chat_role, render_chat_messages, saturating_token_count,
+        session_config_for_model,
     };
 
     #[test]
@@ -1226,6 +1234,13 @@ mod tests {
         assert_eq!(normalized.len(), 1);
         assert!(matches!(normalized[0].0, ChatRole::User));
         assert_eq!(normalized[0].1, "hello world");
+    }
+
+    #[test]
+    fn embedding_prompt_token_count_saturates() {
+        let count = saturating_token_count([u32::MAX as usize, 10]);
+
+        assert_eq!(count, u32::MAX);
     }
 
     #[test]

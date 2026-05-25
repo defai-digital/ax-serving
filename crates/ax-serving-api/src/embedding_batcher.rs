@@ -103,12 +103,14 @@ impl EmbeddingBatchRequest {
         match &self.input {
             EmbeddingBatchRequestInput::Strings(texts) => texts
                 .iter()
-                .map(|text| text.chars().count() as u32)
-                .sum::<u32>()
+                .map(|text| saturating_usize_to_u32(text.chars().count()))
+                .fold(0u32, u32::saturating_add)
                 .max(1),
-            EmbeddingBatchRequestInput::Tokens(seqs) => {
-                seqs.iter().map(|seq| seq.len() as u32).sum::<u32>().max(1)
-            }
+            EmbeddingBatchRequestInput::Tokens(seqs) => seqs
+                .iter()
+                .map(|seq| saturating_usize_to_u32(seq.len()))
+                .fold(0u32, u32::saturating_add)
+                .max(1),
         }
     }
 }
@@ -490,6 +492,10 @@ struct BatchExecutionOutput {
     per_request_prompt_tokens: Vec<u32>,
 }
 
+fn saturating_usize_to_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 fn split_prompt_tokens(total: u32, weights: &[u32]) -> Vec<u32> {
     if weights.is_empty() {
         return Vec::new();
@@ -498,7 +504,11 @@ fn split_prompt_tokens(total: u32, weights: &[u32]) -> Vec<u32> {
         return vec![total];
     }
 
-    let weight_sum = weights.iter().copied().sum::<u32>().max(1) as f64;
+    let weight_sum = weights
+        .iter()
+        .map(|&weight| weight as f64)
+        .sum::<f64>()
+        .max(1.0);
     let mut allocated = Vec::with_capacity(weights.len());
     let mut used = 0u32;
     let mut remainders = Vec::with_capacity(weights.len());
@@ -916,5 +926,12 @@ mod tests {
         for p in &parts {
             assert!(*p >= 2 && *p <= 4, "uneven split: {parts:?}");
         }
+    }
+
+    #[test]
+    fn split_prompt_tokens_handles_large_weights_without_overflow() {
+        let parts = split_prompt_tokens(7, &[u32::MAX, u32::MAX]);
+        assert_eq!(parts.iter().sum::<u32>(), 7);
+        assert!(parts.iter().all(|&part| part <= 7));
     }
 }
