@@ -59,8 +59,8 @@ Stable contract family:
 - worker drain / undrain semantics
 - worker eviction semantics where documented
 - capability advertisement payloads
-- runtime, runtime version, hardware class, runtime endpoint, supported
-  operations, worker pool, backend compatibility hint, health, and queue
+- runtime, runtime mode, runtime version, hardware class, runtime endpoint,
+  supported operations, worker pool, backend compatibility hint, health, and queue
   metadata that are surfaced as protocol data
 
 Stability rule:
@@ -113,6 +113,9 @@ Stable contract family:
   endpoint results, and recursively redacted endpoint bodies
 - CLI AX Fabric validation schema with command, base URL, status, detected
   profile, endpoint results, and per-check contract results
+- CLI embedded migration readiness schema with command, base URL, readiness
+  result, recommended policy, runtime totals, runtime summaries, blockers, and
+  warnings
 
 Stability rule:
 

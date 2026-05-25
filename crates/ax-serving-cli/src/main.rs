@@ -196,6 +196,11 @@ enum Command {
         #[command(subcommand)]
         command: FabricCommand,
     },
+    /// Inspect migration readiness for compatibility paths.
+    Migration {
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
     /// Operate registered gateway workers.
     Workers {
         #[command(subcommand)]
@@ -242,6 +247,22 @@ enum FabricCommand {
     /// Validate the stable AX Fabric runtime endpoints.
     Validate {
         /// Base URL of the worker or API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrationCommand {
+    /// Check whether embedded compatibility workers can be denied.
+    EmbeddedReadiness {
+        /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
         /// Bearer token. Defaults to the first AXS_API_KEY token when set.
@@ -502,6 +523,11 @@ fn main() -> Result<()> {
         Some(Command::Fabric { command }) => match command {
             FabricCommand::Validate { url, api_key, json } => {
                 support::run_fabric_validate(url, api_key, json)
+            }
+        },
+        Some(Command::Migration { command }) => match command {
+            MigrationCommand::EmbeddedReadiness { url, api_key, json } => {
+                support::run_migration_embedded_readiness(url, api_key, json)
             }
         },
         Some(Command::Workers { command }) => match command {

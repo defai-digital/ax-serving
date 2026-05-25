@@ -74,6 +74,7 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert_eq!(registrations.len(), 1);
     assert_eq!(registrations[0]["backend"], "sglang");
     assert_eq!(registrations[0]["runtime"], "sglang");
+    assert_eq!(registrations[0]["runtime_mode"], "adapter");
     assert_eq!(registrations[0]["hardware_class"], "thor");
     assert_eq!(registrations[0]["addr"], "127.0.0.1:18081");
     assert_eq!(

@@ -108,6 +108,7 @@ struct HeartbeatConfig {
     worker_pool: Option<String>,
     node_class: Option<String>,
     runtime: Option<String>,
+    runtime_mode: String,
     runtime_version: Option<String>,
     hardware_class: Option<String>,
     runtime_endpoint: Option<String>,
@@ -122,6 +123,7 @@ struct RegisterConfig<'a> {
     worker_pool: Option<&'a str>,
     node_class: Option<&'a str>,
     runtime: Option<&'a str>,
+    runtime_mode: &'a str,
     runtime_version: Option<&'a str>,
     hardware_class: Option<&'a str>,
     runtime_endpoint: Option<&'a str>,
@@ -173,6 +175,7 @@ async fn register_with_orchestrator(
         "capabilities": cfg.capabilities,
         "backend": "auto",
         "runtime": cfg.runtime,
+        "runtime_mode": cfg.runtime_mode,
         "runtime_version": cfg.runtime_version,
         "hardware_class": cfg.hardware_class,
         "runtime_endpoint": cfg.runtime_endpoint,
@@ -308,6 +311,7 @@ async fn heartbeat_loop(
                         worker_pool: cfg.worker_pool.as_deref(),
                         node_class: cfg.node_class.as_deref(),
                         runtime: cfg.runtime.as_deref(),
+                        runtime_mode: &cfg.runtime_mode,
                         runtime_version: cfg.runtime_version.as_deref(),
                         hardware_class: cfg.hardware_class.as_deref(),
                         runtime_endpoint: cfg.runtime_endpoint.as_deref(),
@@ -532,7 +536,8 @@ pub(crate) fn run_serve(
         tracing::info!(
             runtime = %runtime_metadata.runtime,
             hardware_class = %runtime_metadata.hardware_class,
-            "worker registering as runtime node without preloaded model"
+            embedded_runtime_policy = embedded_runtime_policy.as_str(),
+            "embedded worker registering without preloaded model; prefer ax-runtime-agent for runtime-node deployments"
         );
     } else {
         tracing::warn!(
@@ -567,6 +572,7 @@ pub(crate) fn run_serve(
                         worker_pool: worker_pool.as_deref(),
                         node_class: node_class.as_deref(),
                         runtime: Some(runtime_metadata.runtime.as_str()),
+                        runtime_mode: "embedded",
                         runtime_version: runtime_metadata.runtime_version.as_deref(),
                         hardware_class: Some(runtime_metadata.hardware_class.as_str()),
                         runtime_endpoint: Some(runtime_metadata.runtime_endpoint.as_str()),
@@ -607,6 +613,7 @@ pub(crate) fn run_serve(
                     worker_pool: worker_pool.clone(),
                     node_class: node_class.clone(),
                     runtime: Some(runtime_metadata.runtime.clone()),
+                    runtime_mode: "embedded".to_string(),
                     runtime_version: runtime_metadata.runtime_version.clone(),
                     hardware_class: Some(runtime_metadata.hardware_class.clone()),
                     runtime_endpoint: Some(runtime_metadata.runtime_endpoint.clone()),

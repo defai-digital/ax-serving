@@ -249,6 +249,8 @@ pub struct WorkerEntry {
     capability_source: CapabilitySource,
     pub backend: BackendKind,
     pub runtime: RuntimeKind,
+    /// Runtime integration mode reported by the worker, e.g. `adapter` or `embedded`.
+    pub runtime_mode: Option<String>,
     /// Runtime version reported by the worker adapter, if known.
     pub runtime_version: Option<String>,
     /// Hardware class used for placement and fleet summaries.
@@ -318,6 +320,9 @@ pub struct RegisterRequest {
     /// Runtime type owned by the node, e.g. `"ax_engine"` or `"vllm"`.
     #[serde(default)]
     pub runtime: Option<String>,
+    /// Runtime integration mode, e.g. `"adapter"` or `"embedded"`.
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
     /// Runtime version, if the node adapter can report it.
     #[serde(default)]
     pub runtime_version: Option<String>,
@@ -353,6 +358,7 @@ impl Default for RegisterRequest {
             capabilities: RegisterCapabilities::default(),
             backend: default_backend(),
             runtime: None,
+            runtime_mode: None,
             runtime_version: None,
             hardware_class: None,
             runtime_endpoint: None,
@@ -469,6 +475,8 @@ pub struct WorkerSnapshot {
     pub backend: String,
     pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_class: Option<String>,
@@ -564,6 +572,7 @@ impl WorkerRegistry {
             capabilities,
             backend,
             runtime,
+            runtime_mode,
             runtime_version,
             hardware_class,
             runtime_endpoint,
@@ -599,6 +608,7 @@ impl WorkerRegistry {
             .map(RuntimeKind::parse)
             .filter(|runtime| *runtime != RuntimeKind::Unknown)
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
+        let runtime_mode = normalize_runtime_mode(runtime_mode);
         let (capabilities, capability_source) = capabilities.into_parts();
         let supported_operations = if supported_operations.is_empty() {
             supported_operations_from_capabilities(&capabilities)
@@ -615,6 +625,9 @@ impl WorkerRegistry {
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();
+                existing.runtime_mode = runtime_mode
+                    .clone()
+                    .or_else(|| existing.runtime_mode.clone());
                 existing.max_inflight = max_inflight;
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
@@ -650,6 +663,7 @@ impl WorkerRegistry {
                 capability_source,
                 backend,
                 runtime,
+                runtime_mode,
                 runtime_version,
                 hardware_class,
                 runtime_endpoint,
@@ -1004,6 +1018,7 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         capability_descriptor: e.capabilities.clone(),
         backend: e.backend.as_str().to_string(),
         runtime: e.runtime.as_str().to_string(),
+        runtime_mode: e.runtime_mode.clone(),
         runtime_version: e.runtime_version.clone(),
         hardware_class: e.hardware_class.clone(),
         runtime_endpoint: e.runtime_endpoint.clone(),
@@ -1047,6 +1062,17 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
         operations.push("vision".to_string());
     }
     operations
+}
+
+fn normalize_runtime_mode(mode: Option<String>) -> Option<String> {
+    mode.and_then(|value| {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
 }
 
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
@@ -1475,6 +1501,7 @@ mod tests {
                     max_context: Some(32768),
                 }),
                 backend: "vllm".into(),
+                runtime_mode: Some("adapter".into()),
                 max_inflight: 16,
                 friendly_name: None,
                 chip_model: None,
@@ -1493,6 +1520,7 @@ mod tests {
         let snapshot = r.get_snapshot(id).unwrap();
         assert_eq!(snapshot.backend, "vllm");
         assert_eq!(snapshot.runtime, "vllm");
+        assert_eq!(snapshot.runtime_mode.as_deref(), Some("adapter"));
         assert_eq!(snapshot.runtime_version.as_deref(), Some("0.13.0"));
         assert_eq!(snapshot.hardware_class.as_deref(), Some("pc-cuda"));
         assert_eq!(

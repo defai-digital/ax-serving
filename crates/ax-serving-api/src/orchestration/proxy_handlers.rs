@@ -615,6 +615,7 @@ struct RuntimeDiagnostic {
     hardware_classes: BTreeMap<String, usize>,
     node_classes: BTreeMap<String, usize>,
     worker_pools: BTreeMap<String, usize>,
+    runtime_modes: BTreeMap<String, usize>,
     supported_operations: BTreeSet<String>,
     runtime_endpoints: BTreeSet<String>,
     missing_runtime_endpoint_workers: Vec<String>,
@@ -695,6 +696,9 @@ impl RuntimeDiagnostic {
         if let Some(worker_pool) = worker.worker_pool.as_deref() {
             increment_count(&mut self.worker_pools, worker_pool);
         }
+        if let Some(runtime_mode) = worker.runtime_mode.as_deref() {
+            increment_count(&mut self.runtime_modes, runtime_mode);
+        }
         for operation in &worker.supported_operations {
             self.supported_operations.insert(operation.clone());
         }
@@ -708,11 +712,13 @@ impl RuntimeDiagnostic {
         if worker.runtime == "unknown" {
             self.unknown_runtime_workers.push(worker.id.to_string());
         }
-        if worker.runtime == "ax_engine"
-            && matches!(
-                worker.backend.as_str(),
-                "native" | "auto" | "llama_cpp" | "mlx"
-            )
+        if worker.runtime_mode.as_deref() == Some("embedded")
+            || (worker.runtime == "ax_engine"
+                && worker.runtime_mode.is_none()
+                && matches!(
+                    worker.backend.as_str(),
+                    "native" | "auto" | "llama_cpp" | "mlx"
+                ))
         {
             self.compatibility_workers.push(worker.id.to_string());
         }
@@ -939,6 +945,7 @@ impl RuntimeDiagnostic {
             "hardware_classes": self.hardware_classes,
             "node_classes": self.node_classes,
             "worker_pools": self.worker_pools,
+            "runtime_modes": self.runtime_modes,
             "supported_operations": self.supported_operations,
             "runtime_endpoints": self.runtime_endpoints,
             "unhealthy_workers": self.unhealthy_workers,

@@ -95,4 +95,7 @@ Before removing or disabling any compatibility backend:
 2. Confirm OpenAI-compatible chat/completions behavior through the gateway.
 3. Confirm worker registration, heartbeat, drain, and fleet status.
 4. Confirm routing by model and runtime class.
-5. Provide migration notes for existing configuration and CLI usage.
+5. Run `ax-serving migration embedded-readiness` against the gateway and resolve
+   all blockers before switching production to
+   `AXS_EMBEDDED_RUNTIME_POLICY=deny`.
+6. Provide migration notes for existing configuration and CLI usage.

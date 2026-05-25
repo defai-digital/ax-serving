@@ -118,6 +118,7 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
         },
         "backend": config.runtime.as_str(),
         "runtime": config.runtime.as_str(),
+        "runtime_mode": "adapter",
         "hardware_class": config.hardware_class.as_str(),
         "runtime_endpoint": config.runtime_url.as_str(),
         "supported_operations": supported_operations,

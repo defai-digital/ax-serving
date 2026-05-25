@@ -1404,6 +1404,7 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
 
     let mut mac_req = reg_req("127.0.0.1:28081".parse().unwrap(), &["mac-model"]);
     mac_req.runtime = Some("ax_engine".into());
+    mac_req.runtime_mode = Some("embedded".into());
     mac_req.hardware_class = Some("mac".into());
     mac_req.node_class = Some("mac-studio".into());
     mac_req.worker_pool = Some("mac".into());
@@ -1424,6 +1425,7 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
     let mut vllm_req = reg_req("127.0.0.1:28082".parse().unwrap(), &["cuda-model"]);
     vllm_req.backend = "vllm".into();
     vllm_req.runtime = Some("vllm".into());
+    vllm_req.runtime_mode = Some("adapter".into());
     vllm_req.runtime_endpoint = Some("http://127.0.0.1:8000".into());
     vllm_req.hardware_class = Some("pc-cuda".into());
     vllm_req.node_class = Some("pc-cuda".into());
@@ -1466,6 +1468,7 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
     let runtime_diag = &json["runtime_diagnostics"]["runtimes"];
     assert_eq!(runtime_diag["ax_engine"]["workers"], 1);
     assert_eq!(runtime_diag["ax_engine"]["hardware_classes"]["mac"], 1);
+    assert_eq!(runtime_diag["ax_engine"]["runtime_modes"]["embedded"], 1);
     assert_eq!(
         runtime_diag["ax_engine"]["models"],
         serde_json::json!(["mac-model"])
@@ -1502,6 +1505,7 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
 
     assert_eq!(runtime_diag["vllm"]["workers"], 1);
     assert_eq!(runtime_diag["vllm"]["hardware_classes"]["pc-cuda"], 1);
+    assert_eq!(runtime_diag["vllm"]["runtime_modes"]["adapter"], 1);
     assert_eq!(
         runtime_diag["vllm"]["supported_operations"],
         serde_json::json!(["embedding", "llm"])

@@ -45,6 +45,7 @@ Runtime-neutral fields:
 |---|---:|---|
 | `backend` | string | Legacy routing hint: `native`, `llama_cpp`, `sglang`, `vllm`, or `auto`. |
 | `runtime` | string | Runtime owner: `ax_engine`, `vllm`, `sglang`, `llama_cpp`, or `unknown`. |
+| `runtime_mode` | string | Integration mode: `adapter` for external runtime adapters, `embedded` for AX Serving compatibility workers. |
 | `runtime_version` | string | Runtime version reported by the adapter, when known. |
 | `hardware_class` | string | Placement class such as `mac`, `pc-cuda`, or `thor`. |
 | `runtime_endpoint` | string | Runtime-compatible endpoint or proxy target, when different from `addr`. |
@@ -56,6 +57,10 @@ Compatibility rules:
 
 - `runtime` is optional for legacy workers. If absent, AX Serving derives it
   from `backend` where possible.
+- `runtime_mode` is optional for legacy workers. New runtime-node adapters should
+  send `adapter`; `ax-serving serve` sends `embedded` so diagnostics can
+  quarantine compatibility workers explicitly instead of relying only on backend
+  heuristics.
 - `supported_operations` is optional. If absent, AX Serving derives it from the
   structured capability descriptor.
 - Unknown fields should be ignored by the control plane.
@@ -68,6 +73,7 @@ Example vLLM node registration:
   "addr": "10.0.10.21:18081",
   "backend": "vllm",
   "runtime": "vllm",
+  "runtime_mode": "adapter",
   "runtime_version": "0.13.0",
   "hardware_class": "pc-cuda",
   "runtime_endpoint": "http://10.0.10.21:8000",
@@ -143,11 +149,23 @@ Prometheus gauge names when present:
 | `ax_runtime_max_batch_size` | `max_batch_size` |
 | `ax_runtime_batch_utilization` | `batch_utilization` |
 
-Known vLLM/SGLang aliases are accepted where stable enough to treat as
-best-effort hints. For example, vLLM cache usage gauges can populate
-`kv_utilization`. Missing metrics are not registration failures; the adapter
-sends safe defaults and AX Serving keeps routing by health, capacity, and model
-inventory.
+The adapter also accepts runtime-specific aliases where stable enough to treat
+as best-effort hints:
+
+- AX Serving / ax-engine style `axs_*` Prometheus metrics such as
+  `axs_scheduler_queue_depth`, `axs_scheduler_inflight_count`,
+  `axs_scheduler_decode_sequences_active`, and `axs_ttft_p95_us`
+- AX Serving / ax-engine style `/v1/metrics` JSON fields such as
+  `scheduler.queue_depth`, `scheduler.inflight_count`,
+  `scheduler.ttft_p95_us`, `kv_cache.utilization`, and `batch.utilization`
+- vLLM gauges such as `vllm:num_requests_running`,
+  `vllm:num_requests_waiting`, `vllm:avg_generation_throughput_toks_per_s`,
+  and `vllm:gpu_cache_usage_perc`
+- vLLM `time_to_first_token_seconds_bucket` histogram buckets, translated to
+  `ttft_p95_ms`
+
+Missing metrics are not registration failures; the adapter sends safe defaults
+and AX Serving keeps routing by health, capacity, and model inventory.
 
 ---
 
@@ -219,6 +237,7 @@ The existing `ax-serving serve` command can still register as a worker for
 local Mac compatibility. When runtime metadata is not provided, it registers as:
 
 - `runtime = "ax_engine"`
+- `runtime_mode = "embedded"`
 - `hardware_class = "mac"`
 - `runtime_endpoint = "http://<worker-addr>"`
 

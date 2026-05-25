@@ -97,14 +97,22 @@ target/release/ax-runtime-agent
 
 The agent reads `/v1/models` from the runtime endpoint, registers the adapter
 address with AX Serving, sends heartbeats, and proxies OpenAI-compatible
-inference requests to ax-engine.
+inference requests to ax-engine. Adapter registrations include
+`runtime_mode=adapter`; the legacy `ax-serving serve` worker path registers as
+`runtime_mode=embedded` so diagnostics can identify compatibility workers
+without guessing from backend names.
 
-If the runtime exposes `/metrics`, the agent also translates common
-Prometheus gauges such as `ax_runtime_active_sequences`,
-`ax_runtime_queue_depth`, `ax_runtime_decode_tok_per_sec`,
-`ax_runtime_ttft_p95_ms`, and `ax_runtime_kv_pages_used` into AX Serving
-heartbeat telemetry. Missing metrics are safe; the node remains routable with
-fallback heartbeat values.
+If the runtime exposes `/metrics`, the agent translates common Prometheus
+gauges such as `ax_runtime_active_sequences`, `ax_runtime_queue_depth`,
+`ax_runtime_decode_tok_per_sec`, `ax_runtime_ttft_p95_ms`, and
+`ax_runtime_kv_pages_used` into AX Serving heartbeat telemetry. For ax-engine
+or AX Serving-compatible runtimes, it also accepts `axs_*` gauges such as
+`axs_scheduler_queue_depth`, `axs_scheduler_inflight_count`, and
+`axs_ttft_p95_us`. If Prometheus metrics are unavailable, the agent falls back
+to `/v1/metrics` JSON and reads fields such as `scheduler.queue_depth`,
+`scheduler.inflight_count`, `scheduler.ttft_p95_us`, `kv_cache.utilization`,
+and `batch.utilization`. Missing metrics are safe; the node remains routable
+with fallback heartbeat values.
 
 ### Start a PC CUDA vLLM runtime node
 
@@ -332,6 +340,9 @@ ax-serving status --url http://127.0.0.1:18080 --diagnostics --api-key "${AXS_AP
 # AX Fabric read-side contract validation.
 ax-serving fabric validate --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
 
+# Check whether production can switch to AXS_EMBEDDED_RUNTIME_POLICY=deny.
+ax-serving migration embedded-readiness --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+
 # Redacted support bundle for escalation.
 ax-serving support-bundle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}" --output support-bundle.json
 
@@ -401,12 +412,19 @@ registered as PC CUDA or Thor nodes.
 gateway metrics profiles, and exits non-zero when a documented contract field is
 missing.
 
+`ax-serving migration embedded-readiness` reads gateway diagnostics and reports
+whether the fleet is ready for `AXS_EMBEDDED_RUNTIME_POLICY=deny`. It requires
+registered adapter workers, no `runtime_mode=embedded` workers, no unknown
+runtime-mode workers, and at least one eligible healthy non-draining worker.
+
 Telemetry-based issues such as `high_runtime_error_rate`,
 `runtime_queue_backlog`, `high_runtime_kv_pressure`, and
 `high_runtime_batch_pressure` come from worker heartbeat fields. Adapters can
 report either counter fields such as `kv_pages_used` and `active_batch_size`, or
 ratio fields such as `kv_utilization` and `batch_utilization`. Missing telemetry
 is treated as unknown rather than failed so older adapters can remain compatible.
+The runtime agent can derive these fields from common `ax_runtime_*`, `axs_*`,
+vLLM, and `/v1/metrics` JSON aliases.
 
 ### Support escalation bundle
 

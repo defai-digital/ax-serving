@@ -1,5 +1,6 @@
 //! AX Code support contracts: config validation, status, and smoke tests.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,7 @@ const COMMAND_STATUS: &str = "ax-serving status";
 const COMMAND_SMOKE_TEST: &str = "ax-serving smoke-test";
 const COMMAND_SUPPORT_BUNDLE: &str = "ax-serving support-bundle";
 const COMMAND_FABRIC_VALIDATE: &str = "ax-serving fabric validate";
+const COMMAND_MIGRATION_EMBEDDED_READINESS: &str = "ax-serving migration embedded-readiness";
 const COMMAND_WORKERS: &str = "ax-serving workers";
 const ENDPOINT_DIAGNOSTICS: &str = "diagnostics";
 const STATUS_OK: &str = "ok";
@@ -136,6 +138,40 @@ struct FabricCheck {
     name: &'static str,
     ok: bool,
     detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MigrationEmbeddedReadinessReport {
+    command: &'static str,
+    base_url: String,
+    status: &'static str,
+    ready_to_deny: bool,
+    recommended_policy: &'static str,
+    diagnostics: EndpointReport,
+    totals: MigrationReadinessTotals,
+    runtimes: Vec<MigrationRuntimeSummary>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct MigrationReadinessTotals {
+    workers: usize,
+    adapter_workers: usize,
+    embedded_workers: usize,
+    unknown_mode_workers: usize,
+    eligible_workers: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MigrationRuntimeSummary {
+    runtime: String,
+    workers: usize,
+    eligible: usize,
+    adapter_workers: usize,
+    embedded_workers: usize,
+    unknown_mode_workers: usize,
+    models: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +381,28 @@ pub fn run_fabric_validate(url: String, api_key: Option<String>, json: bool) -> 
 
     emit_json_or_human(json, &report, print_fabric_validate_human)?;
     exit_if(!report.ready);
+    Ok(())
+}
+
+pub fn run_migration_embedded_readiness(
+    url: String,
+    api_key: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let diagnostics = get_json_endpoint(
+        &client,
+        &base_url,
+        "/v1/admin/diagnostics",
+        token.as_deref(),
+        ENDPOINT_DIAGNOSTICS,
+    );
+    let report = build_migration_embedded_readiness_report(base_url, diagnostics);
+
+    emit_json_or_human(json, &report, print_migration_embedded_readiness_human)?;
+    exit_if(!report.ready_to_deny);
     Ok(())
 }
 
@@ -915,6 +973,169 @@ fn health_endpoint_degraded(endpoints: &[EndpointReport]) -> bool {
         || body.get("ready").and_then(Value::as_bool) == Some(false)
 }
 
+fn build_migration_embedded_readiness_report(
+    base_url: String,
+    diagnostics: EndpointReport,
+) -> MigrationEmbeddedReadinessReport {
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    if !diagnostics.ok {
+        blockers.push(endpoint_check_detail(
+            Some(&diagnostics),
+            "GET /v1/admin/diagnostics returned HTTP 200",
+        ));
+    }
+
+    let body = diagnostics.body.as_ref();
+    let mut runtimes = Vec::new();
+    let mut totals = MigrationReadinessTotals::default();
+    if let Some(runtime_map) = body
+        .and_then(|body| body.pointer("/runtime_diagnostics/runtimes"))
+        .and_then(Value::as_object)
+    {
+        let mut sorted = runtime_map.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|(key, _)| *key);
+        for (runtime, value) in sorted {
+            let summary = migration_runtime_summary(runtime, value);
+            totals.workers += summary.workers;
+            totals.adapter_workers += summary.adapter_workers;
+            totals.embedded_workers += summary.embedded_workers;
+            totals.unknown_mode_workers += summary.unknown_mode_workers;
+            totals.eligible_workers += summary.eligible;
+            runtimes.push(summary);
+        }
+    }
+
+    if diagnostics.ok && runtimes.is_empty() {
+        blockers.push("no runtime workers registered".to_string());
+    }
+    if totals.adapter_workers == 0 {
+        blockers.push("no runtime-node adapter workers registered".to_string());
+    }
+    if totals.embedded_workers > 0 {
+        blockers.push(format!(
+            "{} embedded compatibility worker(s) still registered",
+            totals.embedded_workers
+        ));
+    }
+    if totals.unknown_mode_workers > 0 {
+        blockers.push(format!(
+            "{} worker(s) have no runtime_mode; refresh adapters before denying embedded paths",
+            totals.unknown_mode_workers
+        ));
+    }
+    if totals.eligible_workers == 0 {
+        blockers.push("no healthy non-draining workers are eligible for routing".to_string());
+    }
+
+    if let Some(issues) = body
+        .and_then(|body| body.pointer("/runtime_diagnostics/issues"))
+        .and_then(Value::as_array)
+    {
+        if issues.iter().any(|issue| {
+            issue
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "no_workers_registered")
+        }) {
+            blockers.push("gateway diagnostics reports no registered workers".to_string());
+        }
+        for issue in issues {
+            if let Some(code) = issue.get("code").and_then(Value::as_str)
+                && !matches!(
+                    code,
+                    "embedded_compatibility_path" | "no_workers_registered"
+                )
+            {
+                warnings.push(format!("diagnostics issue remains: {code}"));
+            }
+        }
+    }
+
+    let mut deduped_blockers = BTreeSet::new();
+    blockers.retain(|blocker| deduped_blockers.insert(blocker.clone()));
+    let mut deduped_warnings = BTreeSet::new();
+    warnings.retain(|warning| deduped_warnings.insert(warning.clone()));
+
+    let ready_to_deny = diagnostics.ok && blockers.is_empty();
+    MigrationEmbeddedReadinessReport {
+        command: COMMAND_MIGRATION_EMBEDDED_READINESS,
+        base_url,
+        status: if ready_to_deny {
+            STATUS_OK
+        } else if diagnostics.status_code.is_some() {
+            STATUS_FAIL
+        } else {
+            STATUS_UNREACHABLE
+        },
+        ready_to_deny,
+        recommended_policy: if ready_to_deny { "deny" } else { "warn" },
+        diagnostics,
+        totals,
+        runtimes,
+        blockers,
+        warnings,
+    }
+}
+
+fn migration_runtime_summary(runtime: &str, value: &Value) -> MigrationRuntimeSummary {
+    let workers = value.get("workers").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let eligible = value.get("eligible").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let runtime_modes = value
+        .get("runtime_modes")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let adapter_workers = count_runtime_mode(&runtime_modes, "adapter");
+    let mut embedded_workers = count_runtime_mode(&runtime_modes, "embedded");
+    embedded_workers = embedded_workers.max(embedded_workers_from_issues(value));
+    let known_mode_workers = runtime_modes
+        .values()
+        .filter_map(Value::as_u64)
+        .map(|value| value as usize)
+        .sum::<usize>();
+    let unknown_mode_workers = workers.saturating_sub(known_mode_workers);
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect();
+
+    MigrationRuntimeSummary {
+        runtime: runtime.to_string(),
+        workers,
+        eligible,
+        adapter_workers,
+        embedded_workers,
+        unknown_mode_workers,
+        models,
+    }
+}
+
+fn count_runtime_mode(map: &serde_json::Map<String, Value>, mode: &str) -> usize {
+    map.get(mode).and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
+fn embedded_workers_from_issues(value: &Value) -> usize {
+    value
+        .get("issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|issue| {
+            issue
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "embedded_compatibility_path")
+        })
+        .filter_map(|issue| issue.get("workers").and_then(Value::as_array))
+        .map(|workers| workers.len())
+        .sum()
+}
+
 fn with_optional_bearer(request: RequestBuilder, token: Option<&str>) -> RequestBuilder {
     match token {
         Some(token) if !token.trim().is_empty() => request.bearer_auth(token.trim()),
@@ -1081,6 +1302,49 @@ fn print_fabric_validate_human(report: &FabricValidateReport) {
             check.name,
             check.detail,
         );
+    }
+}
+
+fn print_migration_embedded_readiness_human(report: &MigrationEmbeddedReadinessReport) {
+    eprintln!("AX Serving Embedded Migration Readiness\n");
+    eprintln!("  Base URL:       {}", report.base_url);
+    eprintln!("  Status:         {}", report.status);
+    eprintln!("  Ready to deny:  {}", report.ready_to_deny);
+    eprintln!(
+        "  Policy target:  AXS_EMBEDDED_RUNTIME_POLICY={}",
+        report.recommended_policy
+    );
+    eprintln!(
+        "  Workers:        total={} adapter={} embedded={} unknown_mode={} eligible={}",
+        report.totals.workers,
+        report.totals.adapter_workers,
+        report.totals.embedded_workers,
+        report.totals.unknown_mode_workers,
+        report.totals.eligible_workers,
+    );
+    for runtime in &report.runtimes {
+        eprintln!(
+            "  Runtime {}: workers={} adapter={} embedded={} unknown_mode={} eligible={} models={}",
+            runtime.runtime,
+            runtime.workers,
+            runtime.adapter_workers,
+            runtime.embedded_workers,
+            runtime.unknown_mode_workers,
+            runtime.eligible,
+            runtime.models.len(),
+        );
+    }
+    if !report.blockers.is_empty() {
+        eprintln!("\n  Blockers:");
+        for blocker in &report.blockers {
+            eprintln!("  - {blocker}");
+        }
+    }
+    if !report.warnings.is_empty() {
+        eprintln!("\n  Warnings:");
+        for warning in &report.warnings {
+            eprintln!("  - {warning}");
+        }
     }
 }
 
@@ -1467,6 +1731,95 @@ mod tests {
                 && check.name == "metrics_contract_profile"
                 && check.detail.contains(FABRIC_PROFILE_UNKNOWN)
         }));
+    }
+
+    #[test]
+    fn migration_embedded_readiness_accepts_adapter_only_fleet() {
+        let report = build_migration_embedded_readiness_report(
+            "http://127.0.0.1:18080".into(),
+            ok_endpoint(
+                ENDPOINT_DIAGNOSTICS,
+                "/v1/admin/diagnostics",
+                serde_json::json!({
+                    "runtime_diagnostics": {
+                        "runtimes": {
+                            "ax_engine": {
+                                "workers": 1,
+                                "eligible": 1,
+                                "runtime_modes": {"adapter": 1},
+                                "models": ["mac-model"],
+                                "issues": []
+                            },
+                            "vllm": {
+                                "workers": 2,
+                                "eligible": 2,
+                                "runtime_modes": {"adapter": 2},
+                                "models": ["cuda-model"],
+                                "issues": []
+                            }
+                        },
+                        "issues": []
+                    }
+                }),
+            ),
+        );
+
+        assert!(report.ready_to_deny);
+        assert_eq!(report.recommended_policy, "deny");
+        assert_eq!(report.totals.adapter_workers, 3);
+        assert!(report.blockers.is_empty());
+    }
+
+    #[test]
+    fn migration_embedded_readiness_blocks_embedded_and_unknown_mode_workers() {
+        let report = build_migration_embedded_readiness_report(
+            "http://127.0.0.1:18080".into(),
+            ok_endpoint(
+                ENDPOINT_DIAGNOSTICS,
+                "/v1/admin/diagnostics",
+                serde_json::json!({
+                    "runtime_diagnostics": {
+                        "runtimes": {
+                            "ax_engine": {
+                                "workers": 2,
+                                "eligible": 2,
+                                "runtime_modes": {"embedded": 1},
+                                "models": ["mac-model"],
+                                "issues": [
+                                    {
+                                        "code": "embedded_compatibility_path",
+                                        "workers": ["worker-embedded"]
+                                    }
+                                ]
+                            }
+                        },
+                        "issues": [
+                            {
+                                "runtime": "ax_engine",
+                                "code": "embedded_compatibility_path"
+                            }
+                        ]
+                    }
+                }),
+            ),
+        );
+
+        assert!(!report.ready_to_deny);
+        assert_eq!(report.recommended_policy, "warn");
+        assert_eq!(report.totals.embedded_workers, 1);
+        assert_eq!(report.totals.unknown_mode_workers, 1);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.contains("embedded compatibility worker") })
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.contains("no runtime_mode") })
+        );
     }
 
     #[test]
