@@ -798,6 +798,7 @@ fn stream_response(
             created,
             0u8,
             true,
+            0u32,
             Some(model_entry),
             Some(permit),
             Some(pm_permit),
@@ -812,6 +813,7 @@ fn stream_response(
             created,
             phase,
             first_token,
+            next_tool_call_index,
             model_entry,
             permit,
             pm,
@@ -827,7 +829,18 @@ fn stream_response(
                     Some((
                         Ok(ev),
                         (
-                            rx, id, model, created, 2, false, None, None, None, logprobs, None,
+                            rx,
+                            id,
+                            model,
+                            created,
+                            2,
+                            false,
+                            next_tool_call_index,
+                            None,
+                            None,
+                            None,
+                            logprobs,
+                            None,
                             metrics,
                         ),
                     ))
@@ -896,6 +909,7 @@ fn stream_response(
                                     created,
                                     0,
                                     false,
+                                    next_tool_call_index,
                                     model_entry,
                                     permit,
                                     pm,
@@ -910,6 +924,8 @@ fn stream_response(
                             name,
                             arguments,
                         } => {
+                            let tool_call_index = next_tool_call_index;
+                            let next_tool_call_index = next_tool_call_index.saturating_add(1);
                             // Per the OpenAI streaming protocol, the tool call delta
                             // must carry finish_reason: null. A separate empty-delta
                             // chunk with finish_reason: "tool_calls" follows via the
@@ -923,10 +939,10 @@ fn stream_response(
                                 choices: vec![StreamChatChoice {
                                     index: 0,
                                     delta: StreamChatDelta {
-                                        role: Some("assistant"),
+                                        role: if first_token { Some("assistant") } else { None },
                                         content: None,
                                         tool_calls: Some(vec![StreamChatToolCall {
-                                            index: 0,
+                                            index: tool_call_index,
                                             id: &call_id,
                                             tool_type: "function",
                                             function: StreamChatToolFunction {
@@ -950,6 +966,7 @@ fn stream_response(
                                     created,
                                     0,
                                     false,
+                                    next_tool_call_index,
                                     model_entry,
                                     permit,
                                     pm,
@@ -989,6 +1006,7 @@ fn stream_response(
                                     created,
                                     1,
                                     false,
+                                    next_tool_call_index,
                                     model_entry,
                                     None,
                                     None,
@@ -1017,6 +1035,7 @@ fn stream_response(
                                     created,
                                     1,
                                     false,
+                                    next_tool_call_index,
                                     model_entry,
                                     None,
                                     None,
@@ -1047,6 +1066,7 @@ fn stream_response(
                                     created,
                                     1,
                                     false,
+                                    next_tool_call_index,
                                     model_entry,
                                     None,
                                     None,
@@ -2241,6 +2261,7 @@ mod tests {
         BackendType, GenerateEvent, GenerationStats, ModelHandle, ModelMetadata, ThermalMonitor,
     };
     use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -2269,6 +2290,79 @@ mod tests {
             stop_reason: "stop".into(),
             ..GenerationStats::default()
         }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_response_assigns_distinct_tool_call_indexes() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(GenerateEvent::ToolCall {
+            id: "call_a".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(GenerateEvent::ToolCall {
+            id: "call_b".into(),
+            name: "search".into(),
+            arguments: "{\"q\":\"rust\"}".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(GenerateEvent::Done(GenerationStats {
+            stop_reason: "tool_calls".into(),
+            ..GenerationStats::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let chunks = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .collect::<Vec<_>>();
+
+        let tool_indexes = chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .pointer("/choices/0/delta/tool_calls/0/index")
+                    .and_then(|value| value.as_u64())
+            })
+            .collect::<Vec<_>>();
+        let finish_reason = chunks
+            .iter()
+            .find_map(|chunk| {
+                chunk
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap();
+
+        assert_eq!(tool_indexes, vec![0, 1]);
+        assert_eq!(finish_reason, "tool_calls");
     }
 
     #[test]
