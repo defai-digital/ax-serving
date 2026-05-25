@@ -40,7 +40,7 @@ pub unsafe extern "C" fn llama_tokenize(
     };
 
     let m = unsafe { &*model };
-    let result = m.backend.tokenize(m.handle, text_str, add_bos);
+    let result = m.inner.backend.tokenize(m.inner.handle, text_str, add_bos);
 
     match result {
         Ok(ids) => {
@@ -81,7 +81,11 @@ pub unsafe extern "C" fn llama_token_to_piece(
     }
 
     let m = unsafe { &*model };
-    match m.backend.decode_tokens(m.handle, &[token as u32]) {
+    match m
+        .inner
+        .backend
+        .decode_tokens(m.inner.handle, &[token as u32])
+    {
         Ok(piece) => {
             let bytes = piece.as_bytes();
             let n = bytes.len();
@@ -176,15 +180,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend {
             observed: Arc::clone(&observed),
         });
-        let model = LlamaModel {
-            handle: ModelHandle(1),
-            backend,
-            vocab_size: 8,
-            n_ctx: 16,
-            bos_token: -1,
-            eos_token: -1,
-            nl_token: -1,
-        };
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"helloTRAILING\0";
         let mut out = [0_i32; 4];
 
@@ -211,15 +207,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend {
             observed: Arc::clone(&observed),
         });
-        let model = LlamaModel {
-            handle: ModelHandle(1),
-            backend,
-            vocab_size: 8,
-            n_ctx: 16,
-            bos_token: -1,
-            eos_token: -1,
-            nl_token: -1,
-        };
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"hello";
         let mut out = [0_i32; 4];
 

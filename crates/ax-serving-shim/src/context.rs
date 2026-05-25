@@ -37,20 +37,12 @@ pub unsafe extern "C" fn llama_new_context_with_model(
         }
         params.n_ctx as i32
     } else {
-        model_ref.n_ctx
+        model_ref.inner.n_ctx
     };
-    let vocab_size = model_ref.vocab_size as usize;
+    let vocab_size = model_ref.inner.vocab_size as usize;
 
     let ctx = Box::new(LlamaContext {
-        model: Arc::new(LlamaModel {
-            handle: model_ref.handle,
-            backend: model_ref.backend.clone(),
-            vocab_size: model_ref.vocab_size,
-            n_ctx: model_ref.n_ctx,
-            bos_token: model_ref.bos_token,
-            eos_token: model_ref.eos_token,
-            nl_token: model_ref.nl_token,
-        }),
+        model: Arc::clone(&model_ref.inner),
         position: 0,
         logits: vec![0.0_f32; vocab_size],
         n_ctx,
@@ -166,6 +158,7 @@ pub extern "C" fn llama_get_logits(ctx: *mut LlamaContext) -> *mut f32 {
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use ax_serving_engine::{
         CacheTelemetry, EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput,
@@ -173,6 +166,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::model::llama_free_model;
     use crate::types::LlamaModel;
 
     struct DummyBackend;
@@ -239,18 +233,76 @@ mod tests {
         }
     }
 
+    struct CountingEvalBackend {
+        unloads: Arc<AtomicU64>,
+    }
+
+    impl InferenceBackend for CountingEvalBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            self.unloads.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _handle: ModelHandle,
+            _input: GenerateInput,
+            _params: GenerationParams,
+            _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn tokenize(
+            &self,
+            _handle: ModelHandle,
+            _text: &str,
+            _add_bos: bool,
+        ) -> anyhow::Result<Vec<u32>> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            1
+        }
+
+        fn eval_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+    }
+
     #[test]
     fn llama_new_context_rejects_n_ctx_over_i32_max() {
         let backend: Arc<dyn InferenceBackend> = Arc::new(DummyBackend);
-        let model = Box::into_raw(Box::new(LlamaModel {
-            handle: ModelHandle(1),
+        let model = Box::into_raw(Box::new(LlamaModel::new(
+            ModelHandle(1),
             backend,
-            vocab_size: 32,
-            n_ctx: 1024,
-            bos_token: 1,
-            eos_token: 2,
-            nl_token: 3,
-        }));
+            32,
+            1024,
+            1,
+            2,
+            3,
+        )));
 
         let ctx = unsafe {
             llama_new_context_with_model(
@@ -267,5 +319,56 @@ mod tests {
         unsafe {
             drop(Box::from_raw(model));
         }
+    }
+
+    #[test]
+    fn context_keeps_backend_handle_loaded_after_model_free() {
+        let unloads = Arc::new(AtomicU64::new(0));
+        let backend: Arc<dyn InferenceBackend> = Arc::new(CountingEvalBackend {
+            unloads: Arc::clone(&unloads),
+        });
+        let model = Box::into_raw(Box::new(LlamaModel::new(
+            ModelHandle(7),
+            backend,
+            32,
+            1024,
+            1,
+            2,
+            3,
+        )));
+
+        let ctx = unsafe {
+            llama_new_context_with_model(
+                model,
+                LlamaContextParams {
+                    n_ctx: 512,
+                    seed: 0,
+                    _pad: [0; 6],
+                },
+            )
+        };
+        assert!(!ctx.is_null());
+
+        unsafe {
+            llama_free_model(model);
+        }
+        assert_eq!(
+            unloads.load(Ordering::Relaxed),
+            0,
+            "freeing model must not unload a handle still held by a context"
+        );
+
+        let tokens = [1_i32];
+        let eval = unsafe { llama_eval(ctx, tokens.as_ptr(), tokens.len() as i32, 0) };
+        assert_eq!(eval, 0);
+
+        unsafe {
+            llama_free(ctx);
+        }
+        assert_eq!(
+            unloads.load(Ordering::Relaxed),
+            1,
+            "backend handle should unload after the final model/context reference drops"
+        );
     }
 }
