@@ -3,7 +3,7 @@
 > **Status**: Draft  
 > **Date**: 2026-03-29  
 > **Type**: Engineering Refactor Plan  
-> **Scope**: Supports [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md) without changing product positioning
+> **Scope**: Supports the public runtime-node product boundary without changing product positioning
 
 ## 1. Purpose
 
@@ -11,10 +11,12 @@ This plan defines the refactor work needed to reduce code duplication, shrink
 oversized modules, and improve maintainability before significant new v3.0
 feature work begins.
 
-It is intentionally an engineering plan, not a new product PRD. The canonical
-product PRD remains:
+It is intentionally an engineering plan, not a new product PRD. Public product
+boundary evidence remains:
 
-- [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md)
+- [AX Serving Public Contract Inventory](contracts/ax-serving-public-contract-inventory.md)
+- [AX Serving Node Contract](contracts/ax-serving-node-contract.md)
+- [Runtime Responsibility Inventory](contracts/ax-serving-runtime-responsibility-inventory.md)
 
 ## 2. Problem Statement
 
@@ -328,8 +330,9 @@ Exit criteria:
 
 This plan is complete when all of the following are true:
 
-- The canonical product PRD remains unchanged:
-  - [.internal/prd/PRD-AX-SERVING.md](../.internal/prd/PRD-AX-SERVING.md)
+- The public product boundary remains unchanged:
+  - [AX Serving Public Contract Inventory](contracts/ax-serving-public-contract-inventory.md)
+  - [AX Serving Node Contract](contracts/ax-serving-node-contract.md)
 - No single production Rust file exceeds 1500 LOC, except engine adapter files
   explicitly exempted for FFI/backend reasons.
 - No single integration-test Rust file exceeds 1500 LOC.

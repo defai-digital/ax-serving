@@ -27,6 +27,7 @@ opencode.json
 
 # Logs and artifacts
 *.log
+.internal/
 automatosx/
 .automatosx/
 .ax-grok/

@@ -3,7 +3,6 @@
 > **Status**: Active
 > **Date**: 2026-05-25
 > **Owner**: AX Serving Team
-> **Related PRD**: [PRD-AX-SERVING.md](../../.internal/prd/PRD-AX-SERVING.md)
 > **Related**: [Runtime Responsibility Inventory](ax-serving-runtime-responsibility-inventory.md)
 
 ---

@@ -4,7 +4,6 @@
 > **Date**: 2026-03-29
 > **Owner**: AX Serving Core Team
 > **Related**:
-> - [PRD - AX Serving](../../.internal/prd/PRD-AX-SERVING.md)
 > - [AX Serving Node Contract](ax-serving-node-contract.md)
 > - [Runtime Responsibility Inventory](ax-serving-runtime-responsibility-inventory.md)
 > - [AX Fabric Runtime Contract](ax-fabric-runtime-contract.md)

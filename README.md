@@ -70,7 +70,6 @@ For market positioning, competitive analysis, and ICP details, see:
 - [docs/market-positioning.md](docs/market-positioning.md)
 - [docs/competitive-landscape.md](docs/competitive-landscape.md)
 - [docs/icp-and-demand.md](docs/icp-and-demand.md)
-- [.internal/prd/PRD-AX-SERVING.md](.internal/prd/PRD-AX-SERVING.md)
 - [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
 - [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
 - [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
@@ -516,9 +515,8 @@ Other benchmark modes:
 - [docs/competitive-landscape.md](docs/competitive-landscape.md)
 - [docs/icp-and-demand.md](docs/icp-and-demand.md)
 - [docs/ax-code-integration.md](docs/ax-code-integration.md)
-- [.internal/prd/PRD-AX-SERVING.md](.internal/prd/PRD-AX-SERVING.md)
+- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
 - [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
-- [.internal/adr/README.md](.internal/adr/README.md)
 - `docs/contracts/ax-fabric-runtime-contract.md`
 - `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
 - `sdk/python/` (Python SDK)

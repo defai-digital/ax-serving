@@ -1,7 +1,7 @@
 # Multi-Worker Orchestration Runbook
 
 **Version:** 1.2
-**ADR:** [ADR-012](../../.internal/adr/ADR-012-local-multi-worker-orchestration.md)
+**Contract:** [AX Serving Node Contract](../contracts/ax-serving-node-contract.md)
 **Date:** 2026-03-03
 
 ---

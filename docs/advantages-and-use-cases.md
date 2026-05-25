@@ -115,4 +115,4 @@
 - [QUICKSTART.md](../QUICKSTART.md)
 - [python-sdk.md](python-sdk.md)
 - [market-positioning.md](market-positioning.md)
-- [PRD](../.internal/prd/PRD-AX-SERVING.md)
+- [AX Serving Public Contract Inventory](contracts/ax-serving-public-contract-inventory.md)
