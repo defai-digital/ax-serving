@@ -35,6 +35,7 @@ fn registry_error_to_status(e: &anyhow::Error) -> Status {
         ) => Status::invalid_argument(msg),
         Some(RegistryError::PathNotAllowed(_)) => Status::permission_denied(msg),
         Some(RegistryError::CapacityExceeded(_)) => Status::resource_exhausted(msg),
+        Some(RegistryError::Busy(_)) => Status::failed_precondition(msg),
         _ => Status::internal(msg),
     }
 }
@@ -413,6 +414,10 @@ mod tests {
             (
                 &|| RegistryError::CapacityExceeded(16).into(),
                 tonic::Code::ResourceExhausted,
+            ),
+            (
+                &|| RegistryError::Busy("m".into()).into(),
+                tonic::Code::FailedPrecondition,
             ),
             (
                 &|| anyhow::anyhow!("generic backend error"),

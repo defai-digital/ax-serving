@@ -154,6 +154,7 @@ pub async fn rest_load_model(
                 ) => StatusCode::UNPROCESSABLE_ENTITY,
                 Some(RegistryError::PathNotAllowed(_)) => StatusCode::FORBIDDEN,
                 Some(RegistryError::CapacityExceeded(_)) => StatusCode::SERVICE_UNAVAILABLE,
+                Some(RegistryError::Busy(_)) => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()

@@ -164,6 +164,37 @@ impl ModelRegistry {
         }
     }
 
+    fn collect_warm_pool_evictions(
+        guard: &mut HashMap<String, Arc<LoadedModel>>,
+        pool_size: usize,
+        incoming_models: usize,
+        model_id: &str,
+    ) -> std::result::Result<Vec<Arc<LoadedModel>>, RegistryError> {
+        let evictions_needed = guard
+            .len()
+            .saturating_add(incoming_models)
+            .saturating_sub(pool_size);
+        if evictions_needed == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut evictable: Vec<(String, u64)> = guard
+            .iter()
+            .filter(|(_, model)| Arc::strong_count(model) == 1)
+            .map(|(id, model)| (id.clone(), model.last_accessed_ms.load(Ordering::Relaxed)))
+            .collect();
+        if evictable.len() < evictions_needed {
+            return Err(RegistryError::Busy(model_id.to_string()));
+        }
+
+        evictable.sort_by_key(|(_, last_accessed)| *last_accessed);
+        Ok(evictable
+            .into_iter()
+            .take(evictions_needed)
+            .filter_map(|(id, _)| guard.remove(&id))
+            .collect())
+    }
+
     /// Load a model from a GGUF file, registering it under `model_id`.
     ///
     /// Validates:
@@ -230,25 +261,7 @@ impl ModelRegistry {
 
             let mut candidates = Vec::new();
             if let Some(pool_size) = self.warm_pool_size {
-                while guard.len() >= pool_size {
-                    let oldest_id = guard
-                        .iter()
-                        .min_by_key(|(_, m)| m.last_accessed_ms.load(Ordering::Relaxed))
-                        .map(|(id, _)| id.clone());
-                    if let Some(id) = oldest_id {
-                        if let Some(evicted) = guard.remove(&id) {
-                            candidates.push(evicted);
-                        } else {
-                            warn!(
-                                model_id,
-                                "warm-pool eviction candidate disappeared; continuing"
-                            );
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
+                candidates = Self::collect_warm_pool_evictions(&mut guard, pool_size, 1, model_id)?;
             }
 
             if guard.len() >= self.max_loaded_models {
@@ -310,23 +323,16 @@ impl ModelRegistry {
             let mut guard = self.inner_write();
             let mut candidates = Vec::new();
             if let Some(pool_size) = self.warm_pool_size {
-                while guard.len() >= pool_size {
-                    let oldest_id = guard
-                        .iter()
-                        .min_by_key(|(_, m)| m.last_accessed_ms.load(Ordering::Relaxed))
-                        .map(|(id, _)| id.clone());
-                    if let Some(id) = oldest_id {
-                        if let Some(evicted) = guard.remove(&id) {
-                            candidates.push(evicted);
-                        } else {
-                            warn!(
-                                model_id,
-                                "warm-pool final eviction candidate disappeared; continuing"
-                            );
-                            break;
-                        }
-                    } else {
-                        break;
+                match Self::collect_warm_pool_evictions(&mut guard, pool_size, 1, model_id) {
+                    Ok(evictions) => candidates = evictions,
+                    Err(err) => {
+                        drop(guard);
+                        backend.unload_model(handle).with_context(|| {
+                            format!(
+                                "warm-pool finalization for '{model_id}' failed; cleanup failed"
+                            )
+                        })?;
+                        return Err(err.into());
                     }
                 }
             }
@@ -550,7 +556,7 @@ impl ModelRegistry {
                 let mut guard = self.inner_write();
                 let should_evict = if let Some(entry) = guard.get(&id) {
                     let last = entry.last_accessed_ms.load(Ordering::Relaxed);
-                    now_ms.saturating_sub(last) >= idle_timeout_ms
+                    now_ms.saturating_sub(last) >= idle_timeout_ms && Arc::strong_count(entry) == 1
                 } else {
                     false // already unloaded
                 };
@@ -1446,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_loads_enforce_warm_pool_at_final_insert() {
+    fn concurrent_loads_reject_busy_final_warm_pool_eviction() {
         let dir = tempfile::tempdir().unwrap();
         let path1 = dir.path().join("m1.gguf");
         let path2 = dir.path().join("m2.gguf");
@@ -1489,8 +1495,24 @@ mod tests {
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 
-        assert!(r1.is_ok(), "first concurrent load should succeed: {r1:?}");
-        assert!(r2.is_ok(), "second concurrent load should succeed: {r2:?}");
+        let successes = [r1.is_ok(), r2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(successes, 1, "exactly one concurrent load must succeed");
+
+        let busy_errors = [r1.as_ref().err(), r2.as_ref().err()]
+            .into_iter()
+            .flatten()
+            .filter(|err| {
+                err.downcast_ref::<RegistryError>()
+                    .is_some_and(|e| matches!(e, RegistryError::Busy(_)))
+            })
+            .count();
+        assert_eq!(
+            busy_errors, 1,
+            "one concurrent load must fail instead of evicting an active model"
+        );
         assert_eq!(
             reg.len(),
             1,
@@ -1499,7 +1521,7 @@ mod tests {
         assert_eq!(
             backend.unloads.load(Ordering::Relaxed),
             1,
-            "one previously loaded model must be evicted after concurrent finalization"
+            "the rejected concurrent load must clean up its backend handle"
         );
     }
 
@@ -1564,6 +1586,49 @@ mod tests {
             backend.unloads.load(Ordering::Relaxed) >= 1,
             "backend unload must have been attempted for final eviction"
         );
+    }
+
+    #[test]
+    fn warm_pool_load_rejects_busy_eviction_candidate_without_unloading_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("m1.gguf");
+        let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&path1, b"dummy").unwrap();
+        std::fs::write(&path2, b"dummy").unwrap();
+
+        let backend = CountingBackend::new();
+        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
+
+        let active = reg
+            .load("first", &path1, LoadConfig::default(), &backend)
+            .unwrap();
+        let err = reg
+            .load("second", &path2, LoadConfig::default(), &backend)
+            .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::Busy(_))),
+            "expected Busy, got: {err}"
+        );
+        assert_eq!(
+            backend.unloads.load(Ordering::Relaxed),
+            0,
+            "active warm-pool candidate must not be unloaded"
+        );
+        assert_eq!(
+            backend.next_handle.load(Ordering::Relaxed),
+            1,
+            "new model must not be loaded when no safe warm-pool eviction exists"
+        );
+        assert!(reg.get("first").is_some());
+        assert!(reg.get("second").is_none());
+
+        drop(active);
+        reg.load("second", &path2, LoadConfig::default(), &backend)
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1824,6 +1889,7 @@ mod tests {
         // Force last_accessed_ms to epoch (0) so any idle_timeout_ms > 0 fires.
         let entry = reg.list_entries().into_iter().next().unwrap();
         entry.last_accessed_ms.store(0, Ordering::Relaxed);
+        drop(entry);
 
         let evicted = reg.idle_evict_pass(&backend, 1 /* ms */);
         assert_eq!(evicted, vec!["stale"]);
@@ -1862,6 +1928,7 @@ mod tests {
 
         let entry = reg.list_entries().into_iter().next().unwrap();
         entry.last_accessed_ms.store(0, Ordering::Relaxed);
+        drop(entry);
 
         // Even though the backend fails, idle_evict_pass must re-insert the
         // entry rather than leaking the handle.
@@ -1874,5 +1941,31 @@ mod tests {
             reg.get("old").is_some(),
             "entry must be re-inserted after failed idle eviction"
         );
+    }
+
+    #[test]
+    fn idle_evict_pass_skips_active_stale_entry_without_unloading_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_gguf(&dir);
+        let backend = CountingBackend::new();
+        let reg = ModelRegistry::new(16);
+        reg.load("active", &path, LoadConfig::default(), &backend)
+            .unwrap();
+
+        let active = reg.get("active").unwrap();
+        active.last_accessed_ms.store(0, Ordering::Relaxed);
+
+        let evicted = reg.idle_evict_pass(&backend, 1);
+        assert!(evicted.is_empty(), "active stale model must not be evicted");
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 0);
+        assert!(reg.get("active").is_some());
+
+        drop(active);
+        let entry = reg.get("active").unwrap();
+        entry.last_accessed_ms.store(0, Ordering::Relaxed);
+        drop(entry);
+        let evicted = reg.idle_evict_pass(&backend, 1);
+        assert_eq!(evicted, vec!["active"]);
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 1);
     }
 }
