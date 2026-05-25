@@ -230,16 +230,29 @@ fn read_mlx_model_config(path: &Path) -> MlxModelConfig {
     };
     MlxModelConfig {
         model_type: v["model_type"].as_str().unwrap_or("mlx").to_string(),
-        num_hidden_layers: v["num_hidden_layers"].as_u64().unwrap_or(0) as u32,
-        num_attention_heads: v["num_attention_heads"].as_u64().unwrap_or(0) as u32,
-        num_key_value_heads: v["num_key_value_heads"]
-            .as_u64()
-            .or_else(|| v["num_attention_heads"].as_u64())
-            .unwrap_or(0) as u32,
-        hidden_size: v["hidden_size"].as_u64().unwrap_or(0) as u32,
-        vocab_size: v["vocab_size"].as_u64().unwrap_or(0) as u32,
-        max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(0) as u32,
+        num_hidden_layers: json_u32_clamped(&v, "num_hidden_layers"),
+        num_attention_heads: json_u32_clamped(&v, "num_attention_heads"),
+        num_key_value_heads: json_u32_clamped_with_fallback(
+            &v,
+            "num_key_value_heads",
+            "num_attention_heads",
+        ),
+        hidden_size: json_u32_clamped(&v, "hidden_size"),
+        vocab_size: json_u32_clamped(&v, "vocab_size"),
+        max_position_embeddings: json_u32_clamped(&v, "max_position_embeddings"),
     }
+}
+
+fn json_u32_clamped(value: &serde_json::Value, key: &str) -> u32 {
+    value[key].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32
+}
+
+fn json_u32_clamped_with_fallback(value: &serde_json::Value, key: &str, fallback_key: &str) -> u32 {
+    value[key]
+        .as_u64()
+        .or_else(|| value[fallback_key].as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
 
 // ── Health state ──────────────────────────────────────────────────────────────
@@ -1485,6 +1498,25 @@ mod tests {
         assert_eq!(cfg.hidden_size, 4096);
         assert_eq!(cfg.vocab_size, 32000);
         assert_eq!(cfg.max_position_embeddings, 8192);
+    }
+
+    #[test]
+    fn read_mlx_model_config_clamps_oversized_u32_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"num_hidden_layers": 4294967296, "num_attention_heads": 4294967297, "hidden_size": 4294967298, "vocab_size": 4294967299, "max_position_embeddings": 4294967300}"#,
+        )
+        .unwrap();
+
+        let cfg = read_mlx_model_config(dir.path());
+
+        assert_eq!(cfg.num_hidden_layers, u32::MAX);
+        assert_eq!(cfg.num_attention_heads, u32::MAX);
+        assert_eq!(cfg.num_key_value_heads, u32::MAX);
+        assert_eq!(cfg.hidden_size, u32::MAX);
+        assert_eq!(cfg.vocab_size, u32::MAX);
+        assert_eq!(cfg.max_position_embeddings, u32::MAX);
     }
 
     #[test]
