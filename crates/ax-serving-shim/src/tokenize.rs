@@ -90,13 +90,13 @@ pub unsafe extern "C" fn llama_token_to_piece(
             let bytes = piece.as_bytes();
             let n = bytes.len();
             // llama.h contract: return -(n_needed) when buffer too small.
-            // `n + 1` is needed (n bytes + null terminator); length must be > n.
-            if n >= length as usize {
+            // The buffer is byte-counted output, not a C string; exact-size
+            // buffers are valid and no trailing nul is written.
+            if n > length as usize {
                 return -(n.min(i32::MAX as usize) as i32);
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-                *buf.add(n) = 0; // null terminator
             }
             n as i32
         }
@@ -122,6 +122,7 @@ mod tests {
 
     struct RecordingBackend {
         observed: Arc<Mutex<Option<String>>>,
+        decoded: String,
     }
 
     impl InferenceBackend for RecordingBackend {
@@ -158,7 +159,7 @@ mod tests {
         }
 
         fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
-            anyhow::bail!("not used in tests")
+            Ok(self.decoded.clone())
         }
 
         fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
@@ -179,6 +180,7 @@ mod tests {
         let observed = Arc::new(Mutex::new(None));
         let backend = Arc::new(RecordingBackend {
             observed: Arc::clone(&observed),
+            decoded: String::new(),
         });
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"helloTRAILING\0";
@@ -206,6 +208,7 @@ mod tests {
         let observed = Arc::new(Mutex::new(None));
         let backend = Arc::new(RecordingBackend {
             observed: Arc::clone(&observed),
+            decoded: String::new(),
         });
         let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
         let bytes = b"hello";
@@ -225,5 +228,38 @@ mod tests {
 
         assert_eq!(n, -1);
         assert!(observed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn llama_token_to_piece_accepts_exact_size_buffer() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 5];
+
+        let n = unsafe { llama_token_to_piece(&model, 1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, 5);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len()) },
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn llama_token_to_piece_reports_required_size_when_buffer_too_small() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 4];
+
+        let n = unsafe { llama_token_to_piece(&model, 1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, -5);
+        assert_eq!(out, [0_i8; 4]);
     }
 }
