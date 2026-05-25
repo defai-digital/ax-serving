@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 
-pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
+pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
     const DEFAULT_TIMEOUT_SECS: u64 = 120;
-    let timeout_secs = std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS")
+    let timeout_secs = std::env::var("AXS_NODE_STARTUP_TIMEOUT_SECS")
+        .or_else(|_| std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
@@ -12,17 +13,19 @@ pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result
         // BUG-115: check deadline BEFORE attempting the probe so the configured
         // timeout is a hard upper bound even if the connect timeout is longer.
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "sglang runtime at {base_url} did not become healthy within {timeout_secs}s"
-            );
+            anyhow::bail!("runtime at {base_url} did not become healthy within {timeout_secs}s");
         }
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(resp) => tracing::warn!(status = %resp.status(), "sglang health not ready"),
-            Err(err) => tracing::warn!(%err, "sglang health probe failed"),
+            Ok(resp) => tracing::warn!(status = %resp.status(), "runtime health not ready"),
+            Err(err) => tracing::warn!(%err, "runtime health probe failed"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
+    wait_for_runtime(client, base_url).await
 }
 
 /// Model information returned from the runtime.
@@ -47,13 +50,13 @@ pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<
         .get(&url)
         .send()
         .await
-        .context("failed to fetch sglang model list")?
+        .context("failed to fetch runtime model list")?
         .error_for_status()
-        .context("sglang returned error status for /v1/models")?;
+        .context("runtime returned error status for /v1/models")?;
     let raw: serde_json::Value = resp
         .json()
         .await
-        .context("failed to parse sglang /v1/models response")?;
+        .context("failed to parse runtime /v1/models response")?;
     let entries = raw["data"].as_array().cloned().unwrap_or_default();
     let mut models = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -67,7 +70,7 @@ pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<
                 max_model_len,
             });
         } else {
-            tracing::warn!("sglang /v1/models entry missing 'id' field, skipping: {entry}");
+            tracing::warn!("runtime /v1/models entry missing 'id' field, skipping: {entry}");
         }
     }
     Ok(models)

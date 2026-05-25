@@ -99,7 +99,7 @@ async fn proxy_embeddings(
     proxy_to(&state, "/v1/embeddings", &headers, body).await
 }
 
-/// Headers forwarded from the client request to sglang.
+/// Headers forwarded from the client request to the runtime endpoint.
 const FORWARDED_HEADERS: &[&str] = &["authorization", "x-request-id", "content-type"];
 
 async fn proxy_to(
@@ -191,14 +191,14 @@ async fn proxy_to(
                 }
                 Err(err) => (
                     StatusCode::BAD_GATEWAY,
-                    format!("failed to read sglang response: {err}"),
+                    format!("failed to read runtime response: {err}"),
                 )
                     .into_response(),
             }
         }
         Err(err) => (
             StatusCode::BAD_GATEWAY,
-            format!("sglang proxy error: {err}"),
+            format!("runtime proxy error: {err}"),
         )
             .into_response(),
     }

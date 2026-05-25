@@ -147,8 +147,8 @@ Prerequisites:
 - Rust toolchain
 - one inference runtime node path:
   - Mac compatibility worker through `ax-serving serve`
-  - Mac ax-engine node adapter path
-  - PC CUDA or NVIDIA Thor vLLM node path
+  - Mac ax-engine node adapter path through `ax-runtime-agent`
+  - PC CUDA or NVIDIA Thor vLLM node path through `ax-runtime-agent`
 
 Validate your environment:
 
@@ -162,6 +162,21 @@ Recommended topology:
 - run `ax-serving-api` as the API gateway and control plane
 - register runtime nodes through the worker/node contract
 - route requests by model, runtime class, node pool, health, and capacity
+
+Generic runtime node adapter:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
+AXS_NODE_RUNTIME=vllm \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_HARDWARE_CLASS=pc-cuda \
+cargo run -p ax-thor-agent --bin ax-runtime-agent
+```
+
+Use `AXS_NODE_RUNTIME=ax_engine` and `AXS_NODE_HARDWARE_CLASS=mac` for a Mac
+ax-engine node. The legacy `ax-thor-agent` binary remains available as a Thor
+compatibility alias.
 
 Compatibility local worker:
 

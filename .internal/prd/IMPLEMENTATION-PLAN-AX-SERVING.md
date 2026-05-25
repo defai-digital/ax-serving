@@ -154,6 +154,9 @@ Completed slices:
   endpoint, and supported operations
 - routing can use runtime class hints, including `ax_engine` and `vllm`
 - Thor CLI and agent default to vLLM while retaining SGLang compatibility
+- the runtime-node adapter can be launched as `ax-runtime-agent` with generic
+  `AXS_NODE_*` configuration for Mac ax-engine, PC CUDA vLLM, and Thor vLLM
+  nodes
 - local Mac worker compatibility registration defaults to `runtime =
   "ax_engine"` and `hardware_class = "mac"`
 - public node contract is documented in
@@ -170,12 +173,14 @@ Current evidence:
   `docs/contracts/ax-serving-runtime-responsibility-inventory.md`
 - `ax-serving doctor` surfaces runtime-boundary warnings for standalone
   embedded compatibility mode
+- operator runbook examples now cover Mac ax-engine, PC CUDA vLLM, and Thor vLLM
+  runtime-node registration through the common adapter
 
 Remaining major slices:
 
-- dedicated ax-engine node adapter path for Mac inference
+- richer ax-engine health and metrics translation beyond the generic
+  OpenAI-compatible adapter path
 - extraction or deprecation of embedded llama.cpp, MLX, libllama, and native
   runtime responsibilities after adapter replacements exist
-- operator runbooks for Mac ax-engine nodes, PC CUDA vLLM nodes, and Thor vLLM
-  nodes
-- dashboard and diagnostics grouped by runtime class
+- dashboard diagnostics details by runtime class beyond the existing status,
+  diagnostics, and fleet runtime buckets

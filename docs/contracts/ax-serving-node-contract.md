@@ -156,6 +156,24 @@ and vLLM fleets.
 
 Adapters should be thin protocol bridges.
 
+The public workspace provides `ax-runtime-agent` as the generic runtime-node
+adapter binary. It is currently implemented from the same code path as the
+legacy `ax-thor-agent` binary, so existing Thor deployments remain compatible.
+New deployments should prefer the generic `AXS_NODE_*` environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `AXS_CONTROL_PLANE_URL` | AX Serving internal control-plane URL. |
+| `AXS_WORKER_TOKEN` | Optional internal worker registration token. |
+| `AXS_NODE_RUNTIME_URL` | OpenAI-compatible runtime endpoint to proxy to. |
+| `AXS_NODE_RUNTIME` | Runtime owner, e.g. `ax_engine` or `vllm`. |
+| `AXS_NODE_LISTEN_ADDR` | Local adapter listen address. |
+| `AXS_NODE_ADVERTISED_ADDR` | Routable adapter address registered with AX Serving. |
+| `AXS_NODE_HARDWARE_CLASS` | Placement class, e.g. `mac`, `pc-cuda`, or `thor`. |
+| `AXS_NODE_CLASS` | Operator-defined node class. |
+| `AXS_NODE_WORKER_POOL` | Operator-defined routing or maintenance pool. |
+| `AXS_NODE_MAX_INFLIGHT` | Advertised concurrent request capacity. |
+
 An ax-engine adapter should report `runtime = "ax_engine"` and translate
 ax-engine model inventory, health, and metrics into this contract.
 

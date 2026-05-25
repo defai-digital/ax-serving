@@ -8,6 +8,10 @@ edition.workspace = true
 name = "ax-thor-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "ax-runtime-agent"
+path = "src/runtime_main.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 axum = { workspace = true }

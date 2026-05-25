@@ -49,6 +49,7 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         max_inflight: 8,
         worker_pool: Some("thor".into()),
         node_class: "thor".into(),
+        hardware_class: "thor".into(),
         friendly_name: Some("thor-01".into()),
         chip_model: Some("RTX".into()),
         shutdown_timeout_secs: None,
@@ -72,6 +73,8 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     let registrations = control_state.registrations.lock().await;
     assert_eq!(registrations.len(), 1);
     assert_eq!(registrations[0]["backend"], "sglang");
+    assert_eq!(registrations[0]["runtime"], "sglang");
+    assert_eq!(registrations[0]["hardware_class"], "thor");
     assert_eq!(registrations[0]["addr"], "127.0.0.1:18081");
     assert_eq!(
         registrations[0]["capabilities"]["models"],

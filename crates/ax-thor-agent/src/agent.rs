@@ -118,7 +118,7 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
         },
         "backend": config.runtime.as_str(),
         "runtime": config.runtime.as_str(),
-        "hardware_class": "thor",
+        "hardware_class": config.hardware_class.as_str(),
         "runtime_endpoint": config.runtime_url.as_str(),
         "supported_operations": supported_operations,
         "max_inflight": config.max_inflight,
@@ -142,12 +142,12 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
     let response: serde_json::Value = req
         .send()
         .await
-        .context("thor agent registration request failed")?
+        .context("runtime-node agent registration request failed")?
         .error_for_status()
-        .context("thor agent registration rejected")?
+        .context("runtime-node agent registration rejected")?
         .json()
         .await
-        .context("failed to parse thor agent registration response")?;
+        .context("failed to parse runtime-node agent registration response")?;
 
     let worker_id = response["worker_id"]
         .as_str()
@@ -184,7 +184,7 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
                 models
             }
             Err(err) => {
-                tracing::warn!(%err, "failed to refresh sglang model list for heartbeat");
+                tracing::warn!(%err, "failed to refresh runtime model list for heartbeat");
                 runtime.models.read().await.clone()
             }
         };
@@ -220,20 +220,20 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) if matches!(resp.status().as_u16(), 404 | 410) => {
-                tracing::warn!(status = %resp.status(), "thor agent evicted, re-registering");
+                tracing::warn!(status = %resp.status(), "runtime-node agent evicted, re-registering");
                 match register(&client, &config).await {
                     Ok(registration) => {
                         *runtime.models.write().await = registration.models;
                         *runtime.session.write().await = Some(registration.session);
                     }
                     Err(err) => {
-                        tracing::warn!(%err, "thor agent re-registration failed, clearing stale session");
+                        tracing::warn!(%err, "runtime-node agent re-registration failed, clearing stale session");
                         *runtime.session.write().await = None;
                     }
                 }
             }
-            Ok(resp) => tracing::warn!(status = %resp.status(), "thor heartbeat rejected"),
-            Err(err) => tracing::warn!(%err, "thor heartbeat failed"),
+            Ok(resp) => tracing::warn!(status = %resp.status(), "runtime-node heartbeat rejected"),
+            Err(err) => tracing::warn!(%err, "runtime-node heartbeat failed"),
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(
@@ -253,7 +253,7 @@ pub async fn drain(
         .read()
         .await
         .clone()
-        .context("thor agent has no active worker session")?;
+        .context("runtime-node agent has no active worker session")?;
     with_internal_token(
         client.post(format!(
             "{}/internal/workers/{}/drain",
@@ -263,9 +263,9 @@ pub async fn drain(
     )
     .send()
     .await
-    .context("thor drain request failed")?
+    .context("runtime-node drain request failed")?
     .error_for_status()
-    .context("thor drain request rejected")?;
+    .context("runtime-node drain request rejected")?;
     Ok(())
 }
 
@@ -279,7 +279,7 @@ pub async fn drain_complete(
         .read()
         .await
         .clone()
-        .context("thor agent has no active worker session")?;
+        .context("runtime-node agent has no active worker session")?;
     with_internal_token(
         client.post(format!(
             "{}/internal/workers/{}/drain-complete",
@@ -289,9 +289,9 @@ pub async fn drain_complete(
     )
     .send()
     .await
-    .context("thor drain-complete request failed")?
+    .context("runtime-node drain-complete request failed")?
     .error_for_status()
-    .context("thor drain-complete request rejected")?;
+    .context("runtime-node drain-complete request rejected")?;
     Ok(())
 }
 

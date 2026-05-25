@@ -25,6 +25,10 @@ ax-engine node adapters mature.
 
 - Binaries built: `cargo build -p ax-serving-cli --release`
   This produces both `ax-serving` and `ax-serving-api` in `target/release/`.
+- Runtime adapter built when using external runtimes:
+  `cargo build -p ax-thor-agent --release`
+  This produces `ax-runtime-agent` and the legacy `ax-thor-agent` alias in
+  `target/release/`.
 - Orchestrator running (see §2)
 - Runtime node available:
   - `ax-serving serve` compatibility worker for local Mac testing
@@ -59,6 +63,67 @@ ax-serving serve \
 
 Each worker auto-registers with the orchestrator through
 `AXS_ORCHESTRATOR_ADDR` or the equivalent `--orchestrator` CLI flag.
+
+### Start a Mac ax-engine runtime node
+
+Run ax-engine with an OpenAI-compatible endpoint, then place `ax-runtime-agent`
+in front of it so AX Serving only owns serving policy and routing:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
+AXS_NODE_RUNTIME=ax_engine \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
+AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_HARDWARE_CLASS=mac \
+AXS_NODE_CLASS=mac-studio \
+AXS_NODE_WORKER_POOL=mac \
+AXS_NODE_MAX_INFLIGHT=8 \
+target/release/ax-runtime-agent
+```
+
+The agent reads `/v1/models` from the runtime endpoint, registers the adapter
+address with AX Serving, sends heartbeats, and proxies OpenAI-compatible
+inference requests to ax-engine.
+
+### Start a PC CUDA vLLM runtime node
+
+Run vLLM's OpenAI-compatible server on the CUDA node, then start the adapter:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://<gateway-host>:19090 \
+AXS_NODE_RUNTIME=vllm \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
+AXS_NODE_ADVERTISED_ADDR=<cuda-node-ip>:18081 \
+AXS_NODE_HARDWARE_CLASS=pc-cuda \
+AXS_NODE_CLASS=pc-cuda \
+AXS_NODE_WORKER_POOL=cuda \
+AXS_NODE_MAX_INFLIGHT=16 \
+target/release/ax-runtime-agent
+```
+
+AX Serving sees this as the same node contract as a Mac node, with a different
+runtime and hardware class.
+
+### Start a NVIDIA Thor vLLM runtime node
+
+Thor deployments should also use vLLM as the runtime owner. The legacy
+`ax-thor-agent` binary and `AXS_THOR_*` variables remain available, but the
+generic runtime-node form is preferred for new deployments:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://<gateway-host>:19090 \
+AXS_NODE_RUNTIME=vllm \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
+AXS_NODE_ADVERTISED_ADDR=<thor-node-ip>:18081 \
+AXS_NODE_HARDWARE_CLASS=thor \
+AXS_NODE_CLASS=thor \
+AXS_NODE_WORKER_POOL=thor \
+AXS_NODE_MAX_INFLIGHT=16 \
+target/release/ax-runtime-agent
+```
 
 ### Verify workers are registered
 
