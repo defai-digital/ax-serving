@@ -1049,9 +1049,9 @@ impl InferenceBackend for LlamaCppBackend {
         };
 
         // Build the input value: string array or token array.
-        let input_json = match inputs {
-            EmbedInput::Strings(texts) => serde_json::to_value(texts)?,
-            EmbedInput::Tokens(seqs) => serde_json::to_value(seqs)?,
+        let (input_json, expected_embeddings) = match inputs {
+            EmbedInput::Strings(texts) => (serde_json::to_value(texts)?, texts.len()),
+            EmbedInput::Tokens(seqs) => (serde_json::to_value(seqs)?, seqs.len()),
         };
 
         let body = serde_json::json!({
@@ -1071,39 +1071,7 @@ impl InferenceBackend for LlamaCppBackend {
             .json()
             .context("decoding /v1/embeddings response")?;
 
-        let prompt_tokens =
-            json_u32_at_pointer_or_zero(&resp, "/usage/prompt_tokens", "prompt_tokens")?;
-
-        let data = resp["data"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("/v1/embeddings response missing 'data' array"))?;
-
-        // Collect in index order — llama-server may reorder batches.
-        let mut indexed: Vec<(usize, Vec<f32>)> = data
-            .iter()
-            .map(|item| {
-                let index = item["index"].as_u64().unwrap_or(0) as usize;
-                let embedding = item["embedding"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("missing 'embedding' in data[{index}]"))?
-                    .iter()
-                    .map(|v| {
-                        v.as_f64()
-                            .map(|f| f as f32)
-                            .ok_or_else(|| anyhow::anyhow!("non-float in embedding array"))
-                    })
-                    .collect::<Result<Vec<f32>>>()?;
-                Ok((index, embedding))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        indexed.sort_unstable_by_key(|(i, _)| *i);
-        let embeddings = indexed.into_iter().map(|(_, v)| v).collect();
-
-        Ok(EmbedResult {
-            embeddings,
-            prompt_tokens,
-        })
+        parse_embeddings_response(&resp, expected_embeddings)
     }
 
     fn eval_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> Result<u32> {
@@ -2149,6 +2117,66 @@ fn json_u32_at_pointer_or_zero(
         .unwrap_or(Ok(0))
 }
 
+fn parse_embeddings_response(
+    resp: &serde_json::Value,
+    expected_embeddings: usize,
+) -> Result<EmbedResult> {
+    let prompt_tokens = json_u32_at_pointer_or_zero(resp, "/usage/prompt_tokens", "prompt_tokens")?;
+
+    let data = resp["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("/v1/embeddings response missing 'data' array"))?;
+    if data.len() != expected_embeddings {
+        anyhow::bail!(
+            "/v1/embeddings response returned {} vectors for {expected_embeddings} inputs",
+            data.len()
+        );
+    }
+
+    let mut embeddings = Vec::with_capacity(expected_embeddings);
+    embeddings.resize_with(expected_embeddings, || None);
+
+    for (position, item) in data.iter().enumerate() {
+        let raw_index = item
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("missing integer 'index' in data[{position}]"))?;
+        let index = usize::try_from(raw_index)
+            .with_context(|| format!("embedding index {raw_index} exceeds usize::MAX"))?;
+        if index >= expected_embeddings {
+            anyhow::bail!("embedding index {index} out of range for {expected_embeddings} inputs");
+        }
+        if embeddings[index].is_some() {
+            anyhow::bail!("duplicate embedding index {index}");
+        }
+
+        let embedding = item["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing 'embedding' in data[{index}]"))?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow::anyhow!("non-float in embedding array"))
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        embeddings[index] = Some(embedding);
+    }
+
+    let embeddings = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            embedding.ok_or_else(|| anyhow::anyhow!("missing embedding index {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(EmbedResult {
+        embeddings,
+        prompt_tokens,
+    })
+}
+
 fn props_token_id(props: Option<&serde_json::Value>, key: &str, default: u32) -> Result<u32> {
     props
         .and_then(|value| {
@@ -2291,6 +2319,73 @@ mod tests {
             json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn parse_embeddings_response_reorders_by_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 1, "embedding": [2.0, 2.5]},
+                {"index": 0, "embedding": [1.0, 1.5]}
+            ],
+            "usage": {"prompt_tokens": 7}
+        });
+
+        let result = parse_embeddings_response(&value, 2).unwrap();
+
+        assert_eq!(result.prompt_tokens, 7);
+        assert_eq!(result.embeddings, vec![vec![1.0, 1.5], vec![2.0, 2.5]]);
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_missing_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"embedding": [1.0]},
+                {"index": 1, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("missing index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("missing integer 'index'"));
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_duplicate_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 0, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("duplicate index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("duplicate embedding index 0"));
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_out_of_range_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 2, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("out-of-range index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("out of range"));
     }
 
     #[test]
