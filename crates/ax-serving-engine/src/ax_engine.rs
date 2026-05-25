@@ -1228,6 +1228,9 @@ mod tests {
                 {"type": "text", "text": "hello "},
                 {"type": "text", "text": "world"}
             ]),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let normalized = normalize_chat_messages(&messages).unwrap();

@@ -2076,6 +2076,28 @@ async fn chat_completions_content_too_large_400() {
 }
 
 #[tokio::test]
+async fn chat_completions_missing_content_without_tool_calls_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model": "any",
+        "messages": [{"role": "assistant"}]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn chat_completions_accepts_valid_body_above_axum_default_limit() {
     let app = make_app_no_auth();
     let messages: Vec<serde_json::Value> = (0..80)
@@ -3651,6 +3673,64 @@ async fn chat_completions_inference_200() {
     assert!(!choices.is_empty());
     assert_eq!(choices[0]["message"]["content"], "hello");
     assert!(json["usage"].is_object());
+}
+
+#[tokio::test]
+async fn chat_completions_accepts_assistant_tool_call_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_echo_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "echo-tools", "path": path.to_string_lossy()}).to_string();
+    rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let infer_body = serde_json::json!({
+        "model": "echo-tools",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup_weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\":72}"},
+            {"role": "user", "content": "thanks"}
+        ],
+        "max_tokens": 16
+    })
+    .to_string();
+
+    let resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(infer_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

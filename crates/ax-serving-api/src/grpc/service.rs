@@ -203,6 +203,9 @@ impl AxServingServiceTrait for AxServingService {
                     .map(|m| ChatMessage {
                         role: m.role.clone(),
                         content: serde_json::Value::String(m.content.clone()),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
                     })
                     .collect(),
             )

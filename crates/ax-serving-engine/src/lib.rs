@@ -221,6 +221,12 @@ pub struct ChatMessage {
     pub role: String,
     /// Plain string or multipart array (e.g. `[{"type":"text",...},{"type":"image_url",...}]`).
     pub content: serde_json::Value,
+    /// Optional display name from OpenAI-compatible chat messages.
+    pub name: Option<String>,
+    /// Raw OpenAI-compatible `tool_calls` array for assistant messages.
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool call ID for `tool` role messages.
+    pub tool_call_id: Option<String>,
 }
 
 /// Parameters controlling the generation sampler.

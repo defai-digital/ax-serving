@@ -91,10 +91,17 @@ pub struct ImageUrl {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InputMessage {
     pub role: String,
-    pub content: MessageContent,
+    #[serde(default)]
+    pub content: Option<MessageContent>,
     /// Optional display name for the speaker (used in system prompts).
     #[serde(default)]
     pub name: Option<String>,
+    /// Tool calls from a prior assistant turn.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool call ID for `tool` role messages.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 /// Message in a chat response — content is always a plain string.

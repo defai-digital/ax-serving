@@ -224,7 +224,10 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 #[derive(Serialize)]
 pub(crate) struct NormalizedMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
+    name: Option<String>,
+    tool_calls: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
 }
 
 fn model_cache_fingerprint(path: &Path) -> String {
@@ -296,12 +299,15 @@ pub(crate) fn build_cache_key(
         .iter()
         .map(|m| NormalizedMessage {
             role: m.role.clone(),
-            content: m.content.as_text(),
+            content: message_content_value(m.content.as_ref()),
+            name: m.name.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
         })
         .collect();
 
     let payload = CacheKeyPayload {
-        version: "v5",
+        version: "v6",
         resolved_model_path,
         model_fingerprint,
         resolved_model_arch,
@@ -327,6 +333,33 @@ pub(crate) fn build_cache_key(
         top_logprobs: req.top_logprobs,
     };
     serde_json::to_vec(&payload).map_err(anyhow::Error::from)
+}
+
+fn message_content_value(content: Option<&MessageContent>) -> serde_json::Value {
+    match content {
+        Some(content) => serde_json::to_value(content).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn validate_chat_message_content(msg: &InputMessage) -> Option<Response> {
+    if msg.content.is_some() {
+        return None;
+    }
+
+    if msg.role.eq_ignore_ascii_case("assistant") && msg.tool_calls.is_some() {
+        return None;
+    }
+
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "message content is required unless assistant tool_calls are present"
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// Cache key payload for text completions (`POST /v1/completions`).
@@ -422,7 +455,14 @@ pub async fn chat_completions(
             .into_response();
     }
     for msg in &req.messages {
-        if msg.content.byte_len() > MAX_CONTENT_BYTES {
+        if let Some(response) = validate_chat_message_content(msg) {
+            return response;
+        }
+        if msg
+            .content
+            .as_ref()
+            .is_some_and(|content| content.byte_len() > MAX_CONTENT_BYTES)
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "message content exceeds 32 KB limit"})),
@@ -475,7 +515,10 @@ pub async fn chat_completions(
         }
     };
 
-    let has_image_input = req.messages.iter().any(|msg| msg.content.has_images());
+    let has_image_input = req
+        .messages
+        .iter()
+        .any(|msg| msg.content.as_ref().is_some_and(MessageContent::has_images));
     if let Some(resp) = validate_multimodal_backend_support(
         has_image_input,
         layer.backend.backend_name_for_handle(entry.handle),
@@ -673,7 +716,10 @@ pub async fn chat_completions(
         .iter()
         .map(|m| ChatMessage {
             role: m.role.clone(),
-            content: serde_json::to_value(&m.content).unwrap_or_default(),
+            content: message_content_value(m.content.as_ref()),
+            name: m.name.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
         })
         .collect();
 

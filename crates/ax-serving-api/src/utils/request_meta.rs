@@ -27,10 +27,26 @@ pub fn estimate_chat_prompt_tokens_u64(messages: &[InputMessage]) -> u64 {
                 .as_deref()
                 .map(estimated_tokens_from_text)
                 .unwrap_or(0);
-            let content_tokens = estimated_tokens_from_text(&msg.content.as_text());
+            let content_tokens = msg
+                .content
+                .as_ref()
+                .map(|content| estimated_tokens_from_text(&content.as_text()))
+                .unwrap_or(0);
+            let tool_call_tokens = msg
+                .tool_calls
+                .as_ref()
+                .map(|tool_calls| estimated_tokens_from_text(&tool_calls.to_string()))
+                .unwrap_or(0);
+            let tool_call_id_tokens = msg
+                .tool_call_id
+                .as_deref()
+                .map(estimated_tokens_from_text)
+                .unwrap_or(0);
             role_tokens
                 .saturating_add(name_tokens)
                 .saturating_add(content_tokens)
+                .saturating_add(tool_call_tokens)
+                .saturating_add(tool_call_id_tokens)
                 .saturating_add(MESSAGE_FRAMING_TOKENS)
         })
         .sum::<u64>()
@@ -95,8 +111,10 @@ mod tests {
     fn msg(role: &str, content: &str) -> InputMessage {
         InputMessage {
             role: role.to_string(),
-            content: MessageContent::Text(content.to_string()),
+            content: Some(MessageContent::Text(content.to_string())),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 

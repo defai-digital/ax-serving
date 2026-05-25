@@ -193,8 +193,10 @@ mod tests {
             model: "default".into(),
             messages: vec![InputMessage {
                 role: "user".into(),
-                content: MessageContent::Text(content.into()),
+                content: Some(MessageContent::Text(content.into())),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             temperature: 0.0,
@@ -354,6 +356,38 @@ mod tests {
             k1, k2,
             "stop sequence order is forwarded to the backend and must affect cache key"
         );
+    }
+
+    #[test]
+    fn cache_key_preserves_tool_call_history() {
+        let mut r1 = mk_req("Hello");
+        r1.messages = vec![InputMessage {
+            role: "assistant".into(),
+            content: None,
+            name: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }])),
+            tool_call_id: None,
+        }];
+        let mut r2 = mk_req("Hello");
+        r2.messages = vec![InputMessage {
+            role: "assistant".into(),
+            content: None,
+            name: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }])),
+            tool_call_id: None,
+        }];
+
+        let k1 = build_cache_key(&r1, "model.gguf", "llama", Some(16)).unwrap();
+        let k2 = build_cache_key(&r2, "model.gguf", "llama", Some(16)).unwrap();
+        assert_ne!(k1, k2, "tool-call history must affect chat cache keys");
     }
 
     #[test]

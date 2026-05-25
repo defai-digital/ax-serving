@@ -123,6 +123,9 @@ impl AxModel {
             .map(|(role, content)| ChatMessage {
                 role,
                 content: serde_json::Value::String(content),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
             })
             .collect();
 

@@ -861,6 +861,9 @@ fn build_inference_input(prompt: String, use_chat_template: bool) -> GenerateInp
         GenerateInput::Chat(vec![ax_serving_engine::ChatMessage {
             role: "user".into(),
             content: serde_json::Value::String(prompt),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }])
     } else {
         GenerateInput::Text(prompt)
@@ -888,6 +891,9 @@ mod tests {
                 let expected = ChatMessage {
                     role: "user".into(),
                     content: json!("hello world"),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 };
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].role, expected.role);

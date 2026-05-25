@@ -1357,7 +1357,22 @@ fn build_chat_completions_body(
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = msgs
         .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .map(|m| {
+            let mut message = serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            });
+            if let Some(name) = &m.name {
+                message["name"] = serde_json::Value::String(name.clone());
+            }
+            if let Some(tool_calls) = &m.tool_calls {
+                message["tool_calls"] = tool_calls.clone();
+            }
+            if let Some(tool_call_id) = &m.tool_call_id {
+                message["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+            }
+            message
+        })
         .collect();
 
     let mut body = serde_json::json!({
@@ -2585,6 +2600,9 @@ mod tests {
         let msgs = vec![crate::ChatMessage {
             role: "user".into(),
             content: serde_json::Value::String("hi".into()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let params = GenerationParams {
             stream: false,
@@ -2593,6 +2611,34 @@ mod tests {
         let body = build_chat_completions_body(&msgs, &params, true);
         assert_eq!(body["stream"].as_bool(), Some(false));
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn chat_body_preserves_tool_call_message_metadata() {
+        let msgs = vec![
+            crate::ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }])),
+                tool_call_id: None,
+            },
+            crate::ChatMessage {
+                role: "tool".into(),
+                content: serde_json::Value::String("{\"ok\":true}".into()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+        let body = build_chat_completions_body(&msgs, &GenerationParams::default(), true);
+        assert_eq!(body["messages"][0]["content"], serde_json::Value::Null);
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
     }
 
     #[test]
