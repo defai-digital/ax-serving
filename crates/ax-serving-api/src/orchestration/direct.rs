@@ -40,7 +40,11 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
     }
 }
 
@@ -709,6 +713,13 @@ mod tests {
         drop(g1);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn inflight_guard_drop_does_not_underflow_zero_counter() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        drop(InflightGuard(Arc::clone(&counter)));
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 

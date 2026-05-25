@@ -262,8 +262,10 @@ pub struct WorkerEntry {
     /// Operations the worker supports, e.g. `llm`, `embedding`, `vision`.
     pub supported_operations: Vec<String>,
     pub max_inflight: usize,
-    /// Atomically updated by the dispatcher without taking the registry lock.
+    /// Dispatcher-owned in-flight count, updated without taking the registry lock.
     pub inflight: Arc<AtomicUsize>,
+    /// Last in-flight count reported by the worker heartbeat.
+    pub reported_inflight: usize,
     pub health: WorkerHealth,
     pub last_heartbeat: Instant,
     pub drain: bool,
@@ -709,6 +711,7 @@ impl WorkerRegistry {
                 supported_operations,
                 max_inflight,
                 inflight: Arc::new(AtomicUsize::new(0)),
+                reported_inflight: 0,
                 health: WorkerHealth::Healthy,
                 last_heartbeat: Instant::now(),
                 drain: false,
@@ -744,7 +747,7 @@ impl WorkerRegistry {
             Some(mut e) => {
                 e.last_heartbeat = Instant::now();
                 e.health = WorkerHealth::Healthy;
-                e.inflight.store(req.inflight, Ordering::Relaxed);
+                e.reported_inflight = req.inflight.min(MAX_WORKER_INFLIGHT);
                 e.thermal_state = req.thermal_state;
                 e.rss_bytes = req.rss_bytes;
                 // Authoritative capability snapshot from worker heartbeat.
@@ -1060,7 +1063,7 @@ impl Default for WorkerRegistry {
 }
 
 fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
-    let inflight = e.inflight.load(Ordering::Relaxed);
+    let inflight = effective_inflight(e);
     let kv_utilization = worker_kv_utilization(e);
     let batch_utilization = worker_batch_utilization(e);
     WorkerSnapshot {
@@ -1175,13 +1178,17 @@ fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
     WorkerStatus {
         id: e.id,
         addr: e.addr,
-        inflight: e.inflight.load(Ordering::Relaxed),
+        inflight: effective_inflight(e),
         max_inflight: e.max_inflight,
         active_sequences: e.active_sequences,
         ttft_p95_ms: e.ttft_p95_ms,
         kv_utilization,
         batch_headroom,
     }
+}
+
+fn effective_inflight(e: &WorkerEntry) -> usize {
+    e.inflight.load(Ordering::Relaxed).max(e.reported_inflight)
 }
 
 fn worker_kv_utilization(e: &WorkerEntry) -> Option<f64> {
@@ -1955,6 +1962,57 @@ mod tests {
         assert_eq!(snap.thermal_state, "serious");
         assert_eq!(snap.rss_bytes, 1_073_741_824);
         assert_eq!(snap.inflight, 3);
+    }
+
+    #[test]
+    fn heartbeat_does_not_overwrite_dispatcher_inflight_counter() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let counter = r.inflight_counter(id).expect("registered worker counter");
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snap.inflight, 1,
+            "heartbeat must not erase dispatcher-owned in-flight accounting"
+        );
+        assert_eq!(r.eligible_workers("m1")[0].inflight, 1);
+
+        counter.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(r.get_snapshot(id).unwrap().inflight, 0);
+    }
+
+    #[test]
+    fn heartbeat_reported_inflight_is_used_when_dispatch_counter_is_lower() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 2,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        assert_eq!(r.get_snapshot(id).unwrap().inflight, 2);
+        assert_eq!(r.eligible_workers("m1")[0].inflight, 2);
     }
 
     #[test]
