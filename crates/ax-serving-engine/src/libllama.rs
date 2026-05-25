@@ -664,8 +664,8 @@ impl InferenceBackend for LibLlamaBackend {
                     .collect::<Result<_>>()?,
                 EmbedInput::Tokens(seqs) => seqs
                     .iter()
-                    .map(|s| s.iter().map(|&t| t as i32).collect())
-                    .collect(),
+                    .map(|s| backend_tokens_to_llama_tokens(s))
+                    .collect::<Result<_>>()?,
             };
 
             for mut tokens in sequences {
@@ -1267,8 +1267,8 @@ mod tests {
     use crate::GenerateEvent;
 
     use super::{
-        backend_token_to_llama_token, flush_stream_token_batch, llama_tokens_to_backend_tokens,
-        push_stream_token_piece,
+        backend_token_to_llama_token, backend_tokens_to_llama_tokens, flush_stream_token_batch,
+        llama_tokens_to_backend_tokens, push_stream_token_piece,
     };
 
     #[test]
@@ -1359,6 +1359,13 @@ mod tests {
     #[test]
     fn backend_token_conversion_rejects_ids_outside_llama_range() {
         let err = backend_token_to_llama_token(i32::MAX as u32 + 1).unwrap_err();
+
+        assert!(err.to_string().contains("llama_token range"));
+    }
+
+    #[test]
+    fn backend_token_sequence_conversion_rejects_ids_outside_llama_range() {
+        let err = backend_tokens_to_llama_tokens(&[0, i32::MAX as u32 + 1]).unwrap_err();
 
         assert!(err.to_string().contains("llama_token range"));
     }
