@@ -276,6 +276,7 @@ pub fn effective_max_tokens(request_value: Option<u32>, server_default: u32) -> 
 pub fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "length" => "length",
+        "tool_calls" => "tool_calls",
         "content_filter" => "content_filter",
         _ => "stop",
     }
@@ -286,7 +287,8 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{
-        build_generation_params, validate_model_identifier, validate_multimodal_backend_support,
+        build_generation_params, map_stop_reason, validate_model_identifier,
+        validate_multimodal_backend_support,
     };
 
     #[test]
@@ -334,6 +336,14 @@ mod tests {
     fn validate_multimodal_backend_support_skips_non_multimodal() {
         assert!(validate_multimodal_backend_support(false, Some("native")).is_none());
         assert!(validate_multimodal_backend_support(false, None).is_none());
+    }
+
+    #[test]
+    fn map_stop_reason_preserves_openai_finish_reasons() {
+        assert_eq!(map_stop_reason("length"), "length");
+        assert_eq!(map_stop_reason("tool_calls"), "tool_calls");
+        assert_eq!(map_stop_reason("content_filter"), "content_filter");
+        assert_eq!(map_stop_reason("unknown"), "stop");
     }
 
     #[test]
