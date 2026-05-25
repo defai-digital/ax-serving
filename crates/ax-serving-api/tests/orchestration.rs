@@ -1211,6 +1211,8 @@ async fn test_admin_status_requires_auth_and_returns_operational_summary() {
     assert_eq!(json["auth_required"], true);
     assert_eq!(json["workers"]["total"], 1);
     assert_eq!(json["workers"]["eligible"], 1);
+    assert_eq!(json["workers"]["runtimes"]["ax_engine"]["workers"], 1);
+    assert_eq!(json["workers"]["runtimes"]["ax_engine"]["eligible"], 1);
     assert!(json["license"]["edition"].is_string());
 }
 

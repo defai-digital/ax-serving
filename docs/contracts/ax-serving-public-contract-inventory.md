@@ -90,8 +90,8 @@ Stable contract family:
 - startup / diagnostics payloads where publicly documented
 - admin status and fleet summaries where documented
 - audit listing response shape where documented
-- fleet grouping by pool, node class, backend compatibility hint, and runtime
-  class where documented
+- fleet and admin-status grouping by pool, node class, backend compatibility
+  hint, and runtime class where documented
 
 Stability rule:
 

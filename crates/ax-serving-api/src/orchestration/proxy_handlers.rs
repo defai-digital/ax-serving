@@ -381,6 +381,7 @@ pub(super) async fn proxy_admin_status(
     let total_workers = workers.len();
     let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
     let total_active_sequences: usize = workers.iter().map(|w| w.active_sequences).sum();
+    let runtime_buckets = runtime_fleet_buckets(&workers);
     let eligible = layer.registry.eligible_healthy_count();
     let qm = &layer.queue.metrics;
 
@@ -399,6 +400,7 @@ pub(super) async fn proxy_admin_status(
             "eligible": eligible,
             "total_inflight": total_inflight,
             "total_active_sequences": total_active_sequences,
+            "runtimes": runtime_buckets,
         },
         "queue": {
             "active": layer.queue.active(),
@@ -430,6 +432,7 @@ pub(super) async fn proxy_admin_diagnostics(
     let workers = layer.registry.list_all();
     let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
     let total_active_sequences: usize = workers.iter().map(|w| w.active_sequences).sum();
+    let runtime_buckets = runtime_fleet_buckets(&workers);
     let eligible = layer.registry.eligible_healthy_count();
     let qm = &layer.queue.metrics;
     Json(serde_json::json!({
@@ -462,6 +465,7 @@ pub(super) async fn proxy_admin_diagnostics(
                 "eligible": eligible,
                 "total_inflight": total_inflight,
                 "total_active_sequences": total_active_sequences,
+                "runtimes": runtime_buckets,
             },
             "reroute_total": layer.dispatcher.reroutes(),
             "queue": {
@@ -576,6 +580,16 @@ fn accumulate_fleet_bucket(
     } else {
         warn!(key = %key, "unexpected non-object fleet bucket encountered");
     }
+}
+
+fn runtime_fleet_buckets(
+    workers: &[super::registry::WorkerSnapshot],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut runtimes = serde_json::Map::new();
+    for worker in workers {
+        accumulate_fleet_bucket(&mut runtimes, &worker.runtime, worker);
+    }
+    runtimes
 }
 
 fn increment_bucket(

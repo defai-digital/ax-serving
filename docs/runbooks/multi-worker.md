@@ -230,6 +230,9 @@ curl -s http://127.0.0.1:18080/health | jq .
 curl -s http://127.0.0.1:18080/v1/admin/status \
   -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
 
+curl -s http://127.0.0.1:18080/v1/admin/status \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.workers.runtimes'
+
 # Detailed metrics including per-worker inflight and reroute count
 curl -s http://127.0.0.1:18080/v1/metrics | jq .
 
