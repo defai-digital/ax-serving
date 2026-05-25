@@ -305,26 +305,55 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_normalizes_message_whitespace() {
+    fn cache_key_preserves_message_whitespace() {
         let r1 = mk_req("Hello world");
         let r2 = mk_req("  Hello world  ");
         let k1 = build_cache_key(&r1, "model.gguf", "llama", Some(16)).unwrap();
         let k2 = build_cache_key(&r2, "model.gguf", "llama", Some(16)).unwrap();
-        assert_eq!(
+        assert_ne!(
             k1, k2,
-            "leading/trailing whitespace must not affect cache key"
+            "leading/trailing whitespace changes prompt tokenization and must affect cache key"
         );
     }
 
     #[test]
-    fn cache_key_normalizes_role_case() {
+    fn cache_key_preserves_role_case() {
         let mut r1 = mk_req("Hello");
         r1.messages[0].role = "User".into();
         let mut r2 = mk_req("Hello");
         r2.messages[0].role = "user".into();
         let k1 = build_cache_key(&r1, "model.gguf", "llama", Some(16)).unwrap();
         let k2 = build_cache_key(&r2, "model.gguf", "llama", Some(16)).unwrap();
-        assert_eq!(k1, k2, "role case must not affect cache key");
+        assert_ne!(
+            k1, k2,
+            "role casing is sent to the backend and must affect cache key"
+        );
+    }
+
+    #[test]
+    fn text_cache_key_preserves_prompt_whitespace() {
+        let r1 = mk_completion_req("Hello world");
+        let r2 = mk_completion_req("  Hello world  ");
+        let k1 = build_text_cache_key(&r1, "model.gguf", "llama", Some(16)).unwrap();
+        let k2 = build_text_cache_key(&r2, "model.gguf", "llama", Some(16)).unwrap();
+        assert_ne!(
+            k1, k2,
+            "text completion prompt whitespace changes tokenization and must affect cache key"
+        );
+    }
+
+    #[test]
+    fn cache_key_preserves_stop_sequence_order() {
+        let mut r1 = mk_req("Hello");
+        r1.stop = Some(StopSeqs::Many(vec!["ab".into(), "a".into()]));
+        let mut r2 = mk_req("Hello");
+        r2.stop = Some(StopSeqs::Many(vec!["a".into(), "ab".into()]));
+        let k1 = build_cache_key(&r1, "model.gguf", "llama", Some(16)).unwrap();
+        let k2 = build_cache_key(&r2, "model.gguf", "llama", Some(16)).unwrap();
+        assert_ne!(
+            k1, k2,
+            "stop sequence order is forwarded to the backend and must affect cache key"
+        );
     }
 
     #[test]

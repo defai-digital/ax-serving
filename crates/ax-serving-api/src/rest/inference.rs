@@ -242,12 +242,13 @@ fn model_cache_fingerprint(path: &Path) -> String {
 
 /// Cache key payload.
 ///
-/// # Normalization rules
+/// # Keying rules
 /// - `requested_model_id` is dropped: the resolved path already identifies the
 ///   loaded model, so model-alias changes no longer bust the cache.
 /// - `model_fingerprint` includes file metadata so cache entries invalidate
 ///   when weights are replaced in place at the same path.
-/// - `messages`: role lowercased, content trimmed (leading/trailing whitespace).
+/// - `messages`: role and text content are preserved exactly as sent to the
+///   backend. Whitespace and role casing can affect tokenization/templates.
 /// - Floating-point params serialized with 4-decimal precision to absorb f32
 ///   representation noise (`0.6999999` and `0.7` both become `"0.7000"`).
 #[derive(Serialize)]
@@ -294,13 +295,13 @@ pub(crate) fn build_cache_key(
         .messages
         .iter()
         .map(|m| NormalizedMessage {
-            role: m.role.to_lowercase(),
-            content: m.content.as_text().trim().to_string(),
+            role: m.role.clone(),
+            content: m.content.as_text(),
         })
         .collect();
 
     let payload = CacheKeyPayload {
-        version: "v4",
+        version: "v5",
         resolved_model_path,
         model_fingerprint,
         resolved_model_arch,
@@ -312,11 +313,7 @@ pub(crate) fn build_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
-        stop: req.stop.as_ref().map(|s| {
-            let mut v = s.clone().into_vec();
-            v.sort();
-            v
-        }),
+        stop: req.stop.as_ref().map(|s| s.clone().into_vec()),
         frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
         presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
         grammar: req.grammar.as_deref(),
@@ -334,7 +331,7 @@ pub(crate) fn build_cache_key(
 
 /// Cache key payload for text completions (`POST /v1/completions`).
 ///
-/// Normalisation mirrors `CacheKeyPayload`: prompt is trimmed, floats at 4dp.
+/// Keying mirrors `CacheKeyPayload`: prompt is preserved exactly, floats at 4dp.
 #[derive(Serialize)]
 pub(crate) struct TextCacheKeyPayload<'a> {
     version: &'static str,
@@ -371,12 +368,12 @@ pub(crate) fn build_text_cache_key(
 ) -> anyhow::Result<Vec<u8>> {
     let model_fingerprint = model_cache_fingerprint(Path::new(resolved_model_path));
     let payload = TextCacheKeyPayload {
-        version: "v3",
+        version: "v4",
         kind: "text_completion",
         resolved_model_path,
         model_fingerprint,
         resolved_model_arch,
-        prompt: req.prompt.trim(),
+        prompt: &req.prompt,
         temperature: format!("{:.4}", req.temperature),
         top_p: format!("{:.4}", req.top_p),
         min_p: req.min_p.map(|v| format!("{v:.4}")),
@@ -384,11 +381,7 @@ pub(crate) fn build_text_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
-        stop: req.stop.as_ref().map(|s| {
-            let mut v = s.clone().into_vec();
-            v.sort();
-            v
-        }),
+        stop: req.stop.as_ref().map(|s| s.clone().into_vec()),
         frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
         presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
         grammar: req.grammar.as_deref(),
