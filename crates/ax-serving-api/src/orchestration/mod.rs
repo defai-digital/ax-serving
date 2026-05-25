@@ -70,6 +70,18 @@ fn is_loopback_bind_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn parse_global_queue_policy(raw: &str) -> Result<OverloadPolicy> {
+    match raw.to_lowercase().as_str() {
+        "queue" => Ok(OverloadPolicy::Queue),
+        "reject" => Ok(OverloadPolicy::Reject),
+        "shed_oldest" | "shedoldest" => Ok(OverloadPolicy::ShedOldest),
+        other => anyhow::bail!(
+            "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest",
+            other
+        ),
+    }
+}
+
 // ── OrchestratorLayer ─────────────────────────────────────────────────────────
 
 /// Shared state for the orchestrator's public router.
@@ -101,11 +113,7 @@ impl OrchestratorLayer {
         let retry_after_secs = config.retry_after_secs;
         let pool_max_idle = config.pool_max_idle_per_host;
         let timeout_secs = config.request_timeout_secs;
-        let queue_policy = match config.global_queue_policy.to_lowercase().as_str() {
-            "shed_oldest" | "shedoldest" => OverloadPolicy::ShedOldest,
-            "reject" => OverloadPolicy::Reject,
-            _ => OverloadPolicy::Queue,
-        };
+        let queue_policy = parse_global_queue_policy(&config.global_queue_policy)?;
         let queue_config = GlobalQueueConfig {
             max_concurrent: config.global_queue_max,
             max_queue_depth: config.global_queue_depth,
@@ -392,4 +400,28 @@ pub async fn start_orchestrator(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orchestrator_layer_rejects_unknown_global_queue_policy() {
+        let config = OrchestratorConfig {
+            global_queue_policy: "drop_newest".into(),
+            ..Default::default()
+        };
+
+        let err = match OrchestratorLayer::new(
+            config,
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        ) {
+            Ok(_) => panic!("invalid global queue policy should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("global_queue_policy"), "got: {err}");
+    }
 }

@@ -415,6 +415,13 @@ impl ServeConfig {
         if self.orchestrator.global_queue_wait_ms == 0 {
             anyhow::bail!("global_queue_wait_ms must be > 0");
         }
+        const VALID_GLOBAL_QUEUE_POLICIES: &[&str] = &["queue", "reject", "shed_oldest"];
+        if !VALID_GLOBAL_QUEUE_POLICIES.contains(&self.orchestrator.global_queue_policy.as_str()) {
+            anyhow::bail!(
+                "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest",
+                self.orchestrator.global_queue_policy
+            );
+        }
         const VALID_DISPATCH: &[&str] = &[
             "least_inflight",
             "weighted_round_robin",
@@ -803,6 +810,14 @@ mod tests {
         cfg.orchestrator.global_queue_depth = 100; // less than max
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("global_queue_depth"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_global_queue_policy() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.global_queue_policy = "drop_newest".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("global_queue_policy"), "got: {err}");
     }
 
     #[test]
