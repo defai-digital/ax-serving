@@ -130,4 +130,4 @@ Do not add OpenTUI, Bun, or TypeScript dependencies to the AX Serving Rust works
 
 Useful follow-up contracts for AX Code automation:
 
-- `ax-serving support-bundle --redact --output <path>`
+- `ax-serving support-bundle --output <path>`

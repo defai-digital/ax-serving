@@ -169,9 +169,37 @@ enum Command {
         /// Bearer token. Defaults to the first AXS_API_KEY token when set.
         #[arg(long)]
         api_key: Option<String>,
+        /// Include authenticated gateway diagnostics and recovery actions.
+        #[arg(long)]
+        diagnostics: bool,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
         json: bool,
+    },
+    /// Collect a redacted diagnostics bundle for support escalation.
+    SupportBundle {
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Optional output path for the redacted JSON bundle.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Emit the redacted JSON bundle to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate AX Fabric-facing serving contracts.
+    Fabric {
+        #[command(subcommand)]
+        command: FabricCommand,
+    },
+    /// Operate registered gateway workers.
+    Workers {
+        #[command(subcommand)]
+        command: WorkersCommand,
     },
     /// Run a minimal OpenAI-compatible chat completion request.
     SmokeTest {
@@ -203,6 +231,103 @@ enum ConfigCommand {
         /// Config file to validate. Defaults to the normal AXS_CONFIG/search path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FabricCommand {
+    /// Validate the stable AX Fabric runtime endpoints.
+    Validate {
+        /// Base URL of the worker or API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkersCommand {
+    /// List registered workers.
+    List {
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one registered worker.
+    Get {
+        /// Worker ID.
+        id: String,
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a worker draining.
+    Drain {
+        /// Worker ID.
+        id: String,
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Wait until inflight reaches zero, then call drain-complete.
+        #[arg(long)]
+        complete_when_idle: bool,
+        /// Maximum time to wait for idle when --complete-when-idle is set.
+        #[arg(long, default_value_t = 30)]
+        idle_timeout_secs: u64,
+        /// Poll interval for --complete-when-idle.
+        #[arg(long, default_value_t = 1000)]
+        poll_interval_ms: u64,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complete drain and remove a worker from the gateway registry.
+    DrainComplete {
+        /// Worker ID.
+        id: String,
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit machine-readable JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force-remove a worker from the gateway registry.
+    Remove {
+        /// Worker ID.
+        id: String,
+        /// Base URL of the API gateway.
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
+        #[arg(long)]
+        api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
         json: bool,
@@ -362,7 +487,63 @@ fn main() -> Result<()> {
         Some(Command::Config { command }) => match command {
             ConfigCommand::Validate { config, json } => support::run_config_validate(config, json),
         },
-        Some(Command::Status { url, api_key, json }) => support::run_status(url, api_key, json),
+        Some(Command::Status {
+            url,
+            api_key,
+            diagnostics,
+            json,
+        }) => support::run_status(url, api_key, diagnostics, json),
+        Some(Command::SupportBundle {
+            url,
+            api_key,
+            output,
+            json,
+        }) => support::run_support_bundle(url, api_key, output, json),
+        Some(Command::Fabric { command }) => match command {
+            FabricCommand::Validate { url, api_key, json } => {
+                support::run_fabric_validate(url, api_key, json)
+            }
+        },
+        Some(Command::Workers { command }) => match command {
+            WorkersCommand::List { url, api_key, json } => {
+                support::run_workers_list(url, api_key, json)
+            }
+            WorkersCommand::Get {
+                id,
+                url,
+                api_key,
+                json,
+            } => support::run_worker_get(url, id, api_key, json),
+            WorkersCommand::Drain {
+                id,
+                url,
+                api_key,
+                complete_when_idle,
+                idle_timeout_secs,
+                poll_interval_ms,
+                json,
+            } => support::run_worker_drain(
+                url,
+                id,
+                api_key,
+                complete_when_idle,
+                idle_timeout_secs,
+                poll_interval_ms,
+                json,
+            ),
+            WorkersCommand::DrainComplete {
+                id,
+                url,
+                api_key,
+                json,
+            } => support::run_worker_drain_complete(url, id, api_key, json),
+            WorkersCommand::Remove {
+                id,
+                url,
+                api_key,
+                json,
+            } => support::run_worker_remove(url, id, api_key, json),
+        },
         Some(Command::SmokeTest {
             url,
             model,

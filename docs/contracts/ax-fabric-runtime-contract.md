@@ -32,6 +32,12 @@ This contract defines:
 
 Anything outside this list should be treated as implementation detail unless separately documented.
 
+Operators and integration CI can validate the read-side contract with:
+
+```bash
+ax-serving fabric validate --url http://127.0.0.1:18080
+```
+
 ## Health Contract
 
 `GET /health` always returns HTTP `200` when the process is alive enough to answer.
@@ -43,6 +49,14 @@ Important fields:
 - `model_available`: whether at least one model is loaded
 - `reason`: present when degraded
 - `loaded_model_count`: number of currently loaded models
+
+Gateway-mode deployments expose worker readiness instead of single-runtime
+readiness:
+
+- `workers.eligible`: number of healthy, non-draining workers that can accept
+  requests
+- `workers.healthy`, `workers.unhealthy`, `workers.draining`: fleet health
+  counters
 
 Interpretation:
 
@@ -59,6 +73,8 @@ Interpretation:
 AX Fabric integration rule:
 
 - treat `ready=true` as "the runtime can answer requests"
+- for gateway-mode deployments, treat `workers.eligible > 0` as "the serving
+  endpoint can dispatch requests"
 - treat `model_available=true` as "a model-backed workload can be dispatched now"
 - treat `status=degraded` with `reason=no_models_loaded` as a recoverable startup state, not a process failure
 
@@ -168,7 +184,9 @@ Any other `encoding_format` should be treated as client error.
 
 `GET /v1/metrics`
 
-AX Fabric may rely on the following scheduler/runtime keys existing:
+AX Fabric may receive one of two stable metrics profiles.
+
+Single-runtime endpoint profile:
 
 - `scheduler.queue_depth`
 - `scheduler.inflight_count`
@@ -181,6 +199,22 @@ AX Fabric may rely on the following scheduler/runtime keys existing:
 - `scheduler.split_scheduler_enabled`
 - `loaded_models`
 - `thermal`
+
+Gateway endpoint profile:
+
+- `mode`
+- `policy`
+- `workers.healthy`
+- `workers.unhealthy`
+- `workers.draining`
+- `total_inflight`
+- `reroute_total`
+- `queue.active`
+- `queue.queued`
+- `queue.rejected_total`
+- `queue.shed_total`
+- `queue.timeout_total`
+- `worker_detail`
 
 These metrics are intended for readiness decisions, integration diagnostics, and local operator visibility. They are not a replacement for request-level success criteria.
 
@@ -222,3 +256,4 @@ The following are not treated as a stable AX Fabric integration contract in `v1.
   - `scheduler.prefill_tokens_active`
   - `scheduler.decode_sequences_active`
   - `scheduler.split_scheduler_enabled`
+- gateway metrics other than the gateway endpoint profile listed above

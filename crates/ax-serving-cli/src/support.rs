@@ -1,24 +1,31 @@
 //! AX Code support contracts: config validation, status, and smoke tests.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::output::{emit_json_or_human, exit_if};
+use crate::output::{emit_json, emit_json_or_human, exit_if};
 use ax_serving_api::config::ServeConfig;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const COMMAND_CONFIG_VALIDATE: &str = "ax-serving config validate";
 const COMMAND_STATUS: &str = "ax-serving status";
 const COMMAND_SMOKE_TEST: &str = "ax-serving smoke-test";
+const COMMAND_SUPPORT_BUNDLE: &str = "ax-serving support-bundle";
+const COMMAND_FABRIC_VALIDATE: &str = "ax-serving fabric validate";
+const COMMAND_WORKERS: &str = "ax-serving workers";
+const ENDPOINT_DIAGNOSTICS: &str = "diagnostics";
 const STATUS_OK: &str = "ok";
 const STATUS_FAIL: &str = "fail";
 const STATUS_DEGRADED: &str = "degraded";
 const STATUS_UNREACHABLE: &str = "unreachable";
+const FABRIC_PROFILE_GATEWAY: &str = "gateway";
+const FABRIC_PROFILE_SINGLE_RUNTIME: &str = "single_runtime";
+const FABRIC_PROFILE_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, Serialize)]
 struct ConfigValidateReport {
@@ -70,6 +77,18 @@ struct StatusReport {
     status: &'static str,
     reachable: bool,
     endpoints: Vec<EndpointReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recommended_actions: Vec<StatusRecommendedAction>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct StatusRecommendedAction {
+    action: String,
+    runtime: Option<String>,
+    reason: Option<String>,
+    operator_hint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggested_commands: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +104,51 @@ struct SmokeTestReport {
     response: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerLifecycleReport {
+    command: &'static str,
+    base_url: String,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_id: Option<String>,
+    status: &'static str,
+    ok: bool,
+    steps: Vec<EndpointReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FabricValidateReport {
+    command: &'static str,
+    base_url: String,
+    status: &'static str,
+    ready: bool,
+    profile: &'static str,
+    endpoints: Vec<EndpointReport>,
+    checks: Vec<FabricCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct FabricCheck {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleReport {
+    command: &'static str,
+    base_url: String,
+    status: &'static str,
+    reachable: bool,
+    generated_at_unix_ms: u128,
+    redaction: &'static str,
+    endpoints: Vec<EndpointReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
 }
 
 pub fn run_config_validate(config: Option<PathBuf>, json: bool) -> Result<()> {
@@ -134,11 +198,16 @@ fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeC
     )
 }
 
-pub fn run_status(url: String, api_key: Option<String>, json: bool) -> Result<()> {
+pub fn run_status(
+    url: String,
+    api_key: Option<String>,
+    diagnostics: bool,
+    json: bool,
+) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
     let token = effective_api_key(api_key);
-    let endpoints = vec![
+    let mut endpoints = vec![
         get_json_endpoint(&client, &base_url, "/health", token.as_deref(), "health"),
         get_json_endpoint(&client, &base_url, "/v1/models", token.as_deref(), "models"),
         get_json_endpoint(
@@ -149,13 +218,24 @@ pub fn run_status(url: String, api_key: Option<String>, json: bool) -> Result<()
             "metrics",
         ),
     ];
+    if diagnostics {
+        endpoints.push(get_json_endpoint(
+            &client,
+            &base_url,
+            "/v1/admin/diagnostics",
+            token.as_deref(),
+            ENDPOINT_DIAGNOSTICS,
+        ));
+    }
     let (reachable, status) = status_from_endpoints(&endpoints);
+    let recommended_actions = diagnostics_recommended_actions(&endpoints);
     let report = StatusReport {
         command: COMMAND_STATUS,
         base_url,
         status,
         reachable,
         endpoints,
+        recommended_actions,
     };
 
     emit_json_or_human(json, &report, print_status_human)?;
@@ -209,11 +289,217 @@ pub fn run_smoke_test(
     Ok(())
 }
 
+pub fn run_support_bundle(
+    url: String,
+    api_key: Option<String>,
+    output: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let mut endpoints = support_bundle_endpoints()
+        .into_iter()
+        .map(|(name, path)| get_json_endpoint(&client, &base_url, path, token.as_deref(), name))
+        .collect::<Vec<_>>();
+    for endpoint in &mut endpoints {
+        if let Some(body) = &mut endpoint.body {
+            redact_sensitive_value(body);
+        }
+    }
+    let (reachable, status) = status_from_endpoints(&endpoints);
+    let output_label = output.as_ref().map(|path| path.display().to_string());
+    let report = SupportBundleReport {
+        command: COMMAND_SUPPORT_BUNDLE,
+        base_url,
+        status,
+        reachable,
+        generated_at_unix_ms: current_unix_ms(),
+        redaction: "recursive sensitive-key redaction applied",
+        endpoints,
+        output: output_label.clone(),
+    };
+
+    if let Some(path) = output {
+        std::fs::write(&path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("failed to write support bundle {}", path.display()))?;
+    }
+    if json {
+        emit_json(&report)?;
+    } else {
+        print_support_bundle_human(&report);
+    }
+    exit_if(!report.reachable);
+    Ok(())
+}
+
+pub fn run_fabric_validate(url: String, api_key: Option<String>, json: bool) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let endpoints = fabric_validate_endpoints()
+        .into_iter()
+        .map(|(name, path)| get_json_endpoint(&client, &base_url, path, token.as_deref(), name))
+        .collect::<Vec<_>>();
+    let report = build_fabric_validate_report(base_url, endpoints);
+
+    emit_json_or_human(json, &report, print_fabric_validate_human)?;
+    exit_if(!report.ready);
+    Ok(())
+}
+
+pub fn run_workers_list(url: String, api_key: Option<String>, json: bool) -> Result<()> {
+    run_worker_get_like(url, None, api_key, "list", "/v1/workers".to_string(), json)
+}
+
+pub fn run_worker_get(
+    url: String,
+    worker_id: String,
+    api_key: Option<String>,
+    json: bool,
+) -> Result<()> {
+    run_worker_get_like(
+        url,
+        Some(worker_id.clone()),
+        api_key,
+        "get",
+        worker_path(&worker_id, ""),
+        json,
+    )
+}
+
+pub fn run_worker_drain(
+    url: String,
+    worker_id: String,
+    api_key: Option<String>,
+    complete_when_idle: bool,
+    idle_timeout_secs: u64,
+    poll_interval_ms: u64,
+    json: bool,
+) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let mut steps = Vec::new();
+
+    steps.push(send_worker_step(
+        &client,
+        &base_url,
+        &worker_path(&worker_id, "/drain"),
+        token.as_deref(),
+        "drain",
+        WorkerHttpMethod::Post,
+    ));
+
+    let mut workflow_error = None;
+    if steps.last().is_some_and(|step| step.ok) && complete_when_idle {
+        workflow_error = wait_for_worker_idle_and_complete(
+            &client,
+            &base_url,
+            &worker_id,
+            token.as_deref(),
+            idle_timeout_secs,
+            poll_interval_ms,
+            &mut steps,
+        );
+    }
+
+    let report = worker_lifecycle_report(base_url, "drain", Some(worker_id), steps, workflow_error);
+    emit_json_or_human(json, &report, print_worker_lifecycle_human)?;
+    exit_if(!report.ok);
+    Ok(())
+}
+
+pub fn run_worker_drain_complete(
+    url: String,
+    worker_id: String,
+    api_key: Option<String>,
+    json: bool,
+) -> Result<()> {
+    run_worker_mutation(
+        url,
+        worker_id,
+        api_key,
+        json,
+        "drain-complete",
+        "/drain-complete",
+        WorkerHttpMethod::Post,
+    )
+}
+
+pub fn run_worker_remove(
+    url: String,
+    worker_id: String,
+    api_key: Option<String>,
+    json: bool,
+) -> Result<()> {
+    run_worker_mutation(
+        url,
+        worker_id,
+        api_key,
+        json,
+        "remove",
+        "",
+        WorkerHttpMethod::Delete,
+    )
+}
+
 fn support_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .build()
         .context("failed to build support HTTP client")
+}
+
+fn run_worker_get_like(
+    url: String,
+    worker_id: Option<String>,
+    api_key: Option<String>,
+    operation: &'static str,
+    path: String,
+    json: bool,
+) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let steps = vec![send_worker_step(
+        &client,
+        &base_url,
+        &path,
+        token.as_deref(),
+        operation,
+        WorkerHttpMethod::Get,
+    )];
+    let report = worker_lifecycle_report(base_url, operation, worker_id, steps, None);
+    emit_json_or_human(json, &report, print_worker_lifecycle_human)?;
+    exit_if(!report.ok);
+    Ok(())
+}
+
+fn run_worker_mutation(
+    url: String,
+    worker_id: String,
+    api_key: Option<String>,
+    json: bool,
+    operation: &'static str,
+    suffix: &str,
+    method: WorkerHttpMethod,
+) -> Result<()> {
+    let base_url = normalize_base_url(&url);
+    let client = support_client()?;
+    let token = effective_api_key(api_key);
+    let steps = vec![send_worker_step(
+        &client,
+        &base_url,
+        &worker_path(&worker_id, suffix),
+        token.as_deref(),
+        operation,
+        method,
+    )];
+    let report = worker_lifecycle_report(base_url, operation, Some(worker_id), steps, None);
+    emit_json_or_human(json, &report, print_worker_lifecycle_human)?;
+    exit_if(!report.ok);
+    Ok(())
 }
 
 fn get_json_endpoint(
@@ -237,12 +523,154 @@ fn get_json_endpoint(
     }
 }
 
+fn support_bundle_endpoints() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("health", "/health"),
+        ("models", "/v1/models"),
+        ("metrics", "/v1/metrics"),
+        ("admin_status", "/v1/admin/status"),
+        ("diagnostics", "/v1/admin/diagnostics"),
+        ("fleet", "/v1/admin/fleet"),
+        ("workers", "/v1/workers"),
+        ("audit", "/v1/admin/audit?limit=50"),
+    ]
+}
+
+fn fabric_validate_endpoints() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("health", "/health"),
+        ("models", "/v1/models"),
+        ("metrics", "/v1/metrics"),
+    ]
+}
+
+#[derive(Clone, Copy)]
+enum WorkerHttpMethod {
+    Get,
+    Post,
+    Delete,
+}
+
+fn send_worker_step(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    name: &'static str,
+    method: WorkerHttpMethod,
+) -> EndpointReport {
+    let url = format!("{base_url}{path}");
+    let request = match method {
+        WorkerHttpMethod::Get => client.get(&url),
+        WorkerHttpMethod::Post => client.post(&url),
+        WorkerHttpMethod::Delete => client.delete(&url),
+    };
+    let response = send_json_request(request, token);
+
+    EndpointReport {
+        name,
+        url,
+        ok: response.ok,
+        status_code: response.status_code,
+        latency_ms: response.latency_ms,
+        body: response.body,
+        error: response.error,
+    }
+}
+
 struct JsonHttpResponse {
     ok: bool,
     status_code: Option<u16>,
     latency_ms: u128,
     body: Option<Value>,
     error: Option<String>,
+}
+
+fn wait_for_worker_idle_and_complete(
+    client: &Client,
+    base_url: &str,
+    worker_id: &str,
+    token: Option<&str>,
+    idle_timeout_secs: u64,
+    poll_interval_ms: u64,
+    steps: &mut Vec<EndpointReport>,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(idle_timeout_secs);
+    let poll_interval = Duration::from_millis(poll_interval_ms.max(1));
+    loop {
+        let inspect = send_worker_step(
+            client,
+            base_url,
+            &worker_path(worker_id, ""),
+            token,
+            "wait-idle",
+            WorkerHttpMethod::Get,
+        );
+        let inflight = worker_inflight(inspect.body.as_ref());
+        let inspect_ok = inspect.ok;
+        steps.push(inspect);
+
+        if !inspect_ok {
+            return Some("failed to inspect worker while waiting for idle".to_string());
+        }
+        if inflight == Some(0) {
+            let step = send_worker_step(
+                client,
+                base_url,
+                &worker_path(worker_id, "/drain-complete"),
+                token,
+                "drain-complete",
+                WorkerHttpMethod::Post,
+            );
+            let drain_ok = step.ok;
+            let status_code = step.status_code;
+            steps.push(step);
+            return if drain_ok {
+                None
+            } else {
+                Some(format!(
+                    "drain-complete failed (status {})",
+                    status_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "no response".to_string())
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Some(format!(
+                "worker did not become idle within {idle_timeout_secs}s"
+            ));
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn worker_lifecycle_report(
+    base_url: String,
+    operation: &'static str,
+    worker_id: Option<String>,
+    steps: Vec<EndpointReport>,
+    error: Option<String>,
+) -> WorkerLifecycleReport {
+    let ok = error.is_none() && steps.iter().all(|step| step.ok);
+    let reachable = steps.iter().any(|step| step.status_code.is_some());
+    let status = if ok {
+        STATUS_OK
+    } else if reachable {
+        STATUS_FAIL
+    } else {
+        STATUS_UNREACHABLE
+    };
+    WorkerLifecycleReport {
+        command: COMMAND_WORKERS,
+        base_url,
+        operation,
+        worker_id,
+        status,
+        ok,
+        steps,
+        error,
+    }
 }
 
 fn send_json_request(request: RequestBuilder, token: Option<&str>) -> JsonHttpResponse {
@@ -277,6 +705,201 @@ fn status_from_endpoints(endpoints: &[EndpointReport]) -> (bool, &'static str) {
         return (true, STATUS_DEGRADED);
     }
     (true, STATUS_OK)
+}
+
+fn build_fabric_validate_report(
+    base_url: String,
+    endpoints: Vec<EndpointReport>,
+) -> FabricValidateReport {
+    let profile = fabric_profile(&endpoints);
+    let checks = fabric_validate_checks(&endpoints, profile);
+    let reachable = endpoints.iter().any(|e| e.status_code.is_some());
+    let ready = reachable && checks.iter().all(|check| check.ok);
+    let status = if ready {
+        STATUS_OK
+    } else if reachable {
+        STATUS_FAIL
+    } else {
+        STATUS_UNREACHABLE
+    };
+
+    FabricValidateReport {
+        command: COMMAND_FABRIC_VALIDATE,
+        base_url,
+        status,
+        ready,
+        profile,
+        endpoints,
+        checks,
+    }
+}
+
+fn fabric_validate_checks(endpoints: &[EndpointReport], profile: &'static str) -> Vec<FabricCheck> {
+    let health = endpoints.iter().find(|e| e.name == "health");
+    let models = endpoints.iter().find(|e| e.name == "models");
+    let metrics = endpoints.iter().find(|e| e.name == "metrics");
+    let mut checks = Vec::new();
+
+    checks.push(FabricCheck {
+        name: "health_http_200",
+        ok: health.is_some_and(|e| e.status_code == Some(200)),
+        detail: endpoint_check_detail(health, "GET /health returned HTTP 200"),
+    });
+    checks.push(FabricCheck {
+        name: "health_status_known",
+        ok: health
+            .and_then(|e| e.body.as_ref())
+            .and_then(|body| body.get("status"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == STATUS_OK || status == STATUS_DEGRADED),
+        detail: "GET /health status is ok or degraded".to_string(),
+    });
+    checks.push(FabricCheck {
+        name: "health_readiness_signal",
+        ok: health
+            .and_then(|e| e.body.as_ref())
+            .is_some_and(has_fabric_readiness_signal),
+        detail: "GET /health exposes ready or workers.eligible readiness signal".to_string(),
+    });
+    checks.push(FabricCheck {
+        name: "models_http_200",
+        ok: models.is_some_and(|e| e.status_code == Some(200)),
+        detail: endpoint_check_detail(models, "GET /v1/models returned HTTP 200"),
+    });
+    checks.push(FabricCheck {
+        name: "models_data_array",
+        ok: models
+            .and_then(|e| e.body.as_ref())
+            .and_then(|body| body.get("data"))
+            .and_then(Value::as_array)
+            .is_some(),
+        detail: "GET /v1/models exposes OpenAI-compatible data array".to_string(),
+    });
+    checks.push(FabricCheck {
+        name: "metrics_http_200",
+        ok: metrics.is_some_and(|e| e.status_code == Some(200)),
+        detail: endpoint_check_detail(metrics, "GET /v1/metrics returned HTTP 200"),
+    });
+    checks.push(FabricCheck {
+        name: "metrics_contract_profile",
+        ok: profile != FABRIC_PROFILE_UNKNOWN,
+        detail: format!("GET /v1/metrics profile detected as {profile}"),
+    });
+
+    if let Some(metrics_body) = metrics.and_then(|e| e.body.as_ref()) {
+        match profile {
+            FABRIC_PROFILE_SINGLE_RUNTIME => checks.extend(
+                missing_fabric_single_runtime_metric_keys(metrics_body)
+                    .into_iter()
+                    .map(|key| FabricCheck {
+                        name: "metrics_single_runtime_key",
+                        ok: false,
+                        detail: format!("GET /v1/metrics missing {key}"),
+                    }),
+            ),
+            FABRIC_PROFILE_GATEWAY => checks.extend(
+                missing_fabric_gateway_metric_keys(metrics_body)
+                    .into_iter()
+                    .map(|key| FabricCheck {
+                        name: "metrics_gateway_key",
+                        ok: false,
+                        detail: format!("GET /v1/metrics missing {key}"),
+                    }),
+            ),
+            _ => {}
+        }
+    }
+
+    checks
+}
+
+fn fabric_profile(endpoints: &[EndpointReport]) -> &'static str {
+    let Some(metrics_body) = endpoints
+        .iter()
+        .find(|e| e.name == "metrics")
+        .and_then(|e| e.body.as_ref())
+    else {
+        return FABRIC_PROFILE_UNKNOWN;
+    };
+
+    if missing_fabric_single_runtime_metric_keys(metrics_body).is_empty() {
+        return FABRIC_PROFILE_SINGLE_RUNTIME;
+    }
+    if missing_fabric_gateway_metric_keys(metrics_body).is_empty() {
+        return FABRIC_PROFILE_GATEWAY;
+    }
+    FABRIC_PROFILE_UNKNOWN
+}
+
+fn missing_fabric_single_runtime_metric_keys(body: &Value) -> Vec<&'static str> {
+    [
+        "scheduler.queue_depth",
+        "scheduler.inflight_count",
+        "scheduler.cache_follower_waiting",
+        "scheduler.ttft_p50_us",
+        "scheduler.ttft_p95_us",
+        "scheduler.ttft_p99_us",
+        "scheduler.prefill_tokens_active",
+        "scheduler.decode_sequences_active",
+        "scheduler.split_scheduler_enabled",
+        "loaded_models",
+        "thermal",
+    ]
+    .into_iter()
+    .filter(|key| !json_key_exists(body, key))
+    .collect()
+}
+
+fn missing_fabric_gateway_metric_keys(body: &Value) -> Vec<&'static str> {
+    [
+        "mode",
+        "policy",
+        "workers.healthy",
+        "workers.unhealthy",
+        "workers.draining",
+        "total_inflight",
+        "reroute_total",
+        "queue.active",
+        "queue.queued",
+        "queue.rejected_total",
+        "queue.shed_total",
+        "queue.timeout_total",
+        "worker_detail",
+    ]
+    .into_iter()
+    .filter(|key| !json_key_exists(body, key))
+    .collect()
+}
+
+fn has_fabric_readiness_signal(body: &Value) -> bool {
+    body.get("ready").and_then(Value::as_bool).is_some()
+        || body
+            .pointer("/workers/eligible")
+            .and_then(Value::as_u64)
+            .is_some()
+}
+
+fn endpoint_check_detail(endpoint: Option<&EndpointReport>, success_detail: &str) -> String {
+    match endpoint.and_then(|e| e.status_code) {
+        Some(200) => success_detail.to_string(),
+        Some(code) => format!("endpoint returned HTTP {code}"),
+        None => "endpoint did not return an HTTP response".to_string(),
+    }
+}
+
+fn json_key_exists(body: &Value, key: &str) -> bool {
+    if body.get(key).is_some() {
+        return true;
+    }
+
+    let mut cursor = body;
+    for segment in key.split('.') {
+        let Some(next) = cursor.get(segment) else {
+            return false;
+        };
+        cursor = next;
+    }
+    true
 }
 
 fn health_endpoint_degraded(endpoints: &[EndpointReport]) -> bool {
@@ -357,6 +980,28 @@ fn print_status_human(report: &StatusReport) {
             eprintln!("         {error}");
         }
     }
+    if !report.recommended_actions.is_empty() {
+        eprintln!("\n  Recommended actions:");
+        for action in &report.recommended_actions {
+            let runtime = action
+                .runtime
+                .as_deref()
+                .map(|runtime| format!(" runtime={runtime}"))
+                .unwrap_or_default();
+            let reason = action
+                .reason
+                .as_deref()
+                .map(|reason| format!(" reason={reason}"))
+                .unwrap_or_default();
+            eprintln!("  - {}{}{}", action.action, runtime, reason);
+            if let Some(hint) = &action.operator_hint {
+                eprintln!("    {hint}");
+            }
+            for command in &action.suggested_commands {
+                eprintln!("    $ {command}");
+            }
+        }
+    }
 }
 
 fn print_smoke_test_human(report: &SmokeTestReport) {
@@ -370,6 +1015,98 @@ fn print_smoke_test_human(report: &SmokeTestReport) {
     }
     if let Some(error) = &report.error {
         eprintln!("  Error:    {error}");
+    }
+}
+
+fn print_worker_lifecycle_human(report: &WorkerLifecycleReport) {
+    eprintln!("AX Serving Workers\n");
+    eprintln!("  Base URL:   {}", report.base_url);
+    eprintln!("  Operation:  {}", report.operation);
+    eprintln!("  Status:     {}", report.status);
+    if let Some(worker_id) = &report.worker_id {
+        eprintln!("  Worker ID:  {worker_id}");
+    }
+    for step in &report.steps {
+        let status = step
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "no response".to_string());
+        eprintln!(
+            "  [{}] {}: {} ({} ms)",
+            if step.ok { "OK" } else { "FAIL" },
+            step.name,
+            status,
+            step.latency_ms,
+        );
+        if let Some(error) = &step.error {
+            eprintln!("         {error}");
+        }
+        if step.name == "wait-idle"
+            && let Some(inflight) = worker_inflight(step.body.as_ref())
+        {
+            eprintln!("         inflight={inflight}");
+        }
+    }
+    if let Some(error) = &report.error {
+        eprintln!("  Error:      {error}");
+    }
+}
+
+fn print_fabric_validate_human(report: &FabricValidateReport) {
+    eprintln!("AX Serving Fabric Validate\n");
+    eprintln!("  Base URL: {}", report.base_url);
+    eprintln!("  Status:   {}", report.status);
+    eprintln!("  Profile:  {}", report.profile);
+    for endpoint in &report.endpoints {
+        let status = endpoint
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "no response".to_string());
+        eprintln!(
+            "  [{}] {}: {} ({} ms)",
+            if endpoint.ok { "OK" } else { "FAIL" },
+            endpoint.name,
+            status,
+            endpoint.latency_ms,
+        );
+        if let Some(error) = &endpoint.error {
+            eprintln!("         {error}");
+        }
+    }
+    eprintln!("\n  Contract checks:");
+    for check in &report.checks {
+        eprintln!(
+            "  [{}] {}: {}",
+            if check.ok { "OK" } else { "FAIL" },
+            check.name,
+            check.detail,
+        );
+    }
+}
+
+fn print_support_bundle_human(report: &SupportBundleReport) {
+    eprintln!("AX Serving Support Bundle\n");
+    eprintln!("  Base URL: {}", report.base_url);
+    eprintln!("  Status:   {}", report.status);
+    eprintln!("  Redaction: {}", report.redaction);
+    if let Some(output) = &report.output {
+        eprintln!("  Output:   {output}");
+    }
+    for endpoint in &report.endpoints {
+        let status = endpoint
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "no response".to_string());
+        eprintln!(
+            "  [{}] {}: {} ({} ms)",
+            if endpoint.ok { "OK" } else { "FAIL" },
+            endpoint.name,
+            status,
+            endpoint.latency_ms,
+        );
+        if let Some(error) = &endpoint.error {
+            eprintln!("         {error}");
+        }
     }
 }
 
@@ -390,6 +1127,94 @@ fn effective_api_key(api_key: Option<String>) -> Option<String> {
                 .find_map(|part| trimmed_non_empty(part.to_string()))
         })
     })
+}
+
+fn diagnostics_recommended_actions(endpoints: &[EndpointReport]) -> Vec<StatusRecommendedAction> {
+    let Some(diagnostics) = endpoints.iter().find(|e| e.name == ENDPOINT_DIAGNOSTICS) else {
+        return Vec::new();
+    };
+    let Some(body) = diagnostics.body.as_ref() else {
+        return Vec::new();
+    };
+    body.pointer("/runtime_diagnostics/recommended_actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(recommended_action_from_value)
+        .collect()
+}
+
+fn recommended_action_from_value(value: &Value) -> Option<StatusRecommendedAction> {
+    Some(StatusRecommendedAction {
+        action: value.get("action")?.as_str()?.to_string(),
+        runtime: optional_string_field(value, "runtime"),
+        reason: optional_string_field(value, "reason"),
+        operator_hint: optional_string_field(value, "operator_hint"),
+        suggested_commands: value
+            .get("suggested_commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+    })
+}
+
+fn optional_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn redact_sensitive_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *child = Value::String("<redacted>".to_string());
+                } else {
+                    redact_sensitive_value(child);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                redact_sensitive_value(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
+        || normalized.contains("license_key")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+}
+
+fn current_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn worker_path(worker_id: &str, suffix: &str) -> String {
+    format!("/v1/workers/{worker_id}{suffix}")
+}
+
+fn worker_inflight(body: Option<&Value>) -> Option<usize> {
+    body.and_then(|body| body.get("inflight"))
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
 }
 
 fn trimmed_non_empty(value: String) -> Option<String> {
@@ -501,5 +1326,353 @@ mod tests {
 
         assert!(!reachable);
         assert_eq!(status, STATUS_UNREACHABLE);
+    }
+
+    #[test]
+    fn fabric_validate_accepts_single_runtime_contract_payloads() {
+        let report = build_fabric_validate_report(
+            "http://127.0.0.1:18080".into(),
+            vec![
+                ok_endpoint(
+                    "health",
+                    "/health",
+                    serde_json::json!({
+                        "status": "degraded",
+                        "ready": true,
+                        "model_available": false,
+                    }),
+                ),
+                ok_endpoint(
+                    "models",
+                    "/v1/models",
+                    serde_json::json!({
+                        "object": "list",
+                        "data": [],
+                    }),
+                ),
+                ok_endpoint(
+                    "metrics",
+                    "/v1/metrics",
+                    serde_json::json!({
+                        "scheduler": {
+                            "queue_depth": 0,
+                            "inflight_count": 0,
+                            "cache_follower_waiting": 0,
+                            "ttft_p50_us": 0,
+                            "ttft_p95_us": 0,
+                            "ttft_p99_us": 0,
+                            "prefill_tokens_active": 0,
+                            "decode_sequences_active": 0,
+                            "split_scheduler_enabled": true
+                        },
+                        "loaded_models": [],
+                        "thermal": "nominal"
+                    }),
+                ),
+            ],
+        );
+
+        assert!(report.ready);
+        assert_eq!(report.profile, FABRIC_PROFILE_SINGLE_RUNTIME);
+        assert!(report.checks.iter().all(|check| check.ok));
+    }
+
+    #[test]
+    fn fabric_validate_accepts_gateway_contract_payloads() {
+        let report = build_fabric_validate_report(
+            "http://127.0.0.1:18080".into(),
+            vec![
+                ok_endpoint(
+                    "health",
+                    "/health",
+                    serde_json::json!({
+                        "status": "ok",
+                        "workers": {
+                            "eligible": 1
+                        }
+                    }),
+                ),
+                ok_endpoint(
+                    "models",
+                    "/v1/models",
+                    serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": "model-a", "object": "model"}],
+                    }),
+                ),
+                ok_endpoint(
+                    "metrics",
+                    "/v1/metrics",
+                    serde_json::json!({
+                        "mode": "direct",
+                        "policy": "least_inflight",
+                        "workers": {
+                            "healthy": 1,
+                            "unhealthy": 0,
+                            "draining": 0
+                        },
+                        "total_inflight": 0,
+                        "reroute_total": 0,
+                        "queue": {
+                            "active": 0,
+                            "queued": 0,
+                            "rejected_total": 0,
+                            "shed_total": 0,
+                            "timeout_total": 0
+                        },
+                        "worker_detail": []
+                    }),
+                ),
+            ],
+        );
+
+        assert!(report.ready);
+        assert_eq!(report.profile, FABRIC_PROFILE_GATEWAY);
+        assert!(report.checks.iter().all(|check| check.ok));
+    }
+
+    #[test]
+    fn fabric_validate_reports_missing_metrics_contract() {
+        let report = build_fabric_validate_report(
+            "http://127.0.0.1:18080".into(),
+            vec![
+                ok_endpoint(
+                    "health",
+                    "/health",
+                    serde_json::json!({
+                        "status": "ok",
+                        "ready": true
+                    }),
+                ),
+                ok_endpoint(
+                    "models",
+                    "/v1/models",
+                    serde_json::json!({
+                        "object": "list",
+                        "data": []
+                    }),
+                ),
+                ok_endpoint(
+                    "metrics",
+                    "/v1/metrics",
+                    serde_json::json!({"scheduler": {}}),
+                ),
+            ],
+        );
+
+        assert!(!report.ready);
+        assert_eq!(report.profile, FABRIC_PROFILE_UNKNOWN);
+        assert!(report.checks.iter().any(|check| {
+            !check.ok
+                && check.name == "metrics_contract_profile"
+                && check.detail.contains(FABRIC_PROFILE_UNKNOWN)
+        }));
+    }
+
+    #[test]
+    fn status_extracts_diagnostics_recommended_actions() {
+        let endpoints = vec![EndpointReport {
+            name: ENDPOINT_DIAGNOSTICS,
+            url: "http://127.0.0.1:18080/v1/admin/diagnostics".into(),
+            ok: true,
+            status_code: Some(200),
+            latency_ms: 1,
+            body: Some(serde_json::json!({
+                "runtime_diagnostics": {
+                    "recommended_actions": [
+                        {
+                            "action": "restore_runtime_capacity",
+                            "runtime": "vllm",
+                            "reason": "runtime has no eligible workers",
+                            "operator_hint": "Start or recover at least one healthy non-draining runtime node."
+                        }
+                    ]
+                }
+            })),
+            error: None,
+        }];
+
+        let actions = diagnostics_recommended_actions(&endpoints);
+
+        assert_eq!(
+            actions,
+            vec![StatusRecommendedAction {
+                action: "restore_runtime_capacity".into(),
+                runtime: Some("vllm".into()),
+                reason: Some("runtime has no eligible workers".into()),
+                operator_hint: Some(
+                    "Start or recover at least one healthy non-draining runtime node.".into()
+                ),
+                suggested_commands: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn worker_paths_target_public_worker_api() {
+        assert_eq!(worker_path("worker-1", ""), "/v1/workers/worker-1");
+        assert_eq!(
+            worker_path("worker-1", "/drain-complete"),
+            "/v1/workers/worker-1/drain-complete"
+        );
+    }
+
+    #[test]
+    fn worker_lifecycle_report_reflects_step_failure() {
+        let report = worker_lifecycle_report(
+            "http://127.0.0.1:18080".into(),
+            "drain",
+            Some("worker-1".into()),
+            vec![EndpointReport {
+                name: "drain",
+                url: "http://127.0.0.1:18080/v1/workers/worker-1/drain".into(),
+                ok: false,
+                status_code: Some(404),
+                latency_ms: 1,
+                body: None,
+                error: None,
+            }],
+            None,
+        );
+
+        assert!(!report.ok);
+        assert_eq!(report.status, STATUS_FAIL);
+    }
+
+    #[test]
+    fn worker_lifecycle_report_surfaces_workflow_error_in_error_field() {
+        let report = worker_lifecycle_report(
+            "http://127.0.0.1:18080".into(),
+            "drain",
+            Some("worker-1".into()),
+            vec![
+                EndpointReport {
+                    name: "drain",
+                    url: "http://127.0.0.1:18080/v1/workers/worker-1/drain".into(),
+                    ok: true,
+                    status_code: Some(200),
+                    latency_ms: 1,
+                    body: None,
+                    error: None,
+                },
+                EndpointReport {
+                    name: "drain-complete",
+                    url: "http://127.0.0.1:18080/v1/workers/worker-1/drain-complete".into(),
+                    ok: false,
+                    status_code: Some(404),
+                    latency_ms: 1,
+                    body: None,
+                    error: None,
+                },
+            ],
+            Some("drain-complete failed (status 404)".into()),
+        );
+
+        assert!(!report.ok);
+        assert_eq!(report.status, STATUS_FAIL);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("drain-complete failed (status 404)")
+        );
+    }
+
+    #[test]
+    fn worker_lifecycle_report_ok_requires_all_steps_pass_and_no_workflow_error() {
+        let step = |name: &'static str, ok: bool| EndpointReport {
+            name,
+            url: format!("http://127.0.0.1:18080/v1/workers/worker-1/{name}"),
+            ok,
+            status_code: Some(if ok { 200 } else { 500 }),
+            latency_ms: 1,
+            body: None,
+            error: None,
+        };
+
+        let all_pass = worker_lifecycle_report(
+            "http://x".into(),
+            "drain",
+            None,
+            vec![step("drain", true)],
+            None,
+        );
+        assert!(all_pass.ok);
+        assert_eq!(all_pass.status, STATUS_OK);
+        assert!(all_pass.error.is_none());
+
+        let step_fails = worker_lifecycle_report(
+            "http://x".into(),
+            "drain",
+            None,
+            vec![step("drain", false)],
+            None,
+        );
+        assert!(!step_fails.ok);
+        assert!(step_fails.error.is_none());
+
+        let workflow_error = worker_lifecycle_report(
+            "http://x".into(),
+            "drain",
+            None,
+            vec![step("drain", true)],
+            Some("workflow error".into()),
+        );
+        assert!(!workflow_error.ok);
+        assert_eq!(workflow_error.error.as_deref(), Some("workflow error"));
+    }
+
+    #[test]
+    fn worker_inflight_reads_worker_snapshot() {
+        let body = serde_json::json!({
+            "id": "worker-1",
+            "inflight": 3
+        });
+
+        assert_eq!(worker_inflight(Some(&body)), Some(3));
+        assert_eq!(worker_inflight(None), None);
+    }
+
+    #[test]
+    fn support_bundle_endpoint_set_covers_operator_escalation_surfaces() {
+        let endpoints = support_bundle_endpoints();
+
+        assert!(endpoints.contains(&("health", "/health")));
+        assert!(endpoints.contains(&("diagnostics", "/v1/admin/diagnostics")));
+        assert!(endpoints.contains(&("fleet", "/v1/admin/fleet")));
+        assert!(endpoints.contains(&("audit", "/v1/admin/audit?limit=50")));
+    }
+
+    #[test]
+    fn support_bundle_redacts_sensitive_keys_recursively() {
+        let mut body = serde_json::json!({
+            "api_key": "top-secret",
+            "nested": {
+                "worker_token": "node-secret",
+                "safe": "visible"
+            },
+            "events": [
+                {"authorization": "Bearer abc"},
+                {"detail": {"license_key": "license-secret"}}
+            ]
+        });
+
+        redact_sensitive_value(&mut body);
+
+        assert_eq!(body["api_key"], "<redacted>");
+        assert_eq!(body["nested"]["worker_token"], "<redacted>");
+        assert_eq!(body["nested"]["safe"], "visible");
+        assert_eq!(body["events"][0]["authorization"], "<redacted>");
+        assert_eq!(body["events"][1]["detail"]["license_key"], "<redacted>");
+    }
+
+    fn ok_endpoint(name: &'static str, path: &str, body: Value) -> EndpointReport {
+        EndpointReport {
+            name,
+            url: format!("http://127.0.0.1:18080{path}"),
+            ok: true,
+            status_code: Some(200),
+            latency_ms: 1,
+            body: Some(body),
+            error: None,
+        }
     }
 }

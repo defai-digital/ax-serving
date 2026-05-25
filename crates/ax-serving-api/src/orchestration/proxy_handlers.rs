@@ -596,6 +596,10 @@ fn runtime_fleet_buckets(
     runtimes
 }
 
+const RUNTIME_ERROR_RATE_WARN_THRESHOLD: f64 = 0.05;
+const RUNTIME_KV_PRESSURE_WARN_THRESHOLD: f64 = 0.90;
+const RUNTIME_BATCH_PRESSURE_WARN_THRESHOLD: f64 = 0.90;
+
 #[derive(Default)]
 struct RuntimeDiagnostic {
     workers: usize,
@@ -619,6 +623,11 @@ struct RuntimeDiagnostic {
     compatibility_workers: Vec<String>,
     unknown_runtime_workers: Vec<String>,
     empty_model_inventory_workers: Vec<String>,
+    unexpected_hardware_class_workers: Vec<String>,
+    high_error_rate_workers: Vec<String>,
+    queue_backlog_workers: Vec<String>,
+    high_kv_pressure_workers: Vec<String>,
+    high_batch_pressure_workers: Vec<String>,
 }
 
 impl RuntimeDiagnostic {
@@ -641,6 +650,25 @@ impl RuntimeDiagnostic {
         self.total_active_sequences += worker.active_sequences;
         self.total_queue_depth += worker.queue_depth;
         self.max_error_rate = self.max_error_rate.max(worker.error_rate);
+        if worker.error_rate >= RUNTIME_ERROR_RATE_WARN_THRESHOLD {
+            self.high_error_rate_workers.push(worker.id.to_string());
+        }
+        if worker.queue_depth >= worker.max_inflight.max(1) {
+            self.queue_backlog_workers.push(worker.id.to_string());
+        }
+        if worker
+            .kv_utilization
+            .is_some_and(|value| value >= RUNTIME_KV_PRESSURE_WARN_THRESHOLD)
+        {
+            self.high_kv_pressure_workers.push(worker.id.to_string());
+        }
+        if worker
+            .batch_utilization
+            .is_some_and(|value| value >= RUNTIME_BATCH_PRESSURE_WARN_THRESHOLD)
+            || (worker.max_batch_size > 0 && worker.active_batch_size >= worker.max_batch_size)
+        {
+            self.high_batch_pressure_workers.push(worker.id.to_string());
+        }
 
         if worker.capabilities.is_empty() {
             self.empty_model_inventory_workers
@@ -651,6 +679,15 @@ impl RuntimeDiagnostic {
         }
         if let Some(hardware_class) = worker.hardware_class.as_deref() {
             increment_count(&mut self.hardware_classes, hardware_class);
+            if let Some(expected) = expected_hardware_classes(worker.runtime.as_str())
+                && !expected.contains(&hardware_class)
+            {
+                self.unexpected_hardware_class_workers
+                    .push(worker.id.to_string());
+            }
+        } else if expected_hardware_classes(worker.runtime.as_str()).is_some() {
+            self.unexpected_hardware_class_workers
+                .push(worker.id.to_string());
         }
         if let Some(node_class) = worker.node_class.as_deref() {
             increment_count(&mut self.node_classes, node_class);
@@ -725,6 +762,44 @@ impl RuntimeDiagnostic {
                 "workers": self.empty_model_inventory_workers
             }));
         }
+        if !self.unexpected_hardware_class_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "unexpected_hardware_class",
+                "severity": "warning",
+                "workers": self.unexpected_hardware_class_workers
+            }));
+        }
+        if !self.high_error_rate_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "high_runtime_error_rate",
+                "severity": "warning",
+                "workers": self.high_error_rate_workers,
+                "threshold": RUNTIME_ERROR_RATE_WARN_THRESHOLD
+            }));
+        }
+        if !self.queue_backlog_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "runtime_queue_backlog",
+                "severity": "warning",
+                "workers": self.queue_backlog_workers
+            }));
+        }
+        if !self.high_kv_pressure_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "high_runtime_kv_pressure",
+                "severity": "warning",
+                "workers": self.high_kv_pressure_workers,
+                "threshold": RUNTIME_KV_PRESSURE_WARN_THRESHOLD
+            }));
+        }
+        if !self.high_batch_pressure_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "high_runtime_batch_pressure",
+                "severity": "info",
+                "workers": self.high_batch_pressure_workers,
+                "threshold": RUNTIME_BATCH_PRESSURE_WARN_THRESHOLD
+            }));
+        }
         if !self.compatibility_workers.is_empty() {
             issues.push(serde_json::json!({
                 "code": "embedded_compatibility_path",
@@ -752,6 +827,7 @@ impl RuntimeDiagnostic {
                 "runtime": runtime,
                 "priority": "high",
                 "worker_ids": self.unhealthy_workers,
+                "suggested_commands": worker_replacement_commands(&self.unhealthy_workers),
                 "operator_hint": "Drain or remove unhealthy workers, restart the runtime node, then verify registration and heartbeat."
             }));
         }
@@ -761,6 +837,7 @@ impl RuntimeDiagnostic {
                 "runtime": runtime,
                 "priority": "medium",
                 "worker_ids": self.draining_workers,
+                "suggested_commands": worker_drain_complete_commands(&self.draining_workers),
                 "operator_hint": "Wait for inflight requests to reach zero, then call drain-complete before replacement."
             }));
         }
@@ -791,12 +868,56 @@ impl RuntimeDiagnostic {
                 "operator_hint": "Register the worker with runtime ax_engine or vllm."
             }));
         }
+        if !self.unexpected_hardware_class_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "fix_hardware_class",
+                "runtime": runtime,
+                "priority": "medium",
+                "worker_ids": self.unexpected_hardware_class_workers,
+                "expected_hardware_classes": expected_hardware_classes(runtime).unwrap_or(&[]),
+                "operator_hint": "Restart the adapter with the hardware class expected for this runtime."
+            }));
+        }
+        if !self.high_error_rate_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "investigate_runtime_errors",
+                "runtime": runtime,
+                "priority": "high",
+                "worker_ids": self.high_error_rate_workers,
+                "suggested_commands": worker_inspection_commands(&self.high_error_rate_workers),
+                "operator_hint": "Check runtime logs and recent failed requests before returning these workers to normal routing."
+            }));
+        }
+        if !self.queue_backlog_workers.is_empty()
+            || !self.high_kv_pressure_workers.is_empty()
+            || !self.high_batch_pressure_workers.is_empty()
+        {
+            let pressure_workers = unique_worker_ids([
+                &self.queue_backlog_workers,
+                &self.high_kv_pressure_workers,
+                &self.high_batch_pressure_workers,
+            ]);
+            actions.push(serde_json::json!({
+                "action": "relieve_runtime_pressure",
+                "runtime": runtime,
+                "priority": "medium",
+                "queue_backlog_worker_ids": self.queue_backlog_workers,
+                "high_kv_pressure_worker_ids": self.high_kv_pressure_workers,
+                "high_batch_pressure_worker_ids": self.high_batch_pressure_workers,
+                "suggested_commands": worker_replacement_commands(&pressure_workers),
+                "operator_hint": "Reduce admission pressure, add runtime capacity, or drain and replace overloaded nodes."
+            }));
+        }
         if !self.compatibility_workers.is_empty() {
             actions.push(serde_json::json!({
                 "action": "migrate_embedded_compatibility_path",
                 "runtime": runtime,
                 "priority": "low",
                 "worker_ids": self.compatibility_workers,
+                "suggested_commands": [
+                    "ax-serving status --diagnostics --url <gateway-url>",
+                    "AXS_EMBEDDED_RUNTIME_POLICY=deny ax-serving-api"
+                ],
                 "operator_hint": "Move inference to ax-runtime-agent plus ax-engine or vLLM, then set AXS_EMBEDDED_RUNTIME_POLICY=deny in production."
             }));
         }
@@ -822,9 +943,102 @@ impl RuntimeDiagnostic {
             "runtime_endpoints": self.runtime_endpoints,
             "unhealthy_workers": self.unhealthy_workers,
             "draining_workers": self.draining_workers,
+            "high_error_rate_workers": self.high_error_rate_workers,
+            "queue_backlog_workers": self.queue_backlog_workers,
+            "high_kv_pressure_workers": self.high_kv_pressure_workers,
+            "high_batch_pressure_workers": self.high_batch_pressure_workers,
             "issues": self.issues(),
             "recommended_actions": self.recommended_actions(runtime),
+            "runtime_guidance": runtime_guidance(runtime),
         })
+    }
+}
+
+fn unique_worker_ids<'a>(groups: impl IntoIterator<Item = &'a Vec<String>>) -> Vec<String> {
+    groups
+        .into_iter()
+        .flat_map(|group| group.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn worker_inspection_commands(worker_ids: &[String]) -> Vec<String> {
+    worker_ids
+        .iter()
+        .map(|id| format!("ax-serving workers get {id} --url <gateway-url>"))
+        .collect()
+}
+
+fn worker_drain_complete_commands(worker_ids: &[String]) -> Vec<String> {
+    worker_ids
+        .iter()
+        .map(|id| format!("ax-serving workers drain {id} --complete-when-idle --url <gateway-url>"))
+        .collect()
+}
+
+fn worker_replacement_commands(worker_ids: &[String]) -> Vec<String> {
+    worker_ids
+        .iter()
+        .flat_map(|id| {
+            [
+                format!("ax-serving workers drain {id} --complete-when-idle --url <gateway-url>"),
+                "start or restart the replacement ax-runtime-agent node".to_string(),
+                "ax-serving status --diagnostics --url <gateway-url>".to_string(),
+            ]
+        })
+        .collect()
+}
+
+fn expected_hardware_classes(runtime: &str) -> Option<&'static [&'static str]> {
+    match runtime {
+        "ax_engine" => Some(&["mac"]),
+        "vllm" => Some(&["pc-cuda", "thor"]),
+        _ => None,
+    }
+}
+
+fn runtime_guidance(runtime: &str) -> serde_json::Value {
+    match runtime {
+        "ax_engine" => serde_json::json!({
+            "runtime_owner": "ax-engine",
+            "expected_hardware_classes": ["mac"],
+            "adapter": "ax-runtime-agent",
+            "required_registration": {
+                "runtime": "ax_engine",
+                "hardware_class": "mac"
+            },
+            "operator_checks": [
+                "runtime endpoint exposes /health",
+                "runtime endpoint exposes /v1/models",
+                "adapter reports ax_runtime_* metrics when available",
+                "embedded compatibility workers should be migrated before production"
+            ]
+        }),
+        "vllm" => serde_json::json!({
+            "runtime_owner": "vLLM",
+            "expected_hardware_classes": ["pc-cuda", "thor"],
+            "adapter": "ax-runtime-agent",
+            "required_registration": {
+                "runtime": "vllm",
+                "hardware_class": "pc-cuda or thor"
+            },
+            "operator_checks": [
+                "vLLM OpenAI-compatible endpoint exposes /health",
+                "vLLM OpenAI-compatible endpoint exposes /v1/models",
+                "adapter reports runtime endpoint and supported operations",
+                "PC CUDA and Thor placement should be represented by hardware_class and worker_pool"
+            ]
+        }),
+        _ => serde_json::json!({
+            "runtime_owner": "unknown",
+            "expected_hardware_classes": [],
+            "adapter": "unknown",
+            "operator_checks": [
+                "register the node with runtime ax_engine or vllm",
+                "verify the adapter follows the AX Serving node contract"
+            ]
+        }),
     }
 }
 

@@ -211,9 +211,11 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             "error_rate": telemetry.error_rate.unwrap_or(0.0_f64),
             "kv_pages_used": telemetry.kv_pages_used.unwrap_or(0_u64),
             "kv_pages_total": telemetry.kv_pages_total.unwrap_or(0_u64),
+            "kv_utilization": telemetry.kv_utilization,
             "prefix_reusable_tokens": telemetry.prefix_reusable_tokens.unwrap_or(0_u64),
             "active_batch_size": telemetry.active_batch_size.unwrap_or(0_u32),
             "max_batch_size": telemetry.max_batch_size.unwrap_or(0_u32),
+            "batch_utilization": telemetry.batch_utilization,
         });
 
         // BUG-096: use a short per-request timeout for control-plane calls so a

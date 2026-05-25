@@ -326,6 +326,20 @@ curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
 curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
   -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.recommended_actions'
 
+# CLI status with gateway diagnostics and recovery actions.
+ax-serving status --url http://127.0.0.1:18080 --diagnostics --api-key "${AXS_API_KEY}"
+
+# AX Fabric read-side contract validation.
+ax-serving fabric validate --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+
+# Redacted support bundle for escalation.
+ax-serving support-bundle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}" --output support-bundle.json
+
+# CLI worker lifecycle commands for recovery workflows.
+ax-serving workers list --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers drain "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers drain "${WORKER_ID}" --complete-when-idle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+
 # Detailed metrics including per-worker inflight and reroute count
 curl -s http://127.0.0.1:18080/v1/metrics | jq .
 
@@ -363,11 +377,56 @@ curl -s http://127.0.0.1:18080/v1/models | jq '.data[].id'
 |---|---|
 | `restore_runtime_capacity` | Start or recover at least one healthy non-draining runtime node. |
 | `replace_unhealthy_workers` | Drain or remove unhealthy workers, restart the runtime node, then verify heartbeat. |
-| `complete_drain_when_idle` | Wait for inflight to reach zero, then call drain-complete. |
+| `complete_drain_when_idle` | Run `ax-serving workers drain <id> --complete-when-idle`, or wait for inflight to reach zero and call drain-complete. |
 | `fix_runtime_endpoint_registration` | Restart the adapter with `AXS_NODE_RUNTIME_URL` or `AXS_WORKER_RUNTIME_ENDPOINT`. |
 | `refresh_model_inventory` | Check runtime `/v1/models`, load the model, then restart or re-register the adapter. |
 | `fix_runtime_class` | Register with `runtime=ax_engine` or `runtime=vllm`. |
+| `fix_hardware_class` | Register ax-engine nodes as `hardware_class=mac`; register vLLM nodes as `pc-cuda` or `thor`. |
+| `investigate_runtime_errors` | Check runtime logs and recent failed requests before returning affected workers to normal routing. |
+| `relieve_runtime_pressure` | Reduce admission pressure, add runtime capacity, or drain and replace overloaded nodes. |
 | `migrate_embedded_compatibility_path` | Move inference to `ax-runtime-agent` plus ax-engine/vLLM and use `AXS_EMBEDDED_RUNTIME_POLICY=deny` in production. |
+
+Actions that can be advanced through AX Serving CLI include
+`suggested_commands`. `ax-serving status --diagnostics` prints those commands
+under each action so operators can move from diagnosis to drain, inspection, or
+replacement verification without manually translating worker IDs.
+
+Runtime-specific expectations are included under
+`.runtime_diagnostics.runtimes.<runtime>.runtime_guidance`. Use that block to
+verify that ax-engine nodes are registered as Mac nodes and vLLM nodes are
+registered as PC CUDA or Thor nodes.
+
+`ax-serving fabric validate` checks that AX Fabric can rely on `/health`,
+`/v1/models`, and `/v1/metrics`. The command accepts both single-runtime and
+gateway metrics profiles, and exits non-zero when a documented contract field is
+missing.
+
+Telemetry-based issues such as `high_runtime_error_rate`,
+`runtime_queue_backlog`, `high_runtime_kv_pressure`, and
+`high_runtime_batch_pressure` come from worker heartbeat fields. Adapters can
+report either counter fields such as `kv_pages_used` and `active_batch_size`, or
+ratio fields such as `kv_utilization` and `batch_utilization`. Missing telemetry
+is treated as unknown rather than failed so older adapters can remain compatible.
+
+### Support escalation bundle
+
+Use `ax-serving support-bundle` when a runtime issue needs handoff to the
+platform or support team. The bundle collects gateway health, model inventory,
+metrics, admin status, diagnostics, fleet, worker inventory, and recent audit
+events. Sensitive keys such as API keys, tokens, secrets, authorization
+headers, passwords, and license keys are recursively redacted before output.
+
+```bash
+ax-serving support-bundle \
+  --url http://127.0.0.1:18080 \
+  --api-key "${AXS_API_KEY}" \
+  --output support-bundle.json
+
+ax-serving support-bundle \
+  --url http://127.0.0.1:18080 \
+  --api-key "${AXS_API_KEY}" \
+  --json | jq '.endpoints[] | {name, ok, status_code}'
+```
 
 ### Log fields
 
@@ -383,6 +442,16 @@ AXS_LOG=debug ax-serving-api
 
 Use the authenticated public API when operations tooling or browser dashboards
 cannot reach the loopback-only internal router.
+
+Equivalent CLI commands are available for operator workflows:
+
+```bash
+ax-serving workers list --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers get "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers drain "${WORKER_ID}" --complete-when-idle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers drain-complete "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+ax-serving workers remove "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
+```
 
 ```bash
 WORKER_ID="<uuid from /v1/workers>"

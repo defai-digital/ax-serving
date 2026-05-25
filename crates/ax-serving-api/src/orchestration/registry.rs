@@ -289,12 +289,16 @@ pub struct WorkerEntry {
     pub kv_pages_used: u64,
     /// KV cache page budget (0 = unknown).
     pub kv_pages_total: u64,
+    /// KV/cache utilization ratio (0.0-1.0). Used when page counters are unavailable.
+    pub kv_utilization: Option<f64>,
     /// Tokens in reusable prefix cache (0 = unsupported).
     pub prefix_reusable_tokens: u64,
     /// Current internal batch occupancy (0 = unknown).
     pub active_batch_size: u32,
     /// Backend's max batch capacity (0 = unknown).
     pub max_batch_size: u32,
+    /// Batch utilization ratio (0.0-1.0). Used when batch counters are unavailable.
+    pub batch_utilization: Option<f64>,
 }
 
 // ── Payloads (serialised over the internal REST API) ─────────────────────────
@@ -410,6 +414,10 @@ pub struct HeartbeatRequest {
     /// KV cache page budget (0 = unknown).
     #[serde(default)]
     pub kv_pages_total: u64,
+    /// KV/cache utilization ratio (0.0-1.0), for runtimes that expose a ratio
+    /// instead of page counters.
+    #[serde(default)]
+    pub kv_utilization: Option<f64>,
     /// Tokens in reusable prefix cache (0 = unsupported).
     #[serde(default)]
     pub prefix_reusable_tokens: u64,
@@ -419,6 +427,10 @@ pub struct HeartbeatRequest {
     /// Backend's max batch capacity (0 = unknown).
     #[serde(default)]
     pub max_batch_size: u32,
+    /// Batch utilization ratio (0.0-1.0), for runtimes that expose a ratio
+    /// instead of batch counters.
+    #[serde(default)]
+    pub batch_utilization: Option<f64>,
 }
 
 // ── Read-only snapshot for dispatch policies ──────────────────────────────────
@@ -500,12 +512,18 @@ pub struct WorkerSnapshot {
     pub kv_pages_used: u64,
     /// KV cache page budget (0 = unknown).
     pub kv_pages_total: u64,
+    /// KV/cache utilization ratio (0.0-1.0), when reported by the worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_utilization: Option<f64>,
     /// Tokens in reusable prefix cache (0 = unsupported).
     pub prefix_reusable_tokens: u64,
     /// Current internal batch occupancy (0 = unknown).
     pub active_batch_size: u32,
     /// Backend's max batch capacity (0 = unknown).
     pub max_batch_size: u32,
+    /// Batch utilization ratio (0.0-1.0), when reported by the worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_utilization: Option<f64>,
 }
 
 // ── WorkerRegistry ────────────────────────────────────────────────────────────
@@ -654,9 +672,11 @@ impl WorkerRegistry {
                 error_rate: 0.0,
                 kv_pages_used: 0,
                 kv_pages_total: 0,
+                kv_utilization: None,
                 prefix_reusable_tokens: 0,
                 active_batch_size: 0,
                 max_batch_size: 0,
+                batch_utilization: None,
             });
 
         RegisterResponse {
@@ -687,9 +707,11 @@ impl WorkerRegistry {
                 e.error_rate = req.error_rate;
                 e.kv_pages_used = req.kv_pages_used;
                 e.kv_pages_total = req.kv_pages_total;
+                e.kv_utilization = req.kv_utilization.map(|value| value.clamp(0.0, 1.0));
                 e.prefix_reusable_tokens = req.prefix_reusable_tokens;
                 e.active_batch_size = req.active_batch_size;
                 e.max_batch_size = req.max_batch_size;
+                e.batch_utilization = req.batch_utilization.map(|value| value.clamp(0.0, 1.0));
                 true
             }
             None => false,
@@ -973,6 +995,8 @@ impl Default for WorkerRegistry {
 
 fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
     let inflight = e.inflight.load(Ordering::Relaxed);
+    let kv_utilization = worker_kv_utilization(e);
+    let batch_utilization = worker_batch_utilization(e);
     WorkerSnapshot {
         id: e.id,
         addr: e.addr.to_string(),
@@ -1003,9 +1027,11 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         error_rate: e.error_rate,
         kv_pages_used: e.kv_pages_used,
         kv_pages_total: e.kv_pages_total,
+        kv_utilization,
         prefix_reusable_tokens: e.prefix_reusable_tokens,
         active_batch_size: e.active_batch_size,
         max_batch_size: e.max_batch_size,
+        batch_utilization,
     }
 }
 
@@ -1024,16 +1050,8 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
 }
 
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
-    let kv_utilization = if e.kv_pages_total > 0 {
-        Some((e.kv_pages_used as f64 / e.kv_pages_total as f64).clamp(0.0, 1.0))
-    } else {
-        None
-    };
-    let batch_headroom = if e.max_batch_size > 0 {
-        Some((1.0 - (e.active_batch_size as f64 / e.max_batch_size as f64)).clamp(0.0, 1.0))
-    } else {
-        None
-    };
+    let kv_utilization = worker_kv_utilization(e);
+    let batch_headroom = worker_batch_utilization(e).map(|value| 1.0 - value);
     WorkerStatus {
         id: e.id,
         addr: e.addr,
@@ -1043,6 +1061,22 @@ fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
         ttft_p95_ms: e.ttft_p95_ms,
         kv_utilization,
         batch_headroom,
+    }
+}
+
+fn worker_kv_utilization(e: &WorkerEntry) -> Option<f64> {
+    if e.kv_pages_total > 0 {
+        Some((e.kv_pages_used as f64 / e.kv_pages_total as f64).clamp(0.0, 1.0))
+    } else {
+        e.kv_utilization
+    }
+}
+
+fn worker_batch_utilization(e: &WorkerEntry) -> Option<f64> {
+    if e.max_batch_size > 0 {
+        Some((e.active_batch_size as f64 / e.max_batch_size as f64).clamp(0.0, 1.0))
+    } else {
+        e.batch_utilization
     }
 }
 
@@ -2099,6 +2133,47 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].kv_pages_used, 200);
         assert_eq!(all[0].kv_pages_total, 400);
+        assert_eq!(all[0].kv_utilization, Some(0.5));
+        assert_eq!(all[0].batch_utilization, Some(0.25));
+    }
+
+    #[test]
+    fn worker_status_uses_ratio_telemetry_when_counters_are_absent() {
+        let reg = WorkerRegistry::new();
+        let resp = reg.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8084".into(),
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+                backend: "auto".into(),
+                max_inflight: 4,
+                friendly_name: None,
+                chip_model: None,
+                worker_pool: None,
+                node_class: None,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        reg.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 1,
+                kv_utilization: Some(0.6),
+                batch_utilization: Some(0.25),
+                model_ids: vec!["m1".into()],
+                ..Default::default()
+            },
+        );
+
+        let eligible = reg.eligible_workers("m1");
+        assert_eq!(eligible[0].kv_utilization, Some(0.6));
+        assert_eq!(eligible[0].batch_headroom, Some(0.75));
+
+        let all = reg.list_all();
+        assert_eq!(all[0].kv_utilization, Some(0.6));
+        assert_eq!(all[0].batch_utilization, Some(0.25));
     }
 
     #[test]

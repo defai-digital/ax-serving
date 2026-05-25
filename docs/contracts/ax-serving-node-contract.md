@@ -115,9 +115,11 @@ Optional fields:
 | `error_rate` | number | Recent worker-side error fraction. |
 | `kv_pages_used` | number | KV cache pages used, if reported. |
 | `kv_pages_total` | number | KV cache page budget, if reported. |
+| `kv_utilization` | number | KV/cache utilization ratio from 0.0 to 1.0, used when page counters are unavailable. |
 | `prefix_reusable_tokens` | number | Prefix-cache reusable token count. |
 | `active_batch_size` | number | Runtime internal batch occupancy. |
 | `max_batch_size` | number | Runtime batch capacity. |
+| `batch_utilization` | number | Batch utilization ratio from 0.0 to 1.0, used when batch counters are unavailable. |
 
 Heartbeat telemetry is best effort. AX Serving must continue routing safely when
 optional telemetry is absent.
@@ -135,12 +137,15 @@ Prometheus gauge names when present:
 | `ax_runtime_error_rate` | `error_rate` |
 | `ax_runtime_kv_pages_used` | `kv_pages_used` |
 | `ax_runtime_kv_pages_total` | `kv_pages_total` |
+| `ax_runtime_kv_utilization` | `kv_utilization` |
 | `ax_runtime_prefix_reusable_tokens` | `prefix_reusable_tokens` |
 | `ax_runtime_active_batch_size` | `active_batch_size` |
 | `ax_runtime_max_batch_size` | `max_batch_size` |
+| `ax_runtime_batch_utilization` | `batch_utilization` |
 
 Known vLLM/SGLang aliases are accepted where stable enough to treat as
-best-effort hints. Missing metrics are not registration failures; the adapter
+best-effort hints. For example, vLLM cache usage gauges can populate
+`kv_utilization`. Missing metrics are not registration failures; the adapter
 sends safe defaults and AX Serving keeps routing by health, capacity, and model
 inventory.
 

@@ -1514,6 +1514,222 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
 }
 
 #[tokio::test]
+async fn test_admin_diagnostics_reports_runtime_specific_hardware_guidance() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut req = reg_req("127.0.0.1:28083".parse().unwrap(), &["cuda-model"]);
+    req.backend = "vllm".into();
+    req.runtime = Some("vllm".into());
+    req.runtime_endpoint = Some("http://127.0.0.1:8000".into());
+    req.hardware_class = Some("mac".into());
+    req.supported_operations = vec!["llm".into()];
+    layer.registry.register(req, 5000);
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let vllm = &json["runtime_diagnostics"]["runtimes"]["vllm"];
+    assert_eq!(
+        vllm["runtime_guidance"]["expected_hardware_classes"],
+        serde_json::json!(["pc-cuda", "thor"])
+    );
+    assert!(
+        vllm["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "unexpected_hardware_class")
+    );
+    assert!(
+        vllm["recommended_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "fix_hardware_class")
+    );
+}
+
+#[tokio::test]
+async fn test_admin_diagnostics_reports_runtime_telemetry_recovery_actions() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut req = reg_req("127.0.0.1:28084".parse().unwrap(), &["pressure-model"]);
+    req.backend = "vllm".into();
+    req.runtime = Some("vllm".into());
+    req.runtime_endpoint = Some("http://127.0.0.1:8000".into());
+    req.hardware_class = Some("pc-cuda".into());
+    req.supported_operations = vec!["llm".into()];
+    let register = layer.registry.register(req, 5000);
+    let worker_id = WorkerId::parse(&register.worker_id).unwrap();
+    assert!(layer.registry.heartbeat(
+        worker_id,
+        HeartbeatRequest {
+            inflight: 8,
+            model_ids: vec!["pressure-model".into()],
+            active_sequences: 8,
+            queue_depth: 8,
+            error_rate: 0.20,
+            kv_utilization: Some(0.95),
+            batch_utilization: Some(0.95),
+            ..Default::default()
+        }
+    ));
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let vllm = &json["runtime_diagnostics"]["runtimes"]["vllm"];
+    let issues = vllm["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "high_runtime_error_rate")
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "runtime_queue_backlog")
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "high_runtime_kv_pressure")
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "high_runtime_batch_pressure")
+    );
+    let actions = vllm["recommended_actions"].as_array().unwrap();
+    assert!(
+        actions
+            .iter()
+            .any(|action| action["action"] == "investigate_runtime_errors")
+    );
+    let relieve = actions
+        .iter()
+        .find(|action| action["action"] == "relieve_runtime_pressure")
+        .expect("relieve_runtime_pressure action must be present");
+    assert!(
+        relieve["suggested_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap()
+                .contains("ax-serving workers drain"))
+    );
+}
+
+#[tokio::test]
+async fn test_admin_diagnostics_flags_absent_hardware_class_for_known_runtime() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    // Register an ax_engine worker with no hardware_class set.
+    let mut req = reg_req("127.0.0.1:28090".parse().unwrap(), &["native-model"]);
+    req.backend = "ax_engine".into();
+    req.runtime = Some("ax_engine".into());
+    req.runtime_endpoint = Some("http://127.0.0.1:9000".into());
+    req.hardware_class = None;
+    req.supported_operations = vec!["llm".into()];
+    layer.registry.register(req, 5000);
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let ax = &json["runtime_diagnostics"]["runtimes"]["ax_engine"];
+    assert!(
+        ax["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "unexpected_hardware_class"),
+        "absent hardware_class must produce unexpected_hardware_class issue"
+    );
+    assert!(
+        ax["recommended_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "fix_hardware_class"),
+        "absent hardware_class must produce fix_hardware_class recommended action"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     let layer = Arc::new(
         OrchestratorLayer::new(

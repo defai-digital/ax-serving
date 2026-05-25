@@ -88,9 +88,11 @@ pub struct RuntimeTelemetry {
     pub error_rate: Option<f64>,
     pub kv_pages_used: Option<u64>,
     pub kv_pages_total: Option<u64>,
+    pub kv_utilization: Option<f64>,
     pub prefix_reusable_tokens: Option<u64>,
     pub active_batch_size: Option<u32>,
     pub max_batch_size: Option<u32>,
+    pub batch_utilization: Option<f64>,
 }
 
 pub async fn get_runtime_telemetry(
@@ -158,9 +160,29 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
         error_rate: max_f64(&samples, &["ax_runtime_error_rate"]),
         kv_pages_used: sum_u64(&samples, &["ax_runtime_kv_pages_used"]),
         kv_pages_total: sum_u64(&samples, &["ax_runtime_kv_pages_total"]),
+        kv_utilization: max_ratio(
+            &samples,
+            &[
+                "ax_runtime_kv_utilization",
+                "ax_runtime_kv_cache_utilization",
+                "vllm:gpu_cache_usage_perc",
+                "vllm_gpu_cache_usage_perc",
+                "vllm:kv_cache_usage_perc",
+                "vllm_kv_cache_usage_perc",
+            ],
+        ),
         prefix_reusable_tokens: sum_u64(&samples, &["ax_runtime_prefix_reusable_tokens"]),
         active_batch_size: sum_u32(&samples, &["ax_runtime_active_batch_size"]),
         max_batch_size: sum_u32(&samples, &["ax_runtime_max_batch_size"]),
+        batch_utilization: max_ratio(
+            &samples,
+            &[
+                "ax_runtime_batch_utilization",
+                "ax_runtime_batch_pressure",
+                "vllm:batch_utilization",
+                "vllm_batch_utilization",
+            ],
+        ),
     }
 }
 
@@ -218,6 +240,13 @@ fn max_f64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64
         .reduce(f64::max)
 }
 
+fn max_ratio(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
+    max_f64(samples, aliases).map(|value| {
+        let normalized = if value > 1.0 { value / 100.0 } else { value };
+        normalized.clamp(0.0, 1.0)
+    })
+}
+
 fn sum_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
     sum_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
 }
@@ -250,9 +279,11 @@ ax_runtime_ttft_p95_ms 118
 ax_runtime_error_rate 0.025
 ax_runtime_kv_pages_used 12
 ax_runtime_kv_pages_total 128
+ax_runtime_kv_utilization 0.75
 ax_runtime_prefix_reusable_tokens 256
 ax_runtime_active_batch_size 2
 ax_runtime_max_batch_size 16
+ax_runtime_batch_utilization 0.125
 "#,
         );
 
@@ -266,9 +297,11 @@ ax_runtime_max_batch_size 16
                 error_rate: Some(0.025),
                 kv_pages_used: Some(12),
                 kv_pages_total: Some(128),
+                kv_utilization: Some(0.75),
                 prefix_reusable_tokens: Some(256),
                 active_batch_size: Some(2),
                 max_batch_size: Some(16),
+                batch_utilization: Some(0.125),
             }
         );
     }
@@ -280,11 +313,15 @@ ax_runtime_max_batch_size 16
 vllm:num_requests_running 2
 vllm:num_requests_waiting 5
 vllm:avg_generation_throughput_toks_per_s 91.5
+vllm:gpu_cache_usage_perc 87
+vllm:batch_utilization 0.5
 "#,
         );
 
         assert_eq!(telemetry.active_sequences, Some(2));
         assert_eq!(telemetry.queue_depth, Some(5));
         assert_eq!(telemetry.decode_tok_per_sec, Some(91.5));
+        assert_eq!(telemetry.kv_utilization, Some(0.87));
+        assert_eq!(telemetry.batch_utilization, Some(0.5));
     }
 }

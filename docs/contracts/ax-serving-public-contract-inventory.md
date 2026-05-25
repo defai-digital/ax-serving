@@ -34,6 +34,7 @@ Stable contract family:
 - `POST /v1/completions`
 - `POST /v1/embeddings`
 - `GET /v1/metrics`
+- CLI contract validation through `ax-serving fabric validate`
 
 Stability rule:
 
@@ -98,6 +99,20 @@ Stable contract family:
   such as restoring runtime capacity, replacing unhealthy workers, completing
   drains, fixing runtime endpoint registration, refreshing model inventory, and
   migrating embedded compatibility paths
+- diagnostics `suggested_commands` entries for actions that can be advanced
+  through documented CLI workflows such as worker inspect, drain, and
+  complete-when-idle
+- diagnostics telemetry issue/action codes for runtime error rate, queue
+  backlog, KV pressure, and batch pressure, derived from worker heartbeat
+  fields, including counter-based and ratio-based runtime telemetry, when
+  adapters report them
+- diagnostics `runtime_diagnostics.runtimes.<runtime>.runtime_guidance` for
+  runtime-specific expectations such as ax-engine on Mac nodes and vLLM on PC
+  CUDA or NVIDIA Thor nodes
+- CLI support bundle schema with command, base URL, status, redaction marker,
+  endpoint results, and recursively redacted endpoint bodies
+- CLI AX Fabric validation schema with command, base URL, status, detected
+  profile, endpoint results, and per-check contract results
 
 Stability rule:
 
@@ -165,6 +180,8 @@ Stability rule:
 - metric names referenced by public docs or enterprise runbooks are contract
 - temporary or debug-only metrics are not contract unless promoted here or in
   release notes
+- `GET /v1/metrics` may expose either the single-runtime profile or the gateway
+  profile documented by the AX Fabric Runtime Contract
 
 Enterprise usage examples:
 
