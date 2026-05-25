@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     use ax_serving_api::orchestration::start_orchestrator;
 
     // Load config from YAML (with env-var overrides).
-    let mut serve_config = ServeConfig::load_default();
+    let mut serve_config = ServeConfig::load_default()?;
     if let Some(h) = cli.host {
         serve_config.orchestrator.host = h;
     }

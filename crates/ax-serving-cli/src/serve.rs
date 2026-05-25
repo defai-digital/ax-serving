@@ -433,7 +433,7 @@ pub(crate) fn run_serve(
     let config_base = if let Some(path) = serve_config_path {
         ServeConfig::from_file(&path)?
     } else {
-        ServeConfig::load_default()
+        ServeConfig::load_default()?
     };
     let (cfg_host, cfg_port) = parse_rest_addr(&config_base.rest_addr)?;
     let host = host.unwrap_or(cfg_host);
