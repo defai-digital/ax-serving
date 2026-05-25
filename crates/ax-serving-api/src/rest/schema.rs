@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGES: usize = 100;
 pub const MAX_CONTENT_BYTES: usize = 32 * 1024; // 32 KB per message
+pub const MAX_HTTP_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 pub const MAX_MAX_TOKENS: u32 = 32_768;
 pub const MAX_MODEL_ID_BYTES: usize = 128;
 pub const MAX_EMBEDDING_INPUTS: usize = 2048;

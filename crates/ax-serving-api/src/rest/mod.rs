@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
     middleware,
     middleware::Next,
@@ -36,6 +36,7 @@ use tower_http::timeout::TimeoutLayer;
 
 use crate::ServingLayer;
 use crate::auth;
+use crate::rest::schema::MAX_HTTP_REQUEST_BODY_BYTES;
 
 /// Start the Axum REST server with graceful shutdown on SIGINT/SIGTERM.
 pub async fn serve(
@@ -92,6 +93,7 @@ pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(timeout_secs),
         ))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             slo_layer,
             inference_slo_middleware,

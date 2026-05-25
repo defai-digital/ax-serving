@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, DefaultBodyLimit, Request},
     middleware,
     response::Response,
     routing::{get, post},
@@ -60,6 +60,7 @@ use self::queue::{GlobalQueue, GlobalQueueConfig, OverloadPolicy};
 use self::registry::WorkerRegistry;
 use crate::audit::AuditLog;
 use crate::license::LicenseState;
+use crate::rest::schema::MAX_HTTP_REQUEST_BODY_BYTES;
 
 pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
 
@@ -188,6 +189,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
             "/v1/workers/{id}/drain-complete",
             post(proxy_drain_complete_worker),
         )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(ensure_public_connect_info))
         .with_state(layer)
 }

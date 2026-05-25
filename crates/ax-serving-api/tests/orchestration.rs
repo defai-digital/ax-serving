@@ -24,6 +24,7 @@ use ax_serving_api::orchestration::{
     },
     start_orchestrator,
 };
+use ax_serving_api::rest::schema::MAX_CONTENT_BYTES;
 use axum::{Router, middleware, routing::post};
 use reqwest::Client;
 use tower::ServiceExt;
@@ -2635,6 +2636,47 @@ async fn test_proxy_requires_valid_model_field() {
 
         assert_eq!(resp.status(), expected_status);
     }
+}
+
+#[tokio::test]
+async fn test_proxy_accepts_valid_body_above_axum_default_limit() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = ax_serving_api::orchestration::proxy_router(layer);
+    let messages: Vec<serde_json::Value> = (0..80)
+        .map(|_| {
+            serde_json::json!({
+                "role": "user",
+                "content": "x".repeat(MAX_CONTENT_BYTES)
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": "missing-worker-model",
+        "messages": messages
+    })
+    .to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

@@ -1937,6 +1937,39 @@ async fn chat_completions_content_too_large_400() {
 }
 
 #[tokio::test]
+async fn chat_completions_accepts_valid_body_above_axum_default_limit() {
+    let app = make_app_no_auth();
+    let messages: Vec<serde_json::Value> = (0..80)
+        .map(|_| {
+            serde_json::json!({
+                "role": "user",
+                "content": "x".repeat(MAX_CONTENT_BYTES)
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": "any",
+        "messages": messages
+    })
+    .to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn chat_completions_max_tokens_exceeded_400() {
     let app = make_app_no_auth();
     let body = serde_json::json!({
@@ -2362,6 +2395,32 @@ async fn embeddings_text_input_too_large_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_accepts_valid_body_above_axum_default_limit() {
+    let app = make_app_no_auth();
+    let inputs = vec!["a".repeat(MAX_CONTENT_BYTES); 100];
+    let body = serde_json::json!({
+        "model": "embed-ok",
+        "input": inputs
+    })
+    .to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
