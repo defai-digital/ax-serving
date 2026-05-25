@@ -641,11 +641,17 @@ impl WorkerRegistry {
             .filter(|runtime| *runtime != RuntimeKind::Unknown)
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let runtime_mode = normalize_runtime_mode(runtime_mode);
-        let (capabilities, capability_source) = capabilities.into_parts();
+        let (mut capabilities, capability_source) = capabilities.into_parts();
         let incoming_model_inventory = model_inventory;
         let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
         let model_inventory =
             normalize_model_inventory(&capabilities.models, incoming_model_inventory);
+        if capabilities.models.is_empty() && !incoming_model_inventory_empty {
+            capabilities.models = model_inventory
+                .iter()
+                .map(|model| model.id.clone())
+                .collect();
+        }
         let supported_operations = if supported_operations.is_empty() {
             match capability_source {
                 CapabilitySource::Legacy => Vec::new(),
@@ -1605,6 +1611,41 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn registration_routes_models_from_inventory_when_capability_models_absent() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "inventory-model".into(),
+                    max_context: Some(32768),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["inventory-model".to_string()]);
+        assert_eq!(snapshot.model_inventory[0].id, "inventory-model");
+        assert_eq!(r.eligible_workers("inventory-model").len(), 1);
     }
 
     #[test]
