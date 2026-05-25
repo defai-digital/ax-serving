@@ -1839,7 +1839,7 @@ fn parse_completion_sse<R: std::io::Read>(
         let chunk_finish_reason = first_choice
             .and_then(|c| c.finish_reason.as_deref())
             .unwrap_or("");
-        let stopped = val.stop.unwrap_or(false) || matches!(chunk_finish_reason, "stop" | "length");
+        let stopped = val.stop.unwrap_or(false) || is_terminal_finish_reason(chunk_finish_reason);
         if stopped && !chunk_finish_reason.is_empty() {
             stop_reason = chunk_finish_reason.to_string();
         }
@@ -1933,7 +1933,15 @@ fn stream_chat_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_llama(http, port, "/v1/chat/completions", body)?;
+    parse_chat_sse_reader(resp, tx, batch_size, emit_logprobs)
+}
 
+fn parse_chat_sse_reader<R: std::io::Read>(
+    resp: R,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    batch_size: usize,
+    emit_logprobs: bool,
+) -> Result<()> {
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();
     let mut prompt_tokens = 0usize;
@@ -1968,10 +1976,10 @@ fn stream_chat_completions(
         // Read usage from any chunk that carries it, including the final
         // usage-only chunk emitted with empty choices.
         if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
-            prompt_tokens = n as usize;
+            prompt_tokens = u64_to_usize_saturating(n);
         }
         if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
-            completion_tokens = n as usize;
+            completion_tokens = u64_to_usize_saturating(n);
         }
 
         let Some(choice) = val.choices.first() else {
@@ -2015,8 +2023,7 @@ fn stream_chat_completions(
         }
 
         let finish_reason = choice.finish_reason.as_deref().unwrap_or("");
-        let stopped =
-            finish_reason == "stop" || finish_reason == "length" || finish_reason == "tool_calls";
+        let stopped = is_terminal_finish_reason(finish_reason);
         if stopped && !finish_reason.is_empty() {
             stop_reason = finish_reason.to_string();
         }
@@ -2090,6 +2097,10 @@ fn stream_chat_completions(
     }));
 
     Ok(())
+}
+
+fn is_terminal_finish_reason(reason: &str) -> bool {
+    matches!(reason, "stop" | "length" | "tool_calls" | "content_filter")
 }
 
 /// Generate a simple unique ID for tool calls.
@@ -2423,6 +2434,54 @@ mod tests {
                 assert_eq!(stats.prompt_tokens, 3);
                 assert_eq!(stats.completion_tokens, 5);
                 assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_completion_sse_preserves_content_filter_finish_reason() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"text\":\"blocked\",\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_completion_sse(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "blocked"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.stop_reason, "content_filter");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_chat_sse_preserves_content_filter_finish_reason() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_chat_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "blocked"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.stop_reason, "content_filter");
             }
             other => panic!("expected done event, got {other:?}"),
         }
