@@ -849,14 +849,15 @@ unsafe fn tokenize_text(
     add_bos: bool,
 ) -> Result<Vec<i32>> {
     let ctext = CString::new(text).context("text contains NUL byte")?;
-    let max_tokens = (text.len() as i32 + 2).max(16);
+    let text_len = llama_text_byte_count(text.len())?;
+    let max_tokens = text_len.saturating_add(2).max(16);
     let mut tokens = vec![0i32; max_tokens as usize];
 
     let n = unsafe {
         ffi::llama_tokenize(
             vocab,
             ctext.as_ptr(),
-            text.len() as i32,
+            text_len,
             tokens.as_mut_ptr(),
             max_tokens,
             add_bos,
@@ -872,9 +873,9 @@ unsafe fn tokenize_text(
             ffi::llama_tokenize(
                 vocab,
                 ctext.as_ptr(),
-                text.len() as i32,
+                text_len,
                 tokens.as_mut_ptr(),
-                needed as i32,
+                llama_batch_token_count(needed)?,
                 add_bos,
                 false,
             )
@@ -908,6 +909,18 @@ fn llama_batch_token_count(len: usize) -> Result<i32> {
     i32::try_from(len).context("embedding input length exceeds llama_batch range")
 }
 
+fn llama_text_byte_count(len: usize) -> Result<i32> {
+    i32::try_from(len).context("text length exceeds llama tokenizer range")
+}
+
+fn llama_position(index: usize) -> Result<i32> {
+    i32::try_from(index).context("token position exceeds llama position range")
+}
+
+fn llama_top_k(value: usize) -> Result<i32> {
+    i32::try_from(value).context("top_k exceeds llama sampler range")
+}
+
 fn llama_token_to_backend_token(token: i32) -> Result<u32> {
     u32::try_from(token).context("llama returned negative token id")
 }
@@ -935,10 +948,7 @@ fn llama_tokens_to_backend_tokens(tokens: Vec<i32>) -> Result<Vec<u32>> {
 unsafe fn build_sampler(
     _model: *const ffi::llama_model,
     params: &GenerationParams,
-) -> *mut ffi::llama_sampler {
-    let chain_params = unsafe { ffi::llama_sampler_chain_default_params() };
-    let chain = unsafe { ffi::llama_sampler_chain_init(chain_params) };
-
+) -> Result<*mut ffi::llama_sampler> {
     let seed = params.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -947,17 +957,30 @@ unsafe fn build_sampler(
     }) as u32;
 
     let temp = params.temperature.unwrap_or(0.0);
+    let mirostat = params.mirostat.unwrap_or(0);
+    let top_k = if temp > 0.0 && mirostat == 0 {
+        params
+            .top_k
+            .filter(|&k| k > 0)
+            .map(llama_top_k)
+            .transpose()?
+    } else {
+        None
+    };
+
+    let chain_params = unsafe { ffi::llama_sampler_chain_default_params() };
+    let chain = unsafe { ffi::llama_sampler_chain_init(chain_params) };
 
     // Greedy decoding.
     if temp <= 0.0 {
         unsafe {
             ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_greedy());
         }
-        return chain;
+        return Ok(chain);
     }
 
     // Mirostat overrides top-k/top-p.
-    if params.mirostat.unwrap_or(0) > 0 {
+    if mirostat > 0 {
         let tau = params.mirostat_tau.unwrap_or(5.0) as f32;
         let eta = params.mirostat_eta.unwrap_or(0.1) as f32;
         // mirostat_v2 is the stable public API (v1 requires common.h internals).
@@ -968,7 +991,7 @@ unsafe fn build_sampler(
             );
             ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
         }
-        return chain;
+        return Ok(chain);
     }
 
     // Repetition penalties.
@@ -985,11 +1008,9 @@ unsafe fn build_sampler(
     }
 
     // Top-k.
-    if let Some(k) = params.top_k
-        && k > 0
-    {
+    if let Some(k) = top_k {
         unsafe {
-            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_k(k as i32));
+            ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_top_k(k));
         }
     }
 
@@ -1008,7 +1029,7 @@ unsafe fn build_sampler(
         ffi::llama_sampler_chain_add(chain, ffi::llama_sampler_init_dist(seed));
     }
 
-    chain
+    Ok(chain)
 }
 
 /// Apply a simple chat template by concatenating `<role>: <content>\n` pairs.
@@ -1079,27 +1100,32 @@ fn run_generate(
     );
 
     let ctx_size = meta.context_length as usize;
+    anyhow::ensure!(
+        ctx_size <= i32::MAX as usize,
+        "context length ({ctx_size}) exceeds llama position range"
+    );
     let n_input = tokens.len();
     anyhow::ensure!(
         n_input < ctx_size,
         "input ({n_input} tokens) exceeds context length ({ctx_size})"
     );
+    let n_input_i32 = llama_batch_token_count(n_input)?;
 
     let max_new = params.max_tokens.unwrap_or(512).min(ctx_size - n_input);
 
     let eos = unsafe { ffi::llama_vocab_eos(vocab) };
 
     // 3. Build sampler chain.
-    let sampler = unsafe { build_sampler(model, params) };
+    let sampler = unsafe { build_sampler(model, params) }?;
 
     // 4. Prefill — all input tokens in one batch, logits only on the last.
     let prefill_start = Instant::now();
     let prefill_ok = unsafe {
-        let mut batch = ffi::llama_batch_init(n_input as i32, 0, 1);
-        batch.n_tokens = n_input as i32;
+        let mut batch = ffi::llama_batch_init(n_input_i32, 0, 1);
+        batch.n_tokens = n_input_i32;
         for (i, &tok) in tokens.iter().enumerate() {
             *batch.token.add(i) = tok;
-            *batch.pos.add(i) = i as i32;
+            *batch.pos.add(i) = llama_position(i)?;
             *batch.n_seq_id.add(i) = 1;
             *(*batch.seq_id.add(i)).add(0) = 0;
             // Only compute logits for the last position in the prefill batch.
@@ -1205,7 +1231,7 @@ fn run_generate(
             let mut batch = ffi::llama_batch_init(1, 0, 1);
             batch.n_tokens = 1;
             *batch.token.add(0) = next_tok;
-            *batch.pos.add(0) = current_pos as i32;
+            *batch.pos.add(0) = llama_position(current_pos)?;
             *batch.n_seq_id.add(0) = 1;
             *(*batch.seq_id.add(0)).add(0) = 0;
             *batch.logits.add(0) = 1;
@@ -1280,7 +1306,8 @@ mod tests {
 
     use super::{
         backend_token_to_llama_token, backend_tokens_to_llama_tokens, flush_stream_token_batch,
-        llama_batch_token_count, llama_token_to_backend_token, llama_tokens_to_backend_tokens,
+        llama_batch_token_count, llama_position, llama_text_byte_count,
+        llama_token_to_backend_token, llama_tokens_to_backend_tokens, llama_top_k,
         push_stream_token_piece, saturating_usize_to_u32,
     };
 
@@ -1393,6 +1420,27 @@ mod tests {
         let err = llama_batch_token_count(i32::MAX as usize + 1).unwrap_err();
 
         assert!(err.to_string().contains("llama_batch range"));
+    }
+
+    #[test]
+    fn llama_text_byte_count_rejects_values_outside_i32_range() {
+        let err = llama_text_byte_count(i32::MAX as usize + 1).unwrap_err();
+
+        assert!(err.to_string().contains("tokenizer range"));
+    }
+
+    #[test]
+    fn llama_position_rejects_values_outside_i32_range() {
+        let err = llama_position(i32::MAX as usize + 1).unwrap_err();
+
+        assert!(err.to_string().contains("position range"));
+    }
+
+    #[test]
+    fn llama_top_k_rejects_values_outside_i32_range() {
+        let err = llama_top_k(i32::MAX as usize + 1).unwrap_err();
+
+        assert!(err.to_string().contains("sampler range"));
     }
 
     #[test]
