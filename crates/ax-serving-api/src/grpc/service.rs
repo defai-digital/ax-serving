@@ -20,6 +20,7 @@ use tonic::{Request, Response, Status};
 use super::proto::{self, ax_serving_service_server::AxServingService as AxServingServiceTrait};
 use crate::ServingLayer;
 use crate::registry::RegistryError;
+use crate::rest::schema::{MAX_CONTENT_BYTES, MAX_MAX_TOKENS, MAX_MESSAGES, MAX_MODEL_ID_BYTES};
 
 /// Map a registry `anyhow::Error` to a gRPC [`Status`] using the typed
 /// [`RegistryError`] variants where available, falling back to `internal`.
@@ -179,6 +180,10 @@ impl AxServingServiceTrait for AxServingService {
         // Validate model and input BEFORE acquiring the scheduler permit so
         // that invalid or missing-model requests never consume a concurrency
         // slot that could have served a valid request.
+        if let Some(status) = validate_infer_request(&req) {
+            return Err(status);
+        }
+
         let entry = self
             .layer
             .registry
@@ -353,6 +358,75 @@ impl AxServingServiceTrait for AxServingService {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn validate_infer_request(req: &proto::InferRequest) -> Option<Status> {
+    if let Some(status) = validate_grpc_model_id(&req.model_id) {
+        return Some(status);
+    }
+
+    if req.max_tokens > MAX_MAX_TOKENS {
+        return Some(Status::invalid_argument(format!(
+            "max_tokens exceeds limit ({MAX_MAX_TOKENS})"
+        )));
+    }
+
+    if !req.messages.is_empty() {
+        if req.messages.len() > MAX_MESSAGES {
+            return Some(Status::invalid_argument(format!(
+                "too many messages (max {MAX_MESSAGES})"
+            )));
+        }
+        for (index, message) in req.messages.iter().enumerate() {
+            if message.content.len() > MAX_CONTENT_BYTES {
+                return Some(Status::invalid_argument(format!(
+                    "message content at index {index} exceeds {MAX_CONTENT_BYTES} bytes"
+                )));
+            }
+        }
+        return None;
+    }
+
+    if req.prompt.is_empty() {
+        return Some(Status::invalid_argument(
+            "either prompt or messages must be non-empty",
+        ));
+    }
+
+    if req.prompt.len() > MAX_CONTENT_BYTES {
+        return Some(Status::invalid_argument(format!(
+            "prompt exceeds {MAX_CONTENT_BYTES} bytes"
+        )));
+    }
+
+    None
+}
+
+fn validate_grpc_model_id(model_id: &str) -> Option<Status> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return Some(Status::invalid_argument("model_id must not be empty"));
+    }
+    if model_id != trimmed {
+        return Some(Status::invalid_argument(
+            "model_id contains unsupported whitespace",
+        ));
+    }
+    if model_id.len() > MAX_MODEL_ID_BYTES {
+        return Some(Status::invalid_argument(format!(
+            "model_id exceeds max length of {MAX_MODEL_ID_BYTES}"
+        )));
+    }
+    if !model_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Some(Status::invalid_argument(
+            "model_id must be alphanumeric with '-', '_', or '.'",
+        ));
+    }
+
+    None
+}
+
 fn proto_backend_to_engine(backend: i32) -> BackendType {
     match backend {
         x if x == proto::BackendType::Cpu as i32 => BackendType::Cpu,
@@ -383,6 +457,16 @@ mod tests {
     use crate::registry::RegistryError;
 
     use super::*;
+
+    fn valid_infer_request() -> proto::InferRequest {
+        proto::InferRequest {
+            model_id: "test-model".to_string(),
+            prompt: "hello".to_string(),
+            messages: Vec::new(),
+            sampling: None,
+            max_tokens: 128,
+        }
+    }
 
     #[test]
     fn registry_error_maps_to_grpc_status() {
@@ -434,6 +518,81 @@ mod tests {
                 make_err()
             );
         }
+    }
+
+    #[test]
+    fn infer_validation_accepts_valid_prompt_request() {
+        assert!(validate_infer_request(&valid_infer_request()).is_none());
+    }
+
+    #[test]
+    fn infer_validation_rejects_empty_model_id() {
+        let mut req = valid_infer_request();
+        req.model_id.clear();
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("model_id"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_invalid_model_id() {
+        let mut req = valid_infer_request();
+        req.model_id = "bad model".to_string();
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("model_id"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_oversized_prompt() {
+        let mut req = valid_infer_request();
+        req.prompt = "a".repeat(MAX_CONTENT_BYTES + 1);
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("prompt exceeds"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_too_many_messages() {
+        let mut req = valid_infer_request();
+        req.prompt.clear();
+        req.messages = (0..=MAX_MESSAGES)
+            .map(|_| proto::ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            })
+            .collect();
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("too many messages"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_oversized_message() {
+        let mut req = valid_infer_request();
+        req.prompt.clear();
+        req.messages = vec![proto::ChatMessage {
+            role: "user".to_string(),
+            content: "a".repeat(MAX_CONTENT_BYTES + 1),
+        }];
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("message content"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_max_tokens_over_limit() {
+        let mut req = valid_infer_request();
+        req.max_tokens = MAX_MAX_TOKENS + 1;
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("max_tokens exceeds"));
     }
 
     #[test]
