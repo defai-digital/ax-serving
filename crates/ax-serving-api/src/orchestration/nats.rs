@@ -71,7 +71,7 @@ pub struct NatsConfig {
 
 const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
 const DEFAULT_NATS_STREAM: &str = "ax-serving";
-const MAX_NATS_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_NATS_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 impl Default for NatsConfig {
     fn default() -> Self {
