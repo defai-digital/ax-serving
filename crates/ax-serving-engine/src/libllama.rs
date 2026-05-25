@@ -596,7 +596,7 @@ impl InferenceBackend for LibLlamaBackend {
         });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let eos = unsafe { ffi::llama_vocab_eos(vocab) };
-        Ok(vec![eos as u32])
+        Ok(vec![llama_token_to_backend_token(eos)?])
     }
 
     fn bos_token(&self, handle: ModelHandle) -> Result<u32> {
@@ -611,7 +611,7 @@ impl InferenceBackend for LibLlamaBackend {
         });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
         let bos = unsafe { ffi::llama_vocab_bos(vocab) };
-        Ok(bos as u32)
+        llama_token_to_backend_token(bos)
     }
 
     // ── Thermal ───────────────────────────────────────────────────────────────
@@ -900,10 +900,14 @@ fn backend_tokens_to_llama_tokens(tokens: &[u32]) -> Result<Vec<i32>> {
         .collect()
 }
 
+fn llama_token_to_backend_token(token: i32) -> Result<u32> {
+    u32::try_from(token).context("llama returned negative token id")
+}
+
 fn llama_tokens_to_backend_tokens(tokens: Vec<i32>) -> Result<Vec<u32>> {
     tokens
         .into_iter()
-        .map(|token| u32::try_from(token).context("llama tokenizer returned negative token id"))
+        .map(llama_token_to_backend_token)
         .collect()
 }
 
@@ -1268,7 +1272,7 @@ mod tests {
 
     use super::{
         backend_token_to_llama_token, backend_tokens_to_llama_tokens, flush_stream_token_batch,
-        llama_tokens_to_backend_tokens, push_stream_token_piece,
+        llama_token_to_backend_token, llama_tokens_to_backend_tokens, push_stream_token_piece,
     };
 
     #[test]
@@ -1368,6 +1372,13 @@ mod tests {
         let err = backend_tokens_to_llama_tokens(&[0, i32::MAX as u32 + 1]).unwrap_err();
 
         assert!(err.to_string().contains("llama_token range"));
+    }
+
+    #[test]
+    fn llama_special_token_conversion_rejects_negative_ids() {
+        let err = llama_token_to_backend_token(-1).unwrap_err();
+
+        assert!(err.to_string().contains("negative token id"));
     }
 
     #[test]
