@@ -988,7 +988,11 @@ impl WorkerRegistry {
             }
 
             entry.health = if age_ms <= ttl_ms / 3 {
-                WorkerHealth::Healthy
+                if matches!(entry.health, WorkerHealth::Unhealthy { .. }) {
+                    entry.health.clone()
+                } else {
+                    WorkerHealth::Healthy
+                }
             } else if age_ms <= (2 * ttl_ms) / 3 {
                 WorkerHealth::Unhealthy { missed: 1 }
             } else if age_ms <= ttl_ms {
@@ -2046,6 +2050,47 @@ mod tests {
                 ..Default::default()
             }
         ));
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+    }
+
+    #[test]
+    fn tick_preserves_recent_unhealthy_until_heartbeat() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.mark_unhealthy(id);
+        r.tick(9_000);
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Unhealthy { missed: 1 },
+            "tick must not erase a dispatch failure before a heartbeat restores health"
+        );
+        assert!(r.eligible_workers("m1").is_empty());
+        assert!(
+            r.list_unhealthy_addrs()
+                .iter()
+                .any(|(candidate_id, _)| *candidate_id == id),
+            "health ticker must still see the failed worker as a probe candidate"
+        );
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Healthy,
+            "heartbeat is the signal that restores a dispatch-failed worker"
+        );
         assert_eq!(r.eligible_workers("m1").len(), 1);
     }
 
