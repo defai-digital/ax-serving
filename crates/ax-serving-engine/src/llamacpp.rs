@@ -324,8 +324,8 @@ type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Small blocking executor to avoid per-request OS thread creation in generate().
 struct BlockingExecutor {
-    tx: std::sync::mpsc::Sender<BlockingJob>,
-    _workers: Vec<std::thread::JoinHandle<()>>,
+    tx: Option<std::sync::mpsc::Sender<BlockingJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl BlockingExecutor {
@@ -363,8 +363,8 @@ impl BlockingExecutor {
             }
         }
         Self {
-            tx,
-            _workers: workers,
+            tx: Some(tx),
+            workers,
         }
     }
 
@@ -373,8 +373,20 @@ impl BlockingExecutor {
         F: FnOnce() + Send + 'static,
     {
         self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("blocking executor stopped"))?
             .send(Box::new(f))
             .map_err(|_| anyhow::anyhow!("blocking executor stopped"))
+    }
+}
+
+impl Drop for BlockingExecutor {
+    fn drop(&mut self) {
+        // Closing the sender signals all workers to exit their recv() loop.
+        drop(self.tx.take());
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -931,8 +943,10 @@ impl InferenceBackend for LlamaCppBackend {
                 }
                 Err(e) => {
                     // On failure, update circuit breaker.
+                    // Acquire ordering ensures we see the most recent state written
+                    // by the success path (SeqCst CAS) or health poller (Release reset).
                     let was_half_open =
-                        breaker.state.load(Ordering::Relaxed) == CircuitState::HalfOpen as u8;
+                        breaker.state.load(Ordering::Acquire) == CircuitState::HalfOpen as u8;
                     let failures = breaker
                         .consecutive_generate_failures
                         .fetch_add(1, Ordering::Relaxed)
@@ -1203,7 +1217,7 @@ fn run_health_poller(args: PollerArgs) {
     loop {
         std::thread::sleep(poller_interval);
 
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             break;
         }
 
@@ -1250,7 +1264,7 @@ fn run_health_poller(args: PollerArgs) {
         );
         std::thread::sleep(backoff);
 
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             break;
         }
 
@@ -1270,6 +1284,11 @@ fn run_health_poller(args: PollerArgs) {
             if let Some(mut old) = guard.take() {
                 let _ = old.kill();
                 let _ = old.wait();
+            }
+            // Check stop again after killing old child — Drop may have run while
+            // we held the lock; avoid spawning an orphaned replacement process.
+            if stop.load(Ordering::Acquire) {
+                break;
             }
             match LlamaCppBackend::spawn_server(&path, port, &load_config, &llama_config) {
                 Ok(new_child) => {

@@ -266,6 +266,15 @@ impl Drop for LlamaModelHolder {
 
 // ── LibLlamaBackend ───────────────────────────────────────────────────────────
 
+/// RAII guard that calls `llama_backend_free()` when the backend drops.
+/// Pairs with the `llama_backend_init()` call in `LibLlamaBackend::new()`.
+struct BackendGuard;
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::llama_backend_free() };
+    }
+}
+
 /// `InferenceBackend` implementation using the direct libllama C API.
 pub struct LibLlamaBackend {
     models: RwLock<HashMap<ModelHandle, Arc<LlamaModelHolder>>>,
@@ -274,6 +283,7 @@ pub struct LibLlamaBackend {
     flash_attn: bool,
     n_batch: u32,
     pool_size: usize,
+    _backend_guard: BackendGuard,
 }
 
 impl LibLlamaBackend {
@@ -312,6 +322,7 @@ impl LibLlamaBackend {
             flash_attn,
             n_batch,
             pool_size,
+            _backend_guard: BackendGuard,
         }
     }
 

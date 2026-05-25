@@ -325,8 +325,8 @@ fn find_free_port() -> Result<u16> {
 type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct BlockingExecutor {
-    tx: std::sync::mpsc::Sender<BlockingJob>,
-    _workers: Vec<std::thread::JoinHandle<()>>,
+    tx: Option<std::sync::mpsc::Sender<BlockingJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl BlockingExecutor {
@@ -362,15 +362,27 @@ impl BlockingExecutor {
             }
         }
         Self {
-            tx,
-            _workers: workers,
+            tx: Some(tx),
+            workers,
         }
     }
 
     fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
         self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("mlx blocking executor stopped"))?
             .send(Box::new(f))
             .map_err(|_| anyhow::anyhow!("mlx blocking executor stopped"))
+    }
+}
+
+impl Drop for BlockingExecutor {
+    fn drop(&mut self) {
+        // Closing the sender signals all workers to exit their recv() loop.
+        drop(self.tx.take());
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -911,8 +923,10 @@ impl InferenceBackend for MlxBackend {
                         .ok();
                 }
                 Err(e) => {
+                    // Acquire ordering ensures we see the most recent state written
+                    // by the success path (SeqCst CAS) or health poller (Release reset).
                     let was_half_open =
-                        breaker.state.load(Ordering::Relaxed) == CircuitState::HalfOpen as u8;
+                        breaker.state.load(Ordering::Acquire) == CircuitState::HalfOpen as u8;
                     let failures = breaker
                         .consecutive_generate_failures
                         .fetch_add(1, Ordering::Relaxed)

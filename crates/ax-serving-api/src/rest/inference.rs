@@ -3,8 +3,18 @@
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::UNIX_EPOCH;
+
+/// RAII guard that decrements `cache_follower_waiting` on drop, ensuring the
+/// metric stays consistent even when the handler future is dropped mid-await
+/// (e.g., client disconnect at `rx.recv().await`).
+struct FollowerGuard<'a>(&'a AtomicI64);
+impl Drop for FollowerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 use ax_serving_engine::{ChatMessage, GenerateEvent, GenerateInput};
 use axum::Json;
@@ -549,6 +559,9 @@ pub async fn chat_completions(
             .metrics
             .cache_follower_waiting
             .fetch_add(1, Ordering::Relaxed);
+        // Guard ensures fetch_sub runs on all exit paths, including future
+        // drops caused by client disconnects at rx.recv().await.
+        let _follower_guard = FollowerGuard(&layer.scheduler.metrics.cache_follower_waiting);
 
         let mut attempts = 0usize;
         let early_return = loop {
@@ -559,11 +572,6 @@ pub async fn chat_completions(
                     if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                         // Cache hit — no permits ever needed.
                         layer.metrics.record_cache_follower_hit();
-                        layer
-                            .scheduler
-                            .metrics
-                            .cache_follower_waiting
-                            .fetch_sub(1, Ordering::Relaxed);
                         return cache_hit_response(hit_json);
                     }
                     record_cache_error(&layer.cache_metrics, "invalid cached JSON payload");
@@ -587,11 +595,6 @@ pub async fn chat_completions(
                             cache_leader_guard = Some(leader);
                         }
                         Err(e) => {
-                            layer
-                                .scheduler
-                                .metrics
-                                .cache_follower_waiting
-                                .fetch_sub(1, Ordering::Relaxed);
                             return cache_ttl_err(e);
                         }
                     }
@@ -604,11 +607,6 @@ pub async fn chat_completions(
             }
         };
         let _ = early_return; // loop always breaks with false; kept for clarity
-        layer
-            .scheduler
-            .metrics
-            .cache_follower_waiting
-            .fetch_sub(1, Ordering::Relaxed);
     }
 
     // Acquire per-model slot first: if this model is at capacity we fail fast
@@ -881,6 +879,11 @@ fn stream_response(
                             name,
                             arguments,
                         } => {
+                            // Per the OpenAI streaming protocol, the tool call delta
+                            // must carry finish_reason: null. A separate empty-delta
+                            // chunk with finish_reason: "tool_calls" follows via the
+                            // Done event. Sending finish_reason here caused clients
+                            // to see two finish chunks (double-finish bug).
                             let chunk = StreamChatChunk {
                                 id: &id,
                                 object: "chat.completion.chunk",
@@ -901,7 +904,7 @@ fn stream_response(
                                             },
                                         }]),
                                     },
-                                    finish_reason: Some("tool_calls"),
+                                    finish_reason: None,
                                     logprobs: None,
                                 }],
                                 usage: None,
@@ -1339,6 +1342,7 @@ pub async fn text_completions(
             .metrics
             .cache_follower_waiting
             .fetch_add(1, Ordering::Relaxed);
+        let _follower_guard = FollowerGuard(&layer.scheduler.metrics.cache_follower_waiting);
 
         let mut attempts = 0usize;
         let early_return = loop {
@@ -1348,11 +1352,6 @@ pub async fn text_completions(
                 Ok(Some(hit_json)) => {
                     if serde_json::from_str::<serde_json::Value>(&hit_json).is_ok() {
                         layer.metrics.record_cache_follower_hit();
-                        layer
-                            .scheduler
-                            .metrics
-                            .cache_follower_waiting
-                            .fetch_sub(1, Ordering::Relaxed);
                         return cache_hit_response(hit_json);
                     }
                     record_cache_error(&layer.cache_metrics, "invalid cached JSON payload");
@@ -1374,11 +1373,6 @@ pub async fn text_completions(
                             cache_leader_guard = Some(leader);
                         }
                         Err(e) => {
-                            layer
-                                .scheduler
-                                .metrics
-                                .cache_follower_waiting
-                                .fetch_sub(1, Ordering::Relaxed);
                             return cache_ttl_err(e);
                         }
                     }
@@ -1391,11 +1385,6 @@ pub async fn text_completions(
             }
         };
         let _ = early_return;
-        layer
-            .scheduler
-            .metrics
-            .cache_follower_waiting
-            .fetch_sub(1, Ordering::Relaxed);
     }
 
     // Per-model first: fail fast without holding a global slot if this model is saturated.
