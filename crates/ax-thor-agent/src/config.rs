@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8000";
 const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
@@ -42,6 +42,17 @@ fn load_control_plane_url() -> Result<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .context("AXS_CONTROL_PLANE_URL is required")
+}
+
+fn default_advertised_addr(listen_addr: SocketAddr) -> SocketAddr {
+    if listen_addr.ip().is_unspecified() {
+        match listen_addr {
+            SocketAddr::V4(addr) => SocketAddr::from(([127, 0, 0, 1], addr.port())),
+            SocketAddr::V6(addr) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port())),
+        }
+    } else {
+        listen_addr
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,19 +103,20 @@ impl ThorConfig {
                 .unwrap_or_else(|| DEFAULT_THOR_LISTEN_ADDR.into())
                 .parse()
                 .context("invalid AXS_NODE_LISTEN_ADDR or AXS_THOR_LISTEN_ADDR")?;
-        let advertised_addr: SocketAddr = load_first_optional_string_env(&[
+        let advertised_addr = load_first_optional_string_env(&[
             "AXS_NODE_ADVERTISED_ADDR",
             "AXS_THOR_ADVERTISED_ADDR",
-        ])
-        .unwrap_or_else(|| listen_addr.to_string())
-        .parse()
-        .context("invalid AXS_NODE_ADVERTISED_ADDR or AXS_THOR_ADVERTISED_ADDR")?;
+        ]);
+        let advertised_addr: SocketAddr = match advertised_addr {
+            Some(raw) => raw
+                .parse()
+                .context("invalid AXS_NODE_ADVERTISED_ADDR or AXS_THOR_ADVERTISED_ADDR")?,
+            None => default_advertised_addr(listen_addr),
+        };
         if advertised_addr.ip().is_unspecified() {
-            tracing::warn!(
-                %advertised_addr,
-                "advertised address is a wildcard; the control plane will not be \
-                 able to route traffic to this worker; set AXS_NODE_ADVERTISED_ADDR \
-                 or AXS_THOR_ADVERTISED_ADDR to a routable IP"
+            bail!(
+                "advertised address {advertised_addr} is a wildcard; set \
+                 AXS_NODE_ADVERTISED_ADDR or AXS_THOR_ADVERTISED_ADDR to a routable IP"
             );
         }
         let max_inflight =
@@ -153,7 +165,7 @@ impl ThorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::ThorConfig;
+    use super::{ThorConfig, default_advertised_addr};
     use std::ffi::OsString;
 
     struct EnvGuard {
@@ -204,6 +216,26 @@ mod tests {
     }
 
     #[test]
+    fn from_env_defaults_wildcard_listen_to_loopback_advertised_addr() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
+        let _advertised = EnvGuard::remove("AXS_THOR_ADVERTISED_ADDR");
+        let _node_listen = EnvGuard::remove("AXS_NODE_LISTEN_ADDR");
+        let _node_advertised = EnvGuard::remove("AXS_NODE_ADVERTISED_ADDR");
+
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.listen_addr.to_string(), "0.0.0.0:18081");
+        assert_eq!(config.advertised_addr.to_string(), "127.0.0.1:18081");
+    }
+
+    #[test]
+    fn default_advertised_addr_preserves_routable_listen_addr() {
+        let listen = "10.0.0.7:18081".parse().unwrap();
+        assert_eq!(default_advertised_addr(listen), listen);
+    }
+
+    #[test]
     fn from_env_accepts_generic_runtime_node_aliases() {
         let _lock = crate::test_env::lock();
         let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
@@ -239,5 +271,18 @@ mod tests {
 
         let err = ThorConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("AXS_THOR_ADVERTISED_ADDR"));
+    }
+
+    #[test]
+    fn from_env_rejects_explicit_wildcard_advertised_addr() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
+        let _advertised = EnvGuard::set("AXS_THOR_ADVERTISED_ADDR", "0.0.0.0:18081");
+        let _node_advertised = EnvGuard::remove("AXS_NODE_ADVERTISED_ADDR");
+
+        let err = ThorConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("advertised address"));
+        assert!(err.to_string().contains("wildcard"));
     }
 }

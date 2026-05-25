@@ -37,6 +37,12 @@ fn current_rss_bytes() -> u64 {
 use crate::config::ThorConfig;
 use crate::sglang;
 
+const CONTROL_PLANE_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+fn control_plane_request_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
+}
+
 fn with_internal_token(
     req: reqwest::RequestBuilder,
     token: Option<&String>,
@@ -140,7 +146,7 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
                 "{}/internal/workers/register",
                 config.control_plane_url
             ))
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(control_plane_request_timeout())
             .json(&body),
         config.worker_token.as_ref(),
     );
@@ -239,7 +245,7 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
                     "{}/internal/workers/{}/heartbeat",
                     config.control_plane_url, session.worker_id
                 ))
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(control_plane_request_timeout())
                 .json(&body),
             config.worker_token.as_ref(),
         );
@@ -293,10 +299,12 @@ pub async fn drain(
         .clone()
         .context("runtime-node agent has no active worker session")?;
     with_internal_token(
-        client.post(format!(
-            "{}/internal/workers/{}/drain",
-            config.control_plane_url, session.worker_id
-        )),
+        client
+            .post(format!(
+                "{}/internal/workers/{}/drain",
+                config.control_plane_url, session.worker_id
+            ))
+            .timeout(control_plane_request_timeout()),
         config.worker_token.as_ref(),
     )
     .send()
@@ -319,10 +327,12 @@ pub async fn drain_complete(
         .clone()
         .context("runtime-node agent has no active worker session")?;
     with_internal_token(
-        client.post(format!(
-            "{}/internal/workers/{}/drain-complete",
-            config.control_plane_url, session.worker_id
-        )),
+        client
+            .post(format!(
+                "{}/internal/workers/{}/drain-complete",
+                config.control_plane_url, session.worker_id
+            ))
+            .timeout(control_plane_request_timeout()),
         config.worker_token.as_ref(),
     )
     .send()
@@ -335,11 +345,20 @@ pub async fn drain_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::SharedRuntime;
+    use super::{CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout};
 
     #[tokio::test]
     async fn shared_runtime_starts_with_empty_model_cache() {
         let runtime = SharedRuntime::new();
         assert!(runtime.models.read().await.is_empty());
+    }
+
+    #[test]
+    fn control_plane_request_timeout_is_short_enough_for_shutdown_paths() {
+        assert_eq!(
+            control_plane_request_timeout(),
+            std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
+        );
+        assert!(control_plane_request_timeout() <= std::time::Duration::from_secs(10));
     }
 }
