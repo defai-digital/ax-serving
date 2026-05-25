@@ -690,6 +690,20 @@ impl RuntimeDiagnostic {
                 "message": "runtime has no healthy non-draining workers"
             }));
         }
+        if !self.unhealthy_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "unhealthy_workers",
+                "severity": "warning",
+                "workers": self.unhealthy_workers
+            }));
+        }
+        if !self.draining_workers.is_empty() {
+            issues.push(serde_json::json!({
+                "code": "draining_workers",
+                "severity": "info",
+                "workers": self.draining_workers
+            }));
+        }
         if !self.unknown_runtime_workers.is_empty() {
             issues.push(serde_json::json!({
                 "code": "unknown_runtime",
@@ -721,7 +735,75 @@ impl RuntimeDiagnostic {
         issues
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    fn recommended_actions(&self, runtime: &str) -> Vec<serde_json::Value> {
+        let mut actions = Vec::new();
+        if self.eligible == 0 {
+            actions.push(serde_json::json!({
+                "action": "restore_runtime_capacity",
+                "runtime": runtime,
+                "priority": "high",
+                "reason": "runtime has no eligible workers",
+                "operator_hint": "Start or recover at least one healthy non-draining runtime node for this runtime."
+            }));
+        }
+        if !self.unhealthy_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "replace_unhealthy_workers",
+                "runtime": runtime,
+                "priority": "high",
+                "worker_ids": self.unhealthy_workers,
+                "operator_hint": "Drain or remove unhealthy workers, restart the runtime node, then verify registration and heartbeat."
+            }));
+        }
+        if !self.draining_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "complete_drain_when_idle",
+                "runtime": runtime,
+                "priority": "medium",
+                "worker_ids": self.draining_workers,
+                "operator_hint": "Wait for inflight requests to reach zero, then call drain-complete before replacement."
+            }));
+        }
+        if !self.missing_runtime_endpoint_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "fix_runtime_endpoint_registration",
+                "runtime": runtime,
+                "priority": "medium",
+                "worker_ids": self.missing_runtime_endpoint_workers,
+                "operator_hint": "Restart the adapter with AXS_NODE_RUNTIME_URL or AXS_WORKER_RUNTIME_ENDPOINT set."
+            }));
+        }
+        if !self.empty_model_inventory_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "refresh_model_inventory",
+                "runtime": runtime,
+                "priority": "medium",
+                "worker_ids": self.empty_model_inventory_workers,
+                "operator_hint": "Check the runtime /v1/models endpoint and restart the adapter after the model is loaded."
+            }));
+        }
+        if !self.unknown_runtime_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "fix_runtime_class",
+                "runtime": runtime,
+                "priority": "medium",
+                "worker_ids": self.unknown_runtime_workers,
+                "operator_hint": "Register the worker with runtime ax_engine or vllm."
+            }));
+        }
+        if !self.compatibility_workers.is_empty() {
+            actions.push(serde_json::json!({
+                "action": "migrate_embedded_compatibility_path",
+                "runtime": runtime,
+                "priority": "low",
+                "worker_ids": self.compatibility_workers,
+                "operator_hint": "Move inference to ax-runtime-agent plus ax-engine or vLLM, then set AXS_EMBEDDED_RUNTIME_POLICY=deny in production."
+            }));
+        }
+        actions
+    }
+
+    fn to_json(&self, runtime: &str) -> serde_json::Value {
         serde_json::json!({
             "workers": self.workers,
             "healthy": self.healthy,
@@ -741,6 +823,7 @@ impl RuntimeDiagnostic {
             "unhealthy_workers": self.unhealthy_workers,
             "draining_workers": self.draining_workers,
             "issues": self.issues(),
+            "recommended_actions": self.recommended_actions(runtime),
         })
     }
 }
@@ -760,11 +843,18 @@ fn runtime_diagnostics(workers: &[super::registry::WorkerSnapshot]) -> serde_jso
 
     let mut runtimes = serde_json::Map::new();
     let mut issues = Vec::new();
+    let mut recommended_actions = Vec::new();
     if workers.is_empty() {
         issues.push(serde_json::json!({
             "code": "no_workers_registered",
             "severity": "error",
             "message": "no runtime nodes are registered"
+        }));
+        recommended_actions.push(serde_json::json!({
+            "action": "register_runtime_nodes",
+            "priority": "high",
+            "reason": "no runtime nodes are registered",
+            "operator_hint": "Start ax-serving-api and register ax-runtime-agent nodes for ax_engine or vllm."
         }));
     }
     for (runtime, diagnostic) in diagnostics {
@@ -776,12 +866,14 @@ fn runtime_diagnostics(workers: &[super::registry::WorkerSnapshot]) -> serde_jso
                 "severity": issue["severity"],
             }));
         }
-        runtimes.insert(runtime, diagnostic.to_json());
+        recommended_actions.extend(diagnostic.recommended_actions(&runtime));
+        runtimes.insert(runtime.clone(), diagnostic.to_json(&runtime));
     }
 
     serde_json::json!({
         "runtimes": runtimes,
         "issues": issues,
+        "recommended_actions": recommended_actions,
     })
 }
 

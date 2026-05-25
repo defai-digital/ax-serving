@@ -95,6 +95,10 @@ Stable contract family:
 - diagnostics `runtime_diagnostics.runtimes` grouping for runtime model
   inventory, hardware classes, supported operations, runtime endpoints, and
   operator-facing issue codes
+- diagnostics `runtime_diagnostics.recommended_actions` for operator workflows
+  such as restoring runtime capacity, replacing unhealthy workers, completing
+  drains, fixing runtime endpoint registration, refreshing model inventory, and
+  migrating embedded compatibility paths
 
 Stability rule:
 

@@ -430,6 +430,9 @@ Current state:
   Serving heartbeat fields, while missing metrics remain safe defaults
 - dashboard and diagnostics surfaces expose runtime-class summaries for
   operator visibility
+- runtime diagnostics include recommended operator actions for capacity,
+  unhealthy workers, drain completion, endpoint registration, model inventory,
+  runtime class, and embedded compatibility migration issues
 - embedded llama.cpp, MLX, libllama, and direct native paths are compatibility
   paths, not the product direction
 
@@ -439,8 +442,8 @@ Remaining work:
   aliases beyond the common runtime-node contract
 - continue extracting, deprecating, or quarantining embedded runtime paths after
   node-adapter replacements are validated
-- deepen operator workflows for runtime class, hardware class, pool, model
-  placement, drain, recovery, and support escalation
+- deepen runbook and CLI workflows that turn diagnostics into guided drain,
+  recovery, and support escalation procedures
 - keep AX Fabric validation aligned to the public serving and node contracts
 
 ---

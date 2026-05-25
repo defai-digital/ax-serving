@@ -322,6 +322,10 @@ curl -s http://127.0.0.1:18080/v1/admin/status \
 curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
   -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.runtimes'
 
+# Actionable recovery hints derived from runtime diagnostics.
+curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.recommended_actions'
+
 # Detailed metrics including per-worker inflight and reroute count
 curl -s http://127.0.0.1:18080/v1/metrics | jq .
 
@@ -350,6 +354,20 @@ curl -s http://127.0.0.1:18080/v1/models | jq '.data[].id'
 | Rejected requests | `queue.rejected_total` | Rising rate → increase queue or add workers |
 | Reroute total | `reroute_total` | Rising rate → workers returning 5xx |
 | Worker inflight | per-worker `inflight` | Near `max_inflight` → add capacity |
+
+### Runtime diagnostic actions
+
+`/v1/admin/diagnostics` emits machine-readable recommended actions:
+
+| Action | Operator response |
+|---|---|
+| `restore_runtime_capacity` | Start or recover at least one healthy non-draining runtime node. |
+| `replace_unhealthy_workers` | Drain or remove unhealthy workers, restart the runtime node, then verify heartbeat. |
+| `complete_drain_when_idle` | Wait for inflight to reach zero, then call drain-complete. |
+| `fix_runtime_endpoint_registration` | Restart the adapter with `AXS_NODE_RUNTIME_URL` or `AXS_WORKER_RUNTIME_ENDPOINT`. |
+| `refresh_model_inventory` | Check runtime `/v1/models`, load the model, then restart or re-register the adapter. |
+| `fix_runtime_class` | Register with `runtime=ax_engine` or `runtime=vllm`. |
+| `migrate_embedded_compatibility_path` | Move inference to `ax-runtime-agent` plus ax-engine/vLLM and use `AXS_EMBEDDED_RUNTIME_POLICY=deny` in production. |
 
 ### Log fields
 

@@ -1485,6 +1485,20 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
             .iter()
             .any(|issue| issue["code"] == "missing_runtime_endpoint")
     );
+    assert!(
+        runtime_diag["ax_engine"]["recommended_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "migrate_embedded_compatibility_path")
+    );
+    assert!(
+        json["runtime_diagnostics"]["recommended_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "fix_runtime_endpoint_registration")
+    );
 
     assert_eq!(runtime_diag["vllm"]["workers"], 1);
     assert_eq!(runtime_diag["vllm"]["hardware_classes"]["pc-cuda"], 1);
