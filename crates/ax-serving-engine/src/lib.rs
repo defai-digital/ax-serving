@@ -396,6 +396,20 @@ pub struct CacheTelemetry {
     pub max_batch_size: u32,
 }
 
+impl CacheTelemetry {
+    pub fn saturating_add_assign(&mut self, other: &Self) {
+        self.kv_pages_used = self.kv_pages_used.saturating_add(other.kv_pages_used);
+        self.kv_pages_total = self.kv_pages_total.saturating_add(other.kv_pages_total);
+        self.prefix_reusable_tokens = self
+            .prefix_reusable_tokens
+            .saturating_add(other.prefix_reusable_tokens);
+        self.active_batch_size = self
+            .active_batch_size
+            .saturating_add(other.active_batch_size);
+        self.max_batch_size = self.max_batch_size.saturating_add(other.max_batch_size);
+    }
+}
+
 // ── InferenceBackend trait ────────────────────────────────────────────────────
 
 /// Core inference interface implemented by concrete backend adapters.
@@ -494,5 +508,36 @@ pub trait InferenceBackend: Send + Sync {
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> anyhow::Result<u32> {
         let _ = (handle, tokens);
         Err(anyhow::anyhow!("eval_tokens not supported by this backend"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CacheTelemetry;
+
+    #[test]
+    fn cache_telemetry_merge_saturates_counters() {
+        let mut total = CacheTelemetry {
+            kv_pages_used: u64::MAX,
+            kv_pages_total: 10,
+            prefix_reusable_tokens: u64::MAX - 1,
+            active_batch_size: u32::MAX,
+            max_batch_size: 1,
+        };
+        let other = CacheTelemetry {
+            kv_pages_used: 1,
+            kv_pages_total: u64::MAX,
+            prefix_reusable_tokens: 10,
+            active_batch_size: 1,
+            max_batch_size: u32::MAX,
+        };
+
+        total.saturating_add_assign(&other);
+
+        assert_eq!(total.kv_pages_used, u64::MAX);
+        assert_eq!(total.kv_pages_total, u64::MAX);
+        assert_eq!(total.prefix_reusable_tokens, u64::MAX);
+        assert_eq!(total.active_batch_size, u32::MAX);
+        assert_eq!(total.max_batch_size, u32::MAX);
     }
 }

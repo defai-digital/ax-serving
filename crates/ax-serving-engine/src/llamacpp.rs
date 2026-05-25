@@ -1140,13 +1140,20 @@ impl InferenceBackend for LlamaCppBackend {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let idle = json.get("slots_idle").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let idle = json
+                .get("slots_idle")
+                .and_then(|v| v.as_u64())
+                .map(u64_to_u32_saturating)
+                .unwrap_or(0);
             let processing = json
                 .get("slots_processing")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            total.active_batch_size += processing;
-            total.max_batch_size += idle + processing;
+                .map(u64_to_u32_saturating)
+                .unwrap_or(0);
+            total.active_batch_size = total.active_batch_size.saturating_add(processing);
+            total.max_batch_size = total
+                .max_batch_size
+                .saturating_add(idle.saturating_add(processing));
         }
         total
     }
@@ -2119,6 +2126,10 @@ fn u64_to_u32(value: u64, field: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{field} exceeds u32::MAX"))
 }
 
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 fn json_token_id_to_u32(value: &serde_json::Value) -> Result<u32> {
     let id = value
         .as_u64()
@@ -2280,6 +2291,11 @@ mod tests {
             json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn u64_to_u32_saturating_clamps_overflow() {
+        assert_eq!(u64_to_u32_saturating(u32::MAX as u64 + 1), u32::MAX);
     }
 
     #[test]

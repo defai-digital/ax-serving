@@ -710,11 +710,7 @@ impl InferenceBackend for RouterBackend {
 
         let mut agg = CacheTelemetry::default();
         let mut merge = |t: CacheTelemetry| {
-            agg.kv_pages_used += t.kv_pages_used;
-            agg.kv_pages_total += t.kv_pages_total;
-            agg.prefix_reusable_tokens += t.prefix_reusable_tokens;
-            agg.active_batch_size += t.active_batch_size;
-            agg.max_batch_size += t.max_batch_size;
+            agg.saturating_add_assign(&t);
         };
         if has_native {
             merge(self.native.cache_telemetry());
