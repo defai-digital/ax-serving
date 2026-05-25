@@ -60,6 +60,7 @@
   .status-degraded { color: var(--red); }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   .subtle { color: var(--muted); font-size: 12px; }
+  .issue { color: var(--yellow); font-size: 12px; }
   #error-bar { display: none; background: #2d0000; border: 1px solid var(--red); border-radius: 6px; padding: 10px 16px; color: #fca5a5; font-size: 13px; }
 </style>
 </head>
@@ -113,6 +114,24 @@
         </tr>
       </thead>
       <tbody id="workers-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- Runtime diagnostics panel (orchestrator mode) -->
+  <div class="card" id="runtimes-card" style="display:none">
+    <h2>Runtimes</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Runtime</th>
+          <th>Workers</th>
+          <th>Hardware</th>
+          <th>Operations</th>
+          <th>Models</th>
+          <th>Issues</th>
+        </tr>
+      </thead>
+      <tbody id="runtimes-tbody"></tbody>
     </table>
   </div>
 
@@ -214,6 +233,7 @@
 
   function renderOrchestrator(health, metrics) {
     document.getElementById('workers-card').style.display = 'block';
+    document.getElementById('runtimes-card').style.display = 'block';
     document.getElementById('queue-card').style.display = 'block';
     document.getElementById('system-card').style.display = 'none';
 
@@ -246,6 +266,8 @@
       </tr>`;
     }).join('') || '<tr><td colspan="7" style="color:var(--muted);padding:16px 0">No workers registered</td></tr>';
 
+    renderRuntimeDiagnostics(workers);
+
     // Queue stats
     const q = health.queue || metrics.queue || {};
     const hw = health.workers || {};
@@ -261,6 +283,7 @@
 
   function renderSingleWorker(health, metrics) {
     document.getElementById('workers-card').style.display = 'none';
+    document.getElementById('runtimes-card').style.display = 'none';
     document.getElementById('queue-card').style.display = 'none';
     document.getElementById('system-card').style.display = 'block';
 
@@ -277,6 +300,61 @@
       statCard('Queued', fmt(queued), queued > 0 ? 'warn' : ''),
       statCard('RSS', rss),
     ].join('');
+  }
+
+  function renderRuntimeDiagnostics(workers) {
+    const groups = new Map();
+    for (const w of workers) {
+      const runtime = w.runtime || 'unknown';
+      if (!groups.has(runtime)) {
+        groups.set(runtime, {
+          workers: 0,
+          healthy: 0,
+          eligible: 0,
+          hardware: new Set(),
+          operations: new Set(),
+          models: new Set(),
+          issues: new Set(),
+        });
+      }
+      const g = groups.get(runtime);
+      g.workers += 1;
+      if (w.health === 'healthy') g.healthy += 1;
+      if (w.health === 'healthy' && !w.drain) g.eligible += 1;
+      if (w.hardware_class) g.hardware.add(w.hardware_class);
+      for (const op of (w.supported_operations || [])) g.operations.add(op);
+      const models = (w.capability_descriptor && w.capability_descriptor.models) || w.capabilities || [];
+      for (const model of models) g.models.add(model);
+      if (!w.runtime_endpoint) g.issues.add('missing endpoint');
+      if (runtime === 'unknown') g.issues.add('unknown runtime');
+      if (runtime === 'ax_engine' && ['native', 'auto', 'llama_cpp', 'mlx'].includes(w.backend)) {
+        g.issues.add('compatibility path');
+      }
+      if (w.health !== 'healthy') g.issues.add('unhealthy worker');
+      if (w.drain) g.issues.add('draining worker');
+    }
+
+    const tbody = document.getElementById('runtimes-tbody');
+    tbody.innerHTML = Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([runtime, g]) => {
+      const workers = `${g.eligible}/${g.workers} eligible`;
+      const hardware = joinSet(g.hardware);
+      const operations = joinSet(g.operations);
+      const models = joinSet(g.models);
+      const issues = joinSet(g.issues);
+      return `<tr>
+        <td><span class="mono">${esc(runtime)}</span></td>
+        <td>${esc(workers)}</td>
+        <td class="mono subtle">${esc(hardware)}</td>
+        <td class="mono subtle">${esc(operations)}</td>
+        <td class="mono subtle">${esc(models)}</td>
+        <td class="issue">${esc(issues)}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="6" style="color:var(--muted);padding:16px 0">No runtimes registered</td></tr>';
+  }
+
+  function joinSet(values) {
+    const items = Array.from(values).sort();
+    return items.length ? items.join(', ') : '—';
   }
 
   async function removeWorker(id) {

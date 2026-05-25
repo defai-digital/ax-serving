@@ -426,17 +426,21 @@ Current state:
   deployments
 - admin status and orchestration tests cover runtime metadata and runtime fleet
   grouping
+- runtime-node telemetry can translate common `/metrics` gauges into AX
+  Serving heartbeat fields, while missing metrics remain safe defaults
+- dashboard and diagnostics surfaces expose runtime-class summaries for
+  operator visibility
 - embedded llama.cpp, MLX, libllama, and direct native paths are compatibility
   paths, not the product direction
 
 Remaining work:
 
-- improve ax-engine-specific health, model inventory, and metrics translation
-  behind the generic runtime-node adapter
+- improve ax-engine and vLLM-specific health, model inventory, and metrics
+  aliases beyond the common runtime-node contract
 - continue extracting, deprecating, or quarantining embedded runtime paths after
   node-adapter replacements are validated
-- deepen dashboard, diagnostics, and operator workflows by runtime class,
-  hardware class, pool, and model placement
+- deepen operator workflows for runtime class, hardware class, pool, model
+  placement, drain, recovery, and support escalation
 - keep AX Fabric validation aligned to the public serving and node contracts
 
 ---
@@ -511,7 +515,7 @@ The PRD is satisfied when:
 |---|---|---|
 | AX Serving continues duplicating ax-engine runtime work | Wasted engineering effort and unclear ownership | Move Mac inference responsibility to ax-engine nodes |
 | vLLM integration becomes too runtime-specific | Gateway complexity grows | Keep adapters thin and contract-driven |
-| Removing embedded paths breaks current users | Migration friction | Phase deprecation and keep compatibility paths until node adapters are ready |
+| Removing embedded paths breaks current users | Migration friction | Phase deprecation and keep compatibility paths for migration until runtime-node replacements are validated |
 | Node contract is too weak | Runtime integrations become one-off bridges | Define capability, health, metrics, lifecycle, and error-shape requirements early |
 | Product messaging drifts back to hardware claims | Market confusion | Keep runtime/hardware fit as deployment context |
 | Enterprise integrations bypass public contracts | Public core becomes less useful | Require service/node-contract integration |

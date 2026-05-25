@@ -58,9 +58,9 @@ below; active work should be added only when it changes product behavior.
 | Generic runtime-node adapter | Complete | `ax-runtime-agent`, `AXS_NODE_*` config, runtime-agent e2e test |
 | Target node runbooks | Complete | `docs/runbooks/multi-worker.md` |
 | Runtime responsibility classification | Complete | `docs/contracts/ax-serving-runtime-responsibility-inventory.md` |
-| ax-engine-specific telemetry translation | Active | Generic OpenAI-compatible adapter exists; richer health and metrics remain |
-| Embedded runtime reduction | Active | Compatibility paths classified; removal waits for validated replacements |
-| Runtime-class diagnostics depth | Active | Status/runtime buckets exist; deeper dashboard and diagnostics remain |
+| Runtime telemetry translation | Partial | `ax-runtime-agent` translates common `/metrics` gauges; richer runtime-specific mappings remain |
+| Embedded runtime reduction | Active | Compatibility paths classified and can be blocked with `AXS_EMBEDDED_RUNTIME_POLICY=deny`; removal waits for validated replacements |
+| Runtime-class diagnostics depth | Partial | Status, diagnostics, and dashboard summaries exist; deeper runtime-specific guidance remains |
 
 ---
 
@@ -84,8 +84,8 @@ Product validation for remaining work:
 - mixed Mac ax-engine and vLLM worker registration
 - routing by model, runtime, hardware class, pool, and capability
 - drain and failover across runtime classes
-- dashboard and CLI status output for runtime class, node class, hardware class,
-  and model inventory
+- diagnostics, dashboard, and CLI status output for runtime class, node class,
+  hardware class, issue hints, and model inventory
 
 ---
 
@@ -124,12 +124,19 @@ Current evidence:
   operator issue codes
 - `/dashboard` renders runtime summaries from worker detail for quick operator
   visibility into runtime class, hardware, operations, models, and issue hints
+- `ax-runtime-agent` translates common runtime `/metrics` Prometheus gauges
+  into AX Serving heartbeat telemetry, with safe defaults when metrics are
+  absent
+- `AXS_EMBEDDED_RUNTIME_POLICY=deny` blocks embedded local inference paths while
+  leaving gateway and runtime-node adapter deployments available
 
 Remaining work:
 
-- richer ax-engine health and metrics translation beyond the generic
-  OpenAI-compatible adapter path
+- richer ax-engine and vLLM metric aliases beyond the common node telemetry
+  names
 - extraction or deprecation of embedded llama.cpp, MLX, libllama, and native
   runtime responsibilities after adapter replacements exist
 - deeper runtime-specific diagnostics for ax-engine and vLLM beyond the common
   node contract fields
+- operator workflows that connect diagnostics to drain, replacement, recovery,
+  and support escalation decisions

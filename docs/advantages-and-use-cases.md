@@ -2,10 +2,10 @@
 
 ## Core Advantages
 
-### 1. Mac-Native Performance
-- Optimized for Apple Silicon (Metal backend)
-- Excellent thermal and power management awareness
-- Zero-copy inference where possible via `ax-engine`
+### 1. Runtime-Node Control Plane
+- One serving surface across Mac ax-engine, PC CUDA vLLM, and Thor vLLM nodes
+- Runtime and hardware-class inventory for placement decisions
+- Thin adapter boundary that keeps inference execution inside the runtime node
 
 ### 2. Production-Grade Orchestration
 - **Multi-worker gateway** with intelligent routing (`least_inflight`, `model_affinity`, `token_cost`)
@@ -20,15 +20,16 @@
 - **Rich observability** — detailed metrics, dashboard, audit logs
 
 ### 4. Operational Excellence
-- Runtime model loading/unloading without restart
+- Runtime-node registration, heartbeat, drain, and recovery workflows
 - License management and commercial features
 - Comprehensive health checks and diagnostics
 - Enterprise-ready authentication and policy controls
 
-### 5. Hybrid Backend Strategy
-- Default to battle-tested `llama.cpp`
-- Optional high-performance `ax-engine` (native Rust) backend
-- Seamless fallback between them
+### 5. Runtime-Neutral Adapter Strategy
+- Mac inference through ax-engine runtime nodes
+- PC CUDA and NVIDIA Thor inference through vLLM runtime nodes
+- Embedded llama.cpp, MLX, libllama, and native paths kept as compatibility
+  bridges rather than the product direction
 
 ## Target Use Cases
 
@@ -56,19 +57,19 @@
 
 | Feature                    | AX Serving          | llama.cpp server | vLLM / TGI     |
 |---------------------------|---------------------|------------------|----------------|
-| Mac Silicon optimization  | Excellent           | Good             | Poor           |
-| Multi-worker orchestration| Built-in            | None             | Limited        |
-| Response cache            | Yes (exact match)   | No               | Limited        |
-| Dynamic model management  | Yes                 | Limited          | Yes            |
-| Python SDK                | Official + rich     | Basic            | Official       |
-| Thermal & power awareness | Yes                 | Basic            | No             |
-| Commercial licensing path | Yes                 | No               | Yes            |
+| Fleet control plane       | Built-in            | No               | Runtime-centric |
+| Runtime-node inventory    | Built-in            | No               | Partial         |
+| Response cache            | Yes (exact match)   | No               | Limited         |
+| Placement and drain policy| Built-in            | No               | Runtime-specific |
+| Python SDK                | Official + rich     | Basic            | Official        |
+| Diagnostics and audit     | Gateway-level       | Basic            | Runtime-specific |
+| Commercial licensing path | Yes                 | No               | Yes             |
 
 ## When to Use AX Serving
 
 **Use AX Serving when you need:**
-- Production-grade serving on Apple Silicon
-- Multiple models or workers
+- A private serving control plane above ax-engine and vLLM runtime nodes
+- Multiple models, workers, pools, or hardware classes
 - Caching for cost/latency optimization
 - Strong operational controls and observability
 - OpenAI compatibility + advanced features (logprobs, tools, grammar, vision)
@@ -82,12 +83,12 @@
 1. **Local testing**: `cargo run -p ax-serving-cli --bin ax-serving -- serve -m model.gguf`
 2. **With Python**: See `docs/python-sdk.md`
 3. **Production multi-worker**: See `docs/runbooks/multi-worker.md`
-4. **Enterprise**: Use commercial license + `serving.offline-enterprise.yaml`
+4. **Runtime-node adapter**: Use `ax-runtime-agent` with `AXS_NODE_*` config
 
 ## Best Practices
 
 ### Deployment
-- Use dedicated orchestrator (`ax-serving-api`) + multiple `ax-serving serve` workers
+- Use dedicated orchestrator (`ax-serving-api`) + runtime-node adapters
 - Prefer `least_inflight` or `model_affinity` dispatch policy
 - Enable response caching for repetitive prompts
 

@@ -64,6 +64,19 @@ ax-serving serve \
 Each worker auto-registers with the orchestrator through
 `AXS_ORCHESTRATOR_ADDR` or the equivalent `--orchestrator` CLI flag.
 
+Production gateway-only deployments can block embedded compatibility workers:
+
+```bash
+AXS_EMBEDDED_RUNTIME_POLICY=deny ax-serving serve \
+  -m ./models/llama3.gguf \
+  --model-id llama3-8b \
+  --port 18081
+# Expected: startup fails and asks for ax-serving-api plus ax-engine/vLLM runtime nodes.
+```
+
+Use `AXS_EMBEDDED_RUNTIME_POLICY=warn` for migration and local testing, or
+`allow` only when the compatibility path is intentionally accepted.
+
 ### Start a Mac ax-engine runtime node
 
 Run ax-engine with an OpenAI-compatible endpoint, then place `ax-runtime-agent`
@@ -85,6 +98,13 @@ target/release/ax-runtime-agent
 The agent reads `/v1/models` from the runtime endpoint, registers the adapter
 address with AX Serving, sends heartbeats, and proxies OpenAI-compatible
 inference requests to ax-engine.
+
+If the runtime exposes `/metrics`, the agent also translates common
+Prometheus gauges such as `ax_runtime_active_sequences`,
+`ax_runtime_queue_depth`, `ax_runtime_decode_tok_per_sec`,
+`ax_runtime_ttft_p95_ms`, and `ax_runtime_kv_pages_used` into AX Serving
+heartbeat telemetry. Missing metrics are safe; the node remains routable with
+fallback heartbeat values.
 
 ### Start a PC CUDA vLLM runtime node
 

@@ -192,16 +192,28 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
         let current_inflight = runtime.inflight.load(Ordering::Relaxed);
         // BUG-073: use real RSS instead of hardcoded 0.
         let rss_bytes = current_rss_bytes();
+        let telemetry = match sglang::get_runtime_telemetry(&client, &config.runtime_url).await {
+            Ok(telemetry) => telemetry,
+            Err(err) => {
+                tracing::debug!(%err, "runtime metrics unavailable; using heartbeat defaults");
+                sglang::RuntimeTelemetry::default()
+            }
+        };
         let body = json!({
             "inflight": current_inflight,
             "thermal_state": "nominal",
             "model_ids": models,
             "rss_bytes": rss_bytes,
-            "active_sequences": current_inflight,
-            "decode_tok_per_sec": 0.0_f64,
-            "ttft_p95_ms": 0_u64,
-            "queue_depth": 0_usize,
-            "error_rate": 0.0_f64,
+            "active_sequences": telemetry.active_sequences.unwrap_or(current_inflight),
+            "decode_tok_per_sec": telemetry.decode_tok_per_sec.unwrap_or(0.0_f64),
+            "ttft_p95_ms": telemetry.ttft_p95_ms.unwrap_or(0_u64),
+            "queue_depth": telemetry.queue_depth.unwrap_or(0_usize),
+            "error_rate": telemetry.error_rate.unwrap_or(0.0_f64),
+            "kv_pages_used": telemetry.kv_pages_used.unwrap_or(0_u64),
+            "kv_pages_total": telemetry.kv_pages_total.unwrap_or(0_u64),
+            "prefix_reusable_tokens": telemetry.prefix_reusable_tokens.unwrap_or(0_u64),
+            "active_batch_size": telemetry.active_batch_size.unwrap_or(0_u32),
+            "max_batch_size": telemetry.max_batch_size.unwrap_or(0_u32),
         });
 
         // BUG-096: use a short per-request timeout for control-plane calls so a

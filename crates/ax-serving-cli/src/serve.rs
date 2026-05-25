@@ -7,6 +7,53 @@ use anyhow::{Context as _, Result};
 use ax_serving_api::ServingLayer;
 use ax_serving_engine::{LoadConfig, RouterBackend, RoutingConfig};
 
+const EMBEDDED_RUNTIME_POLICY_ENV: &str = "AXS_EMBEDDED_RUNTIME_POLICY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddedRuntimePolicy {
+    Allow,
+    Warn,
+    Deny,
+}
+
+impl EmbeddedRuntimePolicy {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(Self::Warn),
+            Some(value) if value.eq_ignore_ascii_case("allow") => Ok(Self::Allow),
+            Some(value) if value.eq_ignore_ascii_case("warn") => Ok(Self::Warn),
+            Some(value) if value.eq_ignore_ascii_case("deny") => Ok(Self::Deny),
+            Some(value) => {
+                anyhow::bail!(
+                    "invalid {EMBEDDED_RUNTIME_POLICY_ENV}='{value}' (expected allow, warn, or deny)"
+                )
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Warn => "warn",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+pub(crate) fn embedded_runtime_policy_from_env() -> Result<EmbeddedRuntimePolicy> {
+    EmbeddedRuntimePolicy::parse(std::env::var(EMBEDDED_RUNTIME_POLICY_ENV).ok().as_deref())
+}
+
+pub(crate) fn ensure_embedded_runtime_allowed(context: &str) -> Result<EmbeddedRuntimePolicy> {
+    let policy = embedded_runtime_policy_from_env()?;
+    if policy == EmbeddedRuntimePolicy::Deny {
+        anyhow::bail!(
+            "{context} uses AX Serving embedded inference, but {EMBEDDED_RUNTIME_POLICY_ENV}=deny; run ax-serving-api as the gateway and register ax-engine or vLLM runtime nodes"
+        );
+    }
+    Ok(policy)
+}
+
 // ── System identity helpers ───────────────────────────────────────────────────
 
 /// Returns the macOS computer name (e.g. "Aki's MacBook Pro") via `scutil`.
@@ -394,6 +441,11 @@ pub(crate) fn run_serve(
 
     // Preload model (sync, before starting the async runtime).
     let preloaded_model = model.is_some();
+    let embedded_runtime_policy = if preloaded_model {
+        ensure_embedded_runtime_allowed("ax-serving serve -m")?
+    } else {
+        embedded_runtime_policy_from_env()?
+    };
     let capabilities: Vec<String> = if let Some(path) = model {
         let load_config = LoadConfig::default();
         layer
@@ -485,6 +537,7 @@ pub(crate) fn run_serve(
     } else {
         tracing::warn!(
             runtime = %runtime_metadata.runtime,
+            embedded_runtime_policy = embedded_runtime_policy.as_str(),
             "embedded local model loading is a compatibility path; prefer an ax-engine node adapter for Mac inference"
         );
     }
@@ -646,8 +699,8 @@ fn parse_rest_addr(addr: &str) -> Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_advertised_max_inflight, default_advertised_max_inflight,
-        derive_worker_runtime_metadata, parse_rest_addr,
+        EmbeddedRuntimePolicy, clamp_advertised_max_inflight, default_advertised_max_inflight,
+        derive_worker_runtime_metadata, ensure_embedded_runtime_allowed, parse_rest_addr,
     };
     use ax_serving_api::config::ServeConfig;
 
@@ -743,5 +796,66 @@ mod tests {
         assert_eq!(metadata.runtime_version.as_deref(), Some("0.13.0"));
         assert_eq!(metadata.hardware_class, "pc-cuda");
         assert_eq!(metadata.runtime_endpoint, "http://10.0.0.12:8000");
+    }
+
+    #[test]
+    fn embedded_runtime_policy_defaults_to_warn() {
+        assert_eq!(
+            EmbeddedRuntimePolicy::parse(None).unwrap(),
+            EmbeddedRuntimePolicy::Warn
+        );
+    }
+
+    #[test]
+    fn embedded_runtime_policy_accepts_allow_warn_and_deny() {
+        assert_eq!(
+            EmbeddedRuntimePolicy::parse(Some("allow")).unwrap(),
+            EmbeddedRuntimePolicy::Allow
+        );
+        assert_eq!(
+            EmbeddedRuntimePolicy::parse(Some("WARN")).unwrap(),
+            EmbeddedRuntimePolicy::Warn
+        );
+        assert_eq!(
+            EmbeddedRuntimePolicy::parse(Some(" deny ")).unwrap(),
+            EmbeddedRuntimePolicy::Deny
+        );
+    }
+
+    #[test]
+    fn embedded_runtime_policy_rejects_unknown_value() {
+        let err = EmbeddedRuntimePolicy::parse(Some("block")).unwrap_err();
+        assert!(err.to_string().contains("AXS_EMBEDDED_RUNTIME_POLICY"));
+    }
+
+    #[test]
+    fn deny_embedded_runtime_policy_blocks_embedded_use() {
+        let _guard = EnvGuard::set("AXS_EMBEDDED_RUNTIME_POLICY", "deny");
+
+        let err = ensure_embedded_runtime_allowed("test embedded mode").unwrap_err();
+        assert!(err.to_string().contains("test embedded mode"));
+        assert!(err.to_string().contains("runtime nodes"));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }

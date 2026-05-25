@@ -200,6 +200,7 @@ fn check_runtime_boundary() -> CheckResult {
         std::env::var("AXS_WORKER_RUNTIME").ok().as_deref(),
         std::env::var("AXS_ROUTING_CONFIG").ok().as_deref(),
         std::env::var("AXS_LLAMA_CPP_BIN").ok().as_deref(),
+        std::env::var("AXS_EMBEDDED_RUNTIME_POLICY").ok().as_deref(),
     )
 }
 
@@ -208,6 +209,7 @@ fn runtime_boundary_result(
     worker_runtime: Option<&str>,
     routing_config: Option<&str>,
     llama_cpp_bin: Option<&str>,
+    embedded_runtime_policy: Option<&str>,
 ) -> CheckResult {
     let orchestrator_configured = orchestrator_addr.is_some_and(|v| !v.trim().is_empty());
     let runtime = worker_runtime
@@ -216,9 +218,18 @@ fn runtime_boundary_result(
         .map(|v| v.to_ascii_lowercase());
     let embedded_hints = routing_config.is_some_and(|v| !v.trim().is_empty())
         || llama_cpp_bin.is_some_and(|v| !v.trim().is_empty());
+    let embedded_policy = embedded_runtime_policy
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_lowercase());
 
-    match (orchestrator_configured, runtime.as_deref(), embedded_hints) {
-        (true, Some("ax_engine" | "vllm"), _) => CheckResult {
+    match (
+        orchestrator_configured,
+        runtime.as_deref(),
+        embedded_hints,
+        embedded_policy.as_deref(),
+    ) {
+        (true, Some("ax_engine" | "vllm"), _, _) => CheckResult {
             name: "Runtime boundary",
             status: CheckStatus::Pass,
             detail: format!(
@@ -227,7 +238,27 @@ fn runtime_boundary_result(
             ),
             remediation: None,
         },
-        (true, None, _) => CheckResult {
+        (_, Some(other), _, _) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: format!("worker runtime '{other}' is not a PRD target runtime"),
+            remediation: Some("Use AXS_WORKER_RUNTIME=ax_engine or AXS_WORKER_RUNTIME=vllm."),
+        },
+        (_, _, _, Some("deny")) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Pass,
+            detail: "embedded runtime compatibility paths are disabled by policy".into(),
+            remediation: None,
+        },
+        (_, _, _, Some("allow")) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: "embedded runtime compatibility paths are explicitly allowed".into(),
+            remediation: Some(
+                "Use AXS_EMBEDDED_RUNTIME_POLICY=deny in production gateway-only deployments.",
+            ),
+        },
+        (true, None, _, Some("warn") | None) => CheckResult {
             name: "Runtime boundary",
             status: CheckStatus::Warn,
             detail: "orchestrated worker will default to ax_engine/mac compatibility metadata"
@@ -236,13 +267,7 @@ fn runtime_boundary_result(
                 "Set AXS_WORKER_RUNTIME and prefer dedicated ax-engine or vLLM node adapters.",
             ),
         },
-        (_, Some(other), _) => CheckResult {
-            name: "Runtime boundary",
-            status: CheckStatus::Warn,
-            detail: format!("worker runtime '{other}' is not a PRD target runtime"),
-            remediation: Some("Use AXS_WORKER_RUNTIME=ax_engine or AXS_WORKER_RUNTIME=vllm."),
-        },
-        (false, None, true) => CheckResult {
+        (false, None, true, Some("warn") | None) => CheckResult {
             name: "Runtime boundary",
             status: CheckStatus::Warn,
             detail: "embedded local runtime configuration detected; this is a compatibility path"
@@ -251,7 +276,7 @@ fn runtime_boundary_result(
                 "Move inference execution to ax-engine or vLLM runtime nodes and keep AX Serving as the gateway.",
             ),
         },
-        (false, None, false) => CheckResult {
+        (false, None, false, Some("warn") | None) => CheckResult {
             name: "Runtime boundary",
             status: CheckStatus::Warn,
             detail: "standalone embedded inference mode is available only as a compatibility path"
@@ -259,6 +284,12 @@ fn runtime_boundary_result(
             remediation: Some(
                 "Run ax-serving-api as the gateway and register ax-engine or vLLM runtime nodes.",
             ),
+        },
+        (_, _, _, Some(other)) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: format!("unknown AXS_EMBEDDED_RUNTIME_POLICY value '{other}'"),
+            remediation: Some("Use AXS_EMBEDDED_RUNTIME_POLICY=allow, warn, or deny."),
         },
     }
 }
@@ -450,8 +481,13 @@ mod tests {
 
     #[test]
     fn runtime_boundary_passes_for_explicit_target_runtime_node() {
-        let result =
-            runtime_boundary_result(Some("http://127.0.0.1:19090"), Some("vllm"), None, None);
+        let result = runtime_boundary_result(
+            Some("http://127.0.0.1:19090"),
+            Some("vllm"),
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.contains("vllm"));
@@ -459,7 +495,7 @@ mod tests {
 
     #[test]
     fn runtime_boundary_warns_for_embedded_compatibility_mode() {
-        let result = runtime_boundary_result(None, None, Some("./backends.yaml"), None);
+        let result = runtime_boundary_result(None, None, Some("./backends.yaml"), None, None);
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.detail.contains("compatibility path"));
@@ -472,9 +508,27 @@ mod tests {
             Some("custom_runtime"),
             None,
             None,
+            None,
         );
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.detail.contains("not a PRD target runtime"));
+    }
+
+    #[test]
+    fn runtime_boundary_passes_when_embedded_runtime_policy_denies_compatibility_paths() {
+        let result =
+            runtime_boundary_result(None, None, Some("./backends.yaml"), None, Some("deny"));
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.detail.contains("disabled by policy"));
+    }
+
+    #[test]
+    fn runtime_boundary_warns_when_embedded_runtime_policy_explicitly_allows_paths() {
+        let result = runtime_boundary_result(None, None, None, None, Some("allow"));
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.detail.contains("explicitly allowed"));
     }
 }

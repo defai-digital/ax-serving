@@ -24,7 +24,8 @@ inference execution is delegated to runtime nodes:
 - NVIDIA Thor nodes run `vLLM`
 
 The existing embedded local worker path remains available as a compatibility
-bridge while dedicated runtime-node adapters mature.
+bridge. New deployments should prefer runtime-node adapters such as
+`ax-runtime-agent` in front of ax-engine or vLLM endpoints.
 
 AX Fabric is the product-facing layer for retrieval, knowledge, and grounded
 agent workflows. AX Serving is the infrastructure layer that makes that stack
@@ -251,9 +252,9 @@ that routes requests into runtime nodes.
 
 The legacy embedded backend paths (`llama.cpp`, MLX subprocess, optional
 libllama, and direct native ax-engine integration) are compatibility paths.
-They remain available while replacement runtime-node adapters are completed,
-but new product work should use the public node contract instead of adding more
-inference-runtime responsibility to AX Serving.
+They remain available for migration and local testing, but new product work
+should use the public node contract instead of adding more inference-runtime
+responsibility to AX Serving.
 
 In practice, this means AX Serving owns the APIs, scheduling, orchestration,
 fleet health, metrics, and lifecycle policy, while runtime nodes own inference

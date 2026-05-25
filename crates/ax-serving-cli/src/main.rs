@@ -497,6 +497,14 @@ fn main() -> Result<()> {
 fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
     use ax_serving_engine::{GenerateEvent, GenerationParams, InferenceBackend as _};
 
+    let embedded_runtime_policy =
+        serve::ensure_embedded_runtime_allowed("single-shot inference mode")?;
+    if embedded_runtime_policy == serve::EmbeddedRuntimePolicy::Warn {
+        eprintln!(
+            "[ax-serving] warning: single-shot embedded inference is a compatibility path; prefer ax-serving-api plus ax-engine or vLLM runtime nodes"
+        );
+    }
+
     // Inference mode uses RouterBackend (same as serve mode).
     let backend = RouterBackend::from_env();
     let config = LoadConfig {

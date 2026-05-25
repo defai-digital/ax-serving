@@ -27,11 +27,11 @@ toward the PRD target architecture:
 | Worker registry, heartbeat, drain | Fleet control plane | Keep in AX Serving | Gateway |
 | Routing, placement, admission, retry | Fleet policy | Keep in AX Serving | Gateway |
 | Metrics, audit, fleet diagnostics | Operator surface | Keep in AX Serving | Gateway |
-| `ax-thor-agent` proxy | Runtime adapter | Keep as thin vLLM/Thor adapter | Adapter |
+| `ax-runtime-agent` / `ax-thor-agent` proxy | Runtime adapter | Keep as thin OpenAI-compatible runtime adapter | Adapter |
 | `ax-serving serve` local worker | Embedded Mac compatibility worker | Keep only as migration bridge | Compatibility |
-| Native ax-engine backend inside serving crate | Direct runtime execution | Move to ax-engine node adapter | Compatibility |
-| llama.cpp subprocess backend | Direct runtime execution | Deprecate after vLLM/ax-engine node paths cover needs | Compatibility |
-| MLX subprocess backend | Direct runtime execution | Deprecate or adapterize after ax-engine node path | Compatibility |
+| Native ax-engine backend inside serving crate | Direct runtime execution | Prefer `ax-runtime-agent` in front of ax-engine | Compatibility |
+| llama.cpp subprocess backend | Direct runtime execution | Deprecate after runtime-node deployments cover migration needs | Compatibility |
+| MLX subprocess backend | Direct runtime execution | Deprecate or adapterize after runtime-node replacement is validated | Compatibility |
 | optional libllama direct backend | Direct runtime execution | Deprecate unless required for shim compatibility | Compatibility |
 | Shim library | llama-style integration compatibility | Keep only if it serves a supported integration path | Compatibility |
 
@@ -40,7 +40,8 @@ toward the PRD target architecture:
 ## Compatibility Rules
 
 - Compatibility paths must not become new product architecture.
-- Compatibility paths may remain while replacement node adapters are incomplete.
+- Compatibility paths may remain for migration, local testing, and explicitly
+  approved integrations.
 - New routing and observability features should use runtime/node metadata rather
   than embedded backend internals.
 - Runtime-specific tuning belongs in ax-engine or vLLM documentation and
@@ -55,12 +56,35 @@ toward the PRD target architecture:
 
 - `PASS` when worker registration is explicitly configured for `ax_engine` or
   `vllm` runtime-node mode.
+- `PASS` when `AXS_EMBEDDED_RUNTIME_POLICY=deny` disables embedded
+  compatibility paths for gateway-only deployments.
 - `WARN` when AX Serving appears to be used in standalone embedded inference
   mode.
+- `WARN` when embedded compatibility paths are explicitly allowed.
 - `WARN` when an unknown runtime is configured.
 
 This warning is intentional. It does not block local compatibility use, but it
 keeps the PRD target visible to operators.
+
+## Compatibility Quarantine Policy
+
+Embedded runtime paths are controlled by:
+
+```text
+AXS_EMBEDDED_RUNTIME_POLICY=warn
+```
+
+Supported values:
+
+| Value | Behavior |
+|---|---|
+| `warn` | Default. Allow embedded compatibility paths and emit operator warnings. |
+| `allow` | Explicitly allow embedded compatibility paths for migration or local testing. |
+| `deny` | Block embedded local inference and require gateway plus runtime-node deployment. |
+
+The `deny` mode applies to `ax-serving serve -m ...` and single-shot
+`ax-serving -m ...` inference. It does not block `ax-serving-api` gateway mode
+or runtime-node adapters such as `ax-runtime-agent`.
 
 ---
 

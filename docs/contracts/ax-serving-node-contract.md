@@ -123,6 +123,28 @@ Optional fields:
 Heartbeat telemetry is best effort. AX Serving must continue routing safely when
 optional telemetry is absent.
 
+Runtime-node adapters may translate runtime `/metrics` output into these
+heartbeat fields. The generic `ax-runtime-agent` recognizes these common
+Prometheus gauge names when present:
+
+| Metric | Heartbeat field |
+|---|---|
+| `ax_runtime_active_sequences` | `active_sequences` |
+| `ax_runtime_decode_tok_per_sec` | `decode_tok_per_sec` |
+| `ax_runtime_ttft_p95_ms` | `ttft_p95_ms` |
+| `ax_runtime_queue_depth` | `queue_depth` |
+| `ax_runtime_error_rate` | `error_rate` |
+| `ax_runtime_kv_pages_used` | `kv_pages_used` |
+| `ax_runtime_kv_pages_total` | `kv_pages_total` |
+| `ax_runtime_prefix_reusable_tokens` | `prefix_reusable_tokens` |
+| `ax_runtime_active_batch_size` | `active_batch_size` |
+| `ax_runtime_max_batch_size` | `max_batch_size` |
+
+Known vLLM/SGLang aliases are accepted where stable enough to treat as
+best-effort hints. Missing metrics are not registration failures; the adapter
+sends safe defaults and AX Serving keeps routing by health, capacity, and model
+inventory.
+
 ---
 
 ## Runtime Responsibilities
@@ -174,8 +196,11 @@ New deployments should prefer the generic `AXS_NODE_*` environment variables:
 | `AXS_NODE_WORKER_POOL` | Operator-defined routing or maintenance pool. |
 | `AXS_NODE_MAX_INFLIGHT` | Advertised concurrent request capacity. |
 
-An ax-engine adapter should report `runtime = "ax_engine"` and translate
-ax-engine model inventory, health, and metrics into this contract.
+An ax-engine runtime node should report `runtime = "ax_engine"`. When ax-engine
+exposes an OpenAI-compatible endpoint, the generic `ax-runtime-agent` can
+register and proxy it through this contract. Runtime-specific inventory,
+health, and metrics mappings can be added behind the same adapter boundary
+without moving ax-engine internals into AX Serving.
 
 A vLLM adapter should report `runtime = "vllm"` and use vLLM's
 OpenAI-compatible serving endpoint as the runtime endpoint. PC CUDA and NVIDIA
@@ -193,10 +218,10 @@ local Mac compatibility. When runtime metadata is not provided, it registers as:
 - `hardware_class = "mac"`
 - `runtime_endpoint = "http://<worker-addr>"`
 
-This path is a compatibility bridge while the dedicated ax-engine node adapter
-is developed. New Mac inference integration should prefer an explicit
-ax-engine node adapter that implements this contract without moving ax-engine
-runtime internals into AX Serving.
+This path is a compatibility bridge for local development and migration. New
+Mac inference integration should prefer `ax-runtime-agent` in front of an
+OpenAI-compatible ax-engine endpoint, or another thin adapter that implements
+this contract without moving ax-engine runtime internals into AX Serving.
 
 ---
 

@@ -106,6 +106,12 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert!(!heartbeats.is_empty());
     assert_eq!(heartbeats[0].0, "worker-1");
     assert_eq!(heartbeats[0].1["model_ids"], json!(["qwen2-72b"]));
+    assert_eq!(heartbeats[0].1["active_sequences"], json!(4));
+    assert_eq!(heartbeats[0].1["queue_depth"], json!(3));
+    assert_eq!(heartbeats[0].1["decode_tok_per_sec"], json!(42.5));
+    assert_eq!(heartbeats[0].1["ttft_p95_ms"], json!(118));
+    assert_eq!(heartbeats[0].1["kv_pages_used"], json!(12));
+    assert_eq!(heartbeats[0].1["kv_pages_total"], json!(128));
     drop(heartbeats);
 
     let (proxy_base, _proxy_task) = spawn_server(proxy::router(
@@ -173,8 +179,21 @@ fn sglang_router(state: Arc<SgLangState>) -> Router {
             "/v1/models",
             get(|| async { Json(json!({"data": [{"id": "qwen2-72b"}]})) }),
         )
+        .route("/metrics", get(runtime_metrics))
         .route("/v1/chat/completions", post(handle_chat))
         .with_state(state)
+}
+
+async fn runtime_metrics() -> &'static str {
+    r#"
+ax_runtime_active_sequences 4
+ax_runtime_queue_depth 3
+ax_runtime_decode_tok_per_sec 42.5
+ax_runtime_ttft_p95_ms 118
+ax_runtime_error_rate 0.02
+ax_runtime_kv_pages_used 12
+ax_runtime_kv_pages_total 128
+"#
 }
 
 async fn handle_register(
