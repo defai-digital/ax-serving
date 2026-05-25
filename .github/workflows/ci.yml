@@ -26,6 +26,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Install native build dependencies
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
