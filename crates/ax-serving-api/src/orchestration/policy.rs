@@ -468,7 +468,10 @@ impl DispatchPolicy for CacheAffinityPolicy {
         workers: &'a [WorkerStatus],
         ctx: &DispatchContext<'_>,
     ) -> Option<&'a WorkerStatus> {
-        if !workers.iter().any(|w| w.inflight < w.max_inflight) {
+        if !workers
+            .iter()
+            .any(|w| effective_active_sequences(w) < w.max_inflight)
+        {
             return None;
         }
 
@@ -476,7 +479,7 @@ impl DispatchPolicy for CacheAffinityPolicy {
 
         workers
             .iter()
-            .filter(|w| w.inflight < w.max_inflight)
+            .filter(|w| effective_active_sequences(w) < w.max_inflight)
             .max_by(|a, b| {
                 let score = |w: &&WorkerStatus| {
                     let seqs = effective_active_sequences(w) as f64;
@@ -938,6 +941,21 @@ mod tests {
                 .select(&workers, &ctx())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cache_affinity_excludes_workers_full_by_active_sequences() {
+        let policy = CacheAffinityPolicy::new();
+        let full_by_runtime = WorkerStatus {
+            active_sequences: 4,
+            ..make_worker_with_cache(0, 4, 0.1, 0.9)
+        };
+        let available = make_worker_with_cache(1, 4, 0.5, 0.5);
+        let workers = vec![full_by_runtime, available.clone()];
+
+        let selected = policy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(selected.id, available.id);
     }
 
     #[test]
