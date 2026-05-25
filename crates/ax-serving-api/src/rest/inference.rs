@@ -36,6 +36,7 @@ use super::validation::{
 use crate::ServingLayer;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
 use crate::project_policy;
+use crate::registry::LoadedModel;
 use crate::scheduler::SchedulerPermit;
 use crate::utils::request_meta::{
     estimate_chat_prompt_tokens_u64, estimate_text_prompt_tokens_u64,
@@ -715,6 +716,7 @@ pub async fn chat_completions(
             model_name,
             req_logprobs,
             Arc::clone(&layer.metrics),
+            entry,
             permit,
             pm_permit,
         )
@@ -729,6 +731,7 @@ pub async fn chat_completions(
             layer.cache_metrics.as_ref(),
             layer.metrics.as_ref(),
             cache_leader_guard,
+            entry,
             permit,
             pm_permit,
             queue_wait_us,
@@ -749,13 +752,15 @@ fn stream_response(
     model: String,
     logprobs: bool,
     metrics: Arc<crate::metrics::MetricsStore>,
+    model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let created = unix_now();
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
 
-    // State: (rx, id, model, created, phase, first_token, permit, pm_permit, logprobs, pending)
+    // State includes the stream receiver, response metadata, model entry,
+    // scheduler permits, logprobs flag, and any pending terminal event.
     //
     // phase 0 — normal streaming (recv from channel)
     // phase 1 — stop chunk emitted; send `data: [DONE]` sentinel next
@@ -771,6 +776,7 @@ fn stream_response(
             created,
             0u8,
             true,
+            Some(model_entry),
             Some(permit),
             Some(pm_permit),
             logprobs,
@@ -784,6 +790,7 @@ fn stream_response(
             created,
             phase,
             first_token,
+            model_entry,
             permit,
             pm,
             logprobs,
@@ -798,7 +805,8 @@ fn stream_response(
                     Some((
                         Ok(ev),
                         (
-                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                            rx, id, model, created, 2, false, None, None, None, logprobs, None,
+                            metrics,
                         ),
                     ))
                 }
@@ -866,6 +874,7 @@ fn stream_response(
                                     created,
                                     0,
                                     false,
+                                    model_entry,
                                     permit,
                                     pm,
                                     logprobs,
@@ -913,7 +922,17 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 0, false, permit, pm, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    0,
+                                    false,
+                                    model_entry,
+                                    permit,
+                                    pm,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -946,7 +965,17 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -964,7 +993,17 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -984,7 +1023,17 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1012,6 +1061,7 @@ async fn blocking_response(
     cache_metrics: &crate::cache::CacheMetrics,
     metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
+    _model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
     queue_wait_us: u64,
@@ -1474,6 +1524,7 @@ pub async fn text_completions(
             model_name,
             req_logprobs,
             Arc::clone(&layer.metrics),
+            entry,
             permit,
             pm_permit,
         )
@@ -1489,6 +1540,7 @@ pub async fn text_completions(
             layer.cache_metrics.as_ref(),
             layer.metrics.as_ref(),
             cache_leader_guard,
+            entry,
             permit,
             pm_permit,
             queue_wait_us,
@@ -1504,6 +1556,7 @@ fn text_stream_response(
     model: String,
     logprobs: bool,
     metrics: Arc<crate::metrics::MetricsStore>,
+    model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1518,6 +1571,7 @@ fn text_stream_response(
             created,
             0u8,
             true, // first_token
+            Some(model_entry),
             Some(permit),
             Some(pm_permit),
             logprobs,
@@ -1531,6 +1585,7 @@ fn text_stream_response(
             created,
             phase,
             first_token,
+            model_entry,
             permit,
             pm,
             logprobs,
@@ -1544,7 +1599,8 @@ fn text_stream_response(
                     Some((
                         Ok(ev),
                         (
-                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                            rx, id, model, created, 2, false, None, None, None, logprobs, None,
+                            metrics,
                         ),
                     ))
                 }
@@ -1606,6 +1662,7 @@ fn text_stream_response(
                                     created,
                                     0,
                                     false, // first_token: no longer first
+                                    model_entry,
                                     permit,
                                     pm,
                                     logprobs,
@@ -1637,7 +1694,17 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1655,7 +1722,17 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1670,6 +1747,7 @@ fn text_stream_response(
                                 created,
                                 0,
                                 first_token,
+                                model_entry,
                                 permit,
                                 pm,
                                 logprobs,
@@ -1692,7 +1770,17 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1718,6 +1806,7 @@ async fn text_blocking_response(
     cache_metrics: &crate::cache::CacheMetrics,
     metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
+    _model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
     queue_wait_us: u64,
@@ -1944,6 +2033,7 @@ pub async fn embeddings(
         }
     };
     let queue_wait_us = permit.queue_wait_us();
+    let _model_entry = entry;
     let backend = Arc::clone(&layer.backend);
     let result = tokio::task::spawn_blocking(move || match (strings_owned, tokens_owned) {
         (Some(texts), None) => backend.embed(handle, &EmbedInput::Strings(&texts), &config),
@@ -2123,7 +2213,9 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use ax_serving_engine::{GenerateEvent, GenerationStats, ThermalMonitor};
+    use ax_serving_engine::{
+        BackendType, GenerateEvent, GenerationStats, ModelHandle, ModelMetadata, ThermalMonitor,
+    };
     use axum::http::StatusCode;
     use tokio::sync::mpsc;
 
@@ -2153,6 +2245,29 @@ mod tests {
             stop_reason: "stop".into(),
             ..GenerationStats::default()
         }
+    }
+
+    fn dummy_model_entry() -> Arc<LoadedModel> {
+        Arc::new(LoadedModel {
+            id: "model".into(),
+            path: std::path::PathBuf::from("model.gguf"),
+            handle: ModelHandle(1),
+            metadata: ModelMetadata {
+                architecture: "test".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+                resolved_backend: BackendType::Auto,
+            },
+            load_config: Default::default(),
+            loaded_at: std::time::Instant::now(),
+            last_accessed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
     }
 
     #[tokio::test]
@@ -2188,6 +2303,7 @@ mod tests {
             &cache_metrics,
             &metrics,
             None,
+            dummy_model_entry(),
             permit,
             pm_permit,
             queue_wait_us,
@@ -2250,6 +2366,7 @@ mod tests {
             &cache_metrics,
             &metrics,
             None,
+            dummy_model_entry(),
             permit,
             pm_permit,
             queue_wait_us,

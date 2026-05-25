@@ -279,8 +279,12 @@ impl AxServingServiceTrait for AxServingService {
         // Start timing before spawning so total_time_ms covers the full
         // generation window, not just task-scheduled-to-done.
         let start = Instant::now();
+        let model_entry = entry;
 
         tokio::spawn(async move {
+            // Hold the loaded model entry so unload/reload sees the handle as
+            // busy until the stream has fully finished or the client disconnects.
+            let _model_entry = model_entry;
             // Hold both scheduler permits for the full stream lifetime.
             let _pm_permit = pm_permit;
             let _permit = permit;
@@ -730,11 +734,22 @@ mod tests {
             )
             .unwrap();
 
-        let service = AxServingService::new(layer);
+        let service = AxServingService::new(Arc::clone(&layer));
         let first = service
             .infer(Request::new(valid_infer_request()))
             .await
             .expect("first infer should acquire the per-model slot");
+
+        let unload_err = layer
+            .registry
+            .unload("test-model", backend.as_ref())
+            .expect_err("active stream should keep the model handle busy");
+        assert!(
+            unload_err
+                .downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::Busy(id) if id == "test-model")),
+            "unexpected unload error: {unload_err}"
+        );
 
         let second = service.infer(Request::new(valid_infer_request())).await;
         assert!(second.is_err(), "second same-model infer should be capped");
