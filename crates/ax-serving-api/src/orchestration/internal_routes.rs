@@ -226,6 +226,9 @@ async fn handle_drain_complete(
         Ok(id) => id,
         Err(status) => return (status, "invalid worker id").into_response(),
     };
+    if s.registry.get_snapshot(id).is_none() {
+        return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
     s.registry.evict(id);
     info!(%id, "worker drain complete, evicted");
     StatusCode::NO_CONTENT.into_response()
@@ -275,8 +278,17 @@ async fn handle_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LicenseConfig;
     use axum::{Router, middleware, routing::get};
     use tower::ServiceExt;
+
+    fn test_state() -> InternalState {
+        InternalState {
+            registry: WorkerRegistry::new(),
+            config: Arc::new(OrchestratorConfig::default()),
+            license: LicenseState::new(&LicenseConfig::default()),
+        }
+    }
 
     #[test]
     fn parse_allowed_node_cidrs_accepts_ip_and_cidr() {
@@ -365,5 +377,39 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn drain_complete_returns_404_for_unknown_worker() {
+        let id = WorkerId::new();
+        let response = handle_drain_complete(State(test_state()), Path(id.to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn drain_complete_evicts_known_worker() {
+        let state = test_state();
+        let register = state.registry.register(
+            RegisterRequest {
+                addr: "127.0.0.1:18081".into(),
+                capabilities: super::super::registry::RegisterCapabilities::Legacy(vec![
+                    "m1".into(),
+                ]),
+                max_inflight: 1,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&register.worker_id).unwrap();
+
+        let response = handle_drain_complete(State(state.clone()), Path(register.worker_id))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.registry.get_snapshot(id).is_none());
     }
 }
