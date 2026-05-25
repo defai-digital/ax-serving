@@ -821,6 +821,20 @@ impl WorkerRegistry {
         self.inner.remove(&id);
     }
 
+    /// Remove a worker only if it still matches a stale unhealthy probe snapshot.
+    ///
+    /// Active TCP probes are launched from a point-in-time list of unhealthy
+    /// workers. A heartbeat or re-registration can make that snapshot stale
+    /// before the probe result returns, so failed probes must not evict a worker
+    /// that has already recovered or moved to a different address.
+    pub fn evict_if_unhealthy_at_addr(&self, id: WorkerId, addr: SocketAddr) -> bool {
+        self.inner
+            .remove_if(&id, |_, entry| {
+                entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
+            })
+            .is_some()
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Returns workers eligible to receive a request for `model_id`:

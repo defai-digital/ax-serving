@@ -144,9 +144,8 @@ async fn probe_and_evict(registry: &WorkerRegistry, candidates: Vec<(WorkerId, S
     for (id, addr, reachable) in
         probe_candidates(candidates, probe_timeout, MAX_CONCURRENT_TCP_PROBES).await
     {
-        if !reachable {
+        if !reachable && registry.evict_if_unhealthy_at_addr(id, addr) {
             warn!(%id, %addr, "worker evicted: TCP probe failed (unreachable)");
-            registry.evict(id);
         }
     }
 }
@@ -248,5 +247,29 @@ mod tests {
             registry.get_snapshot(closed_id).is_none(),
             "unreachable worker should be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_and_evict_does_not_remove_worker_recovered_by_heartbeat() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed listener");
+        let closed_addr = closed_listener
+            .local_addr()
+            .expect("closed listener local addr");
+        drop(closed_listener);
+
+        let registry = WorkerRegistry::new();
+        let recovered_id = register_worker(&registry, closed_addr);
+        registry.mark_unhealthy(recovered_id);
+        let stale_candidates = registry.list_unhealthy_addrs();
+
+        assert!(registry.heartbeat(recovered_id, Default::default()));
+        probe_and_evict(&registry, stale_candidates).await;
+
+        let snapshot = registry
+            .get_snapshot(recovered_id)
+            .expect("recovered worker must not be evicted by a stale probe");
+        assert_eq!(snapshot.health, "healthy");
     }
 }
