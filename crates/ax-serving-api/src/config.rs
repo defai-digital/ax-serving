@@ -708,10 +708,6 @@ impl ServeConfig {
 mod tests {
     use super::*;
 
-    // Env var mutations are process-global. Serialize all tests that call
-    // set_var / remove_var to prevent data races between parallel test threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn valid_cfg() -> ServeConfig {
         ServeConfig::default()
     }
@@ -856,11 +852,12 @@ mod tests {
 
     // ── apply_env_overrides ────────────────────────────────────────────────────
     // Env var mutations are process-global and `unsafe` in edition 2024.
-    // Serialize all env-mutating tests through ENV_LOCK to avoid test-thread UB.
+    // Serialize all env-mutating tests through the crate-level lock to avoid
+    // test-thread UB.
 
     #[test]
     fn env_override_grpc_host() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_GRPC_HOST", "0.0.0.0") };
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -870,7 +867,7 @@ mod tests {
 
     #[test]
     fn env_override_orchestrator_host() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_ORCHESTRATOR_HOST", "192.168.1.5") };
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -880,7 +877,7 @@ mod tests {
 
     #[test]
     fn env_override_sched_max_inflight_enforces_minimum_one() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_SCHED_MAX_INFLIGHT", "0") };
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -890,7 +887,7 @@ mod tests {
 
     #[test]
     fn env_override_default_max_tokens() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_DEFAULT_MAX_TOKENS", "4096") };
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -900,7 +897,7 @@ mod tests {
 
     #[test]
     fn env_override_dispatch_policy() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_DISPATCH_POLICY", "weighted_round_robin") };
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -910,7 +907,7 @@ mod tests {
 
     #[test]
     fn env_override_orchestrator_ports() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe {
             std::env::set_var("AXS_ORCHESTRATOR_PORT", "9000");
             std::env::set_var("AXS_INTERNAL_PORT", "9001");
@@ -936,7 +933,7 @@ mod tests {
 
     #[test]
     fn env_override_worker_heartbeat_ms_enforces_minimum() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_WORKER_HEARTBEAT_MS", "10") }; // below 100 ms floor
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -946,7 +943,7 @@ mod tests {
 
     #[test]
     fn env_override_dashboard_poll_ms_enforces_minimum() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_DASHBOARD_POLL_MS", "100") }; // below 500 ms floor
         let mut cfg = ServeConfig::default();
         cfg.apply_env_overrides();
@@ -956,7 +953,7 @@ mod tests {
 
     #[test]
     fn env_override_invalid_value_ignored() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         // Non-numeric value for a numeric field should leave the default intact.
         unsafe { std::env::set_var("AXS_SCHED_MAX_QUEUE", "not_a_number") };
         let mut cfg = ServeConfig::default();
@@ -969,7 +966,7 @@ mod tests {
 
     #[test]
     fn load_default_reads_axs_config_env_pointing_to_yaml_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         // Write a minimal valid YAML config to a temp file.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_serving.yaml");
@@ -987,7 +984,7 @@ mod tests {
 
     #[test]
     fn load_default_falls_back_to_env_when_no_file_exists() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         // Point AXS_CONFIG to a nonexistent path → load_default falls back to
         // env-only defaults (from_env). We verify a known default survives.
         unsafe { std::env::set_var("AXS_CONFIG", "/nonexistent/path/serving.yaml") };
@@ -1005,7 +1002,7 @@ mod tests {
 
     #[test]
     fn from_env_applies_env_vars_to_defaults() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_SCHED_MAX_INFLIGHT", "5") };
         let cfg = ServeConfig::from_env();
         unsafe { std::env::remove_var("AXS_SCHED_MAX_INFLIGHT") };
@@ -1081,7 +1078,7 @@ mod tests {
 
     #[test]
     fn from_env_clamps_global_queue_wait_ms_to_one() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "0") };
         let cfg = ServeConfig::from_env();
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };

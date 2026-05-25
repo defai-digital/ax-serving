@@ -489,13 +489,9 @@ fn normalize_restored_job_record(record: &mut JobRecord, restored_at_ms: u128) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::{
         JobRecord, JobStatus, JobStore, PersistedJobStoreState, RESTART_INTERRUPTED_ERROR,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── basic CRUD ────────────────────────────────────────────────────────────
 
@@ -816,7 +812,7 @@ mod tests {
 
     #[test]
     fn mark_finished_auto_prunes_completed_jobs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_JOB_TTL_SECS", "3600") };
         unsafe { std::env::set_var("AXS_JOB_MAX_COMPLETED", "2") };
 

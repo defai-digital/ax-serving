@@ -190,9 +190,8 @@ jobs:
     name: Publish JS SDK to npm
     runs-on: ubuntu-latest
     needs: build-macos
-    # npm publish can fail if the @defai-digital scope is not yet created on
-    # npmjs.com; treat it as a soft failure so the rest of the release succeeds.
-    continue-on-error: true
+    # npm publish is skipped cleanly when the @defai-digital scope/package is
+    # not available on npmjs.com. Other publish failures should fail the job.
     steps:
       - name: Check npm token configuration
         id: npm-token
@@ -246,11 +245,25 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PRERELEASE: ${{ needs.build-macos.outputs.prerelease }}
         run: |
+          set +e
           if [[ "$PRERELEASE" == "true" ]]; then
-            npm publish --access public --tag beta
+            npm publish --access public --tag beta 2>&1 | tee npm-publish.log
           else
-            npm publish --access public
+            npm publish --access public 2>&1 | tee npm-publish.log
           fi
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$status" -eq 0 ]]; then
+            exit 0
+          fi
+
+          if grep -Eq "npm error code E404|Not Found - PUT https://registry\\.npmjs\\.org/@defai-digital%2fax-serving" npm-publish.log; then
+            echo "NPM registry does not have the @defai-digital/ax-serving package/scope available; skipping JS SDK publish."
+            exit 0
+          fi
+
+          exit "$status"
 
       - name: Skip npm publish
         if: ${{ steps.npm-token.outputs.present != 'true' }}

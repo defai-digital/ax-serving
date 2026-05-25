@@ -154,10 +154,6 @@ impl LicenseState {
 mod tests {
     use super::*;
 
-    // Env var mutations are process-global.  Serialize all tests that call
-    // set_var / remove_var to prevent data races between parallel test threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn default_state() -> LicenseState {
         LicenseState {
             key: Mutex::new(None),
@@ -236,7 +232,7 @@ mod tests {
 
     #[test]
     fn file_path_returns_none_when_home_and_xdg_unset() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         // Remove both env vars so file_path() has nowhere to look.
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
@@ -256,7 +252,7 @@ mod tests {
 
     #[test]
     fn set_key_updates_memory_without_file_path() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         // Remove both so license_file_path() returns None → no disk I/O.
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
@@ -285,7 +281,7 @@ mod tests {
 
     #[test]
     fn set_key_persists_to_disk() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Point XDG_CONFIG_HOME at our temp dir so license_file_path() resolves there.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().to_str().unwrap()) };
@@ -315,7 +311,7 @@ mod tests {
 
     #[test]
     fn new_prefers_env_key_over_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Pre-create a file with a different key.
         let key_dir = dir.path().join("ax-serving");

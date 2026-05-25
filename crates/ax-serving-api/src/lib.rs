@@ -236,3 +236,16 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
     result?;
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize process-global environment mutation across all unit tests in
+    /// this crate. Rust 2024 marks env mutation unsafe because concurrent
+    /// readers and writers can race across threads.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+}
