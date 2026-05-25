@@ -210,7 +210,17 @@ impl AxServingServiceTrait for AxServingService {
             ));
         };
 
-        // All validation passed — now acquire the concurrency permit.
+        // All validation passed — now acquire the same per-model and global
+        // concurrency permits used by REST inference. Per-model first avoids
+        // holding a global slot while waiting behind another request for the
+        // same model.
+        let pm_permit = self
+            .layer
+            .per_model_scheduler
+            .acquire(&req.model_id, self.layer.scheduler.config().max_wait_ms)
+            .await
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+
         let permit = self
             .layer
             .scheduler
@@ -271,7 +281,8 @@ impl AxServingServiceTrait for AxServingService {
         let start = Instant::now();
 
         tokio::spawn(async move {
-            // Hold the scheduler permit for the full stream lifetime.
+            // Hold both scheduler permits for the full stream lifetime.
+            let _pm_permit = pm_permit;
             let _permit = permit;
 
             while let Some(event) = engine_rx.recv().await {
@@ -454,9 +465,18 @@ fn engine_thermal_to_proto(state: ThermalState) -> proto::ThermalState {
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::RegistryError;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use ax_serving_engine::{
+        GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
+        ModelMetadata,
+    };
+    use tonic::Request;
 
     use super::*;
+    use crate::config::ServeConfig;
+    use crate::registry::RegistryError;
 
     fn valid_infer_request() -> proto::InferRequest {
         proto::InferRequest {
@@ -465,6 +485,86 @@ mod tests {
             messages: Vec::new(),
             sampling: None,
             max_tokens: 128,
+        }
+    }
+
+    struct HoldingBackend {
+        sender: Mutex<Option<mpsc::Sender<GenerateEvent>>>,
+    }
+
+    impl HoldingBackend {
+        fn new() -> Self {
+            Self {
+                sender: Mutex::new(None),
+            }
+        }
+
+        fn release_generation(&self) {
+            let _ = self.sender.lock().unwrap().take();
+        }
+    }
+
+    impl InferenceBackend for HoldingBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            Ok((
+                ModelHandle(1),
+                ModelMetadata {
+                    architecture: "holding".into(),
+                    n_layers: 0,
+                    n_heads: 0,
+                    n_kv_heads: 0,
+                    embedding_dim: 0,
+                    vocab_size: 0,
+                    context_length: 2048,
+                    load_time_ms: 1,
+                    peak_rss_bytes: 0,
+                    resolved_backend: BackendType::Auto,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _handle: ModelHandle,
+            _input: GenerateInput,
+            _params: GenerationParams,
+            tx: mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            *self.sender.lock().unwrap() = Some(tx);
+            Ok(())
+        }
+
+        fn tokenize(
+            &self,
+            _handle: ModelHandle,
+            _text: &str,
+            _add_bos: bool,
+        ) -> anyhow::Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+
+        fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![2])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            8
         }
     }
 
@@ -593,6 +693,61 @@ mod tests {
         let status = validate_infer_request(&req).unwrap();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("max_tokens exceeds"));
+    }
+
+    #[tokio::test]
+    async fn grpc_infer_enforces_per_model_limit() {
+        let backend = Arc::new(HoldingBackend::new());
+        let mut config = ServeConfig {
+            sched_per_model_max_inflight: 1,
+            sched_max_inflight: 8,
+            sched_max_wait_ms: 20,
+            ..ServeConfig::default()
+        };
+        config.cache.enabled = false;
+        let layer = Arc::new(ServingLayer::new(
+            Arc::clone(&backend) as Arc<dyn InferenceBackend>,
+            config,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, b"dummy").unwrap();
+        layer
+            .registry
+            .load(
+                "test-model",
+                &path,
+                LoadConfig {
+                    context_length: 0,
+                    backend_type: BackendType::Auto,
+                    llama_cpp_n_gpu_layers: None,
+                    mmproj_path: None,
+                    backend_hint: Some("auto".into()),
+                    enable_embeddings: None,
+                    pooling_type: None,
+                },
+                backend.as_ref(),
+            )
+            .unwrap();
+
+        let service = AxServingService::new(layer);
+        let first = service
+            .infer(Request::new(valid_infer_request()))
+            .await
+            .expect("first infer should acquire the per-model slot");
+
+        let second = service.infer(Request::new(valid_infer_request())).await;
+        assert!(second.is_err(), "second same-model infer should be capped");
+        let status = second.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("per-model slot timeout"),
+            "unexpected status message: {}",
+            status.message()
+        );
+
+        drop(first);
+        backend.release_generation();
     }
 
     #[test]
