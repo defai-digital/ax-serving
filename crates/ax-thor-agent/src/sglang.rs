@@ -270,7 +270,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
         ],
         0.95,
     )
-    .map(seconds_to_ms);
+    .and_then(seconds_to_ms);
     RuntimeTelemetry {
         active_sequences: sum_usize(
             &samples,
@@ -630,11 +630,11 @@ fn prometheus_histogram_quantile_seconds(
 }
 
 fn sum_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
-    sum_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
+    sum_f64(samples, aliases).and_then(f64_to_u64)
 }
 
 fn max_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
-    max_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
+    max_f64(samples, aliases).and_then(f64_to_u64)
 }
 
 /// Sums per-label samples within each alias (label stripping collapses per-model values
@@ -655,7 +655,7 @@ fn sum_per_alias_max_across(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&st
 }
 
 fn sum_usize(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<usize> {
-    sum_per_alias_max_across(samples, aliases).map(|v| v.max(0.0).round() as usize)
+    sum_per_alias_max_across(samples, aliases).and_then(f64_to_usize)
 }
 
 fn max_u32(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u32> {
@@ -670,8 +670,28 @@ fn us_to_ms(value: u64) -> u64 {
     value.div_ceil(1_000)
 }
 
-fn seconds_to_ms(value: f64) -> u64 {
-    (value.max(0.0) * 1_000.0).round() as u64
+fn seconds_to_ms(value: f64) -> Option<u64> {
+    let millis = value.max(0.0) * 1_000.0;
+    f64_to_u64(millis)
+}
+
+fn f64_to_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value <= 0.0 {
+        return Some(0);
+    }
+    let rounded = value.round();
+    if rounded > u64::MAX as f64 {
+        None
+    } else {
+        Some(rounded as u64)
+    }
+}
+
+fn f64_to_usize(value: f64) -> Option<usize> {
+    f64_to_u64(value).and_then(|value| usize::try_from(value).ok())
 }
 
 fn ratio_or_zero(value: f64) -> f64 {
@@ -694,11 +714,11 @@ fn json_f64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
 }
 
 fn json_u64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u64> {
-    json_f64_any(body, pointers).map(|value| value.max(0.0).round() as u64)
+    json_f64_any(body, pointers).and_then(f64_to_u64)
 }
 
 fn json_usize_any(body: &serde_json::Value, pointers: &[&str]) -> Option<usize> {
-    json_u64_any(body, pointers).map(|value| value as usize)
+    json_u64_any(body, pointers).and_then(|value| usize::try_from(value).ok())
 }
 
 fn json_u32_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u32> {
@@ -854,6 +874,23 @@ ax_runtime_queue_depth 3
     }
 
     #[test]
+    fn ignores_runtime_metric_values_outside_integer_range() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_runtime_active_sequences 1e40
+ax_runtime_queue_depth 1e40
+ax_runtime_ttft_p95_ms 1e40
+ax_runtime_kv_pages_used 1e40
+"#,
+        );
+
+        assert_eq!(telemetry.active_sequences, None);
+        assert_eq!(telemetry.queue_depth, None);
+        assert_eq!(telemetry.ttft_p95_ms, None);
+        assert_eq!(telemetry.kv_pages_used, None);
+    }
+
+    #[test]
     fn parses_ax_serving_prometheus_alias_metrics() {
         let telemetry = parse_prometheus_telemetry(
             r#"
@@ -940,6 +977,23 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(telemetry.kv_utilization, None);
         assert_eq!(telemetry.batch_utilization, None);
         assert_eq!(telemetry.queue_depth, Some(2));
+    }
+
+    #[test]
+    fn ignores_json_metric_values_outside_integer_range() {
+        let telemetry = parse_json_telemetry(&serde_json::json!({
+            "active_sequences": "1e40",
+            "queue_depth": "1e40",
+            "ttft_p95_ms": "1e40",
+            "kv_cache": {
+                "pages_used": "1e40"
+            }
+        }));
+
+        assert_eq!(telemetry.active_sequences, None);
+        assert_eq!(telemetry.queue_depth, None);
+        assert_eq!(telemetry.ttft_p95_ms, None);
+        assert_eq!(telemetry.kv_pages_used, None);
     }
 
     #[test]
