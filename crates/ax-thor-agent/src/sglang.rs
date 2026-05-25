@@ -636,7 +636,11 @@ fn sum_per_alias_max_across(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&st
         .iter()
         .filter_map(|alias| {
             let values = samples.get(*alias)?;
-            if values.is_empty() { None } else { Some(values.iter().sum::<f64>()) }
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().sum::<f64>())
+            }
         })
         .reduce(f64::max)
 }
