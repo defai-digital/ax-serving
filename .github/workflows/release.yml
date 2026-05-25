@@ -33,6 +33,9 @@ jobs:
           if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
             brew install mlx-c
           fi
+          brew link --overwrite mlx || true
+          brew link --overwrite mlx-c || true
+          test -f /opt/homebrew/include/mlx/c/array.h
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
