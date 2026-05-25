@@ -736,22 +736,8 @@ impl InferenceBackend for LlamaCppBackend {
             .send()
             .ok()
             .and_then(|r| r.json::<serde_json::Value>().ok());
-        let eos_token = props
-            .as_ref()
-            .and_then(|v| {
-                v["default_generation_settings"]["eos_token_id"]
-                    .as_u64()
-                    .or_else(|| v["eos_token_id"].as_u64())
-            })
-            .unwrap_or(2) as u32;
-        let bos_token = props
-            .as_ref()
-            .and_then(|v| {
-                v["default_generation_settings"]["bos_token_id"]
-                    .as_u64()
-                    .or_else(|| v["bos_token_id"].as_u64())
-            })
-            .unwrap_or(1) as u32;
+        let eos_token = props_token_id(props.as_ref(), "eos_token_id", 2)?;
+        let bos_token = props_token_id(props.as_ref(), "bos_token_id", 1)?;
 
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
         let child_arc = Arc::new(Mutex::new(Some(child)));
@@ -997,11 +983,7 @@ impl InferenceBackend for LlamaCppBackend {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("/tokenize response missing 'tokens' array"))?
             .iter()
-            .map(|v| {
-                v.as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("non-integer token id"))
-                    .map(|n| n as u32)
-            })
+            .map(json_token_id_to_u32)
             .collect::<Result<Vec<u32>>>()?;
         Ok(tokens)
     }
@@ -2132,6 +2114,28 @@ fn uuid_simple() -> String {
     format!("{:032x}{:08x}{:08x}", unix_ns_now(), std::process::id(), n)
 }
 
+fn u64_to_u32(value: u64, field: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{field} exceeds u32::MAX"))
+}
+
+fn json_token_id_to_u32(value: &serde_json::Value) -> Result<u32> {
+    let id = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("non-integer token id"))?;
+    u64_to_u32(id, "token id")
+}
+
+fn props_token_id(props: Option<&serde_json::Value>, key: &str, default: u32) -> Result<u32> {
+    props
+        .and_then(|value| {
+            value["default_generation_settings"][key]
+                .as_u64()
+                .or_else(|| value[key].as_u64())
+        })
+        .map(|id| u64_to_u32(id, key))
+        .unwrap_or(Ok(default))
+}
+
 /// Build `ModelMetadata` from GGUF header data + the running server's `/props`.
 fn fetch_model_meta(
     http: &reqwest::blocking::Client,
@@ -2154,7 +2158,7 @@ fn fetch_model_meta(
             .ok()
             .and_then(|r| r.json::<serde_json::Value>().ok())
             .and_then(|v| v["n_ctx"].as_u64())
-            .map(|n| n as u32);
+            .and_then(|n| u32::try_from(n).ok());
 
         from_server
             .or_else(|| {
@@ -2232,6 +2236,31 @@ mod tests {
         let first = uuid_simple();
         let second = uuid_simple();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn json_token_id_to_u32_rejects_overflow() {
+        let value = serde_json::json!(u32::MAX as u64 + 1);
+        let err = json_token_id_to_u32(&value).unwrap_err();
+
+        assert!(err.to_string().contains("token id exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn props_token_id_rejects_overflow() {
+        let props = serde_json::json!({
+            "default_generation_settings": {
+                "eos_token_id": u32::MAX as u64 + 1
+            }
+        });
+        let err = props_token_id(Some(&props), "eos_token_id", 2).unwrap_err();
+
+        assert!(err.to_string().contains("eos_token_id exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn props_token_id_uses_default_when_missing() {
+        assert_eq!(props_token_id(None, "eos_token_id", 2).unwrap(), 2);
     }
 
     #[test]
