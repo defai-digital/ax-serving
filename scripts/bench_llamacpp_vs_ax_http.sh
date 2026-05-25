@@ -25,10 +25,10 @@ PROMPT_LENGTHS="39,509"
 DECODE_TOKENS="128"
 WARMUP="1"
 ITERS="3"
-OUT_DIR="automatosx/tmp/bench-compare-http-$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="target/bench-compare-http-$(date +%Y%m%d-%H%M%S)"
 
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-llama-server}"
-AX_CLI_BIN="${AX_CLI_BIN:-./target/release/ax-llama}"
+AX_CLI_BIN="${AX_CLI_BIN:-./target/release/ax-serving}"
 AXS_ROUTING_CONFIG_PATH="${AXS_ROUTING_CONFIG:-config/backends.yaml}"
 
 LLAMA_PORT="${LLAMA_PORT:-18081}"
@@ -50,7 +50,7 @@ Options:
   --iters <n>                    Measurement iterations, default: 3
   --out-dir <path>               Output directory
   --llama-server-bin <path>      llama-server binary path
-  --ax-cli-bin <path>            ax-llama binary path
+  --ax-cli-bin <path>            ax-serving binary path
   --llama-port <n>               direct llama-server port (default: 18081, 0 = auto)
   --ax-port <n>                  ax-serving port (default: 18082, 0 = auto)
   --startup-timeout-sec <n>      server startup timeout seconds (default: 120)
@@ -98,7 +98,7 @@ if ! command -v "$LLAMA_SERVER_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 if [[ ! -x "$AX_CLI_BIN" ]]; then
-  echo "ax-llama binary not executable: $AX_CLI_BIN" >&2
+  echo "ax-serving binary not executable: $AX_CLI_BIN" >&2
   exit 1
 fi
 if ! command -v curl >/dev/null 2>&1; then

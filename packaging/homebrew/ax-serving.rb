@@ -26,10 +26,6 @@ class AxServing < Formula
     end
   end
 
-  # ax-serving spawns llama-server at runtime for all inference.
-  # llama-server ships with the llama.cpp formula.
-  depends_on "llama.cpp"
-
   def install
     bin.install "bin/ax-serving"
     bin.install "bin/ax-serving-api"
@@ -65,6 +61,9 @@ class AxServing < Formula
         ax-serving-api    — multi-worker API gateway (orchestrator)
         ax-runtime-agent  — generic runtime-node adapter
         ax-thor-agent     — legacy Thor runtime-node adapter alias
+
+      Production deployments should run ax-serving-api as the gateway and
+      register ax-runtime-agent in front of ax-engine or vLLM runtime nodes.
 
       Quick start (single worker, no model yet):
         AXS_ALLOW_NO_AUTH=true ax-serving serve --port 18080 &

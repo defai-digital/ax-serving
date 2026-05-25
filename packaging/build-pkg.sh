@@ -18,7 +18,7 @@
 set -euo pipefail
 
 VERSION="${VERSION:-0.1.0}"
-IDENTIFIER="com.automatosx.ax-serving"
+IDENTIFIER="digital.defai.ax-serving"
 INSTALL_ROOT="/"
 PKG_NAME="ax-serving-v${VERSION}.pkg"
 

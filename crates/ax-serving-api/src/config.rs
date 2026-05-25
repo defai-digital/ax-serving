@@ -63,7 +63,7 @@ pub struct ServeConfig {
     pub llamacpp: LlamaCppConfig,
     /// mlx-lm subprocess backend settings.
     pub mlx: MlxConfig,
-    /// Multi-worker orchestrator settings (`ax-llama orchestrate`).
+    /// Multi-worker orchestrator settings (`ax-serving-api`).
     pub orchestrator: OrchestratorConfig,
     /// License reminder and dashboard settings.
     pub license: LicenseConfig,
@@ -190,7 +190,7 @@ impl Default for CacheConfig {
 
 // ── OrchestratorConfig ────────────────────────────────────────────────────────
 
-/// Multi-worker orchestrator settings (used by `ax-llama orchestrate`).
+/// Multi-worker orchestrator settings (used by `ax-serving-api`).
 ///
 /// These values configure the public proxy gateway and its internal worker
 /// registry.  Loaded from the `orchestrator:` section of `serving.yaml`.

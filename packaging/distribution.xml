@@ -24,10 +24,10 @@
   </choices-outline>
 
   <choice id="default" visible="false" title="ax-serving">
-    <pkg-ref id="com.automatosx.ax-serving"/>
+    <pkg-ref id="digital.defai.ax-serving"/>
   </choice>
 
-  <pkg-ref id="com.automatosx.ax-serving"
+  <pkg-ref id="digital.defai.ax-serving"
            version="0"
            onConclusion="none">component.pkg</pkg-ref>
 
