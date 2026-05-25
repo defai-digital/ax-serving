@@ -41,6 +41,8 @@ pub enum RegistryError {
     CapacityExceeded(usize),
     #[error("model path not allowed by AXS_MODEL_ALLOWED_DIRS: {0}")]
     PathNotAllowed(String),
+    #[error("model is busy: {0}")]
+    Busy(String),
     #[error("{0}")]
     InvalidModelId(String),
 }
@@ -399,9 +401,14 @@ impl ModelRegistry {
         // Remove from map under write lock (fast).
         let entry = {
             let mut guard = self.inner_write();
-            guard
+            let entry = guard
                 .remove(model_id)
-                .ok_or_else(|| RegistryError::NotLoaded(model_id.to_string()))?
+                .ok_or_else(|| RegistryError::NotLoaded(model_id.to_string()))?;
+            if Arc::strong_count(&entry) > 1 {
+                guard.insert(model_id.to_string(), entry);
+                return Err(RegistryError::Busy(model_id.to_string()).into());
+            }
+            entry
         }; // write lock released here
 
         // Backend unload outside the lock — slow operation.
@@ -451,7 +458,18 @@ impl ModelRegistry {
             let mut guard = self.inner_write();
 
             let old_handle = match guard.get(model_id) {
-                Some(e) => e.handle,
+                Some(e) => {
+                    if Arc::strong_count(e) > 1 {
+                        drop(guard);
+                        if let Err(err) = backend.unload_model(new_handle) {
+                            warn!(
+                                "reload: '{model_id}' is busy; cleanup of unused new handle failed: {err}"
+                            );
+                        }
+                        return Err(RegistryError::Busy(model_id.to_string()).into());
+                    }
+                    e.handle
+                }
                 None => {
                     // Model was unloaded concurrently while we were loading.
                     // Clean up the new handle to prevent a leak.
@@ -772,6 +790,80 @@ mod tests {
         }
 
         fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: ModelHandle,
+            _: GenerateInput,
+            _: GenerationParams,
+            _: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn tokenize(&self, _: ModelHandle, _: &str, _: bool) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn decode_tokens(&self, _: ModelHandle, _: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            4
+        }
+    }
+
+    struct CountingBackend {
+        next_handle: AtomicU64,
+        unloads: AtomicU64,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(0),
+                unloads: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl InferenceBackend for CountingBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok((
+                ModelHandle(handle),
+                ModelMetadata {
+                    architecture: "counting".into(),
+                    n_layers: 0,
+                    n_heads: 0,
+                    n_kv_heads: 0,
+                    embedding_dim: 0,
+                    vocab_size: 0,
+                    context_length: 2048,
+                    load_time_ms: 1,
+                    peak_rss_bytes: 0,
+                    resolved_backend: ax_serving_engine::BackendType::Auto,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            self.unloads.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -1540,6 +1632,31 @@ mod tests {
     }
 
     #[test]
+    fn unload_busy_model_is_rejected_without_unloading_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_gguf(&dir);
+        let backend = CountingBackend::new();
+        let reg = ModelRegistry::new(16);
+
+        reg.load("m", &path, LoadConfig::default(), &backend)
+            .unwrap();
+        let active = reg.get("m").unwrap();
+
+        let err = reg.unload("m", &backend).unwrap_err();
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::Busy(_))),
+            "expected Busy, got: {err}"
+        );
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 0);
+        assert!(reg.get("m").is_some());
+
+        drop(active);
+        reg.unload("m", &backend).unwrap();
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn reload_swaps_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = make_gguf(&dir);
@@ -1552,6 +1669,38 @@ mod tests {
         assert_eq!(reloaded.id, "m");
         // Model must still be accessible after reload.
         assert!(reg.get("m").is_some());
+    }
+
+    #[test]
+    fn reload_busy_model_is_rejected_and_new_handle_is_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_gguf(&dir);
+        let backend = CountingBackend::new();
+        let reg = ModelRegistry::new(16);
+
+        let loaded = reg
+            .load("m", &path, LoadConfig::default(), &backend)
+            .unwrap();
+        let original_handle = loaded.handle;
+        drop(loaded);
+        let active = reg.get("m").unwrap();
+
+        let err = reg.reload("m", &backend).unwrap_err();
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::Busy(_))),
+            "expected Busy, got: {err}"
+        );
+        assert_eq!(
+            backend.unloads.load(Ordering::Relaxed),
+            1,
+            "unused new reload handle must be cleaned up"
+        );
+        assert_eq!(reg.get("m").unwrap().handle, original_handle);
+
+        drop(active);
+        reg.reload("m", &backend).unwrap();
+        assert_eq!(backend.unloads.load(Ordering::Relaxed), 2);
     }
 
     #[test]

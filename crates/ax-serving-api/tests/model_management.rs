@@ -1375,6 +1375,98 @@ async fn load_then_reload_200() {
     assert!(layer.registry.get("reload-test").is_some());
 }
 
+#[tokio::test]
+async fn unload_busy_model_returns_409_and_keeps_model_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body = serde_json::json!({
+        "model_id": "busy-unload",
+        "path": path.to_string_lossy(),
+    })
+    .to_string();
+    let load_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let active = layer.registry.get("busy-unload").unwrap();
+    let unload_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/models/busy-unload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(unload_resp.status(), StatusCode::CONFLICT);
+    assert!(layer.registry.get("busy-unload").is_some());
+    drop(active);
+}
+
+#[tokio::test]
+async fn reload_busy_model_returns_409_and_keeps_original_model_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let layer = make_layer();
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body = serde_json::json!({
+        "model_id": "busy-reload",
+        "path": path.to_string_lossy(),
+    })
+    .to_string();
+    let load_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_resp.status(), StatusCode::CREATED);
+
+    let active = layer.registry.get("busy-reload").unwrap();
+    let original_handle = active.handle;
+    let reload_resp = rest::router(Arc::clone(&layer), Arc::clone(&keys))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models/busy-reload/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reload_resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        layer.registry.get("busy-reload").unwrap().handle,
+        original_handle
+    );
+    drop(active);
+}
+
 // ── Capacity test ─────────────────────────────────────────────────────────────
 
 #[tokio::test]

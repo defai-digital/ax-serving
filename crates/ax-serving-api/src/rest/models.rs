@@ -246,6 +246,7 @@ pub async fn rest_unload_model(
             );
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,
+                Some(RegistryError::Busy(_)) => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
@@ -316,6 +317,7 @@ pub async fn rest_reload_model(
             );
             let status = match e.downcast_ref::<RegistryError>() {
                 Some(RegistryError::NotLoaded(_)) => StatusCode::NOT_FOUND,
+                Some(RegistryError::Busy(_)) => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
