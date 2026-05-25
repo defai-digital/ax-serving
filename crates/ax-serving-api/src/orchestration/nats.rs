@@ -71,6 +71,7 @@ pub struct NatsConfig {
 
 const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
 const DEFAULT_NATS_STREAM: &str = "ax-serving";
+const MAX_NATS_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 impl Default for NatsConfig {
     fn default() -> Self {
@@ -191,6 +192,30 @@ impl NatsResponse {
     pub fn to_payload(&self) -> Bytes {
         serde_json::to_vec(self).unwrap_or_default().into()
     }
+}
+
+#[derive(Debug)]
+enum NatsBodyDecodeError {
+    InvalidHex(hex::FromHexError),
+    TooLarge,
+}
+
+fn decode_body_hex_limited(
+    data_hex: Option<&str>,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, NatsBodyDecodeError> {
+    let Some(data_hex) = data_hex else {
+        return Ok(Vec::new());
+    };
+
+    if data_hex.len() > limit_bytes.saturating_mul(2) {
+        return Err(NatsBodyDecodeError::TooLarge);
+    }
+    let body = hex::decode(data_hex).map_err(NatsBodyDecodeError::InvalidHex)?;
+    if body.len() > limit_bytes {
+        return Err(NatsBodyDecodeError::TooLarge);
+    }
+    Ok(body)
 }
 
 // ── NatsDispatcher ────────────────────────────────────────────────────────────
@@ -363,15 +388,29 @@ impl NatsDispatcher {
                     self.reroute_total.fetch_add(1, Ordering::Relaxed);
                 }
 
-                let body_bytes: Vec<u8> =
-                    match resp.data_hex.as_deref().map(hex::decode).transpose() {
-                        Ok(b) => b.unwrap_or_default(),
-                        Err(e) => {
-                            error!(%request_id, %e, "NATS: failed to decode response body hex");
-                            return (StatusCode::BAD_GATEWAY, "NATS: bad response body encoding")
-                                .into_response();
-                        }
-                    };
+                let body_bytes = match decode_body_hex_limited(
+                    resp.data_hex.as_deref(),
+                    MAX_NATS_RESPONSE_BODY_BYTES,
+                ) {
+                    Ok(body) => body,
+                    Err(NatsBodyDecodeError::InvalidHex(e)) => {
+                        error!(%request_id, %e, "NATS: failed to decode response body hex");
+                        return (StatusCode::BAD_GATEWAY, "NATS: bad response body encoding")
+                            .into_response();
+                    }
+                    Err(NatsBodyDecodeError::TooLarge) => {
+                        error!(
+                            %request_id,
+                            limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                            "NATS: response body exceeded size limit"
+                        );
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            "NATS response body exceeded size limit",
+                        )
+                            .into_response();
+                    }
+                };
 
                 axum::response::Response::builder()
                     .status(status)
@@ -494,7 +533,9 @@ impl std::fmt::Debug for NatsDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{NatsConfig, sanitize_subject_component};
+    use super::{
+        NatsBodyDecodeError, NatsConfig, decode_body_hex_limited, sanitize_subject_component,
+    };
 
     #[test]
     fn sanitize_subject_component_preserves_allowed_chars() {
@@ -519,5 +560,23 @@ mod tests {
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
 
         assert_eq!(cfg.wait_ms, 1);
+    }
+
+    #[test]
+    fn decode_body_hex_limited_rejects_oversized_payload_before_decode() {
+        let err = decode_body_hex_limited(Some("000000"), 2).unwrap_err();
+        assert!(matches!(err, NatsBodyDecodeError::TooLarge));
+    }
+
+    #[test]
+    fn decode_body_hex_limited_rejects_invalid_hex() {
+        let err = decode_body_hex_limited(Some("not-hex"), 64).unwrap_err();
+        assert!(matches!(err, NatsBodyDecodeError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn decode_body_hex_limited_accepts_empty_and_valid_payloads() {
+        assert_eq!(decode_body_hex_limited(None, 64).unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_body_hex_limited(Some("6869"), 64).unwrap(), b"hi");
     }
 }
