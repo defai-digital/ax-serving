@@ -150,6 +150,10 @@ impl ModelRegistry {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0);
+        Self::new_with_warm_pool_size(max_loaded_models, warm_pool_size)
+    }
+
+    fn new_with_warm_pool_size(max_loaded_models: usize, warm_pool_size: Option<usize>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             max_loaded_models,
@@ -296,9 +300,39 @@ impl ModelRegistry {
 
         // Commit: insert under write lock. The LoadingGuard ensures no other
         // load() for this model_id is concurrently in progress.
-        {
+        //
+        // Re-apply warm-pool eviction here as well as before the slow load:
+        // different model IDs may load concurrently, and each can pass the
+        // pre-load warm-pool check before any of them commits.
+        let final_evictions: Vec<Arc<LoadedModel>> = {
             let mut guard = self.inner_write();
+            let mut candidates = Vec::new();
+            if let Some(pool_size) = self.warm_pool_size {
+                while guard.len() >= pool_size {
+                    let oldest_id = guard
+                        .iter()
+                        .min_by_key(|(_, m)| m.last_accessed_ms.load(Ordering::Relaxed))
+                        .map(|(id, _)| id.clone());
+                    if let Some(id) = oldest_id {
+                        if let Some(evicted) = guard.remove(&id) {
+                            candidates.push(evicted);
+                        } else {
+                            warn!(
+                                model_id,
+                                "warm-pool final eviction candidate disappeared; continuing"
+                            );
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             if guard.len() >= self.max_loaded_models {
+                for entry in candidates {
+                    guard.insert(entry.id.clone(), entry);
+                }
                 drop(guard);
                 backend.unload_model(handle).with_context(|| {
                     format!(
@@ -308,6 +342,23 @@ impl ModelRegistry {
                 return Err(RegistryError::CapacityExceeded(self.max_loaded_models).into());
             }
             guard.insert(model_id.to_string(), Arc::clone(&entry));
+            candidates
+        };
+
+        for evicted in final_evictions {
+            let evict_id = evicted.id.clone();
+            match backend.unload_model(evicted.handle) {
+                Ok(()) => info!(
+                    "warm pool: evicted '{evict_id}' during finalization to load '{model_id}'"
+                ),
+                Err(e) => {
+                    warn!(
+                        "warm pool: failed to finalize eviction of '{evict_id}' for '{model_id}': {e}"
+                    );
+                    let mut guard = self.inner_write();
+                    guard.insert(evict_id, evicted);
+                }
+            }
         }
 
         // _loading_guard drops here, removing model_id from the loading set.
@@ -637,7 +688,7 @@ fn validate_model_id(id: &str) -> Result<(), RegistryError> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use ax_serving_engine::{
         GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
@@ -1270,6 +1321,63 @@ mod tests {
             backend.unloads.load(Ordering::Relaxed),
             1,
             "the losing concurrent load must clean up its backend handle"
+        );
+    }
+
+    #[test]
+    fn concurrent_loads_enforce_warm_pool_at_final_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("m1.gguf");
+        let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&path1, b"dummy").unwrap();
+        std::fs::write(&path2, b"dummy").unwrap();
+
+        let backend = Arc::new(BlockingLoadBackend {
+            started: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+            next_handle: AtomicU64::new(0),
+            unloads: Arc::new(AtomicU64::new(0)),
+        });
+        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
+
+        let reg1 = reg.clone();
+        let backend1 = Arc::clone(&backend);
+        let path1_clone = path1.clone();
+        let t1 = std::thread::spawn(move || {
+            reg1.load(
+                "first",
+                &path1_clone,
+                LoadConfig::default(),
+                backend1.as_ref(),
+            )
+        });
+
+        let reg2 = reg.clone();
+        let backend2 = Arc::clone(&backend);
+        let path2_clone = path2.clone();
+        let t2 = std::thread::spawn(move || {
+            reg2.load(
+                "second",
+                &path2_clone,
+                LoadConfig::default(),
+                backend2.as_ref(),
+            )
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        assert!(r1.is_ok(), "first concurrent load should succeed: {r1:?}");
+        assert!(r2.is_ok(), "second concurrent load should succeed: {r2:?}");
+        assert_eq!(
+            reg.len(),
+            1,
+            "final insert must re-enforce AXS_MODEL_WARM_POOL_SIZE"
+        );
+        assert_eq!(
+            backend.unloads.load(Ordering::Relaxed),
+            1,
+            "one previously loaded model must be evicted after concurrent finalization"
         );
     }
 
