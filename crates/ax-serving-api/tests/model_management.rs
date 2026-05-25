@@ -916,6 +916,42 @@ async fn load_model_defaults_to_auto_backend_hint() {
 }
 
 #[tokio::test]
+async fn load_model_trims_backend_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capture.gguf");
+    std::fs::write(&path, b"dummy").unwrap();
+
+    let observed = Arc::new(Mutex::new(None::<String>));
+    let backend: Arc<CaptureBackend> = Arc::new(CaptureBackend {
+        observed_backend_hint: Arc::clone(&observed),
+    });
+    let layer = make_layer_with_backend(backend);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body = serde_json::json!({
+        "model_id": "capture",
+        "path": path.to_string_lossy(),
+        "backend": " MLX "
+    })
+    .to_string();
+
+    let resp = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("mlx"));
+}
+
+#[tokio::test]
 async fn auth_models_wrong_key_401() {
     let app = make_app_with_key("secret");
     let resp = app

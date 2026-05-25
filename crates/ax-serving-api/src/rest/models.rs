@@ -65,7 +65,7 @@ pub async fn rest_load_model(
     // Resolve backend hint: explicit `backend` field takes priority; then `mlx: true`
     // flag; then default to "auto" (routing config decides).
     let raw_hint = if let Some(ref b) = req.backend {
-        b.to_ascii_lowercase()
+        b.trim().to_ascii_lowercase()
     } else if req.mlx == Some(true) {
         "mlx".to_string()
     } else {
