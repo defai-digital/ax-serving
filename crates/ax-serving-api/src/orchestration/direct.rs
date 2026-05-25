@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use reqwest::Client;
@@ -134,6 +134,38 @@ async fn read_worker_response_body_limited(
         append_limited_body_chunk(&mut body, &chunk.map_err(WorkerBodyError::Read)?, max_bytes)?;
     }
     Ok(Bytes::from(body))
+}
+
+fn should_forward_worker_header(name: &HeaderName, include_content_length: bool) -> bool {
+    let name = name.as_str();
+    !matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) && (include_content_length || name != header::CONTENT_LENGTH.as_str())
+}
+
+fn response_builder_with_worker_headers(
+    status: StatusCode,
+    headers: &HeaderMap,
+    include_content_length: bool,
+) -> axum::http::response::Builder {
+    let mut builder = axum::response::Response::builder().status(status);
+    for (name, value) in headers {
+        if should_forward_worker_header(name, include_content_length) {
+            builder = builder.header(name, value);
+        }
+    }
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
 }
 
 async fn drain_worker_error_response(resp: reqwest::Response, url: &str) {
@@ -540,13 +572,7 @@ impl DirectDispatcher {
             Ok(resp) => {
                 let status = StatusCode::from_u16(resp.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                let content_type = resp
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/json")
-                    .to_string();
+                let headers = resp.headers().clone();
 
                 if stream {
                     type GuardedResponseStream =
@@ -610,9 +636,7 @@ impl DirectDispatcher {
                         },
                     );
 
-                    axum::response::Response::builder()
-                        .status(status)
-                        .header("content-type", content_type)
+                    response_builder_with_worker_headers(status, &headers, false)
                         .body(Body::from_stream(guarded))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 } else {
@@ -630,9 +654,7 @@ impl DirectDispatcher {
                                 MAX_WORKER_RESPONSE_BODY_BYTES
                             ))
                         }
-                        Ok(bytes) => axum::response::Response::builder()
-                            .status(status)
-                            .header("content-type", content_type)
+                        Ok(bytes) => response_builder_with_worker_headers(status, &headers, true)
                             .body(Body::from(bytes))
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                         Err(WorkerBodyError::Read(e)) => {
@@ -828,6 +850,51 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("worker response body exceeded"));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_response_preserves_worker_response_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "content-type: application/json\r\n",
+                "x-request-id: worker-request-123\r\n",
+                "x-runtime: ax-engine\r\n",
+                "connection: close\r\n",
+                "\r\n",
+                "{\"ok\":true}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let reqwest_resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard: Guard = InflightGuard::acquire(&counter);
+
+        let response = DirectDispatcher::default()
+            .build_response(Ok(reqwest_resp), format!("http://{addr}"), false, guard)
+            .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "worker-request-123"
+        );
+        assert_eq!(response.headers().get("x-runtime").unwrap(), "ax-engine");
+        assert!(!response.headers().contains_key("connection"));
 
         server.await.unwrap();
     }

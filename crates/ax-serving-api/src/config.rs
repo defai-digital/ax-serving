@@ -78,6 +78,9 @@ const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_REST_ADDR: &str = "127.0.0.1:18080";
 const DEFAULT_GRPC_SOCKET: &str = "/tmp/ax-serving.sock";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
+const MIN_WORKER_HEARTBEAT_MS: u64 = 100;
+const MIN_WORKER_TTL_MS: u64 = 500;
+const MIN_DASHBOARD_POLL_MS: u64 = 500;
 
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -359,6 +362,12 @@ impl ServeConfig {
         if self.sched_per_model_max_inflight == 0 {
             anyhow::bail!("sched_per_model_max_inflight must be >= 1");
         }
+        if self.default_max_tokens > crate::rest::schema::MAX_MAX_TOKENS {
+            anyhow::bail!(
+                "default_max_tokens must be 0 or <= {}",
+                crate::rest::schema::MAX_MAX_TOKENS
+            );
+        }
         if self.sched_max_queue < self.sched_max_inflight {
             anyhow::bail!(
                 "sched_max_queue ({}) must be >= sched_max_inflight ({})",
@@ -379,7 +388,21 @@ impl ServeConfig {
             anyhow::bail!("thermal_poll_secs must be >= 1");
         }
 
+        // ── Registry ─────────────────────────────────────────────────────────
+        if self.registry.max_loaded_models == 0 {
+            anyhow::bail!("registry.max_loaded_models must be >= 1");
+        }
+        if self.registry.idle_check_interval_secs == 0 {
+            anyhow::bail!("registry.idle_check_interval_secs must be >= 1");
+        }
+
         // ── Dispatcher ────────────────────────────────────────────────────────
+        if self.dispatcher.pool_max_idle_per_host == 0 {
+            anyhow::bail!("dispatcher.pool_max_idle_per_host must be >= 1");
+        }
+        if self.dispatcher.cache_inflight_max_retries == 0 {
+            anyhow::bail!("dispatcher.cache_inflight_max_retries must be >= 1");
+        }
         if self.dispatcher.request_timeout_secs == 0 {
             anyhow::bail!("dispatcher.request_timeout_secs must be > 0");
         }
@@ -402,12 +425,21 @@ impl ServeConfig {
                 self.orchestrator.port
             );
         }
+        if self.orchestrator.worker_heartbeat_ms < MIN_WORKER_HEARTBEAT_MS {
+            anyhow::bail!("worker_heartbeat_ms must be >= {}", MIN_WORKER_HEARTBEAT_MS);
+        }
+        if self.orchestrator.worker_ttl_ms < MIN_WORKER_TTL_MS {
+            anyhow::bail!("worker_ttl_ms must be >= {}", MIN_WORKER_TTL_MS);
+        }
         if self.orchestrator.worker_ttl_ms <= self.orchestrator.worker_heartbeat_ms {
             anyhow::bail!(
                 "worker_ttl_ms ({}) must be > worker_heartbeat_ms ({})",
                 self.orchestrator.worker_ttl_ms,
                 self.orchestrator.worker_heartbeat_ms
             );
+        }
+        if self.orchestrator.pool_max_idle_per_host == 0 {
+            anyhow::bail!("orchestrator.pool_max_idle_per_host must be >= 1");
         }
         if self.orchestrator.global_queue_max == 0 {
             anyhow::bail!("global_queue_max must be > 0");
@@ -480,6 +512,11 @@ impl ServeConfig {
                     default_project
                 );
             }
+        }
+
+        // ── License/dashboard ───────────────────────────────────────────────
+        if self.license.dashboard_poll_ms < MIN_DASHBOARD_POLL_MS {
+            anyhow::bail!("dashboard_poll_ms must be >= {}", MIN_DASHBOARD_POLL_MS);
         }
 
         Ok(())
@@ -628,10 +665,10 @@ impl ServeConfig {
             self.orchestrator.allowed_node_cidrs = v;
         }
         if let Some(ms) = env_parse::<u64>("AXS_WORKER_HEARTBEAT_MS") {
-            self.orchestrator.worker_heartbeat_ms = ms.max(100);
+            self.orchestrator.worker_heartbeat_ms = ms.max(MIN_WORKER_HEARTBEAT_MS);
         }
         if let Some(ms) = env_parse::<u64>("AXS_WORKER_TTL_MS") {
-            self.orchestrator.worker_ttl_ms = ms.max(500);
+            self.orchestrator.worker_ttl_ms = ms.max(MIN_WORKER_TTL_MS);
         }
         if let Some(v) = env_str("AXS_DISPATCH_POLICY") {
             self.orchestrator.dispatch_policy = v;
@@ -669,7 +706,7 @@ impl ServeConfig {
             self.license.key_file = v;
         }
         if let Some(ms) = env_parse::<u64>("AXS_DASHBOARD_POLL_MS") {
-            self.license.dashboard_poll_ms = ms.max(500);
+            self.license.dashboard_poll_ms = ms.max(MIN_DASHBOARD_POLL_MS);
         }
     }
 
@@ -722,6 +759,21 @@ mod tests {
         cfg.sched_max_inflight = 0;
         // sched_max_queue (128) < sched_max_inflight (0) check comes after, so inflight=0 fires first.
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_default_max_tokens_above_api_limit() {
+        let mut cfg = valid_cfg();
+        cfg.default_max_tokens = crate::rest::schema::MAX_MAX_TOKENS + 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("default_max_tokens"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_zero_default_max_tokens_as_disabled() {
+        let mut cfg = valid_cfg();
+        cfg.default_max_tokens = 0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -793,6 +845,70 @@ mod tests {
         let mut cfg = valid_cfg();
         cfg.dispatcher.request_timeout_secs = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_registry_max_loaded_models() {
+        let mut cfg = valid_cfg();
+        cfg.registry.max_loaded_models = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_loaded_models"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_idle_check_interval() {
+        let mut cfg = valid_cfg();
+        cfg.registry.idle_check_interval_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("idle_check_interval_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_dispatcher_pool_size() {
+        let mut cfg = valid_cfg();
+        cfg.dispatcher.pool_max_idle_per_host = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("pool_max_idle_per_host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_cache_inflight_retries() {
+        let mut cfg = valid_cfg();
+        cfg.dispatcher.cache_inflight_max_retries = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cache_inflight_max_retries"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_too_low_worker_heartbeat() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.worker_heartbeat_ms = MIN_WORKER_HEARTBEAT_MS - 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("worker_heartbeat_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_too_low_worker_ttl() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.worker_ttl_ms = MIN_WORKER_TTL_MS - 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("worker_ttl_ms"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_orchestrator_pool_size() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.pool_max_idle_per_host = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("pool_max_idle_per_host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_too_low_dashboard_poll_ms() {
+        let mut cfg = valid_cfg();
+        cfg.license.dashboard_poll_ms = MIN_DASHBOARD_POLL_MS - 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("dashboard_poll_ms"), "got: {err}");
     }
 
     #[test]
