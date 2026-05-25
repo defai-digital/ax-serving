@@ -572,6 +572,7 @@ impl Scheduler {
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         let queue_len = {
             let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
+            waiters.retain(|tx| !tx.is_closed());
             // Register *before* checking capacity so this request is visible to
             // concurrent shed_oldest callers from the moment it claims a slot.
             waiters.push_back(cancel_tx);
@@ -581,14 +582,19 @@ impl Scheduler {
                     // Evict the oldest waiter to make room for the incoming request.
                     // We need len > 1 so pop_front returns someone *other* than us
                     // (we just pushed to the back).
-                    if waiters.len() > 1 {
+                    let mut shed_live_waiter = false;
+                    while waiters.len() > 1 {
                         if let Some(tx) = waiters.pop_front() {
                             // Signal the victim — its select! branch will fire and return Shed.
-                            let _ = tx.send(());
-                            self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
-                            // queue_depth stays the same: oldest leaves, new request enters.
+                            if tx.send(()).is_ok() {
+                                self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
+                                // queue_depth stays the same: oldest leaves, new request enters.
+                                shed_live_waiter = true;
+                                break;
+                            }
                         }
-                    } else {
+                    }
+                    if !shed_live_waiter {
                         // We are the only waiter (max_queue=0 or all others already
                         // drained) — cannot shed ourselves; reject instead.
                         waiters.pop_back(); // remove ourselves
@@ -1374,6 +1380,57 @@ mod tests {
             .expect("next waiter should not be rejected by leaked queue depth");
         assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
         drop(p2);
+    }
+
+    #[tokio::test]
+    async fn shed_oldest_skips_cancelled_waiters() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5_000,
+                overload_policy: OverloadPolicy::ShedOldest,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        let p1 = s.acquire().await.unwrap();
+
+        let stale_scheduler = Arc::clone(&s);
+        let stale_waiter = tokio::spawn(async move { stale_scheduler.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+        stale_waiter.abort();
+        match stale_waiter.await {
+            Err(err) => assert!(err.is_cancelled(), "first waiter should be cancelled"),
+            Ok(_) => panic!("first waiter should not complete before cancellation"),
+        }
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
+
+        let older_scheduler = Arc::clone(&s);
+        let older_waiter = tokio::spawn(async move { older_scheduler.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        let newer_scheduler = Arc::clone(&s);
+        let newer_waiter = tokio::spawn(async move { newer_scheduler.acquire().await });
+
+        let older_result = tokio::time::timeout(Duration::from_millis(500), older_waiter)
+            .await
+            .expect("oldest live waiter should be shed promptly")
+            .expect("oldest live waiter task panicked");
+        assert!(
+            older_result.is_err_and(|err| err.to_string().contains("shed")),
+            "oldest live waiter should be shed, not a stale cancelled waiter"
+        );
+        assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 1);
+
+        drop(p1);
+        let newer_permit = newer_waiter
+            .await
+            .expect("newer waiter task panicked")
+            .expect("newer waiter should acquire after stale waiter is skipped");
+        drop(newer_permit);
     }
 
     // ── split-scheduler drop-without-ttft clears prefill ──────────────────────
