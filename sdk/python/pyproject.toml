@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ax-serving"
-version = "0.1.0"
+version = "2.2.0"
 requires-python = ">=3.10"
 description = "Python SDK for ax-serving: gRPC + OpenAI-compatible inference client"
 dependencies = [

@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-api"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-bench"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ax-serving-api",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-cli"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ax-serving-api",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-engine"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ax-engine-sdk",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-py"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-shim"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "ax-thor-agent"
-version = "2.0.8"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",

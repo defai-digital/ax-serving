@@ -13,8 +13,8 @@
 class AxServing < Formula
   desc "High-performance LLM inference serving for Apple Silicon M3+"
   homepage "https://github.com/automatosx/ax-serving"
-  version "1.1.0"
-  license "AGPL-3.0-only"
+  version "2.2.0"
+  license "AGPL-3.0-or-later"
 
   # Only Apple Silicon is supported
   on_macos do
