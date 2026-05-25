@@ -101,7 +101,7 @@ impl NatsConfig {
         if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_WAIT_MS")
             && let Ok(ms) = v.parse::<u64>()
         {
-            cfg.wait_ms = ms;
+            cfg.wait_ms = ms.max(1);
         }
         cfg
     }
@@ -494,7 +494,7 @@ impl std::fmt::Debug for NatsDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_subject_component;
+    use super::{NatsConfig, sanitize_subject_component};
 
     #[test]
     fn sanitize_subject_component_preserves_allowed_chars() {
@@ -509,5 +509,15 @@ mod tests {
             sanitize_subject_component("org/model.v1"),
             sanitize_subject_component("org_model.v1")
         );
+    }
+
+    #[test]
+    fn nats_config_clamps_zero_wait_ms_from_env() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "0") };
+        let cfg = NatsConfig::from_env();
+        unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
+
+        assert_eq!(cfg.wait_ms, 1);
     }
 }
