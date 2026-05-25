@@ -39,6 +39,47 @@ fn local_response_exceeds_limit(content_length: Option<u64>) -> bool {
     content_length.is_some_and(|len| len > MAX_NATS_RESPONSE_BODY_BYTES as u64)
 }
 
+#[derive(Debug)]
+enum LocalResponseBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+fn append_limited_local_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), LocalResponseBodyError> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(LocalResponseBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_limited_local_response_body(
+    resp: reqwest::Response,
+) -> Result<Vec<u8>, LocalResponseBodyError> {
+    if local_response_exceeds_limit(resp.content_length()) {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_limited_local_response_chunk(
+            &mut body,
+            &chunk.map_err(LocalResponseBodyError::Read)?,
+            MAX_NATS_RESPONSE_BODY_BYTES,
+        )?;
+    }
+    Ok(body)
+}
+
 // ── NatsWorker ────────────────────────────────────────────────────────────────
 
 /// NATS sidecar that bridges JetStream messages to a local HTTP inference server.
@@ -418,7 +459,9 @@ async fn dispatch_non_streaming(
                 .unwrap_or("application/json")
                 .to_string();
 
-            match tokio::time::timeout(request_timeout, resp.bytes()).await {
+            match tokio::time::timeout(request_timeout, read_limited_local_response_body(resp))
+                .await
+            {
                 Err(_) => {
                     warn!(
                         request_id = %req.request_id,
@@ -429,15 +472,14 @@ async fn dispatch_non_streaming(
                     false
                 }
                 Ok(result) => match result {
-                    Err(e) => {
+                    Err(LocalResponseBodyError::Read(e)) => {
                         warn!(request_id = %req.request_id, %e, "NatsWorker: reading response body failed");
                         publish_error(nats_client, req, &e.to_string()).await;
                         false
                     }
-                    Ok(body) if body.len() > MAX_NATS_RESPONSE_BODY_BYTES => {
+                    Err(LocalResponseBodyError::TooLarge) => {
                         warn!(
                             request_id = %req.request_id,
-                            len = body.len(),
                             limit = MAX_NATS_RESPONSE_BODY_BYTES,
                             "NatsWorker: local HTTP response exceeded size limit"
                         );
@@ -533,7 +575,7 @@ async fn dispatch_streaming(
             publish_error(nats_client, req, "local HTTP response exceeded size limit").await;
             return false;
         }
-        match tokio::time::timeout(request_timeout, resp.bytes()).await {
+        match tokio::time::timeout(request_timeout, read_limited_local_response_body(resp)).await {
             Err(_) => {
                 warn!(
                     request_id = %req.request_id,
@@ -543,15 +585,14 @@ async fn dispatch_streaming(
                 publish_error(nats_client, req, "reading local response body timed out").await;
                 return false;
             }
-            Ok(Err(e)) => {
+            Ok(Err(LocalResponseBodyError::Read(e))) => {
                 warn!(request_id = %req.request_id, %e, "NatsWorker: reading error response body failed");
                 publish_error(nats_client, req, &e.to_string()).await;
                 return false;
             }
-            Ok(Ok(body)) if body.len() > MAX_NATS_RESPONSE_BODY_BYTES => {
+            Ok(Err(LocalResponseBodyError::TooLarge)) => {
                 warn!(
                     request_id = %req.request_id,
-                    len = body.len(),
                     limit = MAX_NATS_RESPONSE_BODY_BYTES,
                     "NatsWorker: local streaming error response exceeded size limit"
                 );
@@ -632,7 +673,10 @@ async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, mess
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NATS_RESPONSE_BODY_BYTES, local_response_exceeds_limit};
+    use super::{
+        MAX_NATS_RESPONSE_BODY_BYTES, append_limited_local_response_chunk,
+        local_response_exceeds_limit,
+    };
 
     #[test]
     fn local_response_exceeds_limit_rejects_declared_oversize() {
@@ -647,5 +691,13 @@ mod tests {
         assert!(!local_response_exceeds_limit(Some(
             MAX_NATS_RESPONSE_BODY_BYTES as u64
         )));
+    }
+
+    #[test]
+    fn append_limited_local_response_chunk_rejects_incremental_excess() {
+        let mut body = Vec::new();
+        append_limited_local_response_chunk(&mut body, b"12345", 8).expect("first chunk fits");
+        assert!(append_limited_local_response_chunk(&mut body, b"6789", 8).is_err());
+        assert_eq!(body, b"12345");
     }
 }
