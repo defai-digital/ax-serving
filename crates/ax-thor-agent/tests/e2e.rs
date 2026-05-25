@@ -81,6 +81,18 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         registrations[0]["capabilities"]["models"],
         json!(["qwen2-72b"])
     );
+    assert_eq!(
+        registrations[0]["model_inventory"][0]["id"],
+        json!("qwen2-72b")
+    );
+    assert_eq!(
+        registrations[0]["model_inventory"][0]["quantization"],
+        json!("awq")
+    );
+    assert_eq!(
+        registrations[0]["model_inventory"][0]["artifact_format"],
+        json!("safetensors")
+    );
     // BUG-114: verify capabilities are not blindly hardcoded.
     assert_eq!(registrations[0]["capabilities"]["embedding"], json!(false));
     assert_eq!(registrations[0]["capabilities"]["vision"], json!(false));
@@ -107,6 +119,14 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert!(!heartbeats.is_empty());
     assert_eq!(heartbeats[0].0, "worker-1");
     assert_eq!(heartbeats[0].1["model_ids"], json!(["qwen2-72b"]));
+    assert_eq!(
+        heartbeats[0].1["model_inventory"][0]["id"],
+        json!("qwen2-72b")
+    );
+    assert_eq!(
+        heartbeats[0].1["model_inventory"][0]["supported_operations"],
+        json!(["llm", "vision"])
+    );
     assert_eq!(heartbeats[0].1["active_sequences"], json!(4));
     assert_eq!(heartbeats[0].1["queue_depth"], json!(3));
     assert_eq!(heartbeats[0].1["decode_tok_per_sec"], json!(42.5));
@@ -178,7 +198,20 @@ fn sglang_router(state: Arc<SgLangState>) -> Router {
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route(
             "/v1/models",
-            get(|| async { Json(json!({"data": [{"id": "qwen2-72b"}]})) }),
+            get(|| async {
+                Json(json!({
+                    "data": [
+                        {
+                            "id": "qwen2-72b",
+                            "max_model_len": 32768,
+                            "quantization": "awq",
+                            "model_format": "safetensors",
+                            "modalities": ["text", "vision"],
+                            "supported_operations": ["llm", "vision"]
+                        }
+                    ]
+                }))
+            }),
         )
         .route("/metrics", get(runtime_metrics))
         .route("/v1/chat/completions", post(handle_chat))

@@ -530,12 +530,18 @@ impl InferenceBackend for RouterBackend {
                 (BackendTag::Native, inner, meta)
             }
             BackendChoice::LlamaCpp => {
-                info!("routing {} → llama.cpp", path.display());
+                warn!(
+                    "routing {} → llama.cpp (embedded compatibility path; prefer ax-runtime-agent + dedicated runtime node)",
+                    path.display()
+                );
                 let (inner, meta) = self.llamacpp.load_model(path, config)?;
                 (BackendTag::LlamaCpp, inner, meta)
             }
             BackendChoice::Mlx => {
-                info!("routing {} → mlx-lm", path.display());
+                warn!(
+                    "routing {} → mlx-lm (embedded compatibility path; prefer ax-runtime-agent + dedicated runtime node)",
+                    path.display()
+                );
                 let (inner, meta) = self.mlx.load_model(path, config)?;
                 (BackendTag::Mlx, inner, meta)
             }

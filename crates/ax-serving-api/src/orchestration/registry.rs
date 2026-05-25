@@ -246,6 +246,8 @@ pub struct WorkerEntry {
     pub id: WorkerId,
     pub addr: SocketAddr,
     pub capabilities: WorkerCapabilities,
+    /// Optional runtime-reported per-model metadata.
+    pub model_inventory: Vec<ModelInventoryEntry>,
     capability_source: CapabilitySource,
     pub backend: BackendKind,
     pub runtime: RuntimeKind,
@@ -305,6 +307,21 @@ pub struct WorkerEntry {
 
 // ── Payloads (serialised over the internal REST API) ─────────────────────────
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInventoryEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_operations: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     /// Omit for first registration; include to re-register with same identity.
@@ -314,6 +331,10 @@ pub struct RegisterRequest {
     /// Either a legacy model-id list or a structured capability descriptor.
     #[serde(default)]
     pub capabilities: RegisterCapabilities,
+    /// Optional structured model inventory. If absent, AX Serving derives
+    /// id-only entries from `capabilities.models`.
+    #[serde(default)]
+    pub model_inventory: Vec<ModelInventoryEntry>,
     /// `"native"` | `"llama_cpp"` | `"sglang"` | `"vllm"` | `"auto"`
     #[serde(default = "default_backend")]
     pub backend: String,
@@ -356,6 +377,7 @@ impl Default for RegisterRequest {
             worker_id: None,
             addr: String::new(),
             capabilities: RegisterCapabilities::default(),
+            model_inventory: Vec::new(),
             backend: default_backend(),
             runtime: None,
             runtime_mode: None,
@@ -393,6 +415,11 @@ pub struct HeartbeatRequest {
     /// replaces the registry capabilities on each heartbeat (including empty).
     #[serde(default)]
     pub model_ids: Vec<String>,
+    /// Optional structured model inventory snapshot. If absent, model_ids
+    /// remain authoritative and existing per-model metadata is retained where
+    /// ids still match.
+    #[serde(default)]
+    pub model_inventory: Vec<ModelInventoryEntry>,
     /// RSS memory in bytes from the worker process.
     #[serde(default)]
     pub rss_bytes: u64,
@@ -471,6 +498,7 @@ pub struct WorkerSnapshot {
     pub id: WorkerId,
     pub addr: String,
     pub capabilities: Vec<String>,
+    pub model_inventory: Vec<ModelInventoryEntry>,
     pub capability_descriptor: WorkerCapabilities,
     pub backend: String,
     pub runtime: String,
@@ -570,6 +598,7 @@ impl WorkerRegistry {
             worker_id,
             addr: raw_addr,
             capabilities,
+            model_inventory,
             backend,
             runtime,
             runtime_mode,
@@ -610,6 +639,7 @@ impl WorkerRegistry {
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let runtime_mode = normalize_runtime_mode(runtime_mode);
         let (capabilities, capability_source) = capabilities.into_parts();
+        let model_inventory = normalize_model_inventory(&capabilities.models, model_inventory);
         let supported_operations = if supported_operations.is_empty() {
             supported_operations_from_capabilities(&capabilities)
         } else {
@@ -622,6 +652,7 @@ impl WorkerRegistry {
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
                 existing.capabilities = capabilities.clone();
+                existing.model_inventory = model_inventory.clone();
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();
@@ -660,6 +691,7 @@ impl WorkerRegistry {
                 id,
                 addr,
                 capabilities,
+                model_inventory,
                 capability_source,
                 backend,
                 runtime,
@@ -710,7 +742,20 @@ impl WorkerRegistry {
                 e.rss_bytes = req.rss_bytes;
                 // Authoritative capability snapshot from worker heartbeat.
                 // Empty model_ids means the worker currently has no models.
-                e.capabilities.models = req.model_ids;
+                let model_ids = if req.model_inventory.is_empty() {
+                    req.model_ids
+                } else {
+                    req.model_inventory
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect()
+                };
+                e.model_inventory = if req.model_inventory.is_empty() {
+                    retain_model_inventory_for_ids(&e.model_inventory, &model_ids)
+                } else {
+                    normalize_model_inventory(&model_ids, req.model_inventory)
+                };
+                e.capabilities.models = model_ids;
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
@@ -1015,6 +1060,7 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         id: e.id,
         addr: e.addr.to_string(),
         capabilities: e.capabilities.models.clone(),
+        model_inventory: e.model_inventory.clone(),
         capability_descriptor: e.capabilities.clone(),
         backend: e.backend.as_str().to_string(),
         runtime: e.runtime.as_str().to_string(),
@@ -1062,6 +1108,47 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
         operations.push("vision".to_string());
     }
     operations
+}
+
+fn normalize_model_inventory(
+    model_ids: &[String],
+    inventory: Vec<ModelInventoryEntry>,
+) -> Vec<ModelInventoryEntry> {
+    let mut by_id = std::collections::BTreeMap::<String, ModelInventoryEntry>::new();
+    for mut item in inventory {
+        item.id = item.id.trim().to_string();
+        if item.id.is_empty() {
+            continue;
+        }
+        item.modalities.sort();
+        item.modalities.dedup();
+        item.supported_operations.sort();
+        item.supported_operations.dedup();
+        by_id.insert(item.id.clone(), item);
+    }
+    for id in model_ids {
+        if !id.trim().is_empty() {
+            by_id
+                .entry(id.clone())
+                .or_insert_with(|| ModelInventoryEntry {
+                    id: id.clone(),
+                    ..Default::default()
+                });
+        }
+    }
+    by_id.into_values().collect()
+}
+
+fn retain_model_inventory_for_ids(
+    previous: &[ModelInventoryEntry],
+    model_ids: &[String],
+) -> Vec<ModelInventoryEntry> {
+    let retained = previous
+        .iter()
+        .filter(|entry| model_ids.iter().any(|id| id == &entry.id))
+        .cloned()
+        .collect();
+    normalize_model_inventory(model_ids, retained)
 }
 
 fn normalize_runtime_mode(mode: Option<String>) -> Option<String> {
@@ -1500,6 +1587,14 @@ mod tests {
                     models: vec!["qwen3-32b".into()],
                     max_context: Some(32768),
                 }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "qwen3-32b".into(),
+                    max_context: Some(32768),
+                    quantization: Some("awq".into()),
+                    artifact_format: Some("safetensors".into()),
+                    modalities: vec!["text".into()],
+                    supported_operations: vec!["llm".into(), "vision".into()],
+                }],
                 backend: "vllm".into(),
                 runtime_mode: Some("adapter".into()),
                 max_inflight: 16,
@@ -1530,6 +1625,15 @@ mod tests {
         assert_eq!(
             snapshot.supported_operations,
             vec!["llm".to_string(), "vision".to_string()]
+        );
+        assert_eq!(snapshot.model_inventory.len(), 1);
+        assert_eq!(
+            snapshot.model_inventory[0].quantization.as_deref(),
+            Some("awq")
+        );
+        assert_eq!(
+            snapshot.model_inventory[0].artifact_format.as_deref(),
+            Some("safetensors")
         );
         assert_eq!(
             r.eligible_workers_filtered("qwen3-32b", RequestKind::Llm, Some("vllm"), None)

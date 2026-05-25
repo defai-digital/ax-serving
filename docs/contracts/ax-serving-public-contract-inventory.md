@@ -62,6 +62,9 @@ Stable contract family:
 - runtime, runtime mode, runtime version, hardware class, runtime endpoint,
   supported operations, worker pool, backend compatibility hint, health, and queue
   metadata that are surfaced as protocol data
+- structured `model_inventory` metadata for model id, context limit,
+  quantization, artifact format, modalities, and model-level operations where
+  runtimes report them
 
 Stability rule:
 

@@ -46,10 +46,21 @@ pub(crate) fn embedded_runtime_policy_from_env() -> Result<EmbeddedRuntimePolicy
 
 pub(crate) fn ensure_embedded_runtime_allowed(context: &str) -> Result<EmbeddedRuntimePolicy> {
     let policy = embedded_runtime_policy_from_env()?;
-    if policy == EmbeddedRuntimePolicy::Deny {
-        anyhow::bail!(
-            "{context} uses AX Serving embedded inference, but {EMBEDDED_RUNTIME_POLICY_ENV}=deny; run ax-serving-api as the gateway and register ax-engine or vLLM runtime nodes"
-        );
+    match policy {
+        EmbeddedRuntimePolicy::Deny => anyhow::bail!(
+            "{context} uses AX Serving embedded inference, but {EMBEDDED_RUNTIME_POLICY_ENV}=deny; \
+             run ax-serving-api as the gateway and register ax-engine or vLLM runtime nodes"
+        ),
+        EmbeddedRuntimePolicy::Warn => {
+            tracing::warn!(
+                context,
+                embedded_runtime_policy = "warn",
+                "embedded inference compatibility path active; \
+                 migrate to ax-runtime-agent + ax-engine or vLLM node adapters, \
+                 or set {EMBEDDED_RUNTIME_POLICY_ENV}=allow to silence"
+            );
+        }
+        EmbeddedRuntimePolicy::Allow => {}
     }
     Ok(policy)
 }

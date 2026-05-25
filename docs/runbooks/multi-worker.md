@@ -102,6 +102,12 @@ inference requests to ax-engine. Adapter registrations include
 `runtime_mode=embedded` so diagnostics can identify compatibility workers
 without guessing from backend names.
 
+When `/v1/models` exposes runtime metadata, the agent also reports structured
+`model_inventory` entries to the gateway. Supported metadata includes
+`max_context`, `quantization`, `artifact_format`, `modalities`, and
+`supported_operations`. The gateway keeps id-only inventory for runtimes that
+only expose OpenAI-compatible model ids.
+
 If the runtime exposes `/metrics`, the agent translates common Prometheus
 gauges such as `ax_runtime_active_sequences`, `ax_runtime_queue_depth`,
 `ax_runtime_decode_tok_per_sec`, `ax_runtime_ttft_p95_ms`, and

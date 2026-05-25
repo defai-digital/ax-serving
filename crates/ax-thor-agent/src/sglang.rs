@@ -34,6 +34,10 @@ pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result
 pub struct ModelInfo {
     pub id: String,
     pub max_model_len: Option<u32>,
+    pub quantization: Option<String>,
+    pub artifact_format: Option<String>,
+    pub modalities: Vec<String>,
+    pub supported_operations: Vec<String>,
 }
 
 pub async fn get_loaded_models(client: &reqwest::Client, base_url: &str) -> Result<Vec<String>> {
@@ -58,6 +62,10 @@ pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<
         .json()
         .await
         .context("failed to parse runtime /v1/models response")?;
+    Ok(parse_model_info_response(&raw))
+}
+
+fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
     let entries = raw["data"].as_array().cloned().unwrap_or_default();
     let mut models = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -65,16 +73,104 @@ pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<
             let max_model_len = entry["max_model_len"]
                 .as_u64()
                 .or_else(|| entry["context_length"].as_u64())
+                .or_else(|| entry["max_context"].as_u64())
                 .map(|v| v as u32);
+            let quantization = string_alias(
+                &entry,
+                &["quantization", "quantization_format", "quantization_config"],
+            );
+            let artifact_format =
+                string_alias(&entry, &["artifact_format", "model_format", "format"]);
+            let modalities = string_array_alias(&entry, &["modalities", "model_modalities"]);
+            let supported_operations =
+                operations_from_model_entry(&entry, modalities.iter().map(String::as_str));
             models.push(ModelInfo {
                 id: id.to_string(),
                 max_model_len,
+                quantization,
+                artifact_format,
+                modalities,
+                supported_operations,
             });
         } else {
             tracing::warn!("runtime /v1/models entry missing 'id' field, skipping: {entry}");
         }
     }
-    Ok(models)
+    models
+}
+
+fn string_alias(entry: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        entry.get(*key).and_then(|value| {
+            value.as_str().map(str::to_string).or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|obj| obj.get("type").or_else(|| obj.get("name")))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+    })
+}
+
+fn string_array_alias(entry: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    let mut values = keys
+        .iter()
+        .find_map(|key| entry.get(*key))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn operations_from_model_entry<'a>(
+    entry: &serde_json::Value,
+    modalities: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut operations = string_array_alias(
+        entry,
+        &[
+            "supported_operations",
+            "operations",
+            "tasks",
+            "capabilities",
+        ],
+    );
+    if entry
+        .get("embedding")
+        .or_else(|| entry.get("supports_embeddings"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        operations.push("embedding".to_string());
+    }
+    if entry
+        .get("vision")
+        .or_else(|| entry.get("supports_vision"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        operations.push("vision".to_string());
+    }
+    for modality in modalities {
+        match modality {
+            "embedding" | "embeddings" => operations.push("embedding".to_string()),
+            "vision" | "image" | "multimodal" => operations.push("vision".to_string()),
+            "text" | "llm" | "chat" | "completion" => operations.push("llm".to_string()),
+            _ => {}
+        }
+    }
+    if operations.is_empty() {
+        operations.push("llm".to_string());
+    }
+    operations.sort();
+    operations.dedup();
+    operations
 }
 
 /// Best-effort runtime telemetry translated into the AX Serving heartbeat
@@ -585,7 +681,10 @@ fn json_duration_ms_any(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeTelemetry, parse_json_telemetry, parse_prometheus_telemetry};
+    use super::{
+        RuntimeTelemetry, parse_json_telemetry, parse_model_info_response,
+        parse_prometheus_telemetry,
+    };
 
     #[test]
     fn parses_common_runtime_prometheus_metrics() {
@@ -715,5 +814,39 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(telemetry.active_batch_size, Some(4));
         assert_eq!(telemetry.max_batch_size, Some(16));
         assert_eq!(telemetry.batch_utilization, Some(0.75));
+    }
+
+    #[test]
+    fn parses_runtime_model_inventory_metadata() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "qwen3-32b",
+                    "max_model_len": 32768,
+                    "quantization": "awq",
+                    "model_format": "safetensors",
+                    "modalities": ["text", "vision"],
+                    "supported_operations": ["llm", "vision"]
+                },
+                {
+                    "id": "embed",
+                    "context_length": 8192,
+                    "quantization_config": {"type": "int8"},
+                    "artifact_format": "gguf",
+                    "supports_embeddings": true
+                }
+            ]
+        }));
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "qwen3-32b");
+        assert_eq!(models[0].max_model_len, Some(32768));
+        assert_eq!(models[0].quantization.as_deref(), Some("awq"));
+        assert_eq!(models[0].artifact_format.as_deref(), Some("safetensors"));
+        assert_eq!(models[0].modalities, vec!["text", "vision"]);
+        assert_eq!(models[0].supported_operations, vec!["llm", "vision"]);
+        assert_eq!(models[1].quantization.as_deref(), Some("int8"));
+        assert_eq!(models[1].artifact_format.as_deref(), Some("gguf"));
+        assert_eq!(models[1].supported_operations, vec!["embedding"]);
     }
 }

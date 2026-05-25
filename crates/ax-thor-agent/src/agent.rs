@@ -85,6 +85,10 @@ impl Default for SharedRuntime {
 pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
     let model_info = sglang::get_model_info(client, &config.runtime_url).await?;
     let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
+    let model_inventory = model_info
+        .iter()
+        .map(model_inventory_entry)
+        .collect::<Vec<_>>();
 
     // BUG-114: derive capabilities from config overrides or runtime metadata
     // instead of hardcoding them.
@@ -116,6 +120,7 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
             "models": models,
             "max_context": max_context
         },
+        "model_inventory": model_inventory,
         "backend": config.runtime.as_str(),
         "runtime": config.runtime.as_str(),
         "runtime_mode": "adapter",
@@ -179,16 +184,22 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             continue;
         };
 
-        let models = match sglang::get_loaded_models(&client, &config.runtime_url).await {
-            Ok(models) => {
-                *runtime.models.write().await = models.clone();
-                models
-            }
-            Err(err) => {
-                tracing::warn!(%err, "failed to refresh runtime model list for heartbeat");
-                runtime.models.read().await.clone()
-            }
-        };
+        let (models, model_inventory) =
+            match sglang::get_model_info(&client, &config.runtime_url).await {
+                Ok(model_info) => {
+                    let models = model_info.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+                    let inventory = model_info
+                        .iter()
+                        .map(model_inventory_entry)
+                        .collect::<Vec<_>>();
+                    *runtime.models.write().await = models.clone();
+                    (models, inventory)
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "failed to refresh runtime model list for heartbeat");
+                    (runtime.models.read().await.clone(), Vec::new())
+                }
+            };
 
         let current_inflight = runtime.inflight.load(Ordering::Relaxed);
         // BUG-073: use real RSS instead of hardcoded 0.
@@ -204,6 +215,7 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             "inflight": current_inflight,
             "thermal_state": "nominal",
             "model_ids": models,
+            "model_inventory": model_inventory,
             "rss_bytes": rss_bytes,
             "active_sequences": telemetry.active_sequences.unwrap_or(current_inflight),
             "decode_tok_per_sec": telemetry.decode_tok_per_sec.unwrap_or(0.0_f64),
@@ -256,6 +268,17 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
         ))
         .await;
     }
+}
+
+fn model_inventory_entry(model: &sglang::ModelInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": model.id.as_str(),
+        "max_context": model.max_model_len,
+        "quantization": model.quantization.as_deref(),
+        "artifact_format": model.artifact_format.as_deref(),
+        "modalities": &model.modalities,
+        "supported_operations": &model.supported_operations,
+    })
 }
 
 pub async fn drain(

@@ -84,6 +84,16 @@ Example vLLM node registration:
     "models": ["qwen3-32b"],
     "max_context": 32768
   },
+  "model_inventory": [
+    {
+      "id": "qwen3-32b",
+      "max_context": 32768,
+      "quantization": "awq",
+      "artifact_format": "safetensors",
+      "modalities": ["text", "vision"],
+      "supported_operations": ["llm", "vision"]
+    }
+  ],
   "supported_operations": ["llm", "vision"],
   "max_inflight": 16,
   "worker_pool": "cuda",
@@ -112,6 +122,7 @@ Optional fields:
 | Field | Type | Meaning |
 |---|---:|---|
 | `model_ids` | string array | Current loaded model inventory. |
+| `model_inventory` | object array | Optional structured per-model metadata. |
 | `thermal_state` | string | Runtime or host thermal state. |
 | `rss_bytes` | number | Worker process RSS. |
 | `active_sequences` | number | Active decode sequences. |
@@ -129,6 +140,21 @@ Optional fields:
 
 Heartbeat telemetry is best effort. AX Serving must continue routing safely when
 optional telemetry is absent.
+
+`model_inventory` entries are additive. Known fields are:
+
+| Field | Type | Meaning |
+|---|---:|---|
+| `id` | string | Stable model id used for routing. |
+| `max_context` | number | Model context limit, when reported by the runtime. |
+| `quantization` | string | Quantization or compression format, when known. |
+| `artifact_format` | string | Artifact/container format such as `gguf` or `safetensors`, when known. |
+| `modalities` | string array | Runtime-reported modalities such as `text` or `vision`. |
+| `supported_operations` | string array | Model-level operations such as `llm`, `embedding`, or `vision`. |
+
+If `model_inventory` is absent, AX Serving derives id-only entries from
+`capabilities.models` during registration and preserves known metadata across
+heartbeats while `model_ids` still contain the same model id.
 
 Runtime-node adapters may translate runtime `/metrics` output into these
 heartbeat fields. The generic `ax-runtime-agent` recognizes these common
@@ -166,6 +192,32 @@ as best-effort hints:
 
 Missing metrics are not registration failures; the adapter sends safe defaults
 and AX Serving keeps routing by health, capacity, and model inventory.
+
+### Per-runtime telemetry support
+
+The table below documents which optional heartbeat fields each known runtime
+actually exposes. Blank cells mean the field is not available from that runtime
+without additional instrumentation; adapters emit the safe default (`0` or
+`0.0`) for those entries.
+
+| Heartbeat field | ax-engine (AXS) | vLLM | SGLang |
+|---|---|---|---|
+| `active_sequences` | `axs_scheduler_inflight_count` gauge | `vllm:num_requests_running` gauge | `num_running_reqs` gauge |
+| `queue_depth` | `axs_scheduler_queue_depth` gauge | `vllm:num_requests_waiting` gauge | `num_waiting_reqs` gauge |
+| `decode_tok_per_sec` | `axs_decode_tok_per_sec` gauge | `vllm:avg_generation_throughput_toks_per_s` gauge | `avg_generation_throughput_toks_per_s` gauge |
+| `ttft_p95_ms` | `axs_ttft_p95_us` gauge (÷ 1000) | `time_to_first_token_seconds_bucket` histogram P95 | `time_to_first_token_seconds_bucket` histogram P95 |
+| `kv_pages_used` | `axs_kv_pages_used` gauge | `vllm:gpu_cache_usage_perc × total_pages` (estimated) | _(not available)_ |
+| `kv_pages_total` | `axs_kv_pages_total` gauge | `vllm:num_gpu_blocks` gauge | _(not available)_ |
+| `kv_utilization` | `kv_cache.utilization` JSON field | `vllm:gpu_cache_usage_perc` gauge | _(not available)_ |
+| `batch_utilization` | `batch.utilization` JSON field | _(not available)_ | _(not available)_ |
+| `error_rate` | `axs_error_rate` gauge | _(not available — use counters)_ | _(not available)_ |
+| `active_batch_size` | `axs_scheduler_inflight_count` gauge | _(not available)_ | _(not available)_ |
+
+**Note on `error_rate`**: vLLM exposes error counts as counters
+(`vllm:num_preemptions_total`), not a fraction gauge. Computing a rate requires
+delta tracking across heartbeats; adapters currently send `0.0` as the safe
+default. The orchestrator's error-rate diagnostic threshold is therefore not
+effective for vLLM or SGLang workers.
 
 ---
 

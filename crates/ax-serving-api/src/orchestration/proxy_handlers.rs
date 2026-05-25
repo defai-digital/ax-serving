@@ -612,6 +612,7 @@ struct RuntimeDiagnostic {
     total_queue_depth: usize,
     max_error_rate: f64,
     models: BTreeSet<String>,
+    model_inventory: Vec<serde_json::Value>,
     hardware_classes: BTreeMap<String, usize>,
     node_classes: BTreeMap<String, usize>,
     worker_pools: BTreeMap<String, usize>,
@@ -677,6 +678,20 @@ impl RuntimeDiagnostic {
         }
         for model in &worker.capabilities {
             self.models.insert(model.clone());
+        }
+        for model in &worker.model_inventory {
+            self.model_inventory.push(serde_json::json!({
+                "worker_id": worker.id,
+                "model_id": model.id.as_str(),
+                "runtime": worker.runtime.as_str(),
+                "node_class": worker.node_class.as_deref(),
+                "hardware_class": worker.hardware_class.as_deref(),
+                "max_context": model.max_context,
+                "quantization": model.quantization.as_deref(),
+                "artifact_format": model.artifact_format.as_deref(),
+                "modalities": &model.modalities,
+                "supported_operations": &model.supported_operations,
+            }));
         }
         if let Some(hardware_class) = worker.hardware_class.as_deref() {
             increment_count(&mut self.hardware_classes, hardware_class);
@@ -942,6 +957,7 @@ impl RuntimeDiagnostic {
             "total_queue_depth": self.total_queue_depth,
             "max_error_rate": self.max_error_rate,
             "models": self.models,
+            "model_inventory": self.model_inventory,
             "hardware_classes": self.hardware_classes,
             "node_classes": self.node_classes,
             "worker_pools": self.worker_pools,

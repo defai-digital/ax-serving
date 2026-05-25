@@ -19,8 +19,8 @@ use ax_serving_api::orchestration::{
     policy::{DispatchContext, DispatchPolicy, policy_from_str},
     queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy},
     registry::{
-        HeartbeatRequest, RegisterCapabilities, RegisterRequest, RequestKind, WorkerCapabilities,
-        WorkerId, WorkerRegistry, WorkerStatus,
+        HeartbeatRequest, ModelInventoryEntry, RegisterCapabilities, RegisterRequest, RequestKind,
+        WorkerCapabilities, WorkerId, WorkerRegistry, WorkerStatus,
     },
     start_orchestrator,
 };
@@ -1431,6 +1431,14 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
     vllm_req.node_class = Some("pc-cuda".into());
     vllm_req.worker_pool = Some("cuda".into());
     vllm_req.supported_operations = vec!["llm".into(), "embedding".into()];
+    vllm_req.model_inventory = vec![ModelInventoryEntry {
+        id: "cuda-model".into(),
+        max_context: Some(32768),
+        quantization: Some("awq".into()),
+        artifact_format: Some("safetensors".into()),
+        modalities: vec!["text".into()],
+        supported_operations: vec!["llm".into()],
+    }];
     let vllm_resp = layer.registry.register(vllm_req, 5000);
     let vllm_id = WorkerId::parse(&vllm_resp.worker_id).unwrap();
     assert!(layer.registry.heartbeat(
@@ -1513,6 +1521,18 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
     assert_eq!(
         runtime_diag["vllm"]["runtime_endpoints"],
         serde_json::json!(["http://127.0.0.1:8000"])
+    );
+    assert_eq!(
+        runtime_diag["vllm"]["model_inventory"][0]["model_id"],
+        "cuda-model"
+    );
+    assert_eq!(
+        runtime_diag["vllm"]["model_inventory"][0]["quantization"],
+        "awq"
+    );
+    assert_eq!(
+        runtime_diag["vllm"]["model_inventory"][0]["artifact_format"],
+        "safetensors"
     );
     assert_eq!(runtime_diag["vllm"]["total_queue_depth"], 4);
 }
