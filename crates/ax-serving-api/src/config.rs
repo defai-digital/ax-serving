@@ -470,14 +470,6 @@ impl ServeConfig {
         if self.orchestrator.request_timeout_secs == 0 {
             anyhow::bail!("orchestrator.request_timeout_secs must be > 0");
         }
-        if self.orchestrator.global_queue_max > self.orchestrator.global_queue_depth {
-            anyhow::bail!(
-                "global_queue_depth ({}) must be >= global_queue_max ({})",
-                self.orchestrator.global_queue_depth,
-                self.orchestrator.global_queue_max
-            );
-        }
-
         // ── Project policy ───────────────────────────────────────────────────
         if self.project_policy.enabled {
             let mut seen = std::collections::HashSet::new();
@@ -677,7 +669,7 @@ impl ServeConfig {
             self.orchestrator.global_queue_max = n.max(1);
         }
         if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_DEPTH") {
-            self.orchestrator.global_queue_depth = n.max(1);
+            self.orchestrator.global_queue_depth = n;
         }
         if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS") {
             self.orchestrator.global_queue_wait_ms = ms.max(1);
@@ -912,12 +904,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_queue_depth_less_than_queue_max() {
+    fn validate_accepts_queue_depth_less_than_queue_max() {
         let mut cfg = valid_cfg();
         cfg.orchestrator.global_queue_max = 200;
         cfg.orchestrator.global_queue_depth = 100; // less than max
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("global_queue_depth"), "got: {err}");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_zero_global_queue_depth() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.global_queue_max = 128;
+        cfg.orchestrator.global_queue_depth = 0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1224,6 +1223,15 @@ mod tests {
         let cfg = ServeConfig::from_env();
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
         assert_eq!(cfg.orchestrator.global_queue_wait_ms, 1);
+    }
+
+    #[test]
+    fn from_env_preserves_zero_global_queue_depth() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_DEPTH", "0") };
+        let cfg = ServeConfig::from_env();
+        unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_DEPTH") };
+        assert_eq!(cfg.orchestrator.global_queue_depth, 0);
     }
 
     #[test]
