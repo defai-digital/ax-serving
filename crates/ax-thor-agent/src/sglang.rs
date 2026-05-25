@@ -2,12 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 
 pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
-    const DEFAULT_TIMEOUT_SECS: u64 = 120;
-    let timeout_secs = std::env::var("AXS_NODE_STARTUP_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS"))
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout_secs = runtime_startup_timeout_secs();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let url = format!("{base_url}/health");
     loop {
@@ -23,6 +18,17 @@ pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Resul
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
+
+fn runtime_startup_timeout_secs() -> u64 {
+    std::env::var("AXS_NODE_STARTUP_TIMEOUT_SECS")
+        .or_else(|_| std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS)
+        .max(1)
 }
 
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
@@ -703,9 +709,56 @@ fn json_duration_ms_any(
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeTelemetry, parse_json_telemetry, parse_model_info_response,
-        parse_prometheus_telemetry,
+        DEFAULT_STARTUP_TIMEOUT_SECS, RuntimeTelemetry, parse_json_telemetry,
+        parse_model_info_response, parse_prometheus_telemetry, runtime_startup_timeout_secs,
     };
+    use std::ffi::OsString;
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn startup_timeout_defaults_when_env_unset() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::remove("AXS_NODE_STARTUP_TIMEOUT_SECS");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        assert_eq!(runtime_startup_timeout_secs(), DEFAULT_STARTUP_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn startup_timeout_clamps_zero_to_one() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::set("AXS_NODE_STARTUP_TIMEOUT_SECS", "0");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        assert_eq!(runtime_startup_timeout_secs(), 1);
+    }
 
     #[test]
     fn parses_common_runtime_prometheus_metrics() {

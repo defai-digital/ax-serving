@@ -155,12 +155,6 @@ impl ThorConfig {
 mod tests {
     use super::ThorConfig;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct EnvGuard {
         key: &'static str,
@@ -192,7 +186,7 @@ mod tests {
 
     #[test]
     fn from_env_defaults_advertised_addr_to_listen_addr() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::test_env::lock();
         let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
         let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
         let _advertised = EnvGuard::set("AXS_THOR_ADVERTISED_ADDR", "127.0.0.1:18081");
@@ -211,7 +205,7 @@ mod tests {
 
     #[test]
     fn from_env_accepts_generic_runtime_node_aliases() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::test_env::lock();
         let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
         let _runtime_url = EnvGuard::set("AXS_NODE_RUNTIME_URL", "http://127.0.0.1:9000");
         let _runtime = EnvGuard::set("AXS_NODE_RUNTIME", "ax_engine");
@@ -237,7 +231,7 @@ mod tests {
 
     #[test]
     fn from_env_rejects_invalid_advertised_addr() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::test_env::lock();
         let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
         let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
         let _advertised = EnvGuard::set("AXS_THOR_ADVERTISED_ADDR", "thor-node.local:18081");
