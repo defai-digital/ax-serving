@@ -51,12 +51,17 @@ async fn main() -> Result<()> {
     let shutdown = async move {
         #[cfg(unix)]
         {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to register SIGTERM handler; using Ctrl-C only");
+                    let _ = tokio::signal::ctrl_c().await;
+                }
             }
         }
         #[cfg(not(unix))]

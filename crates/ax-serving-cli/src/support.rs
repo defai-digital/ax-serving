@@ -8,9 +8,17 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::output::{emit_json_or_human, exit_if};
 use ax_serving_api::config::ServeConfig;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
+const COMMAND_CONFIG_VALIDATE: &str = "ax-serving config validate";
+const COMMAND_STATUS: &str = "ax-serving status";
+const COMMAND_SMOKE_TEST: &str = "ax-serving smoke-test";
+const STATUS_OK: &str = "ok";
+const STATUS_FAIL: &str = "fail";
+const STATUS_DEGRADED: &str = "degraded";
+const STATUS_UNREACHABLE: &str = "unreachable";
 
 #[derive(Debug, Serialize)]
 struct ConfigValidateReport {
@@ -20,7 +28,8 @@ struct ConfigValidateReport {
     valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    summary: ConfigSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<ConfigSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,33 +88,33 @@ struct SmokeTestReport {
 }
 
 pub fn run_config_validate(config: Option<PathBuf>, json: bool) -> Result<()> {
+    let report = build_config_validate_report(config);
+
+    emit_json_or_human(json, &report, print_config_validate_human)?;
+    exit_if(!report.valid);
+    Ok(())
+}
+
+fn build_config_validate_report(config: Option<PathBuf>) -> ConfigValidateReport {
     let (source, loaded) = load_config_for_validation(config);
 
     let (cfg, load_error) = match loaded {
-        Ok(cfg) => (cfg, None),
-        Err(e) => (ServeConfig::from_env(), Some(e.to_string())),
+        Ok(cfg) => (Some(cfg), None),
+        Err(e) => (None, Some(e.to_string())),
     };
-    let validation_error = load_error.or_else(|| cfg.validate().err().map(|e| e.to_string()));
+    let validation_error = load_error.or_else(|| {
+        cfg.as_ref()
+            .and_then(|cfg| cfg.validate().err().map(|e| e.to_string()))
+    });
     let valid = validation_error.is_none();
-    let report = ConfigValidateReport {
-        command: "ax-serving config validate",
-        status: if valid { "ok" } else { "fail" },
+    ConfigValidateReport {
+        command: COMMAND_CONFIG_VALIDATE,
+        status: if valid { STATUS_OK } else { STATUS_FAIL },
         source,
         valid,
         error: validation_error,
-        summary: config_summary(&cfg),
-    };
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_config_validate_human(&report);
+        summary: cfg.as_ref().map(config_summary),
     }
-
-    if !report.valid {
-        std::process::exit(1);
-    }
-    Ok(())
 }
 
 fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeConfig>) {
@@ -140,31 +149,17 @@ pub fn run_status(url: String, api_key: Option<String>, json: bool) -> Result<()
             "metrics",
         ),
     ];
-    let reachable = endpoints.iter().any(|e| e.status_code.is_some());
-    let status = if !reachable {
-        "unreachable"
-    } else if endpoints.iter().any(|e| !e.ok) {
-        "degraded"
-    } else {
-        "ok"
-    };
+    let (reachable, status) = status_from_endpoints(&endpoints);
     let report = StatusReport {
-        command: "ax-serving status",
+        command: COMMAND_STATUS,
         base_url,
         status,
         reachable,
         endpoints,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_status_human(&report);
-    }
-
-    if !report.reachable {
-        std::process::exit(1);
-    }
+    emit_json_or_human(json, &report, print_status_human)?;
+    exit_if(!report.reachable);
     Ok(())
 }
 
@@ -190,48 +185,27 @@ pub fn run_smoke_test(
         "max_tokens": max_tokens,
     });
 
-    let started = Instant::now();
-    let result = with_optional_bearer(client.post(&endpoint).json(&body), token.as_deref()).send();
-    let latency_ms = started.elapsed().as_millis();
-    let report = match result {
-        Ok(resp) => {
-            let status_code = resp.status().as_u16();
-            let ok = resp.status().is_success();
-            let parsed = resp.json::<Value>().ok();
-            SmokeTestReport {
-                command: "ax-serving smoke-test",
-                base_url,
-                model,
-                status: if ok { "ok" } else { "fail" },
-                ok,
-                status_code: Some(status_code),
-                latency_ms,
-                response: parsed,
-                error: None,
-            }
-        }
-        Err(e) => SmokeTestReport {
-            command: "ax-serving smoke-test",
-            base_url,
-            model,
-            status: "unreachable",
-            ok: false,
-            status_code: None,
-            latency_ms,
-            response: None,
-            error: Some(e.to_string()),
+    let response = send_json_request(client.post(&endpoint).json(&body), token.as_deref());
+    let report = SmokeTestReport {
+        command: COMMAND_SMOKE_TEST,
+        base_url,
+        model,
+        status: if response.ok {
+            STATUS_OK
+        } else if response.status_code.is_some() {
+            STATUS_FAIL
+        } else {
+            STATUS_UNREACHABLE
         },
+        ok: response.ok,
+        status_code: response.status_code,
+        latency_ms: response.latency_ms,
+        response: response.body,
+        error: response.error,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_smoke_test_human(&report);
-    }
-
-    if !report.ok {
-        std::process::exit(1);
-    }
+    emit_json_or_human(json, &report, print_smoke_test_human)?;
+    exit_if(!report.ok);
     Ok(())
 }
 
@@ -250,28 +224,41 @@ fn get_json_endpoint(
     name: &'static str,
 ) -> EndpointReport {
     let url = format!("{base_url}{path}");
+    let response = send_json_request(client.get(&url), token);
+
+    EndpointReport {
+        name,
+        url,
+        ok: response.ok,
+        status_code: response.status_code,
+        latency_ms: response.latency_ms,
+        body: response.body,
+        error: response.error,
+    }
+}
+
+struct JsonHttpResponse {
+    ok: bool,
+    status_code: Option<u16>,
+    latency_ms: u128,
+    body: Option<Value>,
+    error: Option<String>,
+}
+
+fn send_json_request(request: RequestBuilder, token: Option<&str>) -> JsonHttpResponse {
     let started = Instant::now();
-    let result = with_optional_bearer(client.get(&url), token).send();
+    let result = with_optional_bearer(request, token).send();
     let latency_ms = started.elapsed().as_millis();
 
     match result {
-        Ok(resp) => {
-            let status_code = resp.status().as_u16();
-            let ok = resp.status().is_success();
-            let body = resp.json::<Value>().ok();
-            EndpointReport {
-                name,
-                url,
-                ok,
-                status_code: Some(status_code),
-                latency_ms,
-                body,
-                error: None,
-            }
-        }
-        Err(e) => EndpointReport {
-            name,
-            url,
+        Ok(resp) => JsonHttpResponse {
+            ok: resp.status().is_success(),
+            status_code: Some(resp.status().as_u16()),
+            latency_ms,
+            body: resp.json::<Value>().ok(),
+            error: None,
+        },
+        Err(e) => JsonHttpResponse {
             ok: false,
             status_code: None,
             latency_ms,
@@ -279,6 +266,30 @@ fn get_json_endpoint(
             error: Some(e.to_string()),
         },
     }
+}
+
+fn status_from_endpoints(endpoints: &[EndpointReport]) -> (bool, &'static str) {
+    let reachable = endpoints.iter().any(|e| e.status_code.is_some());
+    if !reachable {
+        return (false, STATUS_UNREACHABLE);
+    }
+    if endpoints.iter().any(|e| !e.ok) || health_endpoint_degraded(endpoints) {
+        return (true, STATUS_DEGRADED);
+    }
+    (true, STATUS_OK)
+}
+
+fn health_endpoint_degraded(endpoints: &[EndpointReport]) -> bool {
+    let Some(health) = endpoints.iter().find(|e| e.name == "health") else {
+        return false;
+    };
+    let Some(body) = health.body.as_ref() else {
+        return false;
+    };
+    body.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != STATUS_OK)
+        || body.get("ready").and_then(Value::as_bool) == Some(false)
 }
 
 fn with_optional_bearer(request: RequestBuilder, token: Option<&str>) -> RequestBuilder {
@@ -317,13 +328,13 @@ fn print_config_validate_human(report: &ConfigValidateReport) {
     if let Some(error) = &report.error {
         eprintln!("  Error:  {error}");
     }
-    eprintln!("  REST:   {}", report.summary.rest_addr);
-    eprintln!(
-        "  Queue:  inflight={} queue={} wait_ms={}",
-        report.summary.sched_max_inflight,
-        report.summary.sched_max_queue,
-        report.summary.sched_max_wait_ms
-    );
+    if let Some(summary) = &report.summary {
+        eprintln!("  REST:   {}", summary.rest_addr);
+        eprintln!(
+            "  Queue:  inflight={} queue={} wait_ms={}",
+            summary.sched_max_inflight, summary.sched_max_queue, summary.sched_max_wait_ms
+        );
+    }
 }
 
 fn print_status_human(report: &StatusReport) {
@@ -372,15 +383,22 @@ fn normalize_base_url(url: &str) -> String {
 }
 
 fn effective_api_key(api_key: Option<String>) -> Option<String> {
-    api_key.or_else(|| {
+    api_key.and_then(trimmed_non_empty).or_else(|| {
         std::env::var("AXS_API_KEY").ok().and_then(|value| {
             value
                 .split(',')
-                .map(str::trim)
-                .find(|part| !part.is_empty())
-                .map(str::to_string)
+                .find_map(|part| trimmed_non_empty(part.to_string()))
         })
     })
+}
+
+fn trimmed_non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn default_config_candidates() -> Vec<PathBuf> {
@@ -420,5 +438,68 @@ mod tests {
         assert_eq!(summary.rest_addr, "127.0.0.1:18080");
         assert_eq!(summary.dispatch_policy, "least_inflight");
         assert_eq!(summary.sched_max_inflight, 16);
+    }
+
+    #[test]
+    fn malformed_explicit_config_does_not_emit_fallback_summary() {
+        let path =
+            std::env::temp_dir().join(format!("ax-serving-bad-config-{}.toml", std::process::id()));
+        std::fs::write(&path, "=").unwrap();
+
+        let report = build_config_validate_report(Some(path.clone()));
+        let _ = std::fs::remove_file(path);
+
+        assert!(!report.valid);
+        assert_eq!(report.status, STATUS_FAIL);
+        assert!(report.error.is_some());
+        assert!(report.summary.is_none());
+    }
+
+    #[test]
+    fn explicit_api_key_wins_without_env_lookup() {
+        assert_eq!(
+            effective_api_key(Some("  token-a  ".into())).as_deref(),
+            Some("token-a")
+        );
+    }
+
+    #[test]
+    fn status_reflects_degraded_health_body() {
+        let endpoints = vec![EndpointReport {
+            name: "health",
+            url: "http://127.0.0.1:18080/health".into(),
+            ok: true,
+            status_code: Some(200),
+            latency_ms: 1,
+            body: Some(serde_json::json!({
+                "status": "degraded",
+                "ready": true,
+                "reason": "no_models_loaded"
+            })),
+            error: None,
+        }];
+
+        let (reachable, status) = status_from_endpoints(&endpoints);
+
+        assert!(reachable);
+        assert_eq!(status, STATUS_DEGRADED);
+    }
+
+    #[test]
+    fn status_reflects_unreachable_endpoints() {
+        let endpoints = vec![EndpointReport {
+            name: "health",
+            url: "http://127.0.0.1:9/health".into(),
+            ok: false,
+            status_code: None,
+            latency_ms: 1,
+            body: None,
+            error: Some("connection refused".into()),
+        }];
+
+        let (reachable, status) = status_from_endpoints(&endpoints);
+
+        assert!(!reachable);
+        assert_eq!(status, STATUS_UNREACHABLE);
     }
 }

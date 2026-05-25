@@ -357,8 +357,8 @@ impl EmbeddingBatcher {
             Ok(output) => {
                 for ((item, embeddings), prompt_tokens) in items
                     .into_iter()
-                    .zip(output.per_request_embeddings.into_iter())
-                    .zip(output.per_request_prompt_tokens.into_iter())
+                    .zip(output.per_request_embeddings)
+                    .zip(output.per_request_prompt_tokens)
                 {
                     let _ = item.tx.send(Ok(EmbeddingBatchResult {
                         embeddings,

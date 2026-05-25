@@ -411,6 +411,11 @@ struct LlamaCppProcess {
     bos_token: u32,
 }
 
+fn terminate_child(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl Drop for LlamaCppProcess {
     fn drop(&mut self) {
         // Signal poller to stop before killing the child so it doesn't
@@ -426,9 +431,8 @@ impl Drop for LlamaCppProcess {
                 err.into_inner()
             }
         };
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = guard.take() {
+            terminate_child(child);
         }
         // BUG-081: join the poller thread so it cannot attempt a restart after
         // the child has been killed.  A brief timeout avoids hanging forever if
@@ -686,19 +690,23 @@ impl InferenceBackend for LlamaCppBackend {
                     }
                 }
             }
-            return Err(last_err
-                .unwrap()
-                .context(format!("spawning llama-server for {}", path.display())));
+            let err = last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("llama-server spawn retry limit exhausted before any attempt")
+            });
+            return Err(err.context(format!("spawning llama-server for {}", path.display())));
         };
 
-        Self::wait_ready(
+        if let Err(err) = Self::wait_ready(
             &self.http,
             port,
             Duration::from_secs(self.config.server_startup_timeout_secs),
             Duration::from_millis(self.config.wait_ready_poll_interval_ms),
             Duration::from_secs(self.config.wait_ready_check_timeout_secs),
-        )
-        .with_context(|| format!("waiting for llama-server on port {port}"))?;
+        ) {
+            warn!(%err, port, "llama-server not ready; cleaning up spawned process");
+            terminate_child(child);
+            return Err(err).with_context(|| format!("waiting for llama-server on port {port}"));
+        }
 
         let load_ms = start.elapsed().as_millis() as u64;
         info!("llama-server ready on port {port} in {load_ms}ms");
@@ -797,9 +805,8 @@ impl InferenceBackend for LlamaCppBackend {
                                 lock_err.into_inner()
                             }
                         };
-                        if let Some(mut child) = guard.take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                        if let Some(child) = guard.take() {
+                            terminate_child(child);
                         }
                     }
                     return Err(anyhow::anyhow!(
@@ -1281,9 +1288,8 @@ fn run_health_poller(args: PollerArgs) {
                     err.into_inner()
                 }
             };
-            if let Some(mut old) = guard.take() {
-                let _ = old.kill();
-                let _ = old.wait();
+            if let Some(old) = guard.take() {
+                terminate_child(old);
             }
             // Check stop again after killing old child — Drop may have run while
             // we held the lock; avoid spawning an orphaned replacement process.
@@ -1319,10 +1325,9 @@ fn run_health_poller(args: PollerArgs) {
                 warn!("llama-server port {port} failed to start after restart: {e}");
                 // Kill the orphaned child to prevent resource leak (BUG-050).
                 if let Ok(mut guard) = child.lock()
-                    && let Some(c) = guard.as_mut()
+                    && let Some(c) = guard.take()
                 {
-                    let _ = c.kill();
-                    let _ = c.wait();
+                    terminate_child(c);
                 }
                 health.store(HealthState::Dead as u8, Ordering::Relaxed);
                 break;

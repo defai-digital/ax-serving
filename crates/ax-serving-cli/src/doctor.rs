@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::output::{emit_json_or_human, exit_if};
 use crate::tune::HardwareProfile;
 
 #[derive(Debug, Serialize)]
@@ -54,16 +55,8 @@ pub fn run_doctor(json: bool) -> Result<()> {
     let results = run_checks();
     let report = build_report(results);
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_human_report(&report);
-    }
-
-    if report.status == CheckStatus::Fail {
-        std::process::exit(1);
-    }
-
+    emit_json_or_human(json, &report, print_human_report)?;
+    exit_if(report.status == CheckStatus::Fail);
     Ok(())
 }
 

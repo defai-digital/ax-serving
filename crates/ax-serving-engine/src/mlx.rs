@@ -399,6 +399,11 @@ struct MlxProcess {
     _model_type: String,
 }
 
+fn terminate_child(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl Drop for MlxProcess {
     fn drop(&mut self) {
         // Signal the poller to stop before killing the child so it doesn't
@@ -411,9 +416,8 @@ impl Drop for MlxProcess {
                 e.into_inner()
             }
         };
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = guard.take() {
+            terminate_child(child);
         }
         // Join the poller thread to avoid detached threads outliving process
         // state (mirrors LlamaCppProcess::Drop).
@@ -628,9 +632,8 @@ fn run_mlx_health_poller(args: MlxPollerArgs) {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
-            if let Some(mut c) = guard.take() {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(c) = guard.take() {
+                terminate_child(c);
             }
         }
 
@@ -672,6 +675,13 @@ fn run_mlx_health_poller(args: MlxPollerArgs) {
             }
             Err(e) => {
                 warn!(%e, port, "mlx_lm.server restart: not ready within timeout");
+                let mut guard = match child.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                if let Some(c) = guard.take() {
+                    terminate_child(c);
+                }
                 health.store(HealthState::Unhealthy as u8, Ordering::Relaxed);
             }
         }
@@ -719,6 +729,7 @@ impl InferenceBackend for MlxBackend {
                             Ok(()) => break 'retry (port, child),
                             Err(err) => {
                                 warn!(%err, port, "mlx_lm.server not ready; retrying with new port");
+                                terminate_child(child);
                                 last_err = Some(err);
                             }
                         }
@@ -729,9 +740,10 @@ impl InferenceBackend for MlxBackend {
                     }
                 }
             }
-            return Err(last_err
-                .unwrap()
-                .context(format!("spawning mlx_lm.server for {}", path.display())));
+            let err = last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("mlx_lm.server spawn retry limit exhausted before any attempt")
+            });
+            return Err(err.context(format!("spawning mlx_lm.server for {}", path.display())));
         };
 
         let load_ms = start.elapsed().as_millis() as u64;
@@ -800,9 +812,8 @@ impl InferenceBackend for MlxBackend {
                         Ok(g) => g,
                         Err(e2) => e2.into_inner(),
                     };
-                    if let Some(mut c) = guard.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
+                    if let Some(c) = guard.take() {
+                        terminate_child(c);
                     }
                     return Err(anyhow::anyhow!(
                         "failed to spawn mlx health poller thread: {e}"

@@ -8,6 +8,7 @@
 
 mod doctor;
 mod logging;
+mod output;
 mod serve;
 mod support;
 mod thor;

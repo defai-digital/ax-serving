@@ -194,7 +194,7 @@ impl SchedulerMetrics {
     pub fn avg_queue_wait_us(&self) -> u64 {
         let queued = self.queued_requests.load(Ordering::Relaxed);
         let wait = self.queue_wait_us_total.load(Ordering::Relaxed);
-        if queued == 0 { 0 } else { wait / queued }
+        wait.checked_div(queued).unwrap_or(0)
     }
 
     // ── Queue wait percentiles (slow-path requests only) ───────────────────

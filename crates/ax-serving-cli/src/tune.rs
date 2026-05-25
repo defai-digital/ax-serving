@@ -6,6 +6,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::output::emit_json;
+
 /// Hardware profile detected from the local machine.
 #[derive(Debug, Serialize)]
 pub struct HardwareProfile {
@@ -271,8 +273,7 @@ fn print_tune_json(
         recommendation: rec,
         config_toml,
     };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    emit_json(&report)
 }
 
 // ── Hardware detection helpers ───────────────────────────────────────────────

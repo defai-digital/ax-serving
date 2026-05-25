@@ -343,7 +343,7 @@ fn session_config_for_model(
         load_config,
     );
     let total_blocks = context_length.div_ceil(DEFAULT_BLOCK_SIZE_TOKENS).max(1);
-    let max_batch_tokens = context_length.min(DEFAULT_MAX_BATCH_TOKENS).max(1);
+    let max_batch_tokens = context_length.clamp(1, DEFAULT_MAX_BATCH_TOKENS);
 
     EngineSessionConfig::from_preview_request(PreviewSessionConfigRequest {
         cache_group_id: CacheGroupId(0),
@@ -861,17 +861,17 @@ fn run_generate(
         }
     }
 
-    if !stopped_on_stop_sequence {
-        if !push_stream_token_piece(
+    if !stopped_on_stop_sequence
+        && !push_stream_token_piece(
             &tx,
             std::mem::take(&mut stop_buffer),
             stream_batch_size,
             &mut first_stream_chunk_sent,
             &mut stream_token_buffer,
             &mut buffered_stream_tokens,
-        ) {
-            return Ok(());
-        }
+        )
+    {
+        return Ok(());
     }
     if !flush_stream_token_batch(&tx, &mut stream_token_buffer, &mut buffered_stream_tokens) {
         return Ok(());
