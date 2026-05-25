@@ -166,8 +166,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "ax-engine-core"
-version = "3.1.2"
-source = "git+https://github.com/defai-digital/ax-engine.git?rev=509bf912d80025893191719f786e54e81e92b1f6#509bf912d80025893191719f786e54e81e92b1f6"
+version = "3.2.4"
+source = "git+https://github.com/defai-digital/ax-engine.git?rev=e0f1b81c3b30e2ff9a778aa92a0a71373f657573#e0f1b81c3b30e2ff9a778aa92a0a71373f657573"
 dependencies = [
  "anyhow",
  "ax-engine-metal",
@@ -183,8 +183,8 @@ dependencies = [
 
 [[package]]
 name = "ax-engine-metal"
-version = "3.1.2"
-source = "git+https://github.com/defai-digital/ax-engine.git?rev=509bf912d80025893191719f786e54e81e92b1f6#509bf912d80025893191719f786e54e81e92b1f6"
+version = "3.2.4"
+source = "git+https://github.com/defai-digital/ax-engine.git?rev=e0f1b81c3b30e2ff9a778aa92a0a71373f657573#e0f1b81c3b30e2ff9a778aa92a0a71373f657573"
 dependencies = [
  "anyhow",
  "block2",
