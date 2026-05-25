@@ -13,18 +13,26 @@ const DEFAULT_COMPLETED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_COMPLETED_JOBS: usize = 1_000;
 
 fn completed_job_ttl_ms() -> u64 {
-    std::env::var("AXS_JOB_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    let raw = std::env::var("AXS_JOB_TTL_SECS").ok();
+    parse_completed_job_ttl_ms(raw.as_deref())
+}
+
+fn parse_completed_job_ttl_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_COMPLETED_JOB_TTL_SECS)
+        .max(1)
         .saturating_mul(1_000)
 }
 
 fn max_completed_jobs() -> usize {
-    std::env::var("AXS_JOB_MAX_COMPLETED")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let raw = std::env::var("AXS_JOB_MAX_COMPLETED").ok();
+    parse_max_completed_jobs(raw.as_deref())
+}
+
+fn parse_max_completed_jobs(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_COMPLETED_JOBS)
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -490,7 +498,9 @@ fn normalize_restored_job_record(record: &mut JobRecord, restored_at_ms: u128) {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobRecord, JobStatus, JobStore, PersistedJobStoreState, RESTART_INTERRUPTED_ERROR,
+        DEFAULT_COMPLETED_JOB_TTL_SECS, DEFAULT_MAX_COMPLETED_JOBS, JobRecord, JobStatus, JobStore,
+        PersistedJobStoreState, RESTART_INTERRUPTED_ERROR, parse_completed_job_ttl_ms,
+        parse_max_completed_jobs,
     };
 
     // ── basic CRUD ────────────────────────────────────────────────────────────
@@ -669,7 +679,14 @@ mod tests {
         let j1 = store.create("chat", None, Some(bid.clone()));
         let j2 = store.create("chat", None, Some(bid.clone()));
         store.mark_finished(&j1.id, JobStatus::Succeeded, 200, None, None, None);
-        store.mark_finished(&j2.id, JobStatus::Failed, 500, None, None, Some("err".into()));
+        store.mark_finished(
+            &j2.id,
+            JobStatus::Failed,
+            500,
+            None,
+            None,
+            Some("err".into()),
+        );
         let batch = store.get_batch(&bid).unwrap();
         assert_eq!(batch.status, JobStatus::Failed);
         assert_eq!(batch.failed_jobs, 1);
@@ -812,25 +829,36 @@ mod tests {
 
     #[test]
     fn mark_finished_auto_prunes_completed_jobs() {
-        let _guard = crate::test_env::lock();
-        unsafe { std::env::set_var("AXS_JOB_TTL_SECS", "3600") };
-        unsafe { std::env::set_var("AXS_JOB_MAX_COMPLETED", "2") };
-
         let store = JobStore::default();
-        let oldest = store.create("completions", Some("m1".into()), None);
-        store.mark_finished(&oldest.id, JobStatus::Succeeded, 200, None, None, None);
-        let middle = store.create("completions", Some("m2".into()), None);
-        store.mark_finished(&middle.id, JobStatus::Succeeded, 200, None, None, None);
-        let newest = store.create("completions", Some("m3".into()), None);
-        store.mark_finished(&newest.id, JobStatus::Succeeded, 200, None, None, None);
+        let mut ids = Vec::with_capacity(DEFAULT_MAX_COMPLETED_JOBS + 1);
+        for idx in 0..=DEFAULT_MAX_COMPLETED_JOBS {
+            let job = store.create("completions", Some(format!("m{idx}")), None);
+            store.mark_finished(&job.id, JobStatus::Succeeded, 200, None, None, None);
+            ids.push(job.id);
+        }
 
-        assert!(store.get(&oldest.id).is_none());
-        assert!(store.get(&middle.id).is_some());
-        assert!(store.get(&newest.id).is_some());
+        assert!(store.get(&ids[0]).is_none());
+        assert!(store.get(ids.last().unwrap()).is_some());
+        assert_eq!(store.summary().total_jobs, DEFAULT_MAX_COMPLETED_JOBS);
         assert_eq!(store.summary().pruned_total, 1);
+    }
 
-        unsafe { std::env::remove_var("AXS_JOB_TTL_SECS") };
-        unsafe { std::env::remove_var("AXS_JOB_MAX_COMPLETED") };
+    #[test]
+    fn job_retention_env_clamps_zero_to_minimum() {
+        assert_eq!(parse_completed_job_ttl_ms(Some("0")), 1_000);
+        assert_eq!(parse_max_completed_jobs(Some("0")), 1);
+    }
+
+    #[test]
+    fn job_retention_env_defaults_invalid_values() {
+        assert_eq!(
+            parse_completed_job_ttl_ms(Some("not-a-number")),
+            DEFAULT_COMPLETED_JOB_TTL_SECS * 1_000
+        );
+        assert_eq!(
+            parse_max_completed_jobs(Some("not-a-number")),
+            DEFAULT_MAX_COMPLETED_JOBS
+        );
     }
 
     #[test]
@@ -929,7 +957,8 @@ mod tests {
 
         let batches = store.list_batches_recent(10);
         assert_eq!(batches.len(), 2);
-        let ids: std::collections::HashSet<_> = batches.iter().map(|b| b.batch_id.clone()).collect();
+        let ids: std::collections::HashSet<_> =
+            batches.iter().map(|b| b.batch_id.clone()).collect();
         assert!(ids.contains(&batch_a));
         assert!(ids.contains(&batch_b));
     }

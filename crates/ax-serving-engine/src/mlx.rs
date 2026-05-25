@@ -146,12 +146,12 @@ impl MlxConfig {
         if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
             && let Ok(n) = v.parse::<u32>()
         {
-            self.circuit_breaker_trip_threshold = n;
+            self.circuit_breaker_trip_threshold = n.max(1);
         }
         if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
             && let Ok(ms) = v.parse::<u64>()
         {
-            self.circuit_breaker_recovery_ms = ms;
+            self.circuit_breaker_recovery_ms = ms.max(1);
         }
     }
 
@@ -1501,5 +1501,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = read_mlx_model_config(dir.path());
         assert_eq!(cfg.model_type, "mlx");
+    }
+
+    #[test]
+    fn env_overrides_clamp_zero_circuit_breaker_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CB_TRIP_THRESHOLD", "0") };
+        unsafe { std::env::set_var("AXS_CB_RECOVERY_MS", "0") };
+
+        let cfg = MlxConfig::from_env();
+        assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
+        assert_eq!(cfg.circuit_breaker_recovery_ms, 1);
+
+        unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
+        unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
     }
 }

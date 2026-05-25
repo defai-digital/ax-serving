@@ -24,6 +24,7 @@
 pub mod direct;
 pub mod health_ticker;
 pub mod internal_routes;
+pub mod jobs;
 #[cfg(feature = "nats-dispatch")]
 pub mod nats;
 #[cfg(feature = "nats-dispatch")]

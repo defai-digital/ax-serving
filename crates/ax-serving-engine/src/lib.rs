@@ -47,6 +47,17 @@ pub(crate) fn stream_token_batch_size() -> usize {
         .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
 }
 
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+}
+
 /// Return the current process resident set size in bytes.
 ///
 /// This intentionally degrades to 0 on failure because it is used for

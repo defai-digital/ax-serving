@@ -178,12 +178,12 @@ impl LlamaCppConfig {
         if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
             && let Ok(n) = v.parse::<u32>()
         {
-            self.circuit_breaker_trip_threshold = n;
+            self.circuit_breaker_trip_threshold = n.max(1);
         }
         if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
             && let Ok(ms) = v.parse::<u64>()
         {
-            self.circuit_breaker_recovery_ms = ms;
+            self.circuit_breaker_recovery_ms = ms.max(1);
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_CACHE_PROMPT") {
             self.cache_prompt = v != "0" && v.to_lowercase() != "false";
@@ -191,7 +191,7 @@ impl LlamaCppConfig {
         if let Ok(v) = std::env::var("AXS_LLAMACPP_THREADS")
             && let Ok(n) = v.parse::<u32>()
         {
-            self.n_threads = Some(n);
+            self.n_threads = Some(n.max(1));
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_FLASH_ATTN") {
             self.flash_attn = v != "0" && v.to_lowercase() != "false";
@@ -202,12 +202,12 @@ impl LlamaCppConfig {
         if let Ok(v) = std::env::var("AXS_LLAMACPP_N_BATCH")
             && let Ok(n) = v.parse::<u32>()
         {
-            self.n_batch = Some(n);
+            self.n_batch = Some(n.max(1));
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_N_UBATCH")
             && let Ok(n) = v.parse::<u32>()
         {
-            self.n_ubatch = Some(n);
+            self.n_ubatch = Some(n.max(1));
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_PARALLEL")
             && let Ok(n) = v.parse::<u32>()
@@ -2284,5 +2284,28 @@ mod tests {
     fn normalize_pooling_type_rejects_invalid() {
         assert_eq!(normalize_pooling_type("average"), None);
         assert_eq!(normalize_pooling_type(""), None);
+    }
+
+    #[test]
+    fn env_overrides_clamp_zero_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CB_TRIP_THRESHOLD", "0") };
+        unsafe { std::env::set_var("AXS_CB_RECOVERY_MS", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_N_BATCH", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_N_UBATCH", "0") };
+
+        let cfg = LlamaCppConfig::from_env();
+        assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
+        assert_eq!(cfg.circuit_breaker_recovery_ms, 1);
+        assert_eq!(cfg.n_threads, Some(1));
+        assert_eq!(cfg.n_batch, Some(1));
+        assert_eq!(cfg.n_ubatch, Some(1));
+
+        unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
+        unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_N_BATCH") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_N_UBATCH") };
     }
 }
