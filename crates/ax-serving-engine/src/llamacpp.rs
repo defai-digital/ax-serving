@@ -1071,7 +1071,8 @@ impl InferenceBackend for LlamaCppBackend {
             .json()
             .context("decoding /v1/embeddings response")?;
 
-        let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+        let prompt_tokens =
+            json_u32_at_pointer_or_zero(&resp, "/usage/prompt_tokens", "prompt_tokens")?;
 
         let data = resp["data"]
             .as_array()
@@ -2125,6 +2126,18 @@ fn json_token_id_to_u32(value: &serde_json::Value) -> Result<u32> {
     u64_to_u32(id, "token id")
 }
 
+fn json_u32_at_pointer_or_zero(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<u32> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| u64_to_u32(n, field))
+        .unwrap_or(Ok(0))
+}
+
 fn props_token_id(props: Option<&serde_json::Value>, key: &str, default: u32) -> Result<u32> {
     props
         .and_then(|value| {
@@ -2244,6 +2257,29 @@ mod tests {
         let err = json_token_id_to_u32(&value).unwrap_err();
 
         assert!(err.to_string().contains("token id exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn json_u32_at_pointer_or_zero_rejects_overflow() {
+        let value = serde_json::json!({
+            "usage": {
+                "prompt_tokens": u32::MAX as u64 + 1
+            }
+        });
+        let err = json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("prompt_tokens exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn json_u32_at_pointer_or_zero_defaults_missing_values() {
+        let value = serde_json::json!({});
+
+        assert_eq!(
+            json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens").unwrap(),
+            0
+        );
     }
 
     #[test]
