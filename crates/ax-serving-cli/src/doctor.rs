@@ -65,6 +65,7 @@ fn run_checks() -> Vec<CheckResult> {
         check_platform(),
         check_hardware(),
         check_llama_server(),
+        check_runtime_boundary(),
         check_api_key(),
         check_config_file(),
         check_thermal(),
@@ -188,6 +189,75 @@ fn check_llama_server() -> CheckResult {
             ),
             remediation: Some(
                 "Install llama.cpp or set AXS_LLAMA_CPP_BIN to the llama-server path.",
+            ),
+        },
+    }
+}
+
+fn check_runtime_boundary() -> CheckResult {
+    runtime_boundary_result(
+        std::env::var("AXS_ORCHESTRATOR_ADDR").ok().as_deref(),
+        std::env::var("AXS_WORKER_RUNTIME").ok().as_deref(),
+        std::env::var("AXS_ROUTING_CONFIG").ok().as_deref(),
+        std::env::var("AXS_LLAMA_CPP_BIN").ok().as_deref(),
+    )
+}
+
+fn runtime_boundary_result(
+    orchestrator_addr: Option<&str>,
+    worker_runtime: Option<&str>,
+    routing_config: Option<&str>,
+    llama_cpp_bin: Option<&str>,
+) -> CheckResult {
+    let orchestrator_configured = orchestrator_addr.is_some_and(|v| !v.trim().is_empty());
+    let runtime = worker_runtime
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_lowercase());
+    let embedded_hints = routing_config.is_some_and(|v| !v.trim().is_empty())
+        || llama_cpp_bin.is_some_and(|v| !v.trim().is_empty());
+
+    match (orchestrator_configured, runtime.as_deref(), embedded_hints) {
+        (true, Some("ax_engine" | "vllm"), _) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Pass,
+            detail: format!(
+                "worker registration is configured for runtime-node mode ({})",
+                runtime.unwrap()
+            ),
+            remediation: None,
+        },
+        (true, None, _) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: "orchestrated worker will default to ax_engine/mac compatibility metadata"
+                .into(),
+            remediation: Some(
+                "Set AXS_WORKER_RUNTIME and prefer dedicated ax-engine or vLLM node adapters.",
+            ),
+        },
+        (_, Some(other), _) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: format!("worker runtime '{other}' is not a PRD target runtime"),
+            remediation: Some("Use AXS_WORKER_RUNTIME=ax_engine or AXS_WORKER_RUNTIME=vllm."),
+        },
+        (false, None, true) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: "embedded local runtime configuration detected; this is a compatibility path"
+                .into(),
+            remediation: Some(
+                "Move inference execution to ax-engine or vLLM runtime nodes and keep AX Serving as the gateway.",
+            ),
+        },
+        (false, None, false) => CheckResult {
+            name: "Runtime boundary",
+            status: CheckStatus::Warn,
+            detail: "standalone embedded inference mode is available only as a compatibility path"
+                .into(),
+            remediation: Some(
+                "Run ax-serving-api as the gateway and register ax-engine or vLLM runtime nodes.",
             ),
         },
     }
@@ -376,5 +446,35 @@ mod tests {
         assert_eq!(report.summary.pass, 1);
         assert_eq!(report.summary.warn, 0);
         assert_eq!(report.summary.fail, 1);
+    }
+
+    #[test]
+    fn runtime_boundary_passes_for_explicit_target_runtime_node() {
+        let result =
+            runtime_boundary_result(Some("http://127.0.0.1:19090"), Some("vllm"), None, None);
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.detail.contains("vllm"));
+    }
+
+    #[test]
+    fn runtime_boundary_warns_for_embedded_compatibility_mode() {
+        let result = runtime_boundary_result(None, None, Some("./backends.yaml"), None);
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.detail.contains("compatibility path"));
+    }
+
+    #[test]
+    fn runtime_boundary_warns_for_unknown_runtime() {
+        let result = runtime_boundary_result(
+            Some("http://127.0.0.1:19090"),
+            Some("custom_runtime"),
+            None,
+            None,
+        );
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.detail.contains("not a PRD target runtime"));
     }
 }

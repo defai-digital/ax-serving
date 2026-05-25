@@ -13,12 +13,18 @@
 AX Serving is the serving and orchestration control plane behind
 [AX Fabric](https://github.com/defai-digital/ax-fabric). It is designed for
 department-scale private AI fleets that need OpenAI-compatible APIs, runtime
-model lifecycle control, scheduling, metrics, audit surfaces, and multi-worker
-routing across heterogeneous workers.
+and model inventory, scheduling, metrics, audit surfaces, and multi-worker
+routing across heterogeneous runtime nodes.
 
-For inference execution, AX Serving uses:
-- `llama.cpp` by default for all model loads
-- `ax-engine` when explicitly requested via `native` backend override
+AX Serving is not the token-generation engine. In the target architecture,
+inference execution is delegated to runtime nodes:
+
+- Mac nodes run `ax-engine`
+- PC CUDA nodes run `vLLM`
+- NVIDIA Thor nodes run `vLLM`
+
+The existing embedded local worker path remains available as a compatibility
+bridge while dedicated runtime-node adapters mature.
 
 AX Fabric is the product-facing layer for retrieval, knowledge, and grounded
 agent workflows. AX Serving is the infrastructure layer that makes that stack
@@ -68,6 +74,8 @@ For market positioning, competitive analysis, and ICP details, see:
 - [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
 - [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
 - [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
+- [docs/contracts/ax-serving-node-contract.md](docs/contracts/ax-serving-node-contract.md)
+- [docs/contracts/ax-serving-runtime-responsibility-inventory.md](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 
 * * *
 
@@ -137,25 +145,29 @@ Execution artifacts for the open-source / enterprise split:
 Prerequisites:
 - Apple Silicon macOS
 - Rust toolchain
-- `llama-server` on `PATH` for `llama.cpp` fallback and explicit `llama_cpp` loads
-- a GGUF model file
+- one inference runtime node path:
+  - Mac compatibility worker through `ax-serving serve`
+  - Mac ax-engine node adapter path
+  - PC CUDA or NVIDIA Thor vLLM node path
 
 Validate your environment:
 
 ```bash
 cargo check --workspace
-which llama-server
+cargo run -p ax-serving-cli --bin ax-serving -- doctor
 ```
 
-Backend model:
-- `native` = explicit `ax-engine`
-- `llama_cpp` = `llama-server` (default when backend is omitted)
-- `auto` = try native first, then `llama.cpp` on unsupported architectures
+Recommended topology:
 
-Start the simplest local runtime:
+- run `ax-serving-api` as the API gateway and control plane
+- register runtime nodes through the worker/node contract
+- route requests by model, runtime class, node pool, health, and capacity
+
+Compatibility local worker:
 
 ```bash
 AXS_ALLOW_NO_AUTH=true \
+AXS_WORKER_RUNTIME=ax_engine \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
   -m ./models/<model>.gguf \
   --model-id default \
@@ -177,9 +189,9 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
 ```
 
 For fuller setup paths, see [QUICKSTART.md](QUICKSTART.md):
-- single runtime
+- gateway + runtime nodes
+- local compatibility worker
 - authenticated offline deployment
-- gateway + workers
 - model management
 - embeddings
 
@@ -207,18 +219,30 @@ Most local runtimes focus on single-process inference. AX Serving focuses on the
 Positioning:
 - AX Fabric is the product layer
 - AX Serving is the serving and orchestration layer underneath it
-- inference runtimes such as `ax-engine` and `llama.cpp` remain lower-level execution backends
+- inference runtimes such as `ax-engine`, `vLLM`, and compatibility local
+  backends remain lower-level execution systems
 
-### Backend Architecture
+### Runtime Architecture
 
-AX Serving is not itself the token-generation engine. It is the serving layer that routes requests into lower-level runtimes.
+AX Serving is not itself the token-generation engine. It is the serving layer
+that routes requests into runtime nodes.
 
-- `llama.cpp` is the default backend for model loading across families.
-- `ax-engine` remains an explicit opt-in path for AX MLX model artifact directories.
-- routing between those backends is controlled through [`config/backends.yaml`](config/backends.yaml)
-- `ax-engine` is integrated through `ax-engine-sdk` v4.10.0 and its session-based API. Native loads now expect an artifact directory containing `model-manifest.json` and `tokenizer.json`; GGUF files continue to route to `llama.cpp` by default.
+- Mac inference should be provided by `ax-engine` runtime nodes.
+- PC CUDA and NVIDIA Thor inference should be provided by `vLLM` runtime nodes.
+- The worker registry records runtime, runtime version, hardware class, runtime
+  endpoint, supported operations, health, queue, and model inventory.
+- Fleet routing can use model, runtime class, worker pool, hardware class,
+  health, load, queue state, and capability constraints.
 
-In practice, this means AX Serving owns the APIs, scheduling, orchestration, health, metrics, and model lifecycle, while model execution defaults to `llama.cpp` with `ax-engine` as an explicit override.
+The legacy embedded backend paths (`llama.cpp`, MLX subprocess, optional
+libllama, and direct native ax-engine integration) are compatibility paths.
+They remain available while replacement runtime-node adapters are completed,
+but new product work should use the public node contract instead of adding more
+inference-runtime responsibility to AX Serving.
+
+In practice, this means AX Serving owns the APIs, scheduling, orchestration,
+fleet health, metrics, and lifecycle policy, while runtime nodes own inference
+execution.
 
 ### Best With AX Fabric
 

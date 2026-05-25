@@ -1405,14 +1405,13 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     let green = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"green"}}]}"#).await
     );
-    let blue_id = layer.registry.register(
-        reg_req_with_pool(blue, &["fleet-model"], Some("blue"), Some("m3-max")),
-        5000,
-    );
-    let green_id = layer.registry.register(
-        reg_req_with_pool(green, &["fleet-model"], Some("green"), Some("m3-pro")),
-        5000,
-    );
+    let mut blue_req = reg_req_with_pool(blue, &["fleet-model"], Some("blue"), Some("m3-max"));
+    blue_req.runtime = Some("ax_engine".into());
+    let blue_id = layer.registry.register(blue_req, 5000);
+    let mut green_req = reg_req_with_pool(green, &["fleet-model"], Some("green"), Some("m3-pro"));
+    green_req.backend = "vllm".into();
+    green_req.runtime = Some("vllm".into());
+    let green_id = layer.registry.register(green_req, 5000);
     let blue_id = WorkerId::parse(&blue_id.worker_id).unwrap();
     let green_id = WorkerId::parse(&green_id.worker_id).unwrap();
     assert!(layer.registry.heartbeat(
@@ -1470,6 +1469,10 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     assert_eq!(json["pools"]["green"]["workers"], 1);
     assert_eq!(json["node_classes"]["m3-max"]["workers"], 1);
     assert_eq!(json["node_classes"]["m3-pro"]["workers"], 1);
+    assert_eq!(json["runtimes"]["ax_engine"]["workers"], 1);
+    assert_eq!(json["runtimes"]["vllm"]["workers"], 1);
+    assert_eq!(json["runtimes"]["ax_engine"]["total_queue_depth"], 3);
+    assert_eq!(json["runtimes"]["vllm"]["total_queue_depth"], 1);
     assert_eq!(json["pools"]["blue"]["total_queue_depth"], 3);
     assert_eq!(json["pools"]["green"]["total_queue_depth"], 1);
     assert_eq!(json["pools"]["blue"]["max_error_rate"], 0.25);

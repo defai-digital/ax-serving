@@ -6,31 +6,49 @@
 
 ---
 
-## 1. Starting a Worker Pool (direct mode, 4 workers)
+## 1. Starting a Runtime Node Pool (direct mode)
 
-Each worker is an `ax-serving serve` process.  Workers register themselves with
-the orchestrator on startup and send periodic heartbeats.
+AX Serving is the API gateway and control plane. Runtime nodes own inference
+execution and register themselves with the gateway on startup.
+
+Target runtime nodes:
+
+- Mac nodes running `ax-engine`
+- PC CUDA nodes running `vLLM`
+- NVIDIA Thor nodes running `vLLM`
+
+The `ax-serving serve` local worker path is still available for Mac
+compatibility, but it should be treated as a migration bridge while dedicated
+ax-engine node adapters mature.
 
 ### Prerequisites
 
 - Binaries built: `cargo build -p ax-serving-cli --release`
   This produces both `ax-serving` and `ax-serving-api` in `target/release/`.
 - Orchestrator running (see §2)
-- GGUF model file available
+- Runtime node available:
+  - `ax-serving serve` compatibility worker for local Mac testing
+  - ax-engine node adapter for Mac runtime-node deployments
+  - vLLM node/agent for PC CUDA or NVIDIA Thor runtime-node deployments
 
-### Start four workers
+### Start compatibility Mac workers
 
-Open four terminals (or use a process supervisor):
+Open multiple terminals (or use a process supervisor):
 
 ```bash
 # Worker 1 — port 18081
-AXS_INTERNAL_PORT=19090 \
+AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
+AXS_WORKER_RUNTIME=ax_engine \
+AXS_WORKER_HARDWARE_CLASS=mac \
 ax-serving serve \
   -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
   --model-id llama3-8b \
   --port 18081
 
 # Worker 2 — port 8082
+AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
+AXS_WORKER_RUNTIME=ax_engine \
+AXS_WORKER_HARDWARE_CLASS=mac \
 ax-serving serve \
   -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
   --model-id llama3-8b \
@@ -39,13 +57,16 @@ ax-serving serve \
 # Workers 3 and 4: repeat on ports 8083, 8084
 ```
 
-Each worker auto-registers with the orchestrator at `http://127.0.0.1:19090`.
+Each worker auto-registers with the orchestrator through
+`AXS_ORCHESTRATOR_ADDR` or the equivalent `--orchestrator` CLI flag.
 
 ### Verify workers are registered
 
 ```bash
 curl -s http://127.0.0.1:19090/internal/workers | jq '.workers | length'
 # Expected: 4
+
+curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, runtime, hardware_class, health}'
 
 curl -s http://127.0.0.1:18080/health | jq '.workers'
 # Expected: { "total": 4, "healthy": 4, "unhealthy": 0, "dead": 0 }
@@ -101,10 +122,13 @@ ax-serving-api --port 9000 --internal-port 9001 --policy weighted_round_robin
 
 ## 3. Adding a Worker to a Running Pool
 
-Workers can join a running gateway at any time.
+Runtime nodes can join a running gateway at any time.
 
 ```bash
 # Start new worker on port 8085
+AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
+AXS_WORKER_RUNTIME=ax_engine \
+AXS_WORKER_HARDWARE_CLASS=mac \
 ax-serving serve -m ./models/llama3.gguf --model-id llama3-8b --port 8085
 
 # Verify it appeared within one heartbeat interval (~5 s):
@@ -214,7 +238,11 @@ curl -s http://127.0.0.1:18080/v1/workers \
   -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
 
 # Internal worker list (loopback only)
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, health, inflight, addr}'
+curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, runtime, hardware_class, health, inflight, addr}'
+
+# Runtime-level fleet summary
+curl -s http://127.0.0.1:18080/v1/admin/fleet \
+  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtimes'
 
 # Routable model list — only healthy, non-draining workers contribute
 # If a model is missing here, the serving worker is unhealthy or draining.

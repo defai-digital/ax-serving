@@ -500,6 +500,7 @@ pub(super) async fn proxy_admin_fleet(
     let mut pools = serde_json::Map::new();
     let mut node_classes = serde_json::Map::new();
     let mut backends = serde_json::Map::new();
+    let mut runtimes = serde_json::Map::new();
 
     for worker in &workers {
         accumulate_fleet_bucket(
@@ -513,6 +514,7 @@ pub(super) async fn proxy_admin_fleet(
             worker,
         );
         accumulate_fleet_bucket(&mut backends, &worker.backend, worker);
+        accumulate_fleet_bucket(&mut runtimes, &worker.runtime, worker);
     }
 
     Json(serde_json::json!({
@@ -521,6 +523,7 @@ pub(super) async fn proxy_admin_fleet(
         "pools": pools,
         "node_classes": node_classes,
         "backends": backends,
+        "runtimes": runtimes,
         "workers": workers,
     }))
 }

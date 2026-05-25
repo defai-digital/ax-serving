@@ -5,6 +5,8 @@
 > **Owner**: AX Serving Core Team
 > **Related**:
 > - [PRD - AX Serving](../../.internal/prd/PRD-AX-SERVING.md)
+> - [AX Serving Node Contract](ax-serving-node-contract.md)
+> - [Runtime Responsibility Inventory](ax-serving-runtime-responsibility-inventory.md)
 > - [AX Fabric Runtime Contract](ax-fabric-runtime-contract.md)
 
 # Purpose
@@ -57,8 +59,9 @@ Stable contract family:
 - worker drain / undrain semantics
 - worker eviction semantics where documented
 - capability advertisement payloads
-- worker pool, backend, health, and queue metadata that are already surfaced as
-  protocol data
+- runtime, runtime version, hardware class, runtime endpoint, supported
+  operations, worker pool, backend compatibility hint, health, and queue
+  metadata that are surfaced as protocol data
 
 Stability rule:
 
@@ -66,10 +69,14 @@ Stability rule:
   may be depended on
 - new enterprise-only worker capabilities must be added as protocol extensions,
   not as private Rust trait hooks
+- runtime-node integrations must use the public node contract instead of
+  depending on AX Serving internal Rust backend traits
 
 Enterprise usage examples:
 
-- NVIDIA / Thor-class worker implementations
+- Mac ax-engine node adapters
+- PC CUDA vLLM worker implementations
+- NVIDIA / Thor-class vLLM worker implementations
 - heterogeneous fleet placement services
 - enterprise worker health enrichments
 
@@ -83,6 +90,8 @@ Stable contract family:
 - startup / diagnostics payloads where publicly documented
 - admin status and fleet summaries where documented
 - audit listing response shape where documented
+- fleet grouping by pool, node class, backend compatibility hint, and runtime
+  class where documented
 
 Stability rule:
 
@@ -110,6 +119,12 @@ Current documented examples include:
 - `AXS_MODEL_ALLOWED_DIRS`
 - `AXS_MODEL_WARM_POOL_SIZE`
 - `AXS_API_KEY`
+- `AXS_WORKER_RUNTIME`
+- `AXS_WORKER_RUNTIME_VERSION`
+- `AXS_WORKER_HARDWARE_CLASS`
+- `AXS_WORKER_RUNTIME_ENDPOINT`
+- `AXS_THOR_RUNTIME`
+- `AXS_THOR_RUNTIME_URL`
 
 Stability rule:
 
@@ -148,6 +163,7 @@ Enterprise repositories must not treat these as stable contracts:
 
 - internal Rust module paths
 - private helper functions
+- `InferenceBackend` trait implementations and embedded backend internals
 - undocumented HTML or dashboard DOM structure
 - test-only scaffolding
 - local branch-only response fields
@@ -177,7 +193,7 @@ The following are the minimum public contracts required to keep enterprise code
 private while keeping the public core coherent:
 
 - northbound REST serving APIs
-- worker lifecycle and capability protocol
+- worker lifecycle, runtime metadata, and capability protocol
 - documented admin / diagnostics payloads used by enterprise tooling
 - documented config and `AXS_*` environment contracts
 - documented metrics and audit export payloads
