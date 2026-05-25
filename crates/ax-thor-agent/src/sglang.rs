@@ -80,7 +80,7 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
                 .as_u64()
                 .or_else(|| entry["context_length"].as_u64())
                 .or_else(|| entry["max_context"].as_u64())
-                .map(|v| v as u32);
+                .map(clamp_u64_to_u32);
             let quantization = string_alias(
                 &entry,
                 &["quantization", "quantization_format", "quantization_config"],
@@ -659,6 +659,10 @@ fn max_u32(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u32
     max_u64(samples, aliases).map(|v| v.min(u32::MAX as u64) as u32)
 }
 
+fn clamp_u64_to_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 fn us_to_ms(value: u64) -> u64 {
     value.div_ceil(1_000)
 }
@@ -922,5 +926,20 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(models[1].quantization.as_deref(), Some("int8"));
         assert_eq!(models[1].artifact_format.as_deref(), Some("gguf"));
         assert_eq!(models[1].supported_operations, vec!["embedding"]);
+    }
+
+    #[test]
+    fn model_inventory_context_length_clamps_oversized_u32() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "oversized",
+                    "max_model_len": u32::MAX as u64 + 1
+                }
+            ]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_model_len, Some(u32::MAX));
     }
 }
