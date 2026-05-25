@@ -345,6 +345,7 @@ impl ModelRegistry {
             candidates
         };
 
+        let mut failed_final_evictions = Vec::new();
         for evicted in final_evictions {
             let evict_id = evicted.id.clone();
             match backend.unload_model(evicted.handle) {
@@ -355,10 +356,33 @@ impl ModelRegistry {
                     warn!(
                         "warm pool: failed to finalize eviction of '{evict_id}' for '{model_id}': {e}"
                     );
-                    let mut guard = self.inner_write();
-                    guard.insert(evict_id, evicted);
+                    failed_final_evictions.push(evicted);
                 }
             }
+        }
+        if !failed_final_evictions.is_empty() {
+            let new_entry_to_cleanup = {
+                let mut guard = self.inner_write();
+                for evicted in failed_final_evictions {
+                    guard.insert(evicted.id.clone(), evicted);
+                }
+                if guard
+                    .get(model_id)
+                    .is_some_and(|current| current.handle == handle)
+                {
+                    guard.remove(model_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(new_entry) = new_entry_to_cleanup
+                && let Err(e) = backend.unload_model(new_entry.handle)
+            {
+                warn!(
+                    "warm pool: failed to clean up newly loaded '{model_id}' after final eviction failure: {e}"
+                );
+            }
+            anyhow::bail!("warm-pool final eviction failed; cannot load '{model_id}'");
         }
 
         // _loading_guard drops here, removing model_id from the loading set.
@@ -1191,6 +1215,7 @@ mod tests {
         release: Arc<std::sync::Barrier>,
         next_handle: AtomicU64,
         unloads: Arc<AtomicU64>,
+        fail_unloads: bool,
     }
 
     impl InferenceBackend for BlockingLoadBackend {
@@ -1221,6 +1246,9 @@ mod tests {
 
         fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
             self.unloads.fetch_add(1, Ordering::Relaxed);
+            if self.fail_unloads {
+                anyhow::bail!("simulated backend unload failure");
+            }
             Ok(())
         }
 
@@ -1268,6 +1296,7 @@ mod tests {
             release: Arc::new(std::sync::Barrier::new(2)),
             next_handle: AtomicU64::new(0),
             unloads: Arc::new(AtomicU64::new(0)),
+            fail_unloads: false,
         });
         let reg = ModelRegistry::new(1);
 
@@ -1337,6 +1366,7 @@ mod tests {
             release: Arc::new(std::sync::Barrier::new(2)),
             next_handle: AtomicU64::new(0),
             unloads: Arc::new(AtomicU64::new(0)),
+            fail_unloads: false,
         });
         let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
 
@@ -1378,6 +1408,69 @@ mod tests {
             backend.unloads.load(Ordering::Relaxed),
             1,
             "one previously loaded model must be evicted after concurrent finalization"
+        );
+    }
+
+    #[test]
+    fn concurrent_warm_pool_final_eviction_failure_rolls_back_new_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("m1.gguf");
+        let path2 = dir.path().join("m2.gguf");
+        std::fs::write(&path1, b"dummy").unwrap();
+        std::fs::write(&path2, b"dummy").unwrap();
+
+        let backend = Arc::new(BlockingLoadBackend {
+            started: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+            next_handle: AtomicU64::new(0),
+            unloads: Arc::new(AtomicU64::new(0)),
+            fail_unloads: true,
+        });
+        let reg = ModelRegistry::new_with_warm_pool_size(16, Some(1));
+
+        let reg1 = reg.clone();
+        let backend1 = Arc::clone(&backend);
+        let path1_clone = path1.clone();
+        let t1 = std::thread::spawn(move || {
+            reg1.load(
+                "first",
+                &path1_clone,
+                LoadConfig::default(),
+                backend1.as_ref(),
+            )
+        });
+
+        let reg2 = reg.clone();
+        let backend2 = Arc::clone(&backend);
+        let path2_clone = path2.clone();
+        let t2 = std::thread::spawn(move || {
+            reg2.load(
+                "second",
+                &path2_clone,
+                LoadConfig::default(),
+                backend2.as_ref(),
+            )
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let successes = [r1.is_ok(), r2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "only the load that does not need failed final eviction may succeed"
+        );
+        assert_eq!(
+            reg.len(),
+            1,
+            "failed final eviction must not leave warm pool above its configured size"
+        );
+        assert!(
+            backend.unloads.load(Ordering::Relaxed) >= 1,
+            "backend unload must have been attempted for final eviction"
         );
     }
 
