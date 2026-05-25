@@ -1774,7 +1774,15 @@ fn stream_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_llama(http, port, "/v1/completions", body)?;
+    parse_completion_sse(resp, tx, batch_size, emit_logprobs)
+}
 
+fn parse_completion_sse<R: std::io::Read>(
+    resp: R,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    batch_size: usize,
+    emit_logprobs: bool,
+) -> Result<()> {
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();
     let mut prompt_tokens = 0usize;
@@ -1784,6 +1792,7 @@ fn stream_completions(
     let mut token_buf: Vec<StreamToken> = Vec::new();
     let effective_batch = if emit_logprobs { 1 } else { batch_size };
     let mut stop_reason = String::new();
+    let mut saw_stop = false;
 
     loop {
         line.clear();
@@ -1804,6 +1813,18 @@ fn stream_completions(
         let Ok(val) = serde_json::from_str::<CompletionSseChunk>(json_str) else {
             continue;
         };
+
+        // Usage can arrive on a final usage-only chunk after the finish chunk
+        // when stream_options.include_usage is enabled.
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
+            prompt_tokens = u64_to_usize_saturating(n);
+        }
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
+            completion_tokens = u64_to_usize_saturating(n);
+        }
+        if saw_stop {
+            continue;
+        }
 
         let first_choice = val.choices.first();
         let token_text = if !val.content.is_empty() {
@@ -1836,18 +1857,6 @@ fn stream_completions(
             token_buf.push((token_text.to_string(), lp_data));
         }
 
-        if stopped {
-            // /v1/completions returns usage in OpenAI format under the `usage`
-            // object, not in the native `tokens_evaluated`/`tokens_predicted`
-            // fields (those only appear on the native /completion endpoint).
-            if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
-                prompt_tokens = n as usize;
-            }
-            if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
-                completion_tokens = n as usize;
-            }
-        }
-
         // Flush token buffer when batch is full or stream stopped.
         if stopped || token_buf.len() >= effective_batch {
             if !token_buf.is_empty() {
@@ -1873,7 +1882,7 @@ fn stream_completions(
                 }
             }
             if stopped {
-                break;
+                saw_stop = true;
             }
         }
     }
@@ -2096,6 +2105,10 @@ fn u64_to_u32(value: u64, field: &str) -> Result<u32> {
 
 fn u64_to_u32_saturating(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
 }
 
 fn json_token_id_to_u32(value: &serde_json::Value) -> Result<u32> {
@@ -2386,6 +2399,34 @@ mod tests {
         };
 
         assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn parse_completion_sse_reads_usage_after_finish_chunk() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_completion_sse(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "hello"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 3);
+                assert_eq!(stats.completion_tokens, 5);
+                assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
     }
 
     #[test]
