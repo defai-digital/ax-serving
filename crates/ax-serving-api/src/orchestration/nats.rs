@@ -218,6 +218,21 @@ fn decode_body_hex_limited(
     Ok(body)
 }
 
+fn decode_stream_body_hex_limited(
+    data_hex: Option<&str>,
+    total_bytes: &mut usize,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, NatsBodyDecodeError> {
+    let remaining = limit_bytes
+        .checked_sub(*total_bytes)
+        .ok_or(NatsBodyDecodeError::TooLarge)?;
+    let body = decode_body_hex_limited(data_hex, remaining)?;
+    *total_bytes = total_bytes
+        .checked_add(body.len())
+        .ok_or(NatsBodyDecodeError::TooLarge)?;
+    Ok(body)
+}
+
 // ── NatsDispatcher ────────────────────────────────────────────────────────────
 
 /// Orchestrator-side NATS dispatcher.
@@ -436,6 +451,7 @@ impl NatsDispatcher {
             let mut sub = sub;
             let mut tx = tx;
             let deadline = tokio::time::Instant::now() + timeout;
+            let mut total_bytes = 0usize;
             while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             {
                 let msg = match tokio::time::timeout(remaining, sub.next()).await {
@@ -482,11 +498,24 @@ impl NatsDispatcher {
                     );
                 }
 
-                let chunk: Vec<u8> = match resp.data_hex.as_deref().map(hex::decode).transpose() {
-                    Ok(b) => b.unwrap_or_default(),
-                    Err(e) => {
+                let chunk: Vec<u8> = match decode_stream_body_hex_limited(
+                    resp.data_hex.as_deref(),
+                    &mut total_bytes,
+                    MAX_NATS_RESPONSE_BODY_BYTES,
+                ) {
+                    Ok(b) => b,
+                    Err(NatsBodyDecodeError::InvalidHex(e)) => {
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+                            .await;
+                        break;
+                    }
+                    Err(NatsBodyDecodeError::TooLarge) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "NATS streaming response body exceeded size limit",
+                            )))
                             .await;
                         break;
                     }
@@ -534,7 +563,8 @@ impl std::fmt::Debug for NatsDispatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        NatsBodyDecodeError, NatsConfig, decode_body_hex_limited, sanitize_subject_component,
+        NatsBodyDecodeError, NatsConfig, decode_body_hex_limited, decode_stream_body_hex_limited,
+        sanitize_subject_component,
     };
 
     #[test]
@@ -578,5 +608,23 @@ mod tests {
     fn decode_body_hex_limited_accepts_empty_and_valid_payloads() {
         assert_eq!(decode_body_hex_limited(None, 64).unwrap(), Vec::<u8>::new());
         assert_eq!(decode_body_hex_limited(Some("6869"), 64).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn decode_stream_body_hex_limited_tracks_cumulative_limit() {
+        let mut total = 0usize;
+        assert_eq!(
+            decode_stream_body_hex_limited(Some("3132"), &mut total, 4).unwrap(),
+            b"12"
+        );
+        assert_eq!(total, 2);
+        assert_eq!(
+            decode_stream_body_hex_limited(Some("3334"), &mut total, 4).unwrap(),
+            b"34"
+        );
+        assert_eq!(total, 4);
+        let err = decode_stream_body_hex_limited(Some("35"), &mut total, 4).unwrap_err();
+        assert!(matches!(err, NatsBodyDecodeError::TooLarge));
+        assert_eq!(total, 4);
     }
 }

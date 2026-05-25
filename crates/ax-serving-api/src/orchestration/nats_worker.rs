@@ -61,6 +61,20 @@ fn append_limited_local_response_chunk(
     Ok(())
 }
 
+fn add_limited_local_response_len(
+    current_len: usize,
+    chunk_len: usize,
+    max_bytes: usize,
+) -> Result<usize, LocalResponseBodyError> {
+    let next_len = current_len
+        .checked_add(chunk_len)
+        .ok_or(LocalResponseBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+    Ok(next_len)
+}
+
 async fn read_limited_local_response_body(
     resp: reqwest::Response,
 ) -> Result<Vec<u8>, LocalResponseBodyError> {
@@ -619,6 +633,7 @@ async fn dispatch_streaming(
     let mut byte_stream = resp.bytes_stream();
     let mut stream_error = None;
     let deadline = tokio::time::Instant::now() + request_timeout;
+    let mut total_bytes = 0usize;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, byte_stream.next()).await {
@@ -638,6 +653,25 @@ async fn dispatch_streaming(
                 break;
             }
             Ok(Some(Ok(chunk))) => {
+                match add_limited_local_response_len(
+                    total_bytes,
+                    chunk.len(),
+                    MAX_NATS_RESPONSE_BODY_BYTES,
+                ) {
+                    Ok(next_len) => total_bytes = next_len,
+                    Err(LocalResponseBodyError::TooLarge) => {
+                        warn!(
+                            request_id = %req.request_id,
+                            limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                            "NatsWorker: local streaming response exceeded size limit"
+                        );
+                        stream_error = Some("local HTTP response exceeded size limit".to_string());
+                        break;
+                    }
+                    Err(LocalResponseBodyError::Read(_)) => {
+                        unreachable!("length accounting does not read")
+                    }
+                }
                 let payload = NatsResponse::streaming_chunk(req.request_id.clone(), status, &chunk)
                     .to_payload();
                 if let Err(e) = nats_client
@@ -674,8 +708,8 @@ async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, mess
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NATS_RESPONSE_BODY_BYTES, append_limited_local_response_chunk,
-        local_response_exceeds_limit,
+        MAX_NATS_RESPONSE_BODY_BYTES, add_limited_local_response_len,
+        append_limited_local_response_chunk, local_response_exceeds_limit,
     };
 
     #[test]
@@ -699,5 +733,12 @@ mod tests {
         append_limited_local_response_chunk(&mut body, b"12345", 8).expect("first chunk fits");
         assert!(append_limited_local_response_chunk(&mut body, b"6789", 8).is_err());
         assert_eq!(body, b"12345");
+    }
+
+    #[test]
+    fn add_limited_local_response_len_rejects_incremental_excess() {
+        assert_eq!(add_limited_local_response_len(5, 3, 8).unwrap(), 8);
+        assert!(add_limited_local_response_len(5, 4, 8).is_err());
+        assert!(add_limited_local_response_len(usize::MAX, 1, usize::MAX).is_err());
     }
 }
