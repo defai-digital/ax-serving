@@ -2282,6 +2282,50 @@ async fn test_proxy_embeddings_route_and_project_policy() {
 }
 
 #[tokio::test]
+async fn test_proxy_embeddings_does_not_route_to_legacy_llm_only_worker() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let worker_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.1],"index":0}],"model":"embed-main"}"#
+        )
+        .await
+    );
+    let mut req = reg_req(worker_addr, &["embed-main"]);
+    req.supported_operations = vec!["llm".into()];
+    layer.registry.register(req, 5000);
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/embeddings")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"model":"embed-main","input":"hello"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "llm-only legacy workers must not receive embedding requests"
+    );
+}
+
+#[tokio::test]
 async fn test_structured_embedding_worker_is_not_used_for_chat() {
     let worker_addr = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#).await

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
-
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
@@ -355,7 +355,8 @@ pub struct RegisterRequest {
     /// Runtime-compatible endpoint or proxy target, if different from `addr`.
     #[serde(default)]
     pub runtime_endpoint: Option<String>,
-    /// Explicit supported operations. If absent, AX Serving derives them from capabilities.
+    /// Explicit supported operations. If absent, AX Serving derives them from structured
+    /// capabilities while legacy model-id registrations keep compatibility routing.
     #[serde(default)]
     pub supported_operations: Vec<String>,
     pub max_inflight: usize,
@@ -646,9 +647,14 @@ impl WorkerRegistry {
         let model_inventory =
             normalize_model_inventory(&capabilities.models, incoming_model_inventory);
         let supported_operations = if supported_operations.is_empty() {
-            supported_operations_from_capabilities(&capabilities)
+            match capability_source {
+                CapabilitySource::Legacy => Vec::new(),
+                CapabilitySource::Structured => {
+                    supported_operations_from_capabilities(&capabilities)
+                }
+            }
         } else {
-            supported_operations
+            normalize_supported_operations(supported_operations)
         };
 
         self.inner
@@ -1120,6 +1126,16 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
     operations
 }
 
+fn normalize_supported_operations(operations: Vec<String>) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    operations
+        .into_iter()
+        .map(|op| op.trim().to_ascii_lowercase().replace('-', "_"))
+        .filter(|op| !op.is_empty())
+        .filter(|op| seen.insert(op.clone()))
+        .collect()
+}
+
 fn normalize_model_inventory(
     model_ids: &[String],
     inventory: Vec<ModelInventoryEntry>,
@@ -1132,8 +1148,7 @@ fn normalize_model_inventory(
         }
         item.modalities.sort();
         item.modalities.dedup();
-        item.supported_operations.sort();
-        item.supported_operations.dedup();
+        item.supported_operations = normalize_supported_operations(item.supported_operations);
         by_id.insert(item.id.clone(), item);
     }
     for id in model_ids {
@@ -1232,6 +1247,15 @@ fn dispatch_filter_matches(
 }
 
 fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool {
+    if !entry.supported_operations.is_empty()
+        && !entry
+            .supported_operations
+            .iter()
+            .any(|operation| operation == request_kind.as_operation())
+    {
+        return false;
+    }
+
     match entry.capability_source {
         // Compatibility path: legacy workers historically routed by model-id only.
         CapabilitySource::Legacy => true,
@@ -1239,6 +1263,15 @@ fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool
             RequestKind::Llm => entry.capabilities.llm,
             RequestKind::Embedding => entry.capabilities.embedding,
         },
+    }
+}
+
+impl RequestKind {
+    fn as_operation(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Embedding => "embedding",
+        }
     }
 }
 
@@ -1467,6 +1500,78 @@ mod tests {
             r.eligible_workers_for("embed-1", RequestKind::Embedding)
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn legacy_worker_explicit_llm_only_operations_are_not_embedding_eligible() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                supported_operations: vec!["llm".into()],
+                ..reg_req("127.0.0.1:8081", &["shared-model"], 4)
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("shared-model").len(), 1);
+        assert!(
+            r.eligible_workers_for("shared-model", RequestKind::Embedding)
+                .is_empty(),
+            "explicit supported_operations must constrain legacy worker routing"
+        );
+    }
+
+    #[test]
+    fn legacy_worker_without_explicit_operations_keeps_model_id_compatibility() {
+        let r = WorkerRegistry::new();
+        r.register(reg_req("127.0.0.1:8081", &["shared-model"], 4), 5000);
+
+        assert_eq!(
+            r.eligible_workers_for("shared-model", RequestKind::Embedding)
+                .len(),
+            1,
+            "legacy model-id-only registrations remain backward compatible"
+        );
+    }
+
+    #[test]
+    fn explicit_operations_are_normalized_and_deduplicated() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["shared-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec![
+                    " LLM ".into(),
+                    "embedding".into(),
+                    "llm".into(),
+                    "text-generation".into(),
+                    "text_generation".into(),
+                ],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snapshot.supported_operations,
+            vec![
+                "llm".to_string(),
+                "embedding".to_string(),
+                "text_generation".to_string(),
+            ]
         );
     }
 
