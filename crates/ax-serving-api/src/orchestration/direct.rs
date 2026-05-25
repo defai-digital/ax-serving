@@ -73,6 +73,8 @@ const DISPATCHER_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Default pool size and request timeout matching serving.example.yaml defaults.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Maximum buffered non-streaming worker response body.
+const MAX_WORKER_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 impl DirectDispatcher {
     pub fn new(pool_max_idle_per_host: usize, request_timeout_secs: u64) -> Self {
@@ -471,7 +473,34 @@ impl DirectDispatcher {
                         .body(Body::from_stream(guarded))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 } else {
+                    if resp
+                        .content_length()
+                        .is_some_and(|len| len > MAX_WORKER_RESPONSE_BODY_BYTES as u64)
+                    {
+                        error!(
+                            %url,
+                            content_length = resp.content_length().unwrap_or_default(),
+                            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
+                            "worker response body exceeded size limit"
+                        );
+                        return worker_failure_response(format!(
+                            "worker response body exceeded {} byte limit",
+                            MAX_WORKER_RESPONSE_BODY_BYTES
+                        ));
+                    }
                     match resp.bytes().await {
+                        Ok(bytes) if bytes.len() > MAX_WORKER_RESPONSE_BODY_BYTES => {
+                            error!(
+                                %url,
+                                len = bytes.len(),
+                                limit = MAX_WORKER_RESPONSE_BODY_BYTES,
+                                "worker response body exceeded size limit"
+                            );
+                            worker_failure_response(format!(
+                                "worker response body exceeded {} byte limit",
+                                MAX_WORKER_RESPONSE_BODY_BYTES
+                            ))
+                        }
                         Ok(bytes) => axum::response::Response::builder()
                             .status(status)
                             .header("content-type", content_type)
@@ -548,7 +577,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{InflightGuard, worker_url};
+    use axum::body;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{DirectDispatcher, InflightGuard, InflightGuard as Guard, worker_url};
 
     #[test]
     fn worker_url_with_leading_slash() {
@@ -594,5 +626,48 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn build_response_rejects_oversized_content_length_before_buffering() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                super::MAX_WORKER_RESPONSE_BODY_BYTES + 1
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let reqwest_resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard: Guard = InflightGuard::acquire(&counter);
+
+        let response = DirectDispatcher::default()
+            .build_response(Ok(reqwest_resp), format!("http://{addr}"), false, guard)
+            .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("worker response body exceeded"));
+
+        server.await.unwrap();
     }
 }
