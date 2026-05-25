@@ -1849,6 +1849,9 @@ pub async fn embeddings(
     if let Some(response) = validate_model_identifier(&req.model, "model") {
         return response;
     }
+    if let Some(response) = validate_embeddings_input(&req.input) {
+        return response;
+    }
     match req.encoding_format.as_deref() {
         None | Some("float" | "base64") => {}
         Some(other) => {
@@ -1881,10 +1884,16 @@ pub async fn embeddings(
 
     let handle = entry.handle;
     let model_name = req.model.clone();
+    let model_id = req.model.clone();
     let base64_out = req.encoding_format.as_deref() == Some("base64");
     let config = EmbedConfig {
         normalize: req.normalize.unwrap_or(true),
         truncate: req.truncate.unwrap_or(true),
+    };
+    let estimated_prompt_tokens = if layer.scheduler.split_enabled {
+        estimate_embedding_prompt_tokens_u64(&req.input)
+    } else {
+        0
     };
 
     // Resolve input into owned containers so they can cross the spawn_blocking boundary.
@@ -1895,18 +1904,47 @@ pub async fn embeddings(
         EmbeddingsInput::ManyTokens(t) => (None, Some(t)),
     };
 
+    let pm_permit = match layer
+        .per_model_scheduler
+        .acquire(&model_id, layer.scheduler.config().max_wait_ms)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let permit = match layer
+        .scheduler
+        .acquire_with_tokens(estimated_prompt_tokens)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                scheduler_error_status(&e),
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let queue_wait_us = permit.queue_wait_us();
+    let backend = Arc::clone(&layer.backend);
     let result = tokio::task::spawn_blocking(move || match (strings_owned, tokens_owned) {
-        (Some(texts), None) => layer
-            .backend
-            .embed(handle, &EmbedInput::Strings(&texts), &config),
-        (None, Some(seqs)) => layer
-            .backend
-            .embed(handle, &EmbedInput::Tokens(&seqs), &config),
+        (Some(texts), None) => backend.embed(handle, &EmbedInput::Strings(&texts), &config),
+        (None, Some(seqs)) => backend.embed(handle, &EmbedInput::Tokens(&seqs), &config),
         _ => Err(anyhow::anyhow!(
             "embedding request payload had unsupported input state"
         )),
     })
     .await;
+    drop(pm_permit);
+    drop(permit);
 
     match result {
         Ok(Ok(embed_result)) => {
@@ -1929,7 +1967,7 @@ pub async fn embeddings(
                 })
                 .collect();
             let pt = embed_result.prompt_tokens;
-            Json(EmbeddingsResponse {
+            let response = Json(EmbeddingsResponse {
                 object: "list",
                 model: model_name,
                 data,
@@ -1938,7 +1976,8 @@ pub async fn embeddings(
                     total_tokens: pt,
                 },
             })
-            .into_response()
+            .into_response();
+            with_timing(response, queue_wait_us)
         }
         Ok(Err(e)) => {
             // 501 only when the backend explicitly doesn't implement embeddings.
@@ -1948,12 +1987,122 @@ pub async fn embeddings(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+            with_timing(
+                (status, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+                queue_wait_us,
+            )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => with_timing(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            queue_wait_us,
+        ),
+    }
+}
+
+fn validate_embeddings_input(input: &EmbeddingsInput) -> Option<Response> {
+    match input {
+        EmbeddingsInput::One(text) => validate_embedding_text(text, 0),
+        EmbeddingsInput::Many(texts) => {
+            if texts.is_empty() {
+                return Some(embedding_validation_error("input must not be empty"));
+            }
+            if texts.len() > MAX_EMBEDDING_INPUTS {
+                return Some(embedding_validation_error(format!(
+                    "too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"
+                )));
+            }
+            let mut total_bytes = 0usize;
+            for (idx, text) in texts.iter().enumerate() {
+                if let Some(resp) = validate_embedding_text(text, idx) {
+                    return Some(resp);
+                }
+                total_bytes = total_bytes.saturating_add(text.len());
+            }
+            if total_bytes > MAX_EMBEDDING_TOTAL_BYTES {
+                return Some(embedding_validation_error(format!(
+                    "embedding input text exceeds total limit of {MAX_EMBEDDING_TOTAL_BYTES} bytes"
+                )));
+            }
+            None
+        }
+        EmbeddingsInput::OneTokens(tokens) => validate_embedding_tokens(tokens, 0),
+        EmbeddingsInput::ManyTokens(seqs) => {
+            if seqs.is_empty() {
+                return Some(embedding_validation_error("input must not be empty"));
+            }
+            if seqs.len() > MAX_EMBEDDING_INPUTS {
+                return Some(embedding_validation_error(format!(
+                    "too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"
+                )));
+            }
+            let mut total_tokens = 0usize;
+            for (idx, tokens) in seqs.iter().enumerate() {
+                if let Some(resp) = validate_embedding_tokens(tokens, idx) {
+                    return Some(resp);
+                }
+                total_tokens = total_tokens.saturating_add(tokens.len());
+            }
+            if total_tokens > MAX_EMBEDDING_TOTAL_TOKENS {
+                return Some(embedding_validation_error(format!(
+                    "embedding token input exceeds total limit of {MAX_EMBEDDING_TOTAL_TOKENS}"
+                )));
+            }
+            None
+        }
+    }
+}
+
+fn validate_embedding_text(text: &str, index: usize) -> Option<Response> {
+    if text.is_empty() {
+        return Some(embedding_validation_error(format!(
+            "embedding input at index {index} must not be empty"
+        )));
+    }
+    if text.len() > MAX_CONTENT_BYTES {
+        return Some(embedding_validation_error(format!(
+            "embedding input at index {index} exceeds {MAX_CONTENT_BYTES} bytes"
+        )));
+    }
+    None
+}
+
+fn validate_embedding_tokens(tokens: &[u32], index: usize) -> Option<Response> {
+    if tokens.is_empty() {
+        return Some(embedding_validation_error(format!(
+            "embedding token input at index {index} must not be empty"
+        )));
+    }
+    if tokens.len() > MAX_EMBEDDING_TOTAL_TOKENS {
+        return Some(embedding_validation_error(format!(
+            "embedding token input at index {index} exceeds {MAX_EMBEDDING_TOTAL_TOKENS} tokens"
+        )));
+    }
+    None
+}
+
+fn embedding_validation_error(msg: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": msg.to_string()})),
+    )
+        .into_response()
+}
+
+fn estimate_embedding_prompt_tokens_u64(input: &EmbeddingsInput) -> u64 {
+    match input {
+        EmbeddingsInput::One(text) => estimate_text_prompt_tokens_u64(text),
+        EmbeddingsInput::Many(texts) => texts
+            .iter()
+            .map(|text| estimate_text_prompt_tokens_u64(text))
+            .fold(0u64, u64::saturating_add),
+        EmbeddingsInput::OneTokens(tokens) => tokens.len() as u64,
+        EmbeddingsInput::ManyTokens(seqs) => seqs
+            .iter()
+            .map(|tokens| tokens.len() as u64)
+            .fold(0u64, u64::saturating_add),
     }
 }

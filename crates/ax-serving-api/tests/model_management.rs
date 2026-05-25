@@ -13,6 +13,7 @@ use ax_serving_api::{
     ServingLayer,
     config::{ProjectPolicyConfig, ProjectRuleConfig, ServeConfig},
     rest,
+    rest::schema::{MAX_CONTENT_BYTES, MAX_EMBEDDING_INPUTS, MAX_EMBEDDING_TOTAL_TOKENS},
 };
 use ax_serving_engine::{
     EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
@@ -2199,6 +2200,102 @@ async fn embeddings_model_not_found_404() {
 async fn embeddings_empty_model_400() {
     let app = make_app_no_auth();
     let body = serde_json::json!({"model": " ", "input": "hello"}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_empty_text_input_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({"model": "embed-ok", "input": ""}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_empty_array_input_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({"model": "embed-ok", "input": []}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_text_input_too_large_400() {
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model": "embed-ok",
+        "input": "a".repeat(MAX_CONTENT_BYTES + 1)
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_too_many_inputs_400() {
+    let app = make_app_no_auth();
+    let inputs = vec!["x"; MAX_EMBEDDING_INPUTS + 1];
+    let body = serde_json::json!({"model": "embed-ok", "input": inputs}).to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embeddings_too_many_tokens_400() {
+    let app = make_app_no_auth();
+    let tokens = vec![1u32; MAX_EMBEDDING_TOTAL_TOKENS + 1];
+    let body = serde_json::json!({"model": "embed-ok", "input": tokens}).to_string();
     let resp = app
         .oneshot(
             Request::builder()

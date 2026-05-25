@@ -11,6 +11,9 @@ pub const MAX_MESSAGES: usize = 100;
 pub const MAX_CONTENT_BYTES: usize = 32 * 1024; // 32 KB per message
 pub const MAX_MAX_TOKENS: u32 = 32_768;
 pub const MAX_MODEL_ID_BYTES: usize = 128;
+pub const MAX_EMBEDDING_INPUTS: usize = 2048;
+pub const MAX_EMBEDDING_TOTAL_BYTES: usize = MAX_CONTENT_BYTES * MAX_MESSAGES;
+pub const MAX_EMBEDDING_TOTAL_TOKENS: usize = MAX_MAX_TOKENS as usize;
 
 // ── Content size estimation ────────────────────────────────────────────────────
 

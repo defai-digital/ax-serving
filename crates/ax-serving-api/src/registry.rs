@@ -517,6 +517,11 @@ impl ModelRegistry {
 }
 
 fn is_allowed_model_path(path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(dirs) = test_allowed_model_dirs() {
+        return Ok(dirs.is_empty() || dirs.iter().any(|root| path.starts_with(root)));
+    }
+
     let raw = match std::env::var("AXS_MODEL_ALLOWED_DIRS") {
         Ok(v) => v,
         Err(_) => return Ok(true),
@@ -542,6 +547,17 @@ fn is_allowed_model_path(path: &Path) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ALLOWED_MODEL_DIRS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_allowed_model_dirs() -> Option<Vec<PathBuf>> {
+    TEST_ALLOWED_MODEL_DIRS.with(|dirs| dirs.borrow().clone())
 }
 
 fn validate_model_path_format(path: &Path, config: &LoadConfig) -> Result<(), RegistryError> {
@@ -632,34 +648,26 @@ mod tests {
 
     // ── Test backend ──────────────────────────────────────────────────────────
 
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
+    struct AllowedDirsGuard {
+        old: Option<Vec<PathBuf>>,
     }
 
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let guard = crate::test_env::lock();
-            let old = std::env::var_os(key);
-            // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key,
-                old,
-                _guard: guard,
-            }
+    impl AllowedDirsGuard {
+        fn set(paths: &[&Path]) -> Self {
+            let canonical: Vec<PathBuf> = paths
+                .iter()
+                .map(|path| std::fs::canonicalize(path).unwrap())
+                .collect();
+            let old = TEST_ALLOWED_MODEL_DIRS.with(|dirs| dirs.replace(Some(canonical)));
+            Self { old }
         }
     }
 
-    impl Drop for EnvVarGuard {
+    impl Drop for AllowedDirsGuard {
         fn drop(&mut self) {
-            match &self.old {
-                // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
+            TEST_ALLOWED_MODEL_DIRS.with(|dirs| {
+                dirs.replace(self.old.take());
+            });
         }
     }
 
@@ -1085,7 +1093,7 @@ mod tests {
         let model_path = make_gguf(&allowed_dir);
         let mmproj_path = blocked_dir.path().join("mmproj.gguf");
         std::fs::write(&mmproj_path, b"projector").unwrap();
-        let _env = EnvVarGuard::set("AXS_MODEL_ALLOWED_DIRS", allowed_dir.path());
+        let _allowed_dirs = AllowedDirsGuard::set(&[allowed_dir.path()]);
 
         let backend = NullBackend;
         let reg = ModelRegistry::new(16);
