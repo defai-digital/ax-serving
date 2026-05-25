@@ -76,9 +76,9 @@ impl AxServingServiceTrait for AxServingService {
             backend_type: proto_backend_to_engine(req.backend),
             llama_cpp_n_gpu_layers: None,
             mmproj_path: None,
-            // Keep runtime serving behavior aligned with REST defaults: use
-            // llama.cpp unless the caller explicitly selects a different path.
-            backend_hint: Some("llama_cpp".to_string()),
+            // Keep runtime serving behavior aligned with REST defaults: let
+            // the router pick native artifact directories or GGUF compatibility.
+            backend_hint: Some("auto".to_string()),
             enable_embeddings: None,
             pooling_type: None,
         };

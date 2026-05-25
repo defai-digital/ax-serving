@@ -16,10 +16,10 @@ use tracing::warn;
 
 use super::OrchestratorLayer;
 use super::queue::AcquireResult;
-use super::registry::RequestKind;
+use super::registry::{BackendKind, RequestKind, RuntimeKind};
 use crate::auth::RequestId;
 use crate::project_policy;
-use crate::rest::schema::InputMessage;
+use crate::rest::schema::{InputMessage, MAX_MODEL_ID_BYTES};
 use crate::utils::request_meta::{
     audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u32,
     estimate_text_prompt_tokens_u32,
@@ -62,8 +62,23 @@ async fn proxy_inference(
     let (model_id, backend_hint, stream, max_tokens, min_context) =
         match serde_json::from_slice::<ProxyRequestMeta>(&body) {
             Ok(v) => (
-                v.model.unwrap_or_else(|| "default".to_string()),
-                v.runtime.or(v.backend),
+                match validate_proxy_model_id(v.model) {
+                    Ok(model_id) => model_id,
+                    Err((status, error)) => {
+                        return (status, Json(serde_json::json!({ "error": error })))
+                            .into_response();
+                    }
+                },
+                match validate_dispatch_hint(v.runtime.or(v.backend)) {
+                    Ok(hint) => hint,
+                    Err(error) => {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({ "error": error })),
+                        )
+                            .into_response();
+                    }
+                },
                 v.stream,
                 v.max_tokens,
                 if !v.messages.is_empty() {
@@ -195,6 +210,61 @@ async fn proxy_inference(
         drop(permit);
         resp
     }
+}
+
+fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode, String)> {
+    let Some(model) = model else {
+        return Err((StatusCode::BAD_REQUEST, "missing field: model".to_string()));
+    };
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "model must not be empty".to_string(),
+        ));
+    }
+    if model != trimmed {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model contains unsupported whitespace".to_string(),
+        ));
+    }
+    if model.len() > MAX_MODEL_ID_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("model exceeds max length of {MAX_MODEL_ID_BYTES}"),
+        ));
+    }
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model must be alphanumeric with '-', '_', or '.'".to_string(),
+        ));
+    }
+    Ok(model)
+}
+
+fn validate_dispatch_hint(hint: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = hint else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+
+    if BackendKind::parse(trimmed) != BackendKind::Auto
+        || RuntimeKind::parse(trimmed) != RuntimeKind::Unknown
+    {
+        return Ok(Some(trimmed.to_ascii_lowercase()));
+    }
+
+    Err(format!(
+        "invalid backend/runtime hint; expected native, ax_engine, llama_cpp, sglang, vllm, or auto but got {trimmed}"
+    ))
 }
 
 fn fairness_client_key(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {

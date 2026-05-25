@@ -2427,6 +2427,80 @@ async fn test_backend_hint_routes_to_matching_worker() {
 }
 
 #[tokio::test]
+async fn test_invalid_backend_or_runtime_hint_returns_422() {
+    let (addr, _layer) =
+        skip_if_no_socket!(spawn_orchestrator_with_layer(OrchestratorConfig::default()).await);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for body in [
+        serde_json::json!({
+            "model": "shared-backend-model",
+            "backend": "definitely-not-a-backend",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+        serde_json::json!({
+            "model": "shared-backend-model",
+            "runtime": "definitely-not-a-runtime",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_requires_valid_model_field() {
+    let (addr, _layer) =
+        skip_if_no_socket!(spawn_orchestrator_with_layer(OrchestratorConfig::default()).await);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for (body, expected_status) in [
+        (
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({
+                "model": " ",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({
+                "model": "bad model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), expected_status);
+    }
+}
+
+#[tokio::test]
 async fn test_routing_trace_header_includes_selected_worker() {
     let mut env = EnvVarsGuard::new();
     env.set("AXS_ROUTING_TRACE", "true");

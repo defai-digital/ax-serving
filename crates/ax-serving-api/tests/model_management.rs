@@ -1164,6 +1164,64 @@ async fn load_non_gguf_422() {
 }
 
 #[tokio::test]
+async fn load_native_artifact_directory_201() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("model-manifest.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": "native-artifacts",
+        "path": dir.path().to_string_lossy(),
+        "backend": "native"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn load_mmproj_non_gguf_422() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("model.gguf");
+    let mmproj_path = dir.path().join("mmproj.bin");
+    std::fs::write(&model_path, b"dummy").unwrap();
+    std::fs::write(&mmproj_path, b"projector").unwrap();
+
+    let app = make_app_no_auth();
+    let body = serde_json::json!({
+        "model_id": "bad-mmproj",
+        "path": model_path.to_string_lossy(),
+        "mmproj_path": mmproj_path.to_string_lossy()
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn load_model_201_and_duplicate_409() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.gguf");

@@ -28,7 +28,7 @@ pub mod thermal;
 
 use std::path::Path;
 
-pub use ax_engine::AxEngineBackend;
+pub use ax_engine::{AxEngineBackend, is_ax_engine_model_artifacts};
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
@@ -107,7 +107,7 @@ pub struct LoadConfig {
     /// Per-load backend routing override. When `Some`, overrides the global
     /// `backends.yaml` routing config for this specific load call.
     ///
-    /// Accepted values: `"llama_cpp"`, `"native"`, `"lib_llama"`, `"auto"`.
+    /// Accepted values: `"llama_cpp"`, `"native"`, `"mlx"`, `"lib_llama"`, `"auto"`.
     /// `None` = use routing config (`backends.yaml`).
     pub backend_hint: Option<String>,
     /// Explicitly enable embedding mode for llama-server (`--embedding` flag).

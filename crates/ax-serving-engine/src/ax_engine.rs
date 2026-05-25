@@ -135,7 +135,7 @@ fn resolve_model_dir(path: &Path) -> Result<PathBuf> {
     })
 }
 
-pub(crate) fn is_ax_engine_model_artifacts(path: &Path) -> bool {
+pub fn is_ax_engine_model_artifacts(path: &Path) -> bool {
     let model_dir = if path.is_dir() {
         path
     } else if let Some(parent) = path.parent() {

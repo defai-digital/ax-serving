@@ -13,7 +13,10 @@ use std::sync::{
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ax_serving_engine::{InferenceBackend, LoadConfig, ModelHandle, ModelMetadata};
+use ax_serving_engine::{
+    InferenceBackend, LoadConfig, ModelHandle, ModelMetadata, is_ax_engine_model_artifacts,
+    is_mlx_model,
+};
 use tracing::{info, warn};
 
 use crate::utils::time::unix_now_ms;
@@ -171,7 +174,7 @@ impl ModelRegistry {
         &self,
         model_id: &str,
         path: &Path,
-        config: LoadConfig,
+        mut config: LoadConfig,
         backend: &dyn InferenceBackend,
     ) -> Result<Arc<LoadedModel>> {
         validate_model_id(model_id)?;
@@ -182,13 +185,12 @@ impl ModelRegistry {
         let canonical_path = std::fs::canonicalize(path)
             .with_context(|| format!("failed to resolve model path {}", path.display()))?;
 
-        if canonical_path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-            return Err(RegistryError::InvalidFormat(canonical_path.display().to_string()).into());
-        }
+        validate_model_path_format(&canonical_path, &config)?;
 
         if !is_allowed_model_path(&canonical_path)? {
             return Err(RegistryError::PathNotAllowed(canonical_path.display().to_string()).into());
         }
+        validate_optional_mmproj_path(&mut config)?;
 
         // Reserve model_id in the loading set so two concurrent load() calls for
         // the same model_id cannot both proceed past this point.
@@ -542,6 +544,51 @@ fn is_allowed_model_path(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn validate_model_path_format(path: &Path, config: &LoadConfig) -> Result<(), RegistryError> {
+    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        return Ok(());
+    }
+
+    let hint = config.backend_hint.as_deref();
+    let directory_supported = match hint {
+        Some("native") | Some("auto") | None => is_ax_engine_model_artifacts(path),
+        Some("mlx") => is_mlx_model(path),
+        Some("llama_cpp" | "lib_llama") => false,
+        Some(_) => false,
+    };
+
+    if directory_supported {
+        return Ok(());
+    }
+
+    Err(RegistryError::InvalidFormat(path.display().to_string()))
+}
+
+fn validate_optional_mmproj_path(config: &mut LoadConfig) -> Result<()> {
+    let Some(raw) = config.mmproj_path.as_deref() else {
+        return Ok(());
+    };
+
+    let path = Path::new(raw);
+    if !path.exists() {
+        return Err(RegistryError::FileNotFound(path.display().to_string()).into());
+    }
+
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| RegistryError::FileNotFound(path.display().to_string()))?;
+
+    if !canonical.is_file() || canonical.extension().and_then(|e| e.to_str()) != Some("gguf") {
+        return Err(RegistryError::InvalidFormat(canonical.display().to_string()).into());
+    }
+
+    if !is_allowed_model_path(&canonical)? {
+        return Err(RegistryError::PathNotAllowed(canonical.display().to_string()).into());
+    }
+
+    config.mmproj_path = Some(canonical.to_string_lossy().into_owned());
+    Ok(())
+}
+
 impl Default for ModelRegistry {
     fn default() -> Self {
         Self::new(16)
@@ -585,6 +632,37 @@ mod tests {
 
     // ── Test backend ──────────────────────────────────────────────────────────
 
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let guard = crate::test_env::lock();
+            let old = std::env::var_os(key);
+            // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key,
+                old,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: Test-only environment mutation is serialized by `test_env::lock`.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     struct NullBackend;
 
     impl InferenceBackend for NullBackend {
@@ -597,6 +675,69 @@ mod tests {
                 ModelHandle(1),
                 ModelMetadata {
                     architecture: "null".into(),
+                    n_layers: 0,
+                    n_heads: 0,
+                    n_kv_heads: 0,
+                    embedding_dim: 0,
+                    vocab_size: 0,
+                    context_length: 2048,
+                    load_time_ms: 1,
+                    peak_rss_bytes: 0,
+                    resolved_backend: ax_serving_engine::BackendType::Auto,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: ModelHandle,
+            _: GenerateInput,
+            _: GenerationParams,
+            _: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn tokenize(&self, _: ModelHandle, _: &str, _: bool) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn decode_tokens(&self, _: ModelHandle, _: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            4
+        }
+    }
+
+    struct CaptureConfigBackend {
+        observed: Arc<Mutex<Option<LoadConfig>>>,
+    }
+
+    impl InferenceBackend for CaptureConfigBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            *self.observed.lock().unwrap() = Some(config);
+            Ok((
+                ModelHandle(1),
+                ModelMetadata {
+                    architecture: "capture".into(),
                     n_layers: 0,
                     n_heads: 0,
                     n_kv_heads: 0,
@@ -714,6 +855,16 @@ mod tests {
         path
     }
 
+    fn make_ax_engine_artifacts(dir: &tempfile::TempDir) {
+        std::fs::write(dir.path().join("model-manifest.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+    }
+
+    fn make_mlx_model(dir: &tempfile::TempDir) {
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
+    }
+
     // ── model_id validation tests ─────────────────────────────────────────────
 
     #[test]
@@ -810,6 +961,146 @@ mod tests {
             err.downcast_ref::<RegistryError>()
                 .is_some_and(|e| matches!(e, RegistryError::InvalidFormat(_))),
             "expected InvalidFormat, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_ax_engine_artifact_directory_is_allowed_for_auto_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        make_ax_engine_artifacts(&dir);
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            backend_hint: Some("auto".into()),
+            ..LoadConfig::default()
+        };
+
+        let entry = reg
+            .load("native-dir", dir.path(), config, &backend)
+            .expect("AX Engine artifact directory should pass registry validation");
+
+        assert_eq!(entry.path, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn load_mlx_directory_is_allowed_for_mlx_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        make_mlx_model(&dir);
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            backend_hint: Some("mlx".into()),
+            ..LoadConfig::default()
+        };
+
+        let entry = reg
+            .load("mlx-dir", dir.path(), config, &backend)
+            .expect("MLX model directory should pass registry validation for mlx hint");
+
+        assert_eq!(entry.path, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn load_directory_is_rejected_for_llama_cpp_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        make_ax_engine_artifacts(&dir);
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            backend_hint: Some("llama_cpp".into()),
+            ..LoadConfig::default()
+        };
+
+        let err = reg.load("dir", dir.path(), config, &backend).unwrap_err();
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::InvalidFormat(_))),
+            "expected InvalidFormat, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_mmproj_path_is_canonicalized_before_backend_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = make_gguf(&dir);
+        let mmproj_path = dir.path().join("mmproj.gguf");
+        std::fs::write(&mmproj_path, b"projector").unwrap();
+
+        let observed = Arc::new(Mutex::new(None));
+        let backend = CaptureConfigBackend {
+            observed: Arc::clone(&observed),
+        };
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            mmproj_path: Some(mmproj_path.display().to_string()),
+            ..LoadConfig::default()
+        };
+
+        reg.load("with-mmproj", &model_path, config, &backend)
+            .unwrap();
+
+        let observed = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            observed.mmproj_path.as_deref(),
+            Some(
+                std::fs::canonicalize(&mmproj_path)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn load_mmproj_path_rejects_non_gguf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = make_gguf(&dir);
+        let mmproj_path = dir.path().join("mmproj.bin");
+        std::fs::write(&mmproj_path, b"projector").unwrap();
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            mmproj_path: Some(mmproj_path.display().to_string()),
+            ..LoadConfig::default()
+        };
+
+        let err = reg
+            .load("bad-mmproj", &model_path, config, &backend)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::InvalidFormat(_))),
+            "expected InvalidFormat, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_mmproj_path_respects_allowed_dirs() {
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let blocked_dir = tempfile::tempdir().unwrap();
+        let model_path = make_gguf(&allowed_dir);
+        let mmproj_path = blocked_dir.path().join("mmproj.gguf");
+        std::fs::write(&mmproj_path, b"projector").unwrap();
+        let _env = EnvVarGuard::set("AXS_MODEL_ALLOWED_DIRS", allowed_dir.path());
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            mmproj_path: Some(mmproj_path.display().to_string()),
+            ..LoadConfig::default()
+        };
+
+        let err = reg
+            .load("blocked-mmproj", &model_path, config, &backend)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<RegistryError>()
+                .is_some_and(|e| matches!(e, RegistryError::PathNotAllowed(_))),
+            "expected PathNotAllowed, got: {err}"
         );
     }
 
