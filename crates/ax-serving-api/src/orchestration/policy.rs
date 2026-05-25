@@ -72,8 +72,8 @@ fn least_inflight_from<'a>(
     candidates
         .filter(|w| w.inflight < w.max_inflight)
         .min_by(|a, b| {
-            let la = a.inflight * b.max_inflight;
-            let lb = b.inflight * a.max_inflight;
+            let la = (a.inflight as u128) * (b.max_inflight as u128);
+            let lb = (b.inflight as u128) * (a.max_inflight as u128);
             la.cmp(&lb)
                 .then_with(|| a.id.0.as_bytes().cmp(b.id.0.as_bytes()))
         })
@@ -597,6 +597,17 @@ mod tests {
         ];
         let selected = LeastInflightPolicy.select(&workers, &ctx()).unwrap();
         assert_eq!(selected.inflight, 1);
+    }
+
+    #[test]
+    fn least_inflight_compares_large_ratios_without_overflow() {
+        let nearly_full = make_worker(usize::MAX - 2, usize::MAX - 1);
+        let sparse = make_worker(1, usize::MAX);
+        let workers = vec![nearly_full, sparse.clone()];
+
+        let selected = LeastInflightPolicy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(selected.id, sparse.id);
     }
 
     #[test]
