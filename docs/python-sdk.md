@@ -30,7 +30,7 @@ pip install -e ".[dev]"
 ```python
 from ax_serving import Client
 
-client = Client(base_url="http://127.0.0.1:18080")
+client = Client(base_url="http://127.0.0.1:18080", api_key="your-secret-key")
 
 response = client.chat.completions.create(
     model="default",
@@ -51,7 +51,7 @@ print("Usage:", response.usage)
 ```python
 from ax_serving import Client
 
-client = Client(base_url="http://127.0.0.1:18080")
+client = Client(base_url="http://127.0.0.1:18080", api_key="your-secret-key")
 
 stream = client.chat.completions.create(
     model="default",

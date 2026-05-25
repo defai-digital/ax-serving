@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Generator, Iterator
 from typing import Any
 
@@ -73,7 +74,7 @@ class _Completions:
         top_k: int = 0,
         repeat_penalty: float = 1.1,
         seed: int = 0,
-        **_: Any,
+        **extra: Any,
     ) -> _ChatCompletionResponse | Iterator[_CompletionChunk]:
         """Create a chat completion.
 
@@ -96,6 +97,9 @@ class _Completions:
             max_tokens=max_tokens,
             seed=seed,
         )
+        for key, value in extra.items():
+            if value is not None:
+                kwargs[key] = value
 
         if self._client._grpc is not None:
             return self._create_grpc(model, messages, stream, **kwargs)
@@ -145,11 +149,19 @@ class _Completions:
             payload["top_k"] = kwargs["top_k"]
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
+        for key, value in kwargs.items():
+            if key not in payload and value is not None:
+                payload[key] = value
 
         if stream:
             return self._rest_stream(url, payload, model)
 
-        resp = httpx.post(url, json=payload, timeout=120.0)
+        resp = httpx.post(
+            url,
+            json=payload,
+            headers=self._client._headers(),
+            timeout=120.0,
+        )
         resp.raise_for_status()
         data = resp.json()
         choice = data["choices"][0]
@@ -166,7 +178,13 @@ class _Completions:
     ) -> Iterator[_CompletionChunk]:
         import httpx
 
-        with httpx.stream("POST", url, json=payload, timeout=120.0) as resp:
+        with httpx.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=self._client._headers(),
+            timeout=120.0,
+        ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line.startswith("data:"):
@@ -224,8 +242,10 @@ class Client:
         base_url: str = "http://localhost:18080",
         grpc_socket: str | None = None,
         grpc_port: int | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._api_key = api_key if api_key is not None else os.getenv("AXS_API_KEY")
         self._grpc = None
 
         if grpc_socket is not None or grpc_port is not None:
@@ -238,13 +258,22 @@ class Client:
 
         self.chat = _Chat(self)
 
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
+
     def models_list(self) -> list[ModelInfo]:
         """List loaded models (gRPC or REST)."""
         if self._grpc is not None:
             return self._grpc.list_models()
 
         import httpx
-        resp = httpx.get(f"{self._base_url}/v1/models", timeout=10.0)
+        resp = httpx.get(
+            f"{self._base_url}/v1/models",
+            headers=self._headers(),
+            timeout=10.0,
+        )
         resp.raise_for_status()
         data = resp.json()
         return [ModelInfo(id=m["id"]) for m in data.get("data", [])]
