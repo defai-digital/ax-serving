@@ -35,6 +35,13 @@ use uuid::Uuid;
 
 use super::nats::{MAX_NATS_RESPONSE_BODY_BYTES, NatsConfig, NatsRequest, NatsResponse};
 
+/// Maximum decoded request body accepted from JetStream.
+///
+/// This leaves headroom above the public REST schema limits while preventing a
+/// malformed broker message from forcing an unbounded hex decode allocation.
+const MAX_NATS_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATS_REQUEST_MESSAGE_BYTES: usize = MAX_NATS_REQUEST_BODY_BYTES * 2 + 16 * 1024;
+
 fn local_response_exceeds_limit(content_length: Option<u64>) -> bool {
     content_length.is_some_and(|len| len > MAX_NATS_RESPONSE_BODY_BYTES as u64)
 }
@@ -43,6 +50,38 @@ fn local_response_exceeds_limit(content_length: Option<u64>) -> bool {
 enum LocalResponseBodyError {
     TooLarge,
     Read(reqwest::Error),
+}
+
+#[derive(Debug)]
+enum NatsRequestBodyError {
+    InvalidHex(hex::FromHexError),
+    TooLarge,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NatsRequestPathError {
+    UnsupportedPath,
+}
+
+fn validate_request_path(path: &str) -> Result<(), NatsRequestPathError> {
+    match path {
+        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" => Ok(()),
+        _ => Err(NatsRequestPathError::UnsupportedPath),
+    }
+}
+
+fn decode_request_body_hex_limited(
+    body_hex: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NatsRequestBodyError> {
+    if body_hex.len() > max_bytes.saturating_mul(2) {
+        return Err(NatsRequestBodyError::TooLarge);
+    }
+    let body = hex::decode(body_hex).map_err(NatsRequestBodyError::InvalidHex)?;
+    if body.len() > max_bytes {
+        return Err(NatsRequestBodyError::TooLarge);
+    }
+    Ok(body)
 }
 
 fn append_limited_local_response_chunk(
@@ -302,6 +341,19 @@ async fn run_model_loop(
         } {
             match result {
                 Ok(msg) => {
+                    if msg.message.payload.len() > MAX_NATS_REQUEST_MESSAGE_BYTES {
+                        warn!(
+                            %model_id,
+                            payload_len = msg.message.payload.len(),
+                            limit = MAX_NATS_REQUEST_MESSAGE_BYTES,
+                            "NatsWorker: request message exceeded size limit"
+                        );
+                        if let Err(e) = msg.ack().await {
+                            warn!(%model_id, %e, "NatsWorker: ack failed for oversized request");
+                        }
+                        continue;
+                    }
+
                     let req: NatsRequest = match serde_json::from_slice(&msg.message.payload) {
                         Ok(r) => r,
                         Err(e) => {
@@ -373,17 +425,36 @@ async fn dispatch_to_local(
     req: &NatsRequest,
     request_timeout: Duration,
 ) -> bool {
+    if validate_request_path(&req.path).is_err() {
+        warn!(
+            request_id = %req.request_id,
+            path = %req.path,
+            "NatsWorker: unsupported request path"
+        );
+        publish_error(nats_client, req, "unsupported NATS request path").await;
+        return true; // ack — malformed request from broker, not retryable
+    }
     let url = format!("http://{}{}", local_addr, req.path);
 
-    let body_bytes = match hex::decode(&req.body_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            error!(request_id = %req.request_id, %e, "NatsWorker: bad body hex");
-            // Publish error response so the orchestrator isn't left hanging.
-            publish_error(nats_client, req, "bad body hex encoding").await;
-            return true; // ack — not retryable
-        }
-    };
+    let body_bytes =
+        match decode_request_body_hex_limited(&req.body_hex, MAX_NATS_REQUEST_BODY_BYTES) {
+            Ok(b) => b,
+            Err(NatsRequestBodyError::InvalidHex(e)) => {
+                error!(request_id = %req.request_id, %e, "NatsWorker: bad body hex");
+                // Publish error response so the orchestrator isn't left hanging.
+                publish_error(nats_client, req, "bad body hex encoding").await;
+                return true; // ack — not retryable
+            }
+            Err(NatsRequestBodyError::TooLarge) => {
+                error!(
+                    request_id = %req.request_id,
+                    limit = MAX_NATS_REQUEST_BODY_BYTES,
+                    "NatsWorker: request body exceeded size limit"
+                );
+                publish_error(nats_client, req, "NATS request body exceeded size limit").await;
+                return true; // ack — not retryable
+            }
+        };
 
     if !req.stream {
         dispatch_non_streaming(
@@ -708,8 +779,9 @@ async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, mess
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NATS_RESPONSE_BODY_BYTES, add_limited_local_response_len,
-        append_limited_local_response_chunk, local_response_exceeds_limit,
+        MAX_NATS_RESPONSE_BODY_BYTES, NatsRequestBodyError, NatsRequestPathError,
+        add_limited_local_response_len, append_limited_local_response_chunk,
+        decode_request_body_hex_limited, local_response_exceeds_limit, validate_request_path,
     };
 
     #[test]
@@ -740,5 +812,37 @@ mod tests {
         assert_eq!(add_limited_local_response_len(5, 3, 8).unwrap(), 8);
         assert!(add_limited_local_response_len(5, 4, 8).is_err());
         assert!(add_limited_local_response_len(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn validate_request_path_accepts_only_inference_routes() {
+        assert_eq!(validate_request_path("/v1/chat/completions"), Ok(()));
+        assert_eq!(validate_request_path("/v1/completions"), Ok(()));
+        assert_eq!(validate_request_path("/v1/embeddings"), Ok(()));
+        assert_eq!(
+            validate_request_path("/v1/models"),
+            Err(NatsRequestPathError::UnsupportedPath)
+        );
+        assert_eq!(
+            validate_request_path("/v1/chat/completions/../../models"),
+            Err(NatsRequestPathError::UnsupportedPath)
+        );
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_rejects_oversize_before_decode() {
+        let err = decode_request_body_hex_limited("000000", 2).unwrap_err();
+        assert!(matches!(err, NatsRequestBodyError::TooLarge));
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_rejects_invalid_hex() {
+        let err = decode_request_body_hex_limited("not-hex", 64).unwrap_err();
+        assert!(matches!(err, NatsRequestBodyError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_accepts_valid_payload() {
+        assert_eq!(decode_request_body_hex_limited("6869", 64).unwrap(), b"hi");
     }
 }
