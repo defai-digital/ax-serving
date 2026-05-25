@@ -2005,8 +2005,8 @@ fn parse_chat_sse_reader<R: std::io::Read>(
 
         // Tool call deltas — accumulate arguments across chunks.
         if let Some(tool_calls) = delta.map(|d| &d.tool_calls) {
-            for tc in tool_calls {
-                let idx = tc.index.unwrap_or(0);
+            for (fallback_idx, tc) in tool_calls.iter().enumerate() {
+                let idx = tc.index.unwrap_or(fallback_idx as u64);
                 let entry = tool_call_acc
                     .entry(idx)
                     .or_insert_with(|| (String::new(), String::new(), String::new()));
@@ -2483,6 +2483,51 @@ mod tests {
             GenerateEvent::Done(stats) => {
                 assert_eq!(stats.stop_reason, "content_filter");
             }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_chat_sse_uses_delta_position_for_missing_tool_call_indexes() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},",
+            "{\"id\":\"call_b\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_chat_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("first tool call") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_a");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{}");
+            }
+            other => panic!("expected first tool call, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("second tool call") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_b");
+                assert_eq!(name, "search");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected second tool call, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => assert_eq!(stats.stop_reason, "tool_calls"),
             other => panic!("expected done event, got {other:?}"),
         }
         assert!(rx.blocking_recv().is_none());
