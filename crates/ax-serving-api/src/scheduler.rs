@@ -619,6 +619,7 @@ impl Scheduler {
             queue_len
         };
         let _ = queue_len;
+        let _queue_depth_guard = QueueDepthGuard::new(Arc::clone(&self.metrics));
 
         // Count requests that actually enter the wait queue (used as denominator
         // for avg_queue_wait_us — fast-path requests must not pollute this count).
@@ -637,8 +638,6 @@ impl Scheduler {
             }
         })
         .await;
-
-        self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
 
         let permit = match result {
             Ok(Ok(p)) => {
@@ -772,6 +771,22 @@ impl Scheduler {
     fn cleanup_shed_waiters(&self) {
         let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
         waiters.retain(|tx| !tx.is_closed());
+    }
+}
+
+struct QueueDepthGuard {
+    metrics: Arc<SchedulerMetrics>,
+}
+
+impl QueueDepthGuard {
+    fn new(metrics: Arc<SchedulerMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1315,6 +1330,50 @@ mod tests {
             "error message should mention timeout: {msg}"
         );
         assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_acquire_releases_queue_depth() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5_000,
+                overload_policy: OverloadPolicy::Reject,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        let p1 = s.acquire().await.unwrap();
+        let s2 = Arc::clone(&s);
+        let waiter = tokio::spawn(async move { s2.acquire().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        waiter.abort();
+        match waiter.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("queued acquire should have been cancelled"),
+        }
+        assert_eq!(
+            s.metrics.queue_depth.load(Ordering::SeqCst),
+            0,
+            "dropping a queued acquire future must release queue_depth"
+        );
+
+        let s3 = Arc::clone(&s);
+        let next_waiter = tokio::spawn(async move { s3.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        drop(p1);
+        let p2 = next_waiter
+            .await
+            .expect("next waiter task panicked")
+            .expect("next waiter should not be rejected by leaked queue depth");
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
+        drop(p2);
     }
 
     // ── split-scheduler drop-without-ttft clears prefill ──────────────────────
