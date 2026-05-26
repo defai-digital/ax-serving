@@ -69,7 +69,7 @@ pub enum BackendKind {
 
 impl BackendKind {
     pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
             "vllm" | "v_llm" | "v-llm" => Self::Vllm,
@@ -125,7 +125,7 @@ pub enum RuntimeKind {
 
 impl RuntimeKind {
     pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "ax_engine" | "ax-engine" | "axengine" | "native" => Self::AxEngine,
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
@@ -1593,6 +1593,24 @@ mod tests {
     }
 
     #[test]
+    fn register_trims_backend_and_runtime_names() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                backend: " SGLANG ".into(),
+                runtime: Some(" VLLM ".into()),
+                ..reg_req("127.0.0.1:8081", &["m1"], 4)
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snap = r.get_snapshot(id).unwrap();
+
+        assert_eq!(snap.backend, BackendKind::SgLang.as_str());
+        assert_eq!(snap.runtime, RuntimeKind::Vllm.as_str());
+    }
+
+    #[test]
     fn structured_capabilities_registration_is_preserved() {
         let r = WorkerRegistry::new();
         let resp = r.register(
@@ -2857,6 +2875,7 @@ mod tests {
         assert_eq!(BackendKind::parse("llamacpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("llama-cpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("LLAMA_CPP"), BackendKind::LlamaCpp);
+        assert_eq!(BackendKind::parse(" llama-cpp "), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("sglang"), BackendKind::SgLang);
         assert_eq!(BackendKind::parse("sg_lang"), BackendKind::SgLang);
         assert_eq!(BackendKind::parse("sg-lang"), BackendKind::SgLang);
@@ -2868,6 +2887,14 @@ mod tests {
         assert_eq!(BackendKind::parse("auto"), BackendKind::Auto);
         assert_eq!(BackendKind::parse("unknown"), BackendKind::Auto);
         assert_eq!(BackendKind::parse(""), BackendKind::Auto);
+    }
+
+    #[test]
+    fn runtime_kind_parse_trims_operator_values() {
+        assert_eq!(RuntimeKind::parse(" ax-engine "), RuntimeKind::AxEngine);
+        assert_eq!(RuntimeKind::parse(" LLAMA_CPP "), RuntimeKind::LlamaCpp);
+        assert_eq!(RuntimeKind::parse(" sglang "), RuntimeKind::SgLang);
+        assert_eq!(RuntimeKind::parse(" V-LLM "), RuntimeKind::Vllm);
     }
 
     #[test]
