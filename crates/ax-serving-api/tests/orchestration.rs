@@ -2975,6 +2975,24 @@ async fn test_prompt_size_routes_to_sufficient_context_worker() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "long-ctx");
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"ctx-route-model",
+            "messages":[{"role":"user","content": "short"}],
+            "max_tokens": 64
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "long-ctx",
+        "explicit max_tokens must be included in context routing"
+    );
 }
 
 #[tokio::test]

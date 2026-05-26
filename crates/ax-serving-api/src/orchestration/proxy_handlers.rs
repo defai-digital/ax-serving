@@ -61,42 +61,46 @@ async fn proxy_inference(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (model_id, backend_hint, stream, max_tokens, min_context) =
-        match serde_json::from_slice::<ProxyRequestMeta>(&body) {
-            Ok(v) => (
-                match validate_proxy_model_id(v.model) {
-                    Ok(model_id) => model_id,
-                    Err((status, error)) => {
-                        return (status, Json(serde_json::json!({ "error": error })))
-                            .into_response();
-                    }
-                },
-                match validate_dispatch_hint(v.runtime.or(v.backend)) {
-                    Ok(hint) => hint,
-                    Err(error) => {
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(serde_json::json!({ "error": error })),
-                        )
-                            .into_response();
-                    }
-                },
-                v.stream,
-                v.max_tokens,
-                if worker_path == "/v1/embeddings" {
-                    v.input
-                        .and_then(|input| serde_json::from_value::<EmbeddingsInput>(input).ok())
-                        .map(|input| estimate_embedding_input_max_tokens_u32(&input))
-                } else if !v.messages.is_empty() {
-                    Some(estimate_chat_prompt_tokens_u32(&v.messages))
-                } else {
-                    v.prompt.as_deref().map(estimate_text_prompt_tokens_u32)
-                },
-            ),
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
-            }
-        };
+    let meta = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
+        }
+    };
+    let model_id = match validate_proxy_model_id(meta.model) {
+        Ok(model_id) => model_id,
+        Err((status, error)) => {
+            return (status, Json(serde_json::json!({ "error": error }))).into_response();
+        }
+    };
+    let backend_hint = match validate_dispatch_hint(meta.runtime.or(meta.backend)) {
+        Ok(hint) => hint,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let stream = meta.stream;
+    let max_tokens = meta.max_tokens;
+    let min_context = if worker_path == "/v1/embeddings" {
+        meta.input
+            .as_ref()
+            .and_then(|input| serde_json::from_value::<EmbeddingsInput>(input.clone()).ok())
+            .map(|input| estimate_embedding_input_max_tokens_u32(&input))
+    } else if !meta.messages.is_empty() {
+        context_requirement_with_generation(
+            Some(estimate_chat_prompt_tokens_u32(&meta.messages)),
+            max_tokens,
+        )
+    } else {
+        context_requirement_with_generation(
+            meta.prompt.as_deref().map(estimate_text_prompt_tokens_u32),
+            max_tokens,
+        )
+    };
 
     let resolved_policy =
         match project_policy::enforce(&req_headers, &model_id, max_tokens, &layer.project_policy) {
@@ -253,6 +257,18 @@ fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode,
         ));
     }
     Ok(model)
+}
+
+fn context_requirement_with_generation(
+    prompt_tokens: Option<u32>,
+    max_tokens: Option<u32>,
+) -> Option<u32> {
+    match (prompt_tokens, max_tokens) {
+        (Some(prompt_tokens), Some(max_tokens)) => Some(prompt_tokens.saturating_add(max_tokens)),
+        (Some(prompt_tokens), None) => Some(prompt_tokens),
+        (None, Some(max_tokens)) => Some(max_tokens),
+        (None, None) => None,
+    }
 }
 
 fn validate_dispatch_hint(hint: Option<String>) -> Result<Option<String>, String> {
