@@ -101,10 +101,10 @@ impl NatsConfig {
     /// Read configuration from `AXS_NATS_*` environment variables.
     pub fn try_from_env() -> anyhow::Result<Self> {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("AXS_NATS_URL") {
+        if let Some(v) = env_string("AXS_NATS_URL")? {
             cfg.nats_url = v;
         }
-        if let Ok(v) = std::env::var("AXS_NATS_STREAM") {
+        if let Some(v) = env_string("AXS_NATS_STREAM")? {
             cfg.stream_name = v;
         }
         if let Some(n) = env_parse::<i64>("AXS_NATS_MAX_DELIVER")? {
@@ -119,6 +119,19 @@ impl NatsConfig {
         }
         Ok(cfg)
     }
+}
+
+fn env_string(name: &str) -> anyhow::Result<Option<String>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
@@ -805,6 +818,37 @@ mod tests {
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
 
         assert_eq!(cfg.wait_ms, 7000);
+    }
+
+    #[test]
+    fn nats_config_trims_url_and_stream_env() {
+        let _guard = crate::test_env::lock();
+        unsafe {
+            std::env::set_var("AXS_NATS_URL", " nats://127.0.0.1:4223 ");
+            std::env::set_var("AXS_NATS_STREAM", " custom-stream ");
+        };
+        let cfg = NatsConfig::try_from_env().unwrap();
+        unsafe {
+            std::env::remove_var("AXS_NATS_URL");
+            std::env::remove_var("AXS_NATS_STREAM");
+        };
+
+        assert_eq!(cfg.nats_url, "nats://127.0.0.1:4223");
+        assert_eq!(cfg.stream_name, "custom-stream");
+    }
+
+    #[test]
+    fn nats_config_rejects_empty_url_and_stream_env() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_NATS_URL", "   ") };
+        let err = NatsConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_NATS_URL") };
+        assert!(err.contains("AXS_NATS_URL"), "got: {err}");
+
+        unsafe { std::env::set_var("AXS_NATS_STREAM", "\t") };
+        let err = NatsConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_NATS_STREAM") };
+        assert!(err.contains("AXS_NATS_STREAM"), "got: {err}");
     }
 
     #[test]
