@@ -71,6 +71,34 @@ def test_rest_chat_uses_explicit_api_key_and_forwards_options(monkeypatch) -> No
     assert captured["json"]["top_k"] == 4
 
 
+def test_rest_chat_does_not_send_default_top_k_zero(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def post(url: str, **kwargs: Any) -> FakeResponse:
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse(
+            {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                },
+            }
+        )
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=post))
+
+    client = Client(base_url="http://127.0.0.1:18080")
+    client.chat.completions.create(
+        model="default",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert "top_k" not in captured["json"]
+
+
 def test_rest_stream_uses_api_key(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -130,3 +158,37 @@ def test_models_list_uses_axs_api_key_env(monkeypatch) -> None:
 
     assert [model.id for model in models] == ["default"]
     assert captured["headers"] == {"Authorization": "Bearer from-env"}
+
+
+def test_grpc_chat_ignores_rest_only_options() -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeGrpc:
+        def infer_full(
+            self,
+            model_id: str,
+            messages: list[dict[str, str]],
+            **kwargs: Any,
+        ) -> Any:
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(
+                text="ok",
+                metrics=SimpleNamespace(prefill_tokens=1, decode_tokens=2),
+            )
+
+    client = Client(grpc_port=50051)
+    client._grpc = FakeGrpc()
+
+    response = client.chat.completions.create(
+        model="default",
+        messages=[{"role": "user", "content": "hello"}],
+        cache="enable",
+        cache_ttl="30m",
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert captured["model_id"] == "default"
+    assert "cache" not in captured["kwargs"]
+    assert "cache_ttl" not in captured["kwargs"]

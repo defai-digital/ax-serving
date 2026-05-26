@@ -8,6 +8,15 @@ from typing import Any
 
 from .types import ModelInfo
 
+_GRPC_GENERATION_KEYS = {
+    "temperature",
+    "top_k",
+    "top_p",
+    "repeat_penalty",
+    "max_tokens",
+    "seed",
+}
+
 
 class _CompletionChunk:
     """Minimal OpenAI ChatCompletionChunk-compatible object."""
@@ -113,15 +122,20 @@ class _Completions:
         **kwargs: Any,
     ) -> _ChatCompletionResponse | Iterator[_CompletionChunk]:
         grpc_client = self._client._grpc
+        grpc_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in _GRPC_GENERATION_KEYS
+        }
 
         if stream:
             def _stream() -> Generator[_CompletionChunk, None, None]:
-                for tok in grpc_client.infer(model, messages=messages, **kwargs):
+                for tok in grpc_client.infer(model, messages=messages, **grpc_kwargs):
                     yield _CompletionChunk(tok, model)
                 yield _CompletionChunk("", model, finish_reason="stop")
             return _stream()
 
-        result = grpc_client.infer_full(model, messages=messages, **kwargs)
+        result = grpc_client.infer_full(model, messages=messages, **grpc_kwargs)
         pt = result.metrics.prefill_tokens if result.metrics else 0
         ct = result.metrics.decode_tokens if result.metrics else 0
         return _ChatCompletionResponse(result.text, model, pt, ct)
@@ -150,6 +164,8 @@ class _Completions:
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
         for key, value in kwargs.items():
+            if key in _GRPC_GENERATION_KEYS:
+                continue
             if key not in payload and value is not None:
                 payload[key] = value
 
