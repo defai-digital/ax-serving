@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 
 pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
-    let timeout_secs = runtime_startup_timeout_secs();
+    let timeout_secs = runtime_startup_timeout_secs()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let url = format!("{base_url}/health");
     loop {
@@ -22,13 +22,23 @@ pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Resul
 
 const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
 
-fn runtime_startup_timeout_secs() -> u64 {
-    std::env::var("AXS_NODE_STARTUP_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS"))
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS)
-        .max(1)
+fn runtime_startup_timeout_secs() -> Result<u64> {
+    for key in [
+        "AXS_NODE_STARTUP_TIMEOUT_SECS",
+        "AXS_THOR_STARTUP_TIMEOUT_SECS",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let secs = trimmed
+                .parse::<u64>()
+                .with_context(|| format!("invalid {key}: {trimmed}"))?;
+            return Ok(secs.max(1));
+        }
+    }
+    Ok(DEFAULT_STARTUP_TIMEOUT_SECS)
 }
 
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
@@ -784,7 +794,10 @@ mod tests {
         let _node = EnvGuard::remove("AXS_NODE_STARTUP_TIMEOUT_SECS");
         let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
 
-        assert_eq!(runtime_startup_timeout_secs(), DEFAULT_STARTUP_TIMEOUT_SECS);
+        assert_eq!(
+            runtime_startup_timeout_secs().unwrap(),
+            DEFAULT_STARTUP_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -793,7 +806,17 @@ mod tests {
         let _node = EnvGuard::set("AXS_NODE_STARTUP_TIMEOUT_SECS", "0");
         let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
 
-        assert_eq!(runtime_startup_timeout_secs(), 1);
+        assert_eq!(runtime_startup_timeout_secs().unwrap(), 1);
+    }
+
+    #[test]
+    fn startup_timeout_rejects_invalid_explicit_env() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::set("AXS_NODE_STARTUP_TIMEOUT_SECS", "soon");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        let err = runtime_startup_timeout_secs().unwrap_err();
+        assert!(err.to_string().contains("AXS_NODE_STARTUP_TIMEOUT_SECS"));
     }
 
     #[test]
