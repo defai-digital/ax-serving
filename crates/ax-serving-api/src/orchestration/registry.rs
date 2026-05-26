@@ -646,6 +646,18 @@ impl WorkerRegistry {
         let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
         let model_inventory =
             normalize_model_inventory(&capabilities.models, incoming_model_inventory);
+        let inventory_supported_operations = if incoming_model_inventory_empty {
+            Vec::new()
+        } else {
+            let operations = supported_operations_from_model_inventory(&model_inventory);
+            refresh_capabilities_from_inventory_summary(
+                &mut capabilities,
+                &operations,
+                max_context_from_model_inventory(&model_inventory),
+                false,
+            );
+            operations
+        };
         if !incoming_model_inventory_empty {
             capabilities.models = model_inventory
                 .iter()
@@ -653,10 +665,14 @@ impl WorkerRegistry {
                 .collect();
         }
         let supported_operations = if supported_operations.is_empty() {
-            match capability_source {
-                CapabilitySource::Legacy => Vec::new(),
-                CapabilitySource::Structured => {
-                    supported_operations_from_capabilities(&capabilities)
+            if !inventory_supported_operations.is_empty() {
+                inventory_supported_operations
+            } else {
+                match capability_source {
+                    CapabilitySource::Legacy => Vec::new(),
+                    CapabilitySource::Structured => {
+                        supported_operations_from_capabilities(&capabilities)
+                    }
                 }
             }
         } else {
@@ -766,16 +782,13 @@ impl WorkerRegistry {
                     .collect();
                 if heartbeat_has_inventory {
                     let operations = supported_operations_from_model_inventory(&e.model_inventory);
-                    if !operations.is_empty() {
-                        e.capabilities.llm = operations.iter().any(|op| op == "llm");
-                        e.capabilities.embedding = operations.iter().any(|op| op == "embedding");
-                        e.capabilities.vision = operations.iter().any(|op| op == "vision");
-                    }
-                    e.capabilities.max_context = e
-                        .model_inventory
-                        .iter()
-                        .filter_map(|model| model.max_context)
-                        .max();
+                    let max_context = max_context_from_model_inventory(&e.model_inventory);
+                    refresh_capabilities_from_inventory_summary(
+                        &mut e.capabilities,
+                        &operations,
+                        max_context,
+                        true,
+                    );
                     e.supported_operations = operations;
                 }
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
@@ -1184,6 +1197,26 @@ fn supported_operations_from_model_inventory(inventory: &[ModelInventoryEntry]) 
         }
     }
     operations
+}
+
+fn max_context_from_model_inventory(inventory: &[ModelInventoryEntry]) -> Option<u32> {
+    inventory.iter().filter_map(|model| model.max_context).max()
+}
+
+fn refresh_capabilities_from_inventory_summary(
+    capabilities: &mut WorkerCapabilities,
+    operations: &[String],
+    max_context: Option<u32>,
+    clear_missing_max_context: bool,
+) {
+    if !operations.is_empty() {
+        capabilities.llm = operations.iter().any(|op| op == "llm");
+        capabilities.embedding = operations.iter().any(|op| op == "embedding");
+        capabilities.vision = operations.iter().any(|op| op == "vision");
+    }
+    if max_context.is_some() || clear_missing_max_context {
+        capabilities.max_context = max_context;
+    }
 }
 
 fn normalize_supported_operations(operations: Vec<String>) -> Vec<String> {
@@ -1702,6 +1735,90 @@ mod tests {
         assert_eq!(snapshot.capabilities, vec!["inventory-model".to_string()]);
         assert_eq!(snapshot.model_inventory[0].id, "inventory-model");
         assert_eq!(r.eligible_workers("inventory-model").len(), 1);
+    }
+
+    #[test]
+    fn registration_refreshes_structured_operations_from_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["embed-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "inventory-only embedding registration must not be llm eligible"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn registration_preserves_explicit_max_context_when_inventory_omits_it() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: Some(4096),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "chat-model".into(),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(4096));
+        assert_eq!(
+            r.eligible_workers_filtered("chat-model", RequestKind::Llm, None, Some(4096))
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers_filtered("chat-model", RequestKind::Llm, None, Some(4097))
+                .is_empty()
+        );
     }
 
     #[test]
