@@ -1,36 +1,26 @@
 //! Backend routing: dispatches inference to ax-engine (native), MLX, or llama.cpp.
 //!
-//! **Routing model**: ax-serving owns all routing decisions. AX Engine v4's
-//! native SDK path loads AX MLX artifact directories (`model-manifest.json` +
-//! `tokenizer.json`). GGUF files default to llama.cpp unless a caller explicitly
-//! forces `backend = "native"`.
+//! **Routing model**: ax-serving owns serving and orchestration policy. AX
+//! Engine v4's native SDK path loads AX MLX artifact directories
+//! (`model-manifest.json` + `tokenizer.json`). GGUF / llama.cpp remains an
+//! embedded compatibility path that operators must opt into explicitly through
+//! a backend hint or routing override.
 //!
 //! # Config file (`backends.yaml`)
 //!
 //! ```yaml
-//! # Default routing: native for AX artifact directories, llama.cpp otherwise.
+//! # Shipped public routing: native for AX artifact directories.
 //! # Options: native | llama_cpp | auto
 //! #   native    — ax-engine SDK only (requires AX MLX artifacts)
-//! #   llama_cpp — llama.cpp only (requires llama-server on PATH)
-//! #   auto      — AX artifact directory → native, else llama.cpp
-//! default_backend: auto
-//!
-//! # Legacy architecture allowlist for explicit family policies.
-//! native_families:
-//!   - llama
-//!   - mistral
-//!   - mixtral
-//!   - qwen35
-//!   - gemma3
-//!   - gemma4
+//! #   llama_cpp — legacy llama-server subprocess compatibility path
+//! #   auto      — AX artifact directory → native, GGUF compatibility → llama.cpp
+//! default_backend: native
 //!
 //! # Per-family overrides. Keys match `general.architecture` from GGUF metadata.
 //! # Prefix matching: "qwen" matches "qwen35", etc.
 //! # Exact match takes priority over prefix match.
 //! # An explicit entry here overrides native_families for that family.
-//! families:
-//!   phi:     llama_cpp   # phi2, phi3, …
-//!   glm:     llama_cpp
+//! families: {}
 //! ```
 //!
 //! Config is loaded from `$AXS_ROUTING_CONFIG` env var path, or
@@ -109,7 +99,8 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            // Default: auto — AX artifact directories use native, GGUF uses llama.cpp.
+            // Built-in compatibility default. The shipped public config can
+            // choose a stricter policy without changing this fallback.
             default_backend: BackendChoice::Auto,
             families: HashMap::new(),
             native_families: Self::default_native_families(),

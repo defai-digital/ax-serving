@@ -16,21 +16,22 @@ Use this guide for:
 - Apple Silicon macOS 14+
 - Rust toolchain (`cargo`)
 - Python 3.10+ (for the official Python SDK)
-- `llama-server` available on `PATH` for `llama.cpp` fallback, embeddings, and explicit `llama_cpp` loads
-- A GGUF model file at `./models/<model>.gguf`
+- One runtime path:
+  - an ax-engine artifact directory for embedded Mac compatibility workers, or
+  - an OpenAI-compatible ax-engine/vLLM endpoint behind `ax-runtime-agent`
+- `llama-server` only when you explicitly opt into the legacy `llama_cpp` compatibility path
 
 Validate your environment:
 
 ```bash
 cargo check --workspace
-which llama-server
 python3 -c "import sys; print('Python', sys.version); import httpx, grpcio; print('Dependencies OK')"
 ```
 
 Backend model:
 - `native` = explicit `ax-engine` SDK session over AX MLX artifacts
-- `llama_cpp` = `llama-server` from `llama.cpp`
-- `auto` = AX MLX artifact directories use native; GGUF uses `llama.cpp`
+- `llama_cpp` = legacy `llama-server` subprocess compatibility path
+- `auto` = routing policy from `backends.yaml`
 
 ---
 
@@ -44,10 +45,10 @@ One process handles:
 - scheduler/admission control
 - metrics, dashboard, and admin endpoints
 
-By default, AX Serving routes GGUF model loads through `llama.cpp`.
-Use `backend: "native"` in `POST /v1/models` (or equivalent internal controls)
-to force `ax-engine` for a specific AX MLX artifact directory containing
-`model-manifest.json` and `tokenizer.json`.
+The shipped routing config targets ax-engine artifact directories by default.
+Use `backend: "llama_cpp"` in `POST /v1/models`, or provide an override
+`backends.yaml`, only when you intentionally want the embedded llama.cpp
+compatibility path.
 
 Best for:
 - OSS usage
@@ -61,7 +62,7 @@ AXS_CONFIG=config/serving.offline-enterprise.yaml \
 AXS_API_KEY="change-me" \
 AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m /absolute/path/to/models/<model>.gguf \
+  -m /absolute/path/to/models/<ax-engine-artifact-dir> \
   --model-id default \
   --host 127.0.0.1 \
   --port 18080
@@ -72,7 +73,7 @@ Ad hoc local startup without auth:
 ```bash
 AXS_ALLOW_NO_AUTH=true \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id default \
   --host 127.0.0.1 \
   --port 18080
@@ -123,7 +124,7 @@ Start one or more workers:
 ```bash
 AXS_ALLOW_NO_AUTH=true \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id default \
   --port 18081 \
   --orchestrator http://127.0.0.1:19090
@@ -445,10 +446,10 @@ Load a model:
 ```bash
 curl -sS -X POST http://127.0.0.1:18080/v1/models \
   -H 'Content-Type: application/json' \
-  -d '{"model_id":"m2","path":"/absolute/path/to/model.gguf"}'
+  -d '{"model_id":"m2","path":"/absolute/path/to/<ax-engine-artifact-dir>"}'
 ```
 
-Load with overrides:
+Load a GGUF model through the explicit legacy llama.cpp compatibility path:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18080/v1/models \
@@ -466,8 +467,8 @@ curl -sS -X POST http://127.0.0.1:18080/v1/models \
 | Field | Type | Description |
 |-------|------|-------------|
 | `model_id` | string | Identifier (1–128 chars, alphanumeric + `-_./:`) |
-| `path` | string | Absolute path to the `.gguf` file |
-| `backend` | string? | `"llama_cpp"`, `"lib_llama"`, `"native"` (`ax-engine`), or `"auto"` |
+| `path` | string | Absolute path to an ax-engine artifact directory, MLX directory, or explicit `.gguf` compatibility file |
+| `backend` | string? | `"native"` (`ax-engine`), `"mlx"`, `"llama_cpp"`, `"lib_llama"`, or `"auto"` |
 | `mmproj_path` | string? | Multimodal projector `.gguf` for vision models |
 | `n_gpu_layers` | int? | GPU layer count override (`-1` = all) |
 | `context_length` | int? | Context window override (0 = model default) |
@@ -512,7 +513,7 @@ Recommended production setup:
 ```bash
 AXS_API_KEY="token1,token2" \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf --port 18080
+  -m ./models/<ax-engine-artifact-dir> --port 18080
 ```
 
 Protected endpoints require:
@@ -649,7 +650,7 @@ Recommended profiles:
 | Symptom | Fix |
 |---------|-----|
 | `model file not found` | Verify the model path is correct |
-| `failed to spawn llama-server` | Ensure `llama-server` is installed and on `PATH` for `llama_cpp` / fallback routes |
+| `failed to spawn llama-server` | Ensure `llama-server` is installed and on `PATH` for explicit `llama_cpp` compatibility loads |
 | `401` / `403` | Check `AXS_API_KEY` matches the `Authorization: Bearer` token |
 | `503` from gateway | Check `GET http://127.0.0.1:19090/internal/workers` — no healthy workers |
 | Model missing from `GET /v1/models` | Worker is unhealthy or draining; check worker logs |
@@ -666,7 +667,7 @@ Recommended profiles:
 - [docs/advantages-and-use-cases.md](docs/advantages-and-use-cases.md) — Why AX Serving, target use cases, and comparisons
 - `docs/contracts/ax-fabric-runtime-contract.md` — supported AX Fabric integration contract
 - `config/serving.example.yaml` — full configuration reference
-- `config/backends.yaml` — backend routing rules (`ax-engine` native + `llama.cpp` fallback)
+- `config/backends.yaml` — backend routing rules (`ax-engine` artifact directories by default; llama.cpp only by explicit compatibility opt-in)
 - `docs/runbooks/multi-worker.md` — multi-worker deployment guide
 - `docs/perf/service-tuning.md` — throughput and latency tuning
 - [LICENSE](LICENSE) — full AGPL-3.0-only text

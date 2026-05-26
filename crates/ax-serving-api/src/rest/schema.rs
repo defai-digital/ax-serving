@@ -352,15 +352,16 @@ pub struct ModelEntry {
 
 /// POST /v1/models — load a model.
 ///
-/// Supports GGUF files (llama.cpp / native) and MLX model directories
-/// (SafeTensors format, `mlx_lm.server` backend).
+/// Supports ax-engine artifact directories, explicit GGUF compatibility loads
+/// (`llama_cpp` / `lib_llama`), and MLX model directories.
 #[derive(Debug, Deserialize)]
 pub struct LoadModelRequest {
     /// Model ID to register (1–128 chars, alphanumeric/dash/underscore/dot).
     pub model_id: String,
     /// Path to the model.
     ///
-    /// - GGUF backends: path to a `.gguf` file.
+    /// - Native backend: path to an ax-engine artifact directory.
+    /// - GGUF compatibility backends: path to a `.gguf` file.
     /// - MLX backend: path to an MLX model directory (`config.json` + `*.safetensors`).
     pub path: String,
     /// Override context length (0 / omit = use model default).
@@ -373,7 +374,7 @@ pub struct LoadModelRequest {
     /// Enable MLX backend (`mlx_lm.server`).
     ///
     /// When `true`, ax-serving routes to `mlx_lm.server` if the path is an MLX
-    /// model directory; otherwise falls back to llama.cpp automatically.
+    /// model directory; otherwise it uses the explicit compatibility fallback.
     /// Ignored when `backend` is explicitly set.
     #[serde(default)]
     pub mlx: Option<bool>,

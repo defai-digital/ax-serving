@@ -35,7 +35,9 @@ pub enum RegistryError {
     NotLoaded(String),
     #[error("model file not found: {0}")]
     FileNotFound(String),
-    #[error("only .gguf models are supported; got: {0}")]
+    #[error(
+        "unsupported model path format; expected .gguf file, ax-engine artifact directory, or MLX directory: {0}"
+    )]
     InvalidFormat(String),
     #[error("max loaded models ({0}) reached; unload one first")]
     CapacityExceeded(usize),
@@ -196,10 +198,10 @@ impl ModelRegistry {
             .collect())
     }
 
-    /// Load a model from a GGUF file, registering it under `model_id`.
+    /// Load a model file or supported artifact directory, registering it under `model_id`.
     ///
     /// Validates:
-    /// - File exists and has `.gguf` extension
+    /// - Path exists and is a supported model file/directory for the selected backend
     /// - `model_id` is 1–128 chars, alphanumeric/dash/underscore/dot
     /// - Not already loaded (checked under write lock to prevent TOCTOU)
     /// - Total loaded count < MAX_LOADED_MODELS
