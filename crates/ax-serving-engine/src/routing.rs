@@ -24,7 +24,8 @@
 //! ```
 //!
 //! Config is loaded from `$AXS_ROUTING_CONFIG` env var path, or
-//! `./backends.yaml` if the file exists, or the built-in defaults.
+//! `./backends.yaml` if the file exists, or the built-in defaults. If
+//! `$AXS_ROUTING_CONFIG` is set, the path must exist and parse successfully.
 //!
 //! # Model architecture detection (primary)
 //!
@@ -45,7 +46,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -152,29 +153,50 @@ impl RoutingConfig {
         Ok(cfg)
     }
 
-    /// Load from `$AXS_ROUTING_CONFIG` or `./backends.yaml`, silently
-    /// returning defaults if neither exists or cannot be parsed.
-    pub fn load_default() -> Self {
-        let path = std::env::var("AXS_ROUTING_CONFIG")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("backends.yaml"));
-
-        if path.exists() {
-            match Self::from_file(&path) {
-                Ok(cfg) => {
-                    info!("routing config loaded from {}", path.display());
-                    return cfg;
-                }
-                Err(e) => {
-                    warn!(
-                        "failed to load routing config {}: {e} — using defaults",
-                        path.display()
-                    );
-                }
+    /// Load from `$AXS_ROUTING_CONFIG` or `./backends.yaml`.
+    ///
+    /// If `$AXS_ROUTING_CONFIG` is set, the path must exist and parse
+    /// successfully. If it is not set, built-in defaults are used only when no
+    /// `./backends.yaml` exists.
+    pub fn try_load_default() -> Result<Self> {
+        if let Ok(path) = std::env::var("AXS_ROUTING_CONFIG") {
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                anyhow::bail!(
+                    "AXS_ROUTING_CONFIG points to missing routing config {}",
+                    path.display()
+                );
             }
+            let cfg = Self::from_file(&path)
+                .with_context(|| format!("loading routing config {}", path.display()))?;
+            info!("routing config loaded from {}", path.display());
+            return Ok(cfg);
         }
 
-        Self::default()
+        let path = std::path::PathBuf::from("backends.yaml");
+        if path.exists() {
+            let cfg = Self::from_file(&path)
+                .with_context(|| format!("loading routing config {}", path.display()))?;
+            info!("routing config loaded from {}", path.display());
+            return Ok(cfg);
+        }
+
+        Ok(Self::default())
+    }
+
+    /// Load from `$AXS_ROUTING_CONFIG` or `./backends.yaml`, returning defaults
+    /// on load errors.
+    ///
+    /// Prefer [`RoutingConfig::try_load_default`] in command paths that can
+    /// report configuration errors to operators.
+    pub fn load_default() -> Self {
+        match Self::try_load_default() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!("failed to load routing config: {e:#} — using defaults");
+                Self::default()
+            }
+        }
     }
 
     /// Resolve the `BackendChoice` for the model at `path`.
@@ -458,6 +480,18 @@ impl RouterBackend {
     }
 
     /// Convenience: create with defaults loaded from environment.
+    pub fn try_from_env() -> Result<Self> {
+        Ok(Self::new(
+            RoutingConfig::try_load_default()?,
+            LlamaCppConfig::from_env(),
+            MlxConfig::from_env(),
+        ))
+    }
+
+    /// Convenience: create with defaults loaded from environment.
+    ///
+    /// Prefer [`RouterBackend::try_from_env`] in command paths that can report
+    /// configuration errors to operators.
     pub fn from_env() -> Self {
         Self::new(
             RoutingConfig::load_default(),
@@ -1063,6 +1097,38 @@ families:
                 .values()
                 .all(|choice| *choice != BackendChoice::LlamaCpp),
             "public backends.yaml should not force llama.cpp; keep it explicit compatibility"
+        );
+    }
+
+    #[test]
+    fn try_load_default_fails_for_missing_explicit_routing_config() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_ROUTING_CONFIG", "/nonexistent/path/backends.yaml") };
+
+        let result = RoutingConfig::try_load_default();
+
+        unsafe { std::env::remove_var("AXS_ROUTING_CONFIG") };
+
+        let err = result.expect_err("missing explicit routing config must fail closed");
+        assert!(err.to_string().contains("AXS_ROUTING_CONFIG"), "got: {err}");
+    }
+
+    #[test]
+    fn try_load_default_fails_for_invalid_explicit_routing_config() {
+        let _guard = crate::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-backends.yaml");
+        std::fs::write(&path, "{unclosed: brace\n").unwrap();
+        unsafe { std::env::set_var("AXS_ROUTING_CONFIG", &path) };
+
+        let result = RoutingConfig::try_load_default();
+
+        unsafe { std::env::remove_var("AXS_ROUTING_CONFIG") };
+
+        let err = result.expect_err("invalid explicit routing config must fail closed");
+        assert!(
+            err.to_string().contains("loading routing config"),
+            "got: {err}"
         );
     }
 }

@@ -58,10 +58,19 @@ pub unsafe extern "C" fn llama_model_load_from_file(
     };
 
     // Share a single RouterBackend across all model loads (BUG-074).
-    static BACKEND: std::sync::OnceLock<Arc<dyn InferenceBackend>> = std::sync::OnceLock::new();
-    let backend = BACKEND
-        .get_or_init(|| Arc::new(RouterBackend::from_env()))
-        .clone();
+    static BACKEND: std::sync::OnceLock<Result<Arc<dyn InferenceBackend>, String>> =
+        std::sync::OnceLock::new();
+    let backend = match BACKEND.get_or_init(|| {
+        RouterBackend::try_from_env()
+            .map(|backend| Arc::new(backend) as Arc<dyn InferenceBackend>)
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(backend) => Arc::clone(backend),
+        Err(e) => {
+            tracing::error!("llama_model_load_from_file: {e}");
+            return std::ptr::null_mut();
+        }
+    };
 
     match backend.load_model(&path, config) {
         Ok((handle, meta)) => {

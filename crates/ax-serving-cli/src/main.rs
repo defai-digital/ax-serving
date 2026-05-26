@@ -707,7 +707,7 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
     serve::ensure_embedded_runtime_allowed("single-shot inference mode")?;
 
     // Inference mode uses RouterBackend (same as serve mode).
-    let backend = RouterBackend::from_env();
+    let backend = RouterBackend::try_from_env()?;
     let config = LoadConfig {
         context_length: cli.ctx_size,
         backend_type: if cli.n_gpu_layers == 0 {

@@ -26,7 +26,7 @@ pub fn run(
     json_out: Option<PathBuf>,
 ) -> Result<()> {
     // load_model is called here from a plain non-tokio thread.
-    let backend = RouterBackend::from_env();
+    let backend = RouterBackend::try_from_env()?;
     let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
 
     // Dedicated drain runtime — only used for channel recv, never calls backend.
@@ -130,7 +130,7 @@ fn should_use_split_phase(
     probe_len: usize,
     decode_tokens: usize,
 ) -> Result<bool> {
-    let cfg = RoutingConfig::load_default();
+    let cfg = RoutingConfig::try_load_default()?;
     if matches!(cfg.resolve(model), BackendChoice::LlamaCpp) {
         return Ok(true);
     }

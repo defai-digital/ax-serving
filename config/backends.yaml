@@ -25,6 +25,7 @@
 #   2. $AXS_ROUTING_CONFIG env var path
 #   3. ./backends.yaml in CWD
 #   4. Built-in defaults
+# If $AXS_ROUTING_CONFIG is set, the path must exist and parse successfully.
 #
 # To opt into the embedded llama.cpp compatibility path, use an explicit
 # per-load backend (`llama_cpp`) or provide an override routing file that maps

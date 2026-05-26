@@ -438,7 +438,7 @@ pub(crate) fn run_serve(
         RoutingConfig::from_file(&path)
             .with_context(|| format!("loading routing config from {}", path.display()))?
     } else {
-        RoutingConfig::load_default()
+        RoutingConfig::try_load_default()?
     };
 
     let config_base = if let Some(path) = serve_config_path {

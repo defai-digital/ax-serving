@@ -71,7 +71,9 @@ impl AxModel {
     /// Load a GGUF model from `path`. Raises `RuntimeError` on failure.
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
-        let backend: Arc<dyn InferenceBackend> = Arc::new(RouterBackend::from_env());
+        let backend: Arc<dyn InferenceBackend> = Arc::new(
+            RouterBackend::try_from_env().map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        );
         let path = PathBuf::from(path);
         let (handle, _meta) = backend
             .load_model(&path, load_config_for_path(&path))

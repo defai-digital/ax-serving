@@ -26,7 +26,7 @@ pub async fn run(
     // load_model may touch backend runtimes depending on routing. Since
     // soak::run() is async, run model load on a blocking thread.
     let (backend, handle, meta) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let backend = RouterBackend::from_env();
+        let backend = RouterBackend::try_from_env()?;
         let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
         Ok((backend, handle, meta))
     })
