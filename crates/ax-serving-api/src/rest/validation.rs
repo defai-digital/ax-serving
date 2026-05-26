@@ -5,7 +5,9 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use super::schema::{MAX_MAX_TOKENS, MAX_MODEL_ID_BYTES, ResponseFormat};
+use super::schema::{
+    ChatCompletionRequest, InputMessage, MAX_MAX_TOKENS, MAX_MODEL_ID_BYTES, ResponseFormat,
+};
 
 /// Build an error response with the given status code and message.
 pub fn validation_error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
@@ -179,6 +181,46 @@ pub fn validate_multimodal_backend_support(
     }
 }
 
+/// True when a chat request uses tool-calling fields or carries prior tool-call
+/// history. Backend validation must treat this as a capability requirement even
+/// if the model is not asked to call a new tool in the current turn.
+pub fn chat_request_uses_tools(req: &ChatCompletionRequest) -> bool {
+    req.tools.is_some() || req.tool_choice.is_some() || req.messages.iter().any(message_uses_tools)
+}
+
+fn message_uses_tools(message: &InputMessage) -> bool {
+    message.tool_calls.is_some()
+        || message.tool_call_id.is_some()
+        || matches!(
+            message.role.trim().to_ascii_lowercase().as_str(),
+            "tool" | "function"
+        )
+}
+
+/// Validate tool-calling requests against backend capability hints.
+///
+/// `llama_cpp` and `mlx` preserve OpenAI-compatible tool-call messages and
+/// responses. The native ax-engine and direct libllama paths do not.
+pub fn validate_tool_backend_support(
+    uses_tools: bool,
+    backend_name: Option<&'static str>,
+) -> Option<Response> {
+    if !uses_tools {
+        return None;
+    }
+
+    match backend_name {
+        Some(backend @ ("native" | "lib_llama")) => Some(validation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "tool calling requires a llama_cpp or mlx backend, but this model is loaded on {}",
+                backend
+            ),
+        )),
+        _ => None,
+    }
+}
+
 /// Build [`GenerationParams`] from sampling fields shared by both
 /// chat-completions and text-completions requests.
 ///
@@ -286,10 +328,52 @@ pub fn map_stop_reason(reason: &str) -> &'static str {
 mod tests {
     use axum::http::StatusCode;
 
+    use crate::rest::schema::{ChatCompletionRequest, InputMessage, MessageContent};
+
     use super::{
-        build_generation_params, map_stop_reason, validate_model_identifier,
-        validate_multimodal_backend_support,
+        build_generation_params, chat_request_uses_tools, map_stop_reason,
+        validate_model_identifier, validate_multimodal_backend_support,
+        validate_tool_backend_support,
     };
+
+    fn chat_req(messages: Vec<InputMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "model".into(),
+            messages,
+            stream: false,
+            temperature: 0.7,
+            max_tokens: None,
+            top_p: 0.9,
+            min_p: None,
+            top_k: None,
+            seed: None,
+            repeat_penalty: 1.1,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            grammar: None,
+            response_format: None,
+            mirostat: None,
+            mirostat_tau: None,
+            mirostat_eta: None,
+            tools: None,
+            tool_choice: None,
+            cache: None,
+            cache_ttl: None,
+            logprobs: None,
+            top_logprobs: None,
+        }
+    }
+
+    fn user_message() -> InputMessage {
+        InputMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("hello".into())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
 
     #[test]
     fn validate_model_identifier_rejects_empty_or_whitespace() {
@@ -336,6 +420,32 @@ mod tests {
     fn validate_multimodal_backend_support_skips_non_multimodal() {
         assert!(validate_multimodal_backend_support(false, Some("native")).is_none());
         assert!(validate_multimodal_backend_support(false, None).is_none());
+    }
+
+    #[test]
+    fn chat_request_uses_tools_detects_tool_history() {
+        let mut msg = user_message();
+        msg.role = "tool".into();
+        msg.tool_call_id = Some("call_1".into());
+
+        assert!(chat_request_uses_tools(&chat_req(vec![msg])));
+    }
+
+    #[test]
+    fn validate_tool_backend_support_rejects_native_and_libllama() {
+        let native = validate_tool_backend_support(true, Some("native")).unwrap();
+        assert_eq!(native.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let libllama = validate_tool_backend_support(true, Some("lib_llama")).unwrap();
+        assert_eq!(libllama.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validate_tool_backend_support_allows_tool_capable_or_unknown_backends() {
+        assert!(validate_tool_backend_support(true, Some("llama_cpp")).is_none());
+        assert!(validate_tool_backend_support(true, Some("mlx")).is_none());
+        assert!(validate_tool_backend_support(true, None).is_none());
+        assert!(validate_tool_backend_support(false, Some("native")).is_none());
     }
 
     #[test]

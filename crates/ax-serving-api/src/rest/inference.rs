@@ -29,9 +29,10 @@ use uuid::Uuid;
 
 use super::schema::*;
 use super::validation::{
-    build_generation_params, cache_ttl_err, effective_max_tokens, map_stop_reason, resolve_grammar,
-    resolve_logprobs, validate_max_tokens, validate_model_identifier,
-    validate_multimodal_backend_support, validate_response_format, validate_sampling_params,
+    build_generation_params, cache_ttl_err, chat_request_uses_tools, effective_max_tokens,
+    map_stop_reason, resolve_grammar, resolve_logprobs, validate_max_tokens,
+    validate_model_identifier, validate_multimodal_backend_support, validate_response_format,
+    validate_sampling_params, validate_tool_backend_support,
 };
 use crate::ServingLayer;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
@@ -519,10 +520,11 @@ pub async fn chat_completions(
         .messages
         .iter()
         .any(|msg| msg.content.as_ref().is_some_and(MessageContent::has_images));
-    if let Some(resp) = validate_multimodal_backend_support(
-        has_image_input,
-        layer.backend.backend_name_for_handle(entry.handle),
-    ) {
+    let backend_name = layer.backend.backend_name_for_handle(entry.handle);
+    if let Some(resp) = validate_multimodal_backend_support(has_image_input, backend_name) {
+        return resp;
+    }
+    if let Some(resp) = validate_tool_backend_support(chat_request_uses_tools(&req), backend_name) {
         return resp;
     }
 
