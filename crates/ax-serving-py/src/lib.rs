@@ -36,6 +36,17 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::sync::mpsc;
 
+fn load_config_for_path(path: &std::path::Path) -> LoadConfig {
+    LoadConfig {
+        backend_hint: path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            .then(|| "llama_cpp".to_string()),
+        ..LoadConfig::default()
+    }
+}
+
 // ── AxModel ───────────────────────────────────────────────────────────────────
 
 /// A loaded inference model.
@@ -61,8 +72,9 @@ impl AxModel {
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
         let backend: Arc<dyn InferenceBackend> = Arc::new(RouterBackend::from_env());
+        let path = PathBuf::from(path);
         let (handle, _meta) = backend
-            .load_model(&PathBuf::from(path), LoadConfig::default())
+            .load_model(&path, load_config_for_path(&path))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()

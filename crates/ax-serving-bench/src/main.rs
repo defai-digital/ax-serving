@@ -21,6 +21,7 @@ mod bench;
 pub mod bench_common;
 mod cache_bench;
 mod compare;
+mod load_config;
 mod mixed;
 mod multi_worker;
 mod perf;

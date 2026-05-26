@@ -52,7 +52,7 @@ pub unsafe extern "C" fn llama_model_load_from_file(
         backend_type,
         llama_cpp_n_gpu_layers: Some(params.n_gpu_layers),
         mmproj_path: None,
-        backend_hint: None,
+        backend_hint: Some("llama_cpp".to_string()),
         enable_embeddings: None,
         pooling_type: None,
     };

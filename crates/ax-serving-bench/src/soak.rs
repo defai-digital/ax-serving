@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ax_serving_api::metrics::LatencyHistogram;
 use ax_serving_engine::{
-    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, RouterBackend,
+    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, RouterBackend,
 };
 use tokio::sync::mpsc;
+
+use crate::load_config;
 
 pub async fn run(
     model: PathBuf,
@@ -25,7 +27,7 @@ pub async fn run(
     // soak::run() is async, run model load on a blocking thread.
     let (backend, handle, meta) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let backend = RouterBackend::from_env();
-        let (handle, meta) = backend.load_model(&model, LoadConfig::default())?;
+        let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
         Ok((backend, handle, meta))
     })
     .await??;

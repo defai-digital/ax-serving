@@ -11,9 +11,11 @@ use std::time::Instant;
 use anyhow::Result;
 use ax_serving_engine::{
     BackendChoice, GenerateEvent, GenerateInput, GenerationParams, GenerationStats,
-    InferenceBackend, LoadConfig, ModelHandle, RouterBackend, RoutingConfig,
+    InferenceBackend, ModelHandle, RouterBackend, RoutingConfig,
 };
 use tokio::sync::mpsc;
+
+use crate::load_config;
 
 pub fn run(
     model: PathBuf,
@@ -25,7 +27,7 @@ pub fn run(
 ) -> Result<()> {
     // load_model is called here from a plain non-tokio thread.
     let backend = RouterBackend::from_env();
-    let (handle, meta) = backend.load_model(&model, LoadConfig::default())?;
+    let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
 
     // Dedicated drain runtime — only used for channel recv, never calls backend.
     let drain_rt = tokio::runtime::Builder::new_current_thread()
