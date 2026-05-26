@@ -301,12 +301,13 @@ cargo build -p ax-serving-cli --release
 AXS_NATS_URL=nats://127.0.0.1:4222 \
 AXS_NATS_STREAM=ax-serving \
 AXS_NATS_MAX_DELIVER=3 \
+AXS_NATS_WAIT_MS=10000 \
 <your worker process>
 
 # Gateway side — set mode to nats in the requesting code path
 # (NatsDispatcher is used programmatically; ax-serving-api remains in direct mode)
 AXS_NATS_URL=nats://127.0.0.1:4222
-AXS_GLOBAL_QUEUE_WAIT_MS=10000
+AXS_NATS_WAIT_MS=10000
 ```
 
 ### Verify NATS connectivity

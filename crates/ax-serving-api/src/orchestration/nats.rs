@@ -110,7 +110,11 @@ impl NatsConfig {
         if let Some(n) = env_parse::<i64>("AXS_NATS_MAX_DELIVER")? {
             cfg.max_deliver = n.max(1);
         }
-        if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS")? {
+        let wait_ms = match env_parse::<u64>("AXS_NATS_WAIT_MS")? {
+            Some(ms) => Some(ms),
+            None => env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS")?,
+        };
+        if let Some(ms) = wait_ms {
             cfg.wait_ms = ms.max(1);
         }
         Ok(cfg)
@@ -782,11 +786,40 @@ mod tests {
     #[test]
     fn nats_config_clamps_zero_wait_ms_from_env() {
         let _guard = crate::test_env::lock();
-        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "0") };
+        unsafe { std::env::set_var("AXS_NATS_WAIT_MS", "0") };
+        let cfg = NatsConfig::try_from_env().unwrap();
+        unsafe { std::env::remove_var("AXS_NATS_WAIT_MS") };
+
+        assert_eq!(cfg.wait_ms, 1);
+    }
+
+    #[test]
+    fn nats_config_prefers_nats_wait_ms_over_global_queue_wait_ms() {
+        let _guard = crate::test_env::lock();
+        unsafe {
+            std::env::set_var("AXS_NATS_WAIT_MS", "2500");
+            std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "9000");
+        };
+        let cfg = NatsConfig::try_from_env().unwrap();
+        unsafe {
+            std::env::remove_var("AXS_NATS_WAIT_MS");
+            std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS");
+        };
+
+        assert_eq!(cfg.wait_ms, 2500);
+    }
+
+    #[test]
+    fn nats_config_uses_global_queue_wait_ms_as_legacy_fallback() {
+        let _guard = crate::test_env::lock();
+        unsafe {
+            std::env::remove_var("AXS_NATS_WAIT_MS");
+            std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "7000");
+        };
         let cfg = NatsConfig::try_from_env().unwrap();
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
 
-        assert_eq!(cfg.wait_ms, 1);
+        assert_eq!(cfg.wait_ms, 7000);
     }
 
     #[test]
@@ -802,11 +835,11 @@ mod tests {
     #[test]
     fn nats_config_rejects_malformed_wait_ms_env() {
         let _guard = crate::test_env::lock();
-        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "soon") };
+        unsafe { std::env::set_var("AXS_NATS_WAIT_MS", "soon") };
         let err = NatsConfig::try_from_env().unwrap_err().to_string();
-        unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
+        unsafe { std::env::remove_var("AXS_NATS_WAIT_MS") };
 
-        assert!(err.contains("AXS_GLOBAL_QUEUE_WAIT_MS"), "got: {err}");
+        assert!(err.contains("AXS_NATS_WAIT_MS"), "got: {err}");
     }
 
     #[test]

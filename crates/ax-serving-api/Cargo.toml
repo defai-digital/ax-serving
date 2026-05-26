@@ -14,6 +14,7 @@ edition.workspace = true
 ##   AXS_NATS_URL=nats://127.0.0.1:4222
 ##   AXS_NATS_STREAM=ax-serving
 ##   AXS_NATS_MAX_DELIVER=3
+##   AXS_NATS_WAIT_MS=10000
 nats-dispatch = ["dep:async-nats"]
 
 [dependencies]
