@@ -315,6 +315,17 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+fn tool_call_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "call_{:016x}{:08x}{:08x}",
+        unix_ms_now(),
+        std::process::id(),
+        n
+    )
+}
+
 /// Per-model circuit breaker for the mlx_lm.server subprocess.
 ///
 /// Trip threshold (`AXS_CB_TRIP_THRESHOLD`, default 3): consecutive generate
@@ -1211,6 +1222,21 @@ fn post_mlx(
 #[derive(Deserialize)]
 struct MlxSseDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<MlxToolCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct MlxToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MlxToolCallDelta {
+    index: Option<u64>,
+    id: Option<String>,
+    function: Option<MlxToolCallFunctionDelta>,
 }
 
 #[derive(Deserialize)]
@@ -1289,6 +1315,7 @@ fn parse_mlx_sse_reader<R: std::io::Read>(
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut stop_reason = String::new();
+    let mut tool_call_acc: HashMap<u64, (String, String, String)> = HashMap::new();
     // When emitting logprobs, force batch_size=1 to preserve the 1:1
     // Token → TokenLogprob pairing (same strategy as LlamaCppBackend).
     let effective_batch = if emit_logprobs { 1 } else { batch_size };
@@ -1331,14 +1358,28 @@ fn parse_mlx_sse_reader<R: std::io::Read>(
             stop_reason = r.clone();
         }
 
-        let token_text = choice
-            .delta
-            .as_ref()
-            .and_then(|d| d.content.as_deref())
-            .unwrap_or("");
-        if token_text.is_empty() {
-            continue;
+        if let Some(delta) = choice.delta.as_ref() {
+            for (fallback_idx, tc) in delta.tool_calls.iter().enumerate() {
+                let idx = tc.index.unwrap_or(fallback_idx as u64);
+                let entry = tool_call_acc
+                    .entry(idx)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                if let Some(id) = tc.id.as_deref() {
+                    entry.0 = id.to_owned();
+                }
+                if let Some(name) = tc.function.as_ref().and_then(|f| f.name.as_deref()) {
+                    entry.1 = name.to_owned();
+                }
+                if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_deref()) {
+                    entry.2.push_str(args);
+                }
+            }
         }
+
+        let token_text = choice.delta.as_ref().and_then(|d| d.content.as_deref());
+        let Some(token_text) = token_text.filter(|text| !text.is_empty()) else {
+            continue;
+        };
 
         // Extract logprob data for this token if present.
         let lp_data = if emit_logprobs {
@@ -1388,6 +1429,8 @@ fn parse_mlx_sse_reader<R: std::io::Read>(
     if !buf.is_empty() {
         let _ = tx.blocking_send(GenerateEvent::Token(buf));
     }
+
+    emit_accumulated_tool_calls(tool_call_acc, tx);
 
     if stop_reason.is_empty() {
         stop_reason = "stop".to_string();
@@ -1478,6 +1521,9 @@ fn emit_non_streaming_response(
     } else if !text.is_empty() {
         let _ = tx.blocking_send(GenerateEvent::Token(text));
     }
+
+    emit_non_stream_tool_calls(val, tx);
+
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
         completion_tokens,
@@ -1485,6 +1531,56 @@ fn emit_non_streaming_response(
         ..Default::default()
     }));
     Ok(())
+}
+
+fn emit_non_stream_tool_calls(
+    val: &serde_json::Value,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+) {
+    let Some(tool_calls) = val["choices"][0]["message"]["tool_calls"].as_array() else {
+        return;
+    };
+    for tc in tool_calls {
+        let Some(name) = tc["function"]["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let id = tc["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(tool_call_id);
+        let arguments = tc["function"]["arguments"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let _ = tx.blocking_send(GenerateEvent::ToolCall {
+            id,
+            name: name.to_string(),
+            arguments,
+        });
+    }
+}
+
+fn emit_accumulated_tool_calls(
+    mut tool_calls: HashMap<u64, (String, String, String)>,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+) {
+    let mut sorted = tool_calls.drain().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|(idx, _)| *idx);
+    for (_, (id, name, arguments)) in sorted {
+        if name.is_empty() {
+            continue;
+        }
+        let call_id = if id.is_empty() { tool_call_id() } else { id };
+        let _ = tx.blocking_send(GenerateEvent::ToolCall {
+            id: call_id,
+            name,
+            arguments,
+        });
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1671,6 +1767,88 @@ mod tests {
                 assert_eq!(stats.prompt_tokens, 4);
                 assert_eq!(stats.completion_tokens, 6);
                 assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_mlx_sse_emits_accumulated_tool_calls() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}",
+            "]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}",
+            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_mlx_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("tool call event") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_a");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected tool call event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => assert_eq!(stats.stop_reason, "tool_calls"),
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn emit_mlx_non_streaming_response_emits_tool_calls() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{\"q\":\"rust\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        emit_non_streaming_response(&value, &tx, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("tool call event") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected tool call event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 2);
+                assert_eq!(stats.completion_tokens, 3);
+                assert_eq!(stats.stop_reason, "tool_calls");
             }
             other => panic!("expected done event, got {other:?}"),
         }
