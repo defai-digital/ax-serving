@@ -187,6 +187,18 @@ struct PendingEmbeddingRequest {
     tx: oneshot::Sender<std::result::Result<EmbeddingBatchResult, EmbeddingBatchFailure>>,
 }
 
+fn prune_closed_batch_requests(queue: &mut PendingBatchQueue) {
+    for batch in &mut queue.batches {
+        batch.items.retain(|item| !item.tx.is_closed());
+        batch.total_inputs = batch
+            .items
+            .iter()
+            .map(|item| item.request.input_len())
+            .sum();
+    }
+    queue.batches.retain(|batch| !batch.items.is_empty());
+}
+
 impl EmbeddingBatcher {
     pub fn new(
         backend: Arc<dyn InferenceBackend>,
@@ -233,6 +245,7 @@ impl EmbeddingBatcher {
         {
             let mut inner = self.inner.lock().await;
             let queue = inner.entry(key.clone()).or_default();
+            prune_closed_batch_requests(queue);
 
             let fits_existing = queue
                 .batches
@@ -359,8 +372,13 @@ impl EmbeddingBatcher {
         let PendingBatch {
             id: _,
             total_inputs: _,
-            items,
+            mut items,
         } = batch;
+        items.retain(|item| !item.tx.is_closed());
+        if items.is_empty() {
+            return;
+        }
+
         let result = self.execute_batch_backend(&items).await;
         match result {
             Ok(output) => {
@@ -550,6 +568,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use ax_serving_engine::{
         EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
@@ -861,6 +880,35 @@ mod tests {
         // only bumped in execute_batch_backend for the batching path).
         let m = batcher.metrics();
         assert_eq!(m.executed_batches.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_batch_request_is_not_sent_to_backend() {
+        let backend = EchoEmbedBackend::new(2);
+        let sched = make_scheduler();
+        let pm = Arc::new(PerModelScheduler::new(4));
+        let batcher = EmbeddingBatcher::new(backend, sched, pm, 4, 20);
+
+        let canceled_batcher = batcher.clone();
+        let canceled = tokio::spawn(async move {
+            canceled_batcher
+                .submit(make_request(vec!["canceled"]))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        canceled.abort();
+        let _ = canceled.await;
+
+        let result = batcher
+            .submit(make_request(vec!["live-a", "live-b", "live-c"]))
+            .await
+            .unwrap();
+
+        assert_eq!(result.embeddings.len(), 3);
+        let metrics = batcher.metrics();
+        assert_eq!(metrics.executed_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.executed_inputs.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.largest_batch_inputs.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

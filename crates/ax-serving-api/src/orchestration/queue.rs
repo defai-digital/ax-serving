@@ -351,7 +351,9 @@ impl GlobalQueue {
 
     /// Current number of requests waiting in queue.
     pub fn queued(&self) -> usize {
-        self.waiters_lock().len()
+        let mut waiters = self.waiters_lock();
+        waiters.retain(|entry| !entry.tx.is_closed());
+        waiters.len()
     }
 }
 
@@ -461,6 +463,19 @@ mod tests {
         let result = handle.await.unwrap();
         assert!(matches!(result, AcquireResult::Timeout));
         assert_eq!(q.metrics.timeout_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_prunes_timed_out_waiters() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 20, OverloadPolicy::Reject)));
+        let _permit = q.acquire(key("a")).await;
+
+        let q2 = Arc::clone(&q);
+        let waiter = tokio::spawn(async move { q2.acquire(key("b")).await });
+
+        let result = waiter.await.unwrap();
+        assert!(matches!(result, AcquireResult::Timeout));
+        assert_eq!(q.queued(), 0);
     }
 
     #[tokio::test]
