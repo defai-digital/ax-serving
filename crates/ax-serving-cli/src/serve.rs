@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::sync::atomic::Ordering;
@@ -167,6 +167,17 @@ fn derive_worker_runtime_metadata(
             .unwrap_or_else(|| "mac".to_string()),
         runtime_endpoint: runtime_endpoint.unwrap_or_else(|| format!("http://{self_addr}")),
         supported_operations: vec!["llm".to_string()],
+    }
+}
+
+fn preload_load_config_for_path(path: &Path) -> LoadConfig {
+    LoadConfig {
+        backend_hint: path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            .then(|| "llama_cpp".to_string()),
+        ..LoadConfig::default()
     }
 }
 
@@ -462,7 +473,7 @@ pub(crate) fn run_serve(
         embedded_runtime_policy_from_env()?
     };
     let capabilities: Vec<String> = if let Some(path) = model {
-        let load_config = LoadConfig::default();
+        let load_config = preload_load_config_for_path(&path);
         layer
             .registry
             .load(&model_id, &path, load_config, backend.as_ref())?;
@@ -719,6 +730,7 @@ mod tests {
     use super::{
         EmbeddedRuntimePolicy, clamp_advertised_max_inflight, default_advertised_max_inflight,
         derive_worker_runtime_metadata, ensure_embedded_runtime_allowed, parse_rest_addr,
+        preload_load_config_for_path,
     };
     use ax_serving_api::config::ServeConfig;
 
@@ -814,6 +826,18 @@ mod tests {
         assert_eq!(metadata.runtime_version.as_deref(), Some("0.13.0"));
         assert_eq!(metadata.hardware_class, "pc-cuda");
         assert_eq!(metadata.runtime_endpoint, "http://10.0.0.12:8000");
+    }
+
+    #[test]
+    fn preload_load_config_routes_gguf_to_llama_cpp() {
+        let config = preload_load_config_for_path(std::path::Path::new("/models/model.GGUF"));
+        assert_eq!(config.backend_hint.as_deref(), Some("llama_cpp"));
+    }
+
+    #[test]
+    fn preload_load_config_keeps_artifact_directories_on_router_default() {
+        let config = preload_load_config_for_path(std::path::Path::new("/models/ax-artifact"));
+        assert_eq!(config.backend_hint, None);
     }
 
     #[test]
