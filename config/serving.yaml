@@ -52,6 +52,7 @@ llamacpp:
   health_poller_restart_threshold: 3
   health_poller_max_restarts: 3
   cache_prompt: true
+  # executor_threads: 8        # env: AXS_LLAMACPP_EXECUTOR_THREADS
   # n_batch: 4096              # env: AXS_LLAMACPP_N_BATCH  (logical batch size)
   # n_ubatch: 4096             # env: AXS_LLAMACPP_N_UBATCH  (physical/micro batch size)
                                # IMPORTANT: set n_ubatch >= n_batch for embedding models.
@@ -72,6 +73,7 @@ mlx:
   health_poller_restart_threshold: 3
   health_poller_max_restarts: 3
   # decode_concurrency: 32     # env: AXS_MLX_DECODE_CONCURRENCY
+  # executor_threads: 8        # env: AXS_MLX_EXECUTOR_THREADS
 
 orchestrator:
   host: "127.0.0.1"

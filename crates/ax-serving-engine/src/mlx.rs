@@ -89,6 +89,10 @@ pub struct MlxConfig {
     /// Recovery window (ms) — how long the breaker stays Open before HalfOpen
     /// (env: `AXS_CB_RECOVERY_MS`).
     pub circuit_breaker_recovery_ms: u64,
+    /// Worker threads used to bridge blocking mlx_lm.server HTTP calls into async callers
+    /// (env: `AXS_MLX_EXECUTOR_THREADS`).
+    /// `None` = default to available host parallelism.
+    pub executor_threads: Option<usize>,
 }
 
 const DEFAULT_MLX_BIN: &str = "mlx_lm.server";
@@ -122,6 +126,7 @@ impl Default for MlxConfig {
             decode_concurrency: None,
             circuit_breaker_trip_threshold: DEFAULT_CB_TRIP_THRESHOLD,
             circuit_breaker_recovery_ms: DEFAULT_CB_RECOVERY_MS,
+            executor_threads: None,
         }
     }
 }
@@ -146,6 +151,9 @@ impl MlxConfig {
         }
         if let Some(n) = env_parse::<u32>("AXS_MLX_DECODE_CONCURRENCY")? {
             self.decode_concurrency = Some(n.max(1));
+        }
+        if let Some(n) = env_parse::<usize>("AXS_MLX_EXECUTOR_THREADS")? {
+            self.executor_threads = Some(n.max(1));
         }
         // Circuit breaker — shared env vars with LlamaCppBackend.
         if let Some(n) = env_parse::<u32>("AXS_CB_TRIP_THRESHOLD")? {
@@ -488,15 +496,11 @@ impl MlxBackend {
                 reqwest::blocking::Client::new()
             }
         };
-        let executor_threads = std::env::var("AXS_MLX_EXECUTOR_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(4)
-            });
+        let executor_threads = config.executor_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+        });
         Self {
             models: Arc::new(Mutex::new(HashMap::new())),
             thermal: ThermalMonitor::new(),
@@ -1612,13 +1616,16 @@ mod tests {
         let _guard = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_CB_TRIP_THRESHOLD", "0") };
         unsafe { std::env::set_var("AXS_CB_RECOVERY_MS", "0") };
+        unsafe { std::env::set_var("AXS_MLX_EXECUTOR_THREADS", "0") };
 
         let cfg = MlxConfig::from_env();
         assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
         assert_eq!(cfg.circuit_breaker_recovery_ms, 1);
+        assert_eq!(cfg.executor_threads, Some(1));
 
         unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
         unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+        unsafe { std::env::remove_var("AXS_MLX_EXECUTOR_THREADS") };
     }
 
     #[test]
@@ -1630,6 +1637,17 @@ mod tests {
 
         unsafe { std::env::remove_var("AXS_MLX_DECODE_CONCURRENCY") };
         assert!(err.contains("AXS_MLX_DECODE_CONCURRENCY"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_executor_threads() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_MLX_EXECUTOR_THREADS", "many") };
+
+        let err = MlxConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_MLX_EXECUTOR_THREADS") };
+        assert!(err.contains("AXS_MLX_EXECUTOR_THREADS"), "got: {err}");
     }
 
     #[test]

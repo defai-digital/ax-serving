@@ -102,6 +102,10 @@ pub struct LlamaCppConfig {
     /// Number of parallel request slots (env: `AXS_LLAMACPP_PARALLEL`, default 1).
     /// Increase to allow KV prefix reuse across concurrent requests.
     pub n_parallel: u32,
+    /// Worker threads used to bridge blocking llama-server HTTP calls into async callers
+    /// (env: `AXS_LLAMACPP_EXECUTOR_THREADS`).
+    /// `None` = default to available host parallelism.
+    pub executor_threads: Option<usize>,
     /// Multimodal projector path for vision models (env: `AXS_LLAMACPP_MMPROJ`).
     /// Passed as `--mmproj` to llama-server.
     pub mmproj_path: Option<String>,
@@ -162,6 +166,7 @@ impl Default for LlamaCppConfig {
             n_batch: None,
             n_ubatch: None,
             n_parallel: DEFAULT_N_PARALLEL,
+            executor_threads: None,
             mmproj_path: None,
         }
     }
@@ -208,6 +213,9 @@ impl LlamaCppConfig {
         }
         if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_PARALLEL")? {
             self.n_parallel = n.max(1);
+        }
+        if let Some(n) = env_parse::<usize>("AXS_LLAMACPP_EXECUTOR_THREADS")? {
+            self.executor_threads = Some(n.max(1));
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_MMPROJ") {
             self.mmproj_path = Some(v);
@@ -535,15 +543,11 @@ impl LlamaCppBackend {
                 reqwest::blocking::Client::new()
             }
         };
-        let executor_threads = std::env::var("AXS_LLAMACPP_EXECUTOR_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(4)
-            });
+        let executor_threads = config.executor_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+        });
         Self {
             models: Arc::new(Mutex::new(HashMap::new())),
             thermal: ThermalMonitor::new(),
@@ -2694,6 +2698,7 @@ mod tests {
         unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "0") };
         unsafe { std::env::set_var("AXS_LLAMACPP_N_BATCH", "0") };
         unsafe { std::env::set_var("AXS_LLAMACPP_N_UBATCH", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_EXECUTOR_THREADS", "0") };
 
         let cfg = LlamaCppConfig::from_env();
         assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
@@ -2701,12 +2706,14 @@ mod tests {
         assert_eq!(cfg.n_threads, Some(1));
         assert_eq!(cfg.n_batch, Some(1));
         assert_eq!(cfg.n_ubatch, Some(1));
+        assert_eq!(cfg.executor_threads, Some(1));
 
         unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
         unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
         unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
         unsafe { std::env::remove_var("AXS_LLAMACPP_N_BATCH") };
         unsafe { std::env::remove_var("AXS_LLAMACPP_N_UBATCH") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_EXECUTOR_THREADS") };
     }
 
     #[test]
@@ -2718,6 +2725,17 @@ mod tests {
 
         unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
         assert!(err.contains("AXS_LLAMACPP_THREADS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_executor_threads() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_EXECUTOR_THREADS", "many") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_EXECUTOR_THREADS") };
+        assert!(err.contains("AXS_LLAMACPP_EXECUTOR_THREADS"), "got: {err}");
     }
 
     #[test]

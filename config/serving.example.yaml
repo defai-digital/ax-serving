@@ -81,6 +81,8 @@ llamacpp:
   health_poller_max_restarts: 3
   cache_prompt: true           # env: AXS_LLAMACPP_CACHE_PROMPT
                                # (pass cache_prompt=true in llama-server requests)
+  # executor_threads: 8        # env: AXS_LLAMACPP_EXECUTOR_THREADS
+                               # (blocking HTTP bridge threads; defaults to host parallelism)
   # n_batch: 4096              # env: AXS_LLAMACPP_N_BATCH  (logical batch size)
   # n_ubatch: 4096             # env: AXS_LLAMACPP_N_UBATCH  (physical/micro batch size)
                                # IMPORTANT: set n_ubatch >= n_batch for embedding models.
