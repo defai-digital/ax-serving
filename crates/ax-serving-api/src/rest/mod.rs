@@ -22,7 +22,7 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
@@ -44,7 +44,7 @@ pub async fn serve(
     addr: String,
     keys: Arc<HashSet<String>>,
 ) -> Result<()> {
-    let app = router(layer, keys);
+    let app = try_router(layer, keys)?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("REST server listening on http://{addr}");
     axum::serve(listener, app)
@@ -55,10 +55,51 @@ pub async fn serve(
 
 /// Build the Axum router.
 pub fn router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Router {
-    let timeout_secs = std::env::var("AXS_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+    let timeout_secs = match request_timeout_secs_from_env() {
+        Ok(timeout_secs) => timeout_secs,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "invalid AXS_REQUEST_TIMEOUT_SECS ignored by infallible REST router constructor"
+            );
+            DEFAULT_REQUEST_TIMEOUT_SECS
+        }
+    };
+    router_with_timeout(layer, keys, timeout_secs)
+}
+
+/// Build the Axum router, failing on invalid explicit environment overrides.
+pub fn try_router(layer: Arc<ServingLayer>, keys: Arc<HashSet<String>>) -> Result<Router> {
+    let timeout_secs = request_timeout_secs_from_env()?;
+    Ok(router_with_timeout(layer, keys, timeout_secs))
+}
+
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+fn request_timeout_secs_from_env() -> Result<u64> {
+    match std::env::var("AXS_REQUEST_TIMEOUT_SECS") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(DEFAULT_REQUEST_TIMEOUT_SECS)
+            } else {
+                let timeout_secs = trimmed
+                    .parse::<u64>()
+                    .context("invalid AXS_REQUEST_TIMEOUT_SECS")?;
+                anyhow::ensure!(timeout_secs > 0, "AXS_REQUEST_TIMEOUT_SECS must be > 0");
+                Ok(timeout_secs)
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_REQUEST_TIMEOUT_SECS),
+        Err(err) => Err(err).context("invalid AXS_REQUEST_TIMEOUT_SECS"),
+    }
+}
+
+fn router_with_timeout(
+    layer: Arc<ServingLayer>,
+    keys: Arc<HashSet<String>>,
+    timeout_secs: u64,
+) -> Router {
     let slo_layer = Arc::clone(&layer);
 
     Router::new()
@@ -144,4 +185,76 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received — draining connections");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::{DEFAULT_REQUEST_TIMEOUT_SECS, request_timeout_secs_from_env};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn request_timeout_defaults_when_env_unset() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::unset("AXS_REQUEST_TIMEOUT_SECS");
+
+        assert_eq!(
+            request_timeout_secs_from_env().unwrap(),
+            DEFAULT_REQUEST_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn request_timeout_parses_trimmed_env_value() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_REQUEST_TIMEOUT_SECS", " 15 ");
+
+        assert_eq!(request_timeout_secs_from_env().unwrap(), 15);
+    }
+
+    #[test]
+    fn request_timeout_rejects_malformed_env_value() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_REQUEST_TIMEOUT_SECS", "soon");
+
+        let err = request_timeout_secs_from_env().unwrap_err();
+        assert!(err.to_string().contains("AXS_REQUEST_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    fn request_timeout_rejects_zero_env_value() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_REQUEST_TIMEOUT_SECS", "0");
+
+        let err = request_timeout_secs_from_env().unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
+    }
 }
