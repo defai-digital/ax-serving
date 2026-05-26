@@ -177,6 +177,44 @@ async fn thor_status_require_ready_accepts_dynamic_runtime_capabilities() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thor_status_require_ready_accepts_generic_node_env() -> Result<()> {
+    let state = Arc::new(MockServerState::default());
+    let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"ax_engine","runtime":"ax_engine","health":"healthy","drain":false}]"#;
+    let health_json = r#"{"status":"ok","backend":"ax_engine","runtime":"ax_engine","capabilities":{"llm":true,"embedding":true,"vision":false},"max_context":null,"model_ids":["qwen3"],"inflight":0,"queue_depth":0}"#;
+    let (base_url, listen_addr, server_task) =
+        spawn_mock_server_with_health(worker_list, health_json, state).await?;
+    let config_path = temp_path("thor-status-generic-node-env", "env");
+    let worker_id_path = temp_path("thor-status-generic-node-env-worker", "id");
+    std::fs::write(&worker_id_path, "worker-1\n")
+        .with_context(|| format!("failed to write {}", worker_id_path.display()))?;
+    write_node_env(&config_path, &base_url, listen_addr, &worker_id_path)?;
+
+    let config_arg = config_path.to_str().unwrap().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(ax_serving_bin())
+            .args(["thor", "status", "--config", &config_arg, "--require-ready"])
+            .output()
+    })
+    .await
+    .context("thor status generic-node-env task join failed")?
+    .context("failed to run ax-serving thor status for generic node env")?;
+
+    server_task.abort();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("runtime: ax_engine"));
+    assert!(stdout.contains("overall_state=ready"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thor_status_require_ready_detects_live_agent_capability_mismatch() -> Result<()> {
     let state = Arc::new(MockServerState::default());
     let worker_list = r#"[{"id":"worker-1","addr":"127.0.0.1:18081","backend":"vllm","runtime":"vllm","health":"healthy","drain":false}]"#;
@@ -279,6 +317,26 @@ AXS_THOR_RUNTIME_URL={base_url}
 AXS_THOR_LISTEN_ADDR={listen_addr}
 AXS_THOR_ADVERTISED_ADDR={listen_addr}
 AXS_THOR_WORKER_ID_PATH={}
+",
+        worker_id_path.display()
+    );
+    std::fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_node_env(
+    path: &Path,
+    base_url: &str,
+    listen_addr: std::net::SocketAddr,
+    worker_id_path: &Path,
+) -> Result<()> {
+    let contents = format!(
+        "\
+AXS_CONTROL_PLANE_URL={base_url}
+AXS_NODE_RUNTIME=ax_engine
+AXS_NODE_RUNTIME_URL={base_url}
+AXS_NODE_LISTEN_ADDR={listen_addr}
+AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081
+AXS_NODE_WORKER_ID_PATH={}
 ",
         worker_id_path.display()
     );
