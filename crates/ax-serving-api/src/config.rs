@@ -336,6 +336,17 @@ fn env_str(name: &str) -> Result<Option<String>> {
     }
 }
 
+fn env_trimmed_nonempty(name: &str) -> Result<Option<String>> {
+    let Some(raw) = env_str(name)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Read an env var and parse it as type T.
 fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
     let Some(raw) = env_str(name)? else {
@@ -579,14 +590,14 @@ impl ServeConfig {
         if let Some(port) = env_parse::<u16>("AXS_REST_PORT")? {
             self.rest_addr = format!("{DEFAULT_BIND_HOST}:{port}");
         }
-        if let Ok(v) = std::env::var("AXS_REST_HOST") {
+        if let Some(v) = env_trimmed_nonempty("AXS_REST_HOST")? {
             let port = self.rest_addr.rsplit(':').next().unwrap_or("18080");
             self.rest_addr = format!("{v}:{port}");
         }
         if let Some(v) = env_str("AXS_GRPC_SOCKET")? {
             self.grpc_socket = v;
         }
-        if let Some(v) = env_str("AXS_GRPC_HOST")? {
+        if let Some(v) = env_trimmed_nonempty("AXS_GRPC_HOST")? {
             self.grpc_host = v;
         }
         if let Some(port) = env_parse::<u16>("AXS_GRPC_PORT")? {
@@ -676,7 +687,7 @@ impl ServeConfig {
         self.mlx.try_apply_env_overrides()?;
 
         // ── Orchestrator ──────────────────────────────────────────────────────
-        if let Some(v) = env_str("AXS_ORCHESTRATOR_HOST")? {
+        if let Some(v) = env_trimmed_nonempty("AXS_ORCHESTRATOR_HOST")? {
             self.orchestrator.host = v;
         }
         if let Some(p) = env_parse::<u16>("AXS_ORCHESTRATOR_PORT")? {
@@ -685,7 +696,7 @@ impl ServeConfig {
         if let Some(p) = env_parse::<u16>("AXS_INTERNAL_PORT")? {
             self.orchestrator.internal_port = p;
         }
-        if let Some(v) = env_str("AXS_INTERNAL_BIND_ADDR")? {
+        if let Some(v) = env_trimmed_nonempty("AXS_INTERNAL_BIND_ADDR")? {
             self.orchestrator.internal_bind_addr = v;
         }
         if let Some(v) = env_str("AXS_ALLOWED_NODE_CIDRS")? {
@@ -1034,6 +1045,15 @@ mod tests {
     }
 
     #[test]
+    fn env_override_rest_host_trims_whitespace() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_REST_HOST", " 0.0.0.0 ") };
+        let cfg = ServeConfig::try_from_env().unwrap();
+        unsafe { std::env::remove_var("AXS_REST_HOST") };
+        assert_eq!(cfg.rest_addr, "0.0.0.0:18080");
+    }
+
+    #[test]
     fn env_override_orchestrator_host() {
         let _g = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_ORCHESTRATOR_HOST", "192.168.1.5") };
@@ -1041,6 +1061,22 @@ mod tests {
         cfg.apply_env_overrides();
         unsafe { std::env::remove_var("AXS_ORCHESTRATOR_HOST") };
         assert_eq!(cfg.orchestrator.host, "192.168.1.5");
+    }
+
+    #[test]
+    fn try_from_env_rejects_empty_host_overrides() {
+        let _g = crate::test_env::lock();
+        for key in [
+            "AXS_REST_HOST",
+            "AXS_GRPC_HOST",
+            "AXS_ORCHESTRATOR_HOST",
+            "AXS_INTERNAL_BIND_ADDR",
+        ] {
+            unsafe { std::env::set_var(key, "  ") };
+            let err = ServeConfig::try_from_env().unwrap_err().to_string();
+            unsafe { std::env::remove_var(key) };
+            assert!(err.contains(key), "got: {err}");
+        }
     }
 
     #[test]
