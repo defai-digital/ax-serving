@@ -36,6 +36,11 @@ class AxServing < Formula
     (etc/"ax-serving").mkpath
     etc.install "config/backends.yaml" => "ax-serving/backends.yaml"
     etc.install "config/serving.yaml" => "ax-serving/serving.yaml"
+
+    doc.install "README.md"
+    doc.install "LICENSE"
+    doc.install "LICENSING.md"
+    doc.install "LICENSE-COMMERCIAL.md"
   end
 
   # brew services start ax-serving — runs the single-worker inference server

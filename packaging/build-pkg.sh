@@ -46,6 +46,13 @@ mkdir -p "$STAGING/etc/ax-serving"
 cp config/backends.yaml "$STAGING/etc/ax-serving/"
 cp config/serving.yaml  "$STAGING/etc/ax-serving/"
 
+# Copy release docs and license notices.
+mkdir -p "$STAGING/usr/local/share/doc/ax-serving"
+cp README.md "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSE "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSING.md "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSE-COMMERCIAL.md "$STAGING/usr/local/share/doc/ax-serving/"
+
 # ── 3. Build component .pkg ──────────────────────────────────────────────────
 echo "==> Running pkgbuild…"
 pkgbuild \
