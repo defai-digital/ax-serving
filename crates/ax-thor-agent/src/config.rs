@@ -51,11 +51,52 @@ fn load_optional_string_env(key: &str) -> Option<String> {
 }
 
 fn load_control_plane_url() -> Result<String> {
-    std::env::var("AXS_CONTROL_PLANE_URL")
+    let raw = std::env::var("AXS_CONTROL_PLANE_URL")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .context("AXS_CONTROL_PLANE_URL is required")
+        .context("AXS_CONTROL_PLANE_URL is required")?;
+    normalize_http_base_url(&raw, "AXS_CONTROL_PLANE_URL")
+}
+
+fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{field} URL is empty");
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("{field} URL is empty after trimming trailing slashes");
+    }
+
+    let mut rest = trimmed;
+    let has_scheme = if let Some(scheme_end) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_end];
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            rest = &trimmed[scheme_end + 3..];
+            true
+        } else {
+            bail!("{field} has unsupported URL scheme: {trimmed}");
+        }
+    } else {
+        false
+    };
+
+    if rest.is_empty() {
+        bail!("{field} URL is incomplete: {trimmed}");
+    }
+    if rest.contains('/') {
+        bail!("{field} URL must not include a path: {trimmed}");
+    }
+    if rest.contains('?') || rest.contains('#') {
+        bail!("{field} URL must not include query params or fragments: {trimmed}");
+    }
+
+    if has_scheme {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("http://{trimmed}"))
+    }
 }
 
 fn default_advertised_addr(listen_addr: SocketAddr) -> SocketAddr {
@@ -158,9 +199,9 @@ impl ThorConfig {
         let vision = parse_first_bool_env(&["AXS_NODE_VISION", "AXS_THOR_VISION"])?;
 
         Ok(Self {
-            control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
+            control_plane_url,
             worker_token,
-            runtime_url: runtime_url.trim_end_matches('/').to_string(),
+            runtime_url: normalize_http_base_url(&runtime_url, "runtime URL")?,
             runtime,
             listen_addr,
             advertised_addr,
@@ -180,7 +221,7 @@ impl ThorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThorConfig, default_advertised_addr};
+    use super::{ThorConfig, default_advertised_addr, normalize_http_base_url};
     use std::ffi::OsString;
 
     struct EnvGuard {
@@ -251,10 +292,57 @@ mod tests {
     }
 
     #[test]
+    fn normalize_http_base_url_adds_http_scheme_if_missing() {
+        let normalized =
+            normalize_http_base_url("127.0.0.1:19090", "AXS_CONTROL_PLANE_URL").unwrap();
+        assert_eq!(normalized, "http://127.0.0.1:19090");
+    }
+
+    #[test]
+    fn normalize_http_base_url_trims_trailing_slashes() {
+        let normalized =
+            normalize_http_base_url(" https://127.0.0.1:19090// ", "AXS_CONTROL_PLANE_URL")
+                .unwrap();
+        assert_eq!(normalized, "https://127.0.0.1:19090");
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_path_query_and_fragment() {
+        let path = normalize_http_base_url("http://127.0.0.1:19090/api", "runtime URL")
+            .unwrap_err()
+            .to_string();
+        assert!(path.contains("must not include a path"), "got: {path}");
+
+        let query = normalize_http_base_url("http://127.0.0.1:19090?x=1", "runtime URL")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            query.contains("must not include query params or fragments"),
+            "got: {query}"
+        );
+
+        let fragment = normalize_http_base_url("http://127.0.0.1:19090#runtime", "runtime URL")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fragment.contains("must not include query params or fragments"),
+            "got: {fragment}"
+        );
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_unsupported_scheme() {
+        let err = normalize_http_base_url("ftp://127.0.0.1:19090", "runtime URL")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported URL scheme"), "got: {err}");
+    }
+
+    #[test]
     fn from_env_accepts_generic_runtime_node_aliases() {
         let _lock = crate::test_env::lock();
-        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
-        let _runtime_url = EnvGuard::set("AXS_NODE_RUNTIME_URL", "http://127.0.0.1:9000");
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", " 127.0.0.1:8080// ");
+        let _runtime_url = EnvGuard::set("AXS_NODE_RUNTIME_URL", " 127.0.0.1:9000// ");
         let _runtime = EnvGuard::set("AXS_NODE_RUNTIME", "ax_engine");
         let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18091");
         let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18092");
@@ -265,6 +353,7 @@ mod tests {
         let _embedding = EnvGuard::set("AXS_NODE_EMBEDDING", "true");
 
         let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.control_plane_url, "http://127.0.0.1:8080");
         assert_eq!(config.runtime_url, "http://127.0.0.1:9000");
         assert_eq!(config.runtime, "ax_engine");
         assert_eq!(config.listen_addr.to_string(), "127.0.0.1:18091");
