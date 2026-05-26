@@ -66,14 +66,14 @@ const WORKER_ID_PATH_ALIASES: &[&str] = &["AXS_NODE_WORKER_ID_PATH", "AXS_THOR_W
 
 const THOR_NOT_READY_EXIT_CODE: i32 = 24;
 
-fn normalize_control_plane_url(raw: &str) -> Result<String> {
+fn normalize_http_base_url(raw: &str, label: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("control plane URL is empty");
+        anyhow::bail!("{label} URL is empty");
     }
     let trimmed = trimmed.trim_end_matches('/');
     if trimmed.is_empty() {
-        anyhow::bail!("control plane URL is empty");
+        anyhow::bail!("{label} URL is empty");
     }
 
     let mut rest = trimmed;
@@ -83,20 +83,20 @@ fn normalize_control_plane_url(raw: &str) -> Result<String> {
             rest = &trimmed[scheme_end + 3..];
             true
         } else {
-            anyhow::bail!("unsupported control plane URL scheme: {trimmed}");
+            anyhow::bail!("unsupported {label} URL scheme: {trimmed}");
         }
     } else {
         false
     };
 
     if rest.is_empty() {
-        anyhow::bail!("control plane URL is incomplete: {trimmed}");
+        anyhow::bail!("{label} URL is incomplete: {trimmed}");
     }
     if rest.contains('/') {
-        anyhow::bail!("control plane URL must not include a path: {trimmed}");
+        anyhow::bail!("{label} URL must not include a path: {trimmed}");
     }
     if rest.contains('?') || rest.contains('#') {
-        anyhow::bail!("control plane URL must not include query params or fragments: {trimmed}");
+        anyhow::bail!("{label} URL must not include query params or fragments: {trimmed}");
     }
 
     let normalized = if has_scheme {
@@ -106,6 +106,14 @@ fn normalize_control_plane_url(raw: &str) -> Result<String> {
     };
 
     Ok(normalized.trim_end_matches('/').to_string())
+}
+
+fn normalize_control_plane_url(raw: &str) -> Result<String> {
+    normalize_http_base_url(raw, "control plane")
+}
+
+fn normalize_runtime_url(raw: &str) -> Result<String> {
+    normalize_http_base_url(raw, "runtime")
 }
 
 pub struct InstallArgs {
@@ -262,7 +270,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
         env_file.set("AXS_CONTROL_PLANE_URL", Some(control_plane));
     }
     let runtime = normalize_runtime(&args.runtime);
-    let runtime_url = trim_trailing_slash(args.runtime_url);
+    let runtime_url = normalize_runtime_url(&args.runtime_url)?;
     env_file.set_aliases(RUNTIME_ALIASES, Some(runtime.clone()));
     env_file.set_aliases(
         &["AXS_NODE_RUNTIME_URL", "AXS_THOR_RUNTIME_URL"],
@@ -310,7 +318,10 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     env_file.set_if_some("AXS_WORKER_TOKEN", args.worker_token);
     env_file.set_aliases_if_some(
         &["AXS_NODE_RUNTIME_URL", "AXS_THOR_RUNTIME_URL"],
-        args.runtime_url.map(trim_trailing_slash),
+        args.runtime_url
+            .as_deref()
+            .map(normalize_runtime_url)
+            .transpose()?,
     );
     if runtime == "sglang"
         && env_file.get("AXS_SGLANG_URL").is_none()
@@ -319,6 +330,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
         env_file.set("AXS_SGLANG_URL", Some(runtime_url.to_string()));
     }
     if let Some(runtime_url) = env_file.get_first(RUNTIME_URL_ALIASES).map(str::to_string) {
+        let runtime_url = normalize_runtime_url(&runtime_url)?;
         env_file.set_aliases(
             &["AXS_NODE_RUNTIME_URL", "AXS_THOR_RUNTIME_URL"],
             Some(runtime_url),
@@ -520,10 +532,6 @@ fn default_thor_env_path() -> PathBuf {
             PathBuf::from("/tmp")
         })
         .join(".config/ax-serving/thor.env")
-}
-
-fn trim_trailing_slash(input: String) -> String {
-    input.trim().trim_end_matches('/').to_string()
 }
 
 fn normalize_runtime(raw: &str) -> String {
@@ -1124,7 +1132,7 @@ mod tests {
             listen_addr: "127.0.0.1:18081".into(),
             advertised_addr: None,
             runtime: "ax-engine".into(),
-            runtime_url: "http://127.0.0.1:8000/".into(),
+            runtime_url: "127.0.0.1:8000/".into(),
             worker_token: None,
             max_inflight: 8,
             worker_pool: Some("mac".into()),
@@ -1145,6 +1153,36 @@ mod tests {
         assert!(contents.contains("AXS_THOR_LISTEN_ADDR=127.0.0.1:18081"));
         assert!(contents.contains("AXS_NODE_CLASS=mac-studio"));
         assert!(contents.contains("AXS_THOR_NODE_CLASS=mac-studio"));
+        Ok(())
+    }
+
+    #[test]
+    fn install_rejects_runtime_url_path_suffix() -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
+        let path =
+            std::env::temp_dir().join(format!("ax-serving-runtime-install-invalid-{now}.env"));
+
+        let err = super::install(InstallArgs {
+            control_plane: Some("127.0.0.1:19090".into()),
+            listen_addr: "127.0.0.1:18081".into(),
+            advertised_addr: None,
+            runtime: "ax-engine".into(),
+            runtime_url: "http://127.0.0.1:8000/v1".into(),
+            worker_token: None,
+            max_inflight: 8,
+            worker_pool: None,
+            node_class: "thor".into(),
+            friendly_name: None,
+            chip_model: None,
+            output: Some(path.clone()),
+        })
+        .expect_err("runtime URL path should fail");
+
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.to_string()
+                .contains("runtime URL must not include a path")
+        );
         Ok(())
     }
 
@@ -1202,6 +1240,23 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("control plane URL must not include a path")
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_url_adds_http_scheme_if_missing() -> Result<()> {
+        let normalized = super::normalize_runtime_url("127.0.0.1:8000")?;
+        assert_eq!(normalized, "http://127.0.0.1:8000");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_runtime_url_rejects_path_suffix() {
+        let err = super::normalize_runtime_url("http://127.0.0.1:8000/v1")
+            .expect_err("path suffix should be rejected");
+        assert!(
+            err.to_string()
+                .contains("runtime URL must not include a path")
         );
     }
 }
