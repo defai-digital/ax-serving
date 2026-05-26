@@ -460,7 +460,7 @@ pub(crate) fn run_serve(
         config.mlx.clone(),
     ));
 
-    let layer = Arc::new(ServingLayer::new(backend.clone(), config.clone()));
+    let layer = Arc::new(ServingLayer::try_new(backend.clone(), config.clone())?);
 
     // Print identity info to stderr so operators can identify this worker node.
     tracing::info!(%host, %port, "worker starting");

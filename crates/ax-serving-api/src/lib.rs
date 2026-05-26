@@ -88,6 +88,20 @@ pub struct ServingLayer {
 
 impl ServingLayer {
     pub fn new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Self {
+        let registry = ModelRegistry::new(config.registry.max_loaded_models);
+        Self::from_registry(backend, config, registry)
+    }
+
+    pub fn try_new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Result<Self> {
+        let registry = ModelRegistry::try_new(config.registry.max_loaded_models)?;
+        Ok(Self::from_registry(backend, config, registry))
+    }
+
+    fn from_registry(
+        backend: Arc<dyn InferenceBackend>,
+        config: ServeConfig,
+        registry: ModelRegistry,
+    ) -> Self {
         let cache = if config.cache.enabled {
             match ResponseCache::new(&config.cache) {
                 Ok(c) => Some(c),
@@ -107,7 +121,7 @@ impl ServingLayer {
         let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
         let cache_inflight_max_retries = config.dispatcher.cache_inflight_max_retries;
         let layer = Self {
-            registry: ModelRegistry::new(config.registry.max_loaded_models),
+            registry,
             metrics: Arc::new(MetricsStore::new()),
             config: Arc::new(config.clone()),
             scheduler: Scheduler::from_serve_config(

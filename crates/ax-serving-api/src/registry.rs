@@ -151,11 +151,24 @@ impl ModelRegistry {
     }
 
     pub fn new(max_loaded_models: usize) -> Self {
-        let warm_pool_size = std::env::var("AXS_MODEL_WARM_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0);
-        Self::new_with_warm_pool_size(max_loaded_models, warm_pool_size)
+        match Self::try_new(max_loaded_models) {
+            Ok(registry) => registry,
+            Err(err) => {
+                warn!(
+                    %err,
+                    "invalid AXS_MODEL_WARM_POOL_SIZE ignored by infallible registry constructor"
+                );
+                Self::new_with_warm_pool_size(max_loaded_models, None)
+            }
+        }
+    }
+
+    pub fn try_new(max_loaded_models: usize) -> Result<Self> {
+        let warm_pool_size = warm_pool_size_from_env()?;
+        Ok(Self::new_with_warm_pool_size(
+            max_loaded_models,
+            warm_pool_size,
+        ))
     }
 
     fn new_with_warm_pool_size(max_loaded_models: usize, warm_pool_size: Option<usize>) -> Self {
@@ -611,6 +624,24 @@ impl ModelRegistry {
     }
 }
 
+fn warm_pool_size_from_env() -> Result<Option<usize>> {
+    match std::env::var("AXS_MODEL_WARM_POOL_SIZE") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                let size = trimmed
+                    .parse::<usize>()
+                    .context("invalid AXS_MODEL_WARM_POOL_SIZE")?;
+                Ok((size > 0).then_some(size))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).context("invalid AXS_MODEL_WARM_POOL_SIZE"),
+    }
+}
+
 fn is_allowed_model_path(path: &Path) -> Result<bool> {
     #[cfg(test)]
     if let Some(dirs) = test_allowed_model_dirs() {
@@ -731,6 +762,7 @@ fn validate_model_id(id: &str) -> Result<(), RegistryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -742,6 +774,34 @@ mod tests {
     use super::*;
 
     // ── Test backend ──────────────────────────────────────────────────────────
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     struct AllowedDirsGuard {
         old: Option<Vec<PathBuf>>,
@@ -1056,6 +1116,42 @@ mod tests {
         assert!(validate_model_id("").is_err());
         assert!(validate_model_id("model id").is_err()); // space
         assert!(validate_model_id(&"a".repeat(129)).is_err()); // too long
+    }
+
+    #[test]
+    fn warm_pool_size_from_env_defaults_when_unset() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::unset("AXS_MODEL_WARM_POOL_SIZE");
+
+        assert_eq!(warm_pool_size_from_env().unwrap(), None);
+    }
+
+    #[test]
+    fn warm_pool_size_from_env_parses_trimmed_value() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_MODEL_WARM_POOL_SIZE", " 2 ");
+
+        assert_eq!(warm_pool_size_from_env().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn warm_pool_size_from_env_rejects_malformed_value() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_MODEL_WARM_POOL_SIZE", "many");
+
+        let err = warm_pool_size_from_env().unwrap_err();
+        assert!(err.to_string().contains("AXS_MODEL_WARM_POOL_SIZE"));
+    }
+
+    #[test]
+    fn try_new_rejects_malformed_warm_pool_env() {
+        let _lock = crate::test_env::lock();
+        let _guard = EnvGuard::set("AXS_MODEL_WARM_POOL_SIZE", "many");
+
+        let err = ModelRegistry::try_new(16)
+            .err()
+            .expect("malformed warm-pool env should fail");
+        assert!(err.to_string().contains("AXS_MODEL_WARM_POOL_SIZE"));
     }
 
     // ── ModelRegistry lifecycle tests ─────────────────────────────────────────
