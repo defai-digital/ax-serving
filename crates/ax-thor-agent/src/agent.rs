@@ -135,7 +135,7 @@ fn registration_body(config: &ThorConfig, model_info: &[sglang::ModelInfo]) -> V
     let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
     let model_inventory = model_info
         .iter()
-        .map(model_inventory_entry)
+        .map(|model| model_inventory_entry(model, config))
         .collect::<Vec<_>>();
 
     // BUG-114: derive capabilities from config overrides or runtime metadata
@@ -192,9 +192,12 @@ fn registration_body(config: &ThorConfig, model_info: &[sglang::ModelInfo]) -> V
 }
 
 fn model_info_supports_operation(model_info: &[sglang::ModelInfo], operation: &str) -> bool {
-    model_info
-        .iter()
-        .any(|model| model.supported_operations.iter().any(|op| op == operation))
+    model_info.iter().any(|model| {
+        model
+            .supported_operations
+            .iter()
+            .any(|op| operation_matches(op, operation))
+    })
 }
 
 pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime: SharedRuntime) {
@@ -215,7 +218,7 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
                     let models = model_info.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
                     let inventory = model_info
                         .iter()
-                        .map(model_inventory_entry)
+                        .map(|model| model_inventory_entry(model, &config))
                         .collect::<Vec<_>>();
                     *runtime.models.write().await = models.clone();
                     (models, inventory)
@@ -295,15 +298,56 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
     }
 }
 
-fn model_inventory_entry(model: &sglang::ModelInfo) -> serde_json::Value {
+fn model_inventory_entry(model: &sglang::ModelInfo, config: &ThorConfig) -> serde_json::Value {
     serde_json::json!({
         "id": model.id.as_str(),
         "max_context": model.max_model_len,
         "quantization": model.quantization.as_deref(),
         "artifact_format": model.artifact_format.as_deref(),
         "modalities": &model.modalities,
-        "supported_operations": &model.supported_operations,
+        "supported_operations": model_supported_operations(model, config),
     })
+}
+
+fn model_supported_operations(model: &sglang::ModelInfo, config: &ThorConfig) -> Vec<String> {
+    let mut operations = model
+        .supported_operations
+        .iter()
+        .filter_map(|operation| normalize_operation(operation))
+        .collect::<Vec<_>>();
+    apply_operation_override(&mut operations, "embedding", config.embedding);
+    apply_operation_override(&mut operations, "vision", config.vision);
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+fn apply_operation_override(
+    operations: &mut Vec<String>,
+    operation: &'static str,
+    override_value: Option<bool>,
+) {
+    match override_value {
+        Some(true) => operations.push(operation.to_string()),
+        Some(false) => operations.retain(|op| !operation_matches(op, operation)),
+        None => {}
+    }
+}
+
+fn operation_matches(raw: &str, operation: &str) -> bool {
+    normalize_operation(raw).as_deref() == Some(operation)
+}
+
+fn normalize_operation(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let operation = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(operation.to_string())
 }
 
 pub async fn drain(
@@ -449,5 +493,56 @@ mod tests {
 
         assert_eq!(body["capabilities"]["embedding"], false);
         assert_eq!(body["supported_operations"], serde_json::json!([]));
+        assert_eq!(
+            body["model_inventory"][0]["supported_operations"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn registration_body_env_override_updates_model_inventory_operations() {
+        let mut config = test_config();
+        config.embedding = Some(true);
+        config.vision = Some(false);
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "mixed-main".into(),
+                max_model_len: Some(8192),
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["Completion".into(), "Image".into()],
+            }],
+        );
+
+        assert_eq!(body["capabilities"]["embedding"], true);
+        assert_eq!(body["capabilities"]["vision"], false);
+        assert_eq!(
+            body["model_inventory"][0]["supported_operations"],
+            serde_json::json!(["embedding", "llm"])
+        );
+    }
+
+    #[test]
+    fn registration_body_normalizes_runtime_operation_aliases() {
+        let config = test_config();
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["Embeddings".into()],
+            }],
+        );
+
+        assert_eq!(body["capabilities"]["embedding"], true);
+        assert_eq!(
+            body["model_inventory"][0]["supported_operations"],
+            serde_json::json!(["embedding"])
+        );
     }
 }
