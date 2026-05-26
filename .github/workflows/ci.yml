@@ -86,6 +86,24 @@ jobs:
         working-directory: sdk/javascript
         run: npm run typecheck
 
+  python-sdk:
+    name: Python SDK Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: sdk/python/pyproject.toml
+
+      - name: Install Python SDK dependencies
+        run: python -m pip install -e "sdk/python[dev]"
+
+      - name: Test Python SDK
+        run: pytest sdk/python/tests
+
   # ── Integration tests (no model required) ────────────────────────────────────
   # These run on every push and PR to catch regressions in:
   #   - orchestration (queue, dispatch, reroute, health, overload, chaos)
@@ -96,7 +114,7 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: macos-15
-    needs: [check, js-sdk]
+    needs: [check, js-sdk, python-sdk]
     env:
       AXS_ALLOW_NO_AUTH: "true"   # integration tests build apps without API keys
     steps:
