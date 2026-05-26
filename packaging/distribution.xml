@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!--
   distribution.xml — productbuild distribution descriptor for ax-serving.
-  Customise welcome/readme/license text by editing the pkg-ref blocks.
+  License text is loaded from the generated packaging resources directory.
 -->
 <installer-gui-script minSpecVersion="2">
 
   <title>ax-serving</title>
-  <welcome    file="welcome.rtf"    mime-type="text/rtf"    language="en"/>
   <license    file="LICENSE"         mime-type="text/plain"  language="en"/>
 
   <!-- macOS 14 (Sonoma) + Apple Silicon required -->

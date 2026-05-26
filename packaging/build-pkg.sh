@@ -25,6 +25,7 @@ PKG_NAME="ax-serving-v${VERSION}.pkg"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAGING="${REPO_ROOT}/packaging/payload"
 DIST_XML="${REPO_ROOT}/packaging/distribution.xml"
+RESOURCES="${REPO_ROOT}/target/pkg-resources"
 
 # ── 1. Build release binaries ───────────────────────────────────────────────
 echo "==> Building release binaries…"
@@ -54,15 +55,21 @@ pkgbuild \
   --install-location "$INSTALL_ROOT" \
   "packaging/component.pkg"
 
-# ── 4. Build distribution .pkg (adds welcome/readme screens) ────────────────
+# ── 4. Build distribution .pkg (adds installer metadata/license) ────────────
 echo "==> Running productbuild…"
+rm -rf "$RESOURCES"
+mkdir -p "$RESOURCES"
+cp "$REPO_ROOT/LICENSE" "$RESOURCES/LICENSE"
+
 productbuild \
   --distribution "$DIST_XML" \
   --package-path "packaging" \
+  --resources "$RESOURCES" \
   --version "$VERSION" \
   "$PKG_NAME"
 
 rm -f packaging/component.pkg
+rm -rf "$RESOURCES"
 
 # ── 5. Sign (if DEVELOPER_ID_INSTALLER is set) ───────────────────────────────
 if [[ -n "${DEVELOPER_ID_INSTALLER:-}" ]]; then
