@@ -750,6 +750,7 @@ impl WorkerRegistry {
                 // Authoritative capability snapshot from worker heartbeat.
                 // Empty model_ids means the worker currently has no models.
                 let mut model_ids = req.model_ids;
+                let heartbeat_has_inventory = !req.model_inventory.is_empty();
                 if !req.model_inventory.is_empty() {
                     model_ids.extend(req.model_inventory.iter().map(|model| model.id.clone()));
                 }
@@ -763,6 +764,20 @@ impl WorkerRegistry {
                     .iter()
                     .map(|model| model.id.clone())
                     .collect();
+                if heartbeat_has_inventory {
+                    let operations = supported_operations_from_model_inventory(&e.model_inventory);
+                    if !operations.is_empty() {
+                        e.capabilities.llm = operations.iter().any(|op| op == "llm");
+                        e.capabilities.embedding = operations.iter().any(|op| op == "embedding");
+                        e.capabilities.vision = operations.iter().any(|op| op == "vision");
+                    }
+                    e.capabilities.max_context = e
+                        .model_inventory
+                        .iter()
+                        .filter_map(|model| model.max_context)
+                        .max();
+                    e.supported_operations = operations;
+                }
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
@@ -1153,6 +1168,20 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
     }
     if capabilities.vision {
         operations.push("vision".to_string());
+    }
+    operations
+}
+
+fn supported_operations_from_model_inventory(inventory: &[ModelInventoryEntry]) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    let mut operations = Vec::new();
+    for operation in inventory
+        .iter()
+        .flat_map(|model| model.supported_operations.iter())
+    {
+        if seen.insert(operation.clone()) {
+            operations.push(operation.clone());
+        }
     }
     operations
 }
@@ -2358,6 +2387,59 @@ mod tests {
         assert_eq!(snapshot.model_inventory.len(), 2);
         assert_eq!(r.eligible_workers("m1").len(), 1);
         assert_eq!(r.eligible_workers("m2").len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_refreshes_structured_operations_from_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["chat-model".into()],
+                    max_context: Some(2048),
+                }),
+                supported_operations: vec!["llm".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["embed-model".into()],
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["embed-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "heartbeat inventory must remove stale llm eligibility"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
     }
 
     #[test]
