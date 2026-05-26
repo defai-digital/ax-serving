@@ -1099,7 +1099,10 @@ async fn test_token_cost_dispatch_prefers_lower_cost_worker() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"tc-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "tc-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
@@ -2861,6 +2864,91 @@ async fn test_proxy_requires_valid_model_field() {
 }
 
 #[tokio::test]
+async fn test_proxy_rejects_invalid_endpoint_bodies_before_dispatch() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let worker = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"unexpected"}}]}"#).await
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: worker.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: true,
+                vision: false,
+                models: vec!["shape-model".into()],
+                max_context: Some(4096),
+            }),
+            supported_operations: vec!["llm".into(), "embedding".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+            ..Default::default()
+        },
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "shape-model", "messages": []}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "shape-model", "messages": [{"role": "user"}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "shape-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 0
+            }),
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "shape-model", "prompt": ""}),
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "shape-model", "input": []}),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(path)
+                    .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "path {path} with body {body} should be rejected before dispatch"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_proxy_accepts_valid_body_above_axum_default_limit() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -3332,7 +3420,10 @@ async fn test_overload_queue_full_429() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"overload-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "overload-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
@@ -3378,7 +3469,10 @@ async fn test_overload_shed_oldest_503() {
     let req1 = tokio::spawn(async move {
         client1
             .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model":"shed-model","messages":[]}))
+            .json(&serde_json::json!({
+                "model": "shed-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
             .send()
             .await
             .unwrap()
@@ -3393,7 +3487,10 @@ async fn test_overload_shed_oldest_503() {
     let req2 = tokio::spawn(async move {
         client2
             .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model":"shed-model","messages":[]}))
+            .json(&serde_json::json!({
+                "model": "shed-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
             .send()
             .await
             .unwrap()
@@ -3447,7 +3544,10 @@ async fn test_overload_queue_timeout_503() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"timeout-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "timeout-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
@@ -3491,7 +3591,10 @@ async fn test_overload_reroute_storm_503() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"storm-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "storm-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
