@@ -687,14 +687,32 @@ impl WorkerRegistry {
         self.inner
             .entry(id)
             .and_modify(|existing| {
+                let mut updated_capabilities = capabilities.clone();
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
-                existing.capabilities = capabilities.clone();
                 existing.model_inventory = if incoming_model_inventory_empty {
-                    retain_model_inventory_for_ids(&existing.model_inventory, &capabilities.models)
+                    retain_model_inventory_for_ids(
+                        &existing.model_inventory,
+                        &updated_capabilities.models,
+                    )
                 } else {
                     model_inventory.clone()
                 };
+                let retained_inventory_supported_operations =
+                    if incoming_model_inventory_empty && supported_operations.is_empty() {
+                        let operations =
+                            supported_operations_from_model_inventory(&existing.model_inventory);
+                        refresh_capabilities_from_inventory_summary(
+                            &mut updated_capabilities,
+                            &operations,
+                            max_context_from_model_inventory(&existing.model_inventory),
+                            false,
+                        );
+                        operations
+                    } else {
+                        Vec::new()
+                    };
+                existing.capabilities = updated_capabilities;
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();
@@ -705,7 +723,12 @@ impl WorkerRegistry {
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
                 existing.drain = false;
-                existing.supported_operations = supported_operations.clone();
+                existing.supported_operations =
+                    if retained_inventory_supported_operations.is_empty() {
+                        supported_operations.clone()
+                    } else {
+                        retained_inventory_supported_operations
+                    };
                 existing.runtime_version = runtime_version.clone();
                 existing.hardware_class = hardware_class.clone();
                 existing.runtime_endpoint = runtime_endpoint.clone();
@@ -2346,6 +2369,64 @@ mod tests {
         assert_eq!(
             snapshot.model_inventory[0].artifact_format.as_deref(),
             Some("gguf")
+        );
+    }
+
+    #[test]
+    fn reregister_without_inventory_preserves_retained_operation_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.register(
+            RegisterRequest {
+                worker_id: Some(resp.worker_id),
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                backend: "sglang".into(),
+                max_inflight: 8,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "retained embedding-only inventory must continue to reject llm routing"
         );
     }
 
