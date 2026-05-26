@@ -261,6 +261,7 @@ pub struct WorkerEntry {
     pub runtime_endpoint: Option<String>,
     /// Operations the worker supports, e.g. `llm`, `embedding`, `vision`.
     pub supported_operations: Vec<String>,
+    supported_operations_explicit: bool,
     pub max_inflight: usize,
     /// Dispatcher-owned in-flight count, updated without taking the registry lock.
     pub inflight: Arc<AtomicUsize>,
@@ -731,6 +732,7 @@ impl WorkerRegistry {
                     } else {
                         retained_inventory_supported_operations
                     };
+                existing.supported_operations_explicit = !explicit_supported_operations_empty;
                 existing.runtime_version = runtime_version.clone();
                 existing.hardware_class = hardware_class.clone();
                 existing.runtime_endpoint = runtime_endpoint.clone();
@@ -752,6 +754,7 @@ impl WorkerRegistry {
                 hardware_class,
                 runtime_endpoint,
                 supported_operations,
+                supported_operations_explicit: !explicit_supported_operations_empty,
                 max_inflight,
                 inflight: Arc::new(AtomicUsize::new(0)),
                 reported_inflight: 0,
@@ -810,7 +813,13 @@ impl WorkerRegistry {
                     .iter()
                     .map(|model| model.id.clone())
                     .collect();
-                if heartbeat_has_inventory {
+                let retained_inventory_has_operations = e
+                    .model_inventory
+                    .iter()
+                    .any(|model| !model.supported_operations.is_empty());
+                if heartbeat_has_inventory
+                    || (retained_inventory_has_operations && !e.supported_operations_explicit)
+                {
                     let operations = supported_operations_from_model_inventory(&e.model_inventory);
                     let max_context = max_context_from_model_inventory(&e.model_inventory);
                     refresh_capabilities_from_inventory_summary(
@@ -820,6 +829,7 @@ impl WorkerRegistry {
                         true,
                     );
                     e.supported_operations = operations;
+                    e.supported_operations_explicit = false;
                 }
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
@@ -2895,6 +2905,56 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn heartbeat_model_ids_refresh_operations_from_retained_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["chat-model".into(), "embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![
+                    ModelInventoryEntry {
+                        id: "chat-model".into(),
+                        supported_operations: vec!["llm".into()],
+                        ..Default::default()
+                    },
+                    ModelInventoryEntry {
+                        id: "embed-model".into(),
+                        supported_operations: vec!["embedding".into()],
+                        ..Default::default()
+                    },
+                ],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["chat-model".into()],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["chat-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["llm".to_string()]);
+        assert!(snapshot.capability_descriptor.llm);
+        assert!(!snapshot.capability_descriptor.embedding);
     }
 
     #[test]
