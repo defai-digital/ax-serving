@@ -123,7 +123,11 @@ impl RoutingConfig {
         if is_ax_engine_model_artifacts(path) {
             return BackendChoice::Native;
         }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("gguf") {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
             return BackendChoice::LlamaCpp;
         }
 
@@ -974,6 +978,10 @@ mod tests {
         assert_eq!(cfg.resolve(dir.path()), BackendChoice::Native);
         assert_eq!(
             cfg.resolve(Path::new("llama3-8b.gguf")),
+            BackendChoice::LlamaCpp
+        );
+        assert_eq!(
+            cfg.resolve(Path::new("llama3-8b.GGUF")),
             BackendChoice::LlamaCpp
         );
     }
