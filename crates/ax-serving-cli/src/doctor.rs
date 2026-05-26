@@ -166,6 +166,20 @@ fn check_hardware() -> CheckResult {
 }
 
 fn check_llama_server() -> CheckResult {
+    let worker_runtime = std::env::var("AXS_WORKER_RUNTIME").ok();
+    let embedded_runtime_policy = std::env::var("AXS_EMBEDDED_RUNTIME_POLICY").ok();
+    if !llama_server_required(
+        worker_runtime.as_deref(),
+        embedded_runtime_policy.as_deref(),
+    ) {
+        return CheckResult {
+            name: "llama-server",
+            status: CheckStatus::Pass,
+            detail: "not required for runtime-node deployment".into(),
+            remediation: None,
+        };
+    }
+
     // Check AXS_LLAMA_CPP_BIN first, then PATH
     let bin = std::env::var("AXS_LLAMA_CPP_BIN").unwrap_or_else(|_| "llama-server".into());
 
@@ -192,6 +206,21 @@ fn check_llama_server() -> CheckResult {
             ),
         },
     }
+}
+
+fn llama_server_required(
+    worker_runtime: Option<&str>,
+    embedded_runtime_policy: Option<&str>,
+) -> bool {
+    if embedded_runtime_policy
+        .map(str::trim)
+        .is_some_and(|v| v.eq_ignore_ascii_case("deny"))
+    {
+        return false;
+    }
+
+    let runtime = worker_runtime.map(str::trim).filter(|v| !v.is_empty());
+    !matches!(runtime, Some(v) if v.eq_ignore_ascii_case("ax_engine") || v.eq_ignore_ascii_case("vllm"))
 }
 
 fn check_runtime_boundary() -> CheckResult {
@@ -491,6 +520,28 @@ mod tests {
 
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.contains("vllm"));
+    }
+
+    #[test]
+    fn llama_server_not_required_for_runtime_node_modes() {
+        assert!(!llama_server_required(Some("ax_engine"), None));
+        assert!(!llama_server_required(Some(" VLLM "), None));
+    }
+
+    #[test]
+    fn llama_server_not_required_when_embedded_policy_denies_paths() {
+        assert!(!llama_server_required(None, Some("deny")));
+        assert!(!llama_server_required(
+            Some("custom_runtime"),
+            Some(" DENY ")
+        ));
+    }
+
+    #[test]
+    fn llama_server_required_for_embedded_compatibility_paths() {
+        assert!(llama_server_required(None, None));
+        assert!(llama_server_required(Some("custom_runtime"), None));
+        assert!(llama_server_required(None, Some("allow")));
     }
 
     #[test]
