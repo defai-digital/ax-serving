@@ -669,7 +669,8 @@ impl WorkerRegistry {
             .iter()
             .map(|model| model.id.clone())
             .collect();
-        let supported_operations = if supported_operations.is_empty() {
+        let explicit_supported_operations_empty = supported_operations.is_empty();
+        let supported_operations = if explicit_supported_operations_empty {
             if !inventory_supported_operations.is_empty() {
                 inventory_supported_operations
             } else {
@@ -700,7 +701,7 @@ impl WorkerRegistry {
                     model_inventory.clone()
                 };
                 let retained_inventory_supported_operations =
-                    if incoming_model_inventory_empty && supported_operations.is_empty() {
+                    if incoming_model_inventory_empty && explicit_supported_operations_empty {
                         let operations =
                             supported_operations_from_model_inventory(&existing.model_inventory);
                         refresh_capabilities_from_inventory_summary(
@@ -2476,6 +2477,65 @@ mod tests {
         assert!(
             r.eligible_workers("embed-model").is_empty(),
             "retained embedding-only inventory must continue to reject llm routing"
+        );
+    }
+
+    #[test]
+    fn reregister_without_inventory_prefers_retained_operations_over_derived_capabilities() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.register(
+            RegisterRequest {
+                worker_id: Some(resp.worker_id),
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                backend: "sglang".into(),
+                max_inflight: 8,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert!(!snapshot.capability_descriptor.llm);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "retained embedding-only inventory must override derived llm capabilities"
         );
     }
 
