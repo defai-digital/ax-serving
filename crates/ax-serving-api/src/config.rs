@@ -398,13 +398,6 @@ impl ServeConfig {
                 crate::rest::schema::MAX_MAX_TOKENS
             );
         }
-        if self.sched_max_queue < self.sched_max_inflight {
-            anyhow::bail!(
-                "sched_max_queue ({}) must be >= sched_max_inflight ({})",
-                self.sched_max_queue,
-                self.sched_max_inflight
-            );
-        }
         const VALID_OVERLOAD: &[&str] = &["queue", "reject", "shed_oldest"];
         if !VALID_OVERLOAD.contains(&self.sched_overload_policy.as_str()) {
             anyhow::bail!(
@@ -609,7 +602,7 @@ impl ServeConfig {
             self.sched_max_inflight = n.max(1);
         }
         if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_QUEUE")? {
-            self.sched_max_queue = n.max(1);
+            self.sched_max_queue = n;
         }
         if let Some(ms) = env_parse::<u64>("AXS_SCHED_MAX_WAIT_MS")? {
             self.sched_max_wait_ms = ms.max(1);
@@ -826,12 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_queue_smaller_than_inflight() {
+    fn validate_accepts_zero_queue_for_fail_fast_admission() {
+        let mut cfg = valid_cfg();
+        cfg.sched_max_inflight = 64;
+        cfg.sched_max_queue = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_queue_smaller_than_inflight() {
         let mut cfg = valid_cfg();
         cfg.sched_max_inflight = 64;
         cfg.sched_max_queue = 32;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("sched_max_queue"), "got: {err}");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1375,6 +1375,15 @@ mod tests {
         let cfg = ServeConfig::from_env();
         unsafe { std::env::remove_var("AXS_SCHED_MAX_WAIT_MS") };
         assert_eq!(cfg.sched_max_wait_ms, 1);
+    }
+
+    #[test]
+    fn from_env_preserves_zero_sched_max_queue() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_SCHED_MAX_QUEUE", "0") };
+        let cfg = ServeConfig::from_env();
+        unsafe { std::env::remove_var("AXS_SCHED_MAX_QUEUE") };
+        assert_eq!(cfg.sched_max_queue, 0);
     }
 
     #[test]

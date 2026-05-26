@@ -17,7 +17,7 @@ grpc_port: null                # env: AXS_GRPC_PORT  (set to enable TCP gRPC alo
 
 # ── Admission scheduler ───────────────────────────────────────────────────────
 sched_max_inflight: 16         # env: AXS_SCHED_MAX_INFLIGHT
-sched_max_queue: 128           # env: AXS_SCHED_MAX_QUEUE
+sched_max_queue: 128           # env: AXS_SCHED_MAX_QUEUE (0 = fail fast, no waiting queue)
 sched_max_wait_ms: 120000      # env: AXS_SCHED_MAX_WAIT_MS
                                # (2 minutes — embedding requests can take 2-15s on local models)
 sched_overload_policy: "queue" # env: AXS_OVERLOAD_POLICY  ("queue" | "reject" | "shed_oldest")
