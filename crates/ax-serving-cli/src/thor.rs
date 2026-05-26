@@ -116,6 +116,23 @@ fn normalize_runtime_url(raw: &str) -> Result<String> {
     normalize_http_base_url(raw, "runtime")
 }
 
+fn sync_runtime_url_aliases(env_file: &mut ThorEnvFile, runtime: &str) -> Result<()> {
+    let Some(runtime_url) = env_file.get_first(RUNTIME_URL_ALIASES).map(str::to_string) else {
+        return Ok(());
+    };
+    let runtime_url = normalize_runtime_url(&runtime_url)?;
+    env_file.set_aliases(
+        &["AXS_NODE_RUNTIME_URL", "AXS_THOR_RUNTIME_URL"],
+        Some(runtime_url.clone()),
+    );
+    if runtime == "sglang" {
+        env_file.set("AXS_SGLANG_URL", Some(runtime_url));
+    } else {
+        env_file.set("AXS_SGLANG_URL", None);
+    }
+    Ok(())
+}
+
 pub struct InstallArgs {
     pub control_plane: Option<String>,
     pub listen_addr: String,
@@ -278,6 +295,8 @@ pub fn install(args: InstallArgs) -> Result<()> {
     );
     if runtime == "sglang" {
         env_file.set("AXS_SGLANG_URL", Some(runtime_url));
+    } else {
+        env_file.set("AXS_SGLANG_URL", None);
     }
     env_file.set("AXS_WORKER_TOKEN", args.worker_token);
     env_file.set_aliases(LISTEN_ADDR_ALIASES, Some(listen_addr.to_string()));
@@ -323,19 +342,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
             .map(normalize_runtime_url)
             .transpose()?,
     );
-    if runtime == "sglang"
-        && env_file.get("AXS_SGLANG_URL").is_none()
-        && let Some(runtime_url) = env_file.get_first(RUNTIME_URL_ALIASES)
-    {
-        env_file.set("AXS_SGLANG_URL", Some(runtime_url.to_string()));
-    }
-    if let Some(runtime_url) = env_file.get_first(RUNTIME_URL_ALIASES).map(str::to_string) {
-        let runtime_url = normalize_runtime_url(&runtime_url)?;
-        env_file.set_aliases(
-            &["AXS_NODE_RUNTIME_URL", "AXS_THOR_RUNTIME_URL"],
-            Some(runtime_url),
-        );
-    }
+    sync_runtime_url_aliases(&mut env_file, &runtime)?;
     if let Some(listen_addr) = args.listen_addr {
         let listen_addr = parse_socket_addr(&listen_addr, "listen address")?;
         env_file.set_aliases(LISTEN_ADDR_ALIASES, Some(listen_addr.to_string()));
@@ -475,7 +482,7 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
             .context("AXS_CONTROL_PLANE_URL missing from thor config")?,
     )?;
     let worker_id = resolve_worker_id(&env_file).context("thor worker_id is not available")?;
-    let runtime_url = runtime_base_url(&env_file);
+    let runtime_url = runtime_base_url(&env_file)?;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(5))
@@ -775,12 +782,12 @@ async fn probe_registered_worker(
         .find(|worker| worker.addr == advertised_addr.to_string()))
 }
 
-fn runtime_base_url(env_file: &ThorEnvFile) -> String {
-    env_file
-        .get_first(RUNTIME_URL_ALIASES)
-        .unwrap_or(DEFAULT_RUNTIME_URL)
-        .trim_end_matches('/')
-        .to_string()
+fn runtime_base_url(env_file: &ThorEnvFile) -> Result<String> {
+    normalize_runtime_url(
+        env_file
+            .get_first(RUNTIME_URL_ALIASES)
+            .unwrap_or(DEFAULT_RUNTIME_URL),
+    )
 }
 
 fn thor_runtime(env_file: &ThorEnvFile) -> String {
@@ -856,7 +863,7 @@ async fn collect_status_report(
     let advertised_addr = parse_socket_addr(advertised_addr_raw, "advertised address")?;
     let local_agent_base = local_probe_base(listen_addr);
     let runtime = thor_runtime(&env_file);
-    let runtime_url = runtime_base_url(&env_file);
+    let runtime_url = runtime_base_url(&env_file)?;
     let expected_backend = runtime.as_str();
     let expected_max_context = env_file
         .get_first(MAX_CONTEXT_ALIASES)
@@ -1003,7 +1010,7 @@ fn fallback_status_report_from_env(
             detail: "timeout".to_string(),
         },
         runtime: thor_runtime(env_file),
-        runtime_url: runtime_base_url(env_file),
+        runtime_url: runtime_base_url(env_file)?,
         runtime_endpoint: EndpointStatus {
             ok: false,
             detail: "timeout".to_string(),
@@ -1157,6 +1164,35 @@ mod tests {
     }
 
     #[test]
+    fn install_clears_stale_sglang_runtime_url_for_non_sglang_runtime() -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
+        let path = std::env::temp_dir().join(format!("ax-serving-runtime-install-stale-{now}.env"));
+        std::fs::write(&path, "AXS_SGLANG_URL=http://old-runtime:8000\n")?;
+
+        super::install(InstallArgs {
+            control_plane: Some("127.0.0.1:19090".into()),
+            listen_addr: "127.0.0.1:18081".into(),
+            advertised_addr: None,
+            runtime: "ax-engine".into(),
+            runtime_url: "127.0.0.1:9000".into(),
+            worker_token: None,
+            max_inflight: 8,
+            worker_pool: None,
+            node_class: "thor".into(),
+            friendly_name: None,
+            chip_model: None,
+            output: Some(path.clone()),
+        })?;
+
+        let contents = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        assert!(contents.contains("AXS_NODE_RUNTIME_URL=http://127.0.0.1:9000"));
+        assert!(contents.contains("AXS_THOR_RUNTIME_URL=http://127.0.0.1:9000"));
+        assert!(!contents.contains("AXS_SGLANG_URL="));
+        Ok(())
+    }
+
+    #[test]
     fn install_rejects_runtime_url_path_suffix() -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
         let path =
@@ -1198,7 +1234,53 @@ mod tests {
         env_file.set("AXS_THOR_RUNTIME_URL", Some("http://127.0.0.1:8000".into()));
 
         assert_eq!(super::thor_runtime(&env_file), "ax_engine");
-        assert_eq!(super::runtime_base_url(&env_file), "http://127.0.0.1:9000");
+        assert_eq!(super::runtime_base_url(&env_file)?, "http://127.0.0.1:9000");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_base_url_normalizes_legacy_runtime_url() -> Result<()> {
+        let mut env_file = ThorEnvFile::default();
+        env_file.set("AXS_THOR_RUNTIME_URL", Some("127.0.0.1:9000//".into()));
+
+        assert_eq!(super::runtime_base_url(&env_file)?, "http://127.0.0.1:9000");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_base_url_rejects_legacy_runtime_url_path_suffix() {
+        let mut env_file = ThorEnvFile::default();
+        env_file.set(
+            "AXS_THOR_RUNTIME_URL",
+            Some("http://127.0.0.1:9000/v1".into()),
+        );
+
+        let err = super::runtime_base_url(&env_file).expect_err("path suffix should fail");
+        assert!(
+            err.to_string()
+                .contains("runtime URL must not include a path")
+        );
+    }
+
+    #[test]
+    fn sync_runtime_url_aliases_normalizes_sglang_legacy_alias() -> Result<()> {
+        let mut env_file = ThorEnvFile::default();
+        env_file.set("AXS_SGLANG_URL", Some("127.0.0.1:9000//".into()));
+
+        super::sync_runtime_url_aliases(&mut env_file, "sglang")?;
+
+        assert_eq!(
+            env_file.get("AXS_NODE_RUNTIME_URL"),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            env_file.get("AXS_THOR_RUNTIME_URL"),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            env_file.get("AXS_SGLANG_URL"),
+            Some("http://127.0.0.1:9000")
+        );
         Ok(())
     }
 
