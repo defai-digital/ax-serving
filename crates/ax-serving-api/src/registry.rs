@@ -686,8 +686,14 @@ fn test_allowed_model_dirs() -> Option<Vec<PathBuf>> {
     TEST_ALLOWED_MODEL_DIRS.with(|dirs| dirs.borrow().clone())
 }
 
+fn has_gguf_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
 fn validate_model_path_format(path: &Path, config: &LoadConfig) -> Result<(), RegistryError> {
-    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+    if path.is_file() && has_gguf_extension(path) {
         return Ok(());
     }
 
@@ -719,7 +725,7 @@ fn validate_optional_mmproj_path(config: &mut LoadConfig) -> Result<()> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|_| RegistryError::FileNotFound(path.display().to_string()))?;
 
-    if !canonical.is_file() || canonical.extension().and_then(|e| e.to_str()) != Some("gguf") {
+    if !canonical.is_file() || !has_gguf_extension(&canonical) {
         return Err(RegistryError::InvalidFormat(canonical.display().to_string()).into());
     }
 
@@ -1238,6 +1244,21 @@ mod tests {
     }
 
     #[test]
+    fn load_uppercase_gguf_extension_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.GGUF");
+        std::fs::write(&path, b"dummy").unwrap();
+
+        let backend = NullBackend;
+        let reg = ModelRegistry::new(16);
+
+        let entry = reg
+            .load("uppercase", &path, LoadConfig::default(), &backend)
+            .expect("uppercase GGUF extension should pass registry validation");
+        assert_eq!(entry.path, std::fs::canonicalize(&path).unwrap());
+    }
+
+    #[test]
     fn load_ax_engine_artifact_directory_is_allowed_for_auto_routing() {
         let dir = tempfile::tempdir().unwrap();
         make_ax_engine_artifacts(&dir);
@@ -1348,6 +1369,38 @@ mod tests {
             err.downcast_ref::<RegistryError>()
                 .is_some_and(|e| matches!(e, RegistryError::InvalidFormat(_))),
             "expected InvalidFormat, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_mmproj_path_accepts_uppercase_gguf_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = make_gguf(&dir);
+        let mmproj_path = dir.path().join("mmproj.GGUF");
+        std::fs::write(&mmproj_path, b"projector").unwrap();
+
+        let observed = Arc::new(Mutex::new(None));
+        let backend = CaptureConfigBackend {
+            observed: Arc::clone(&observed),
+        };
+        let reg = ModelRegistry::new(16);
+        let config = LoadConfig {
+            mmproj_path: Some(mmproj_path.display().to_string()),
+            ..LoadConfig::default()
+        };
+
+        reg.load("uppercase-mmproj", &model_path, config, &backend)
+            .expect("uppercase GGUF mmproj extension should pass registry validation");
+
+        let observed = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            observed.mmproj_path.as_deref(),
+            Some(
+                std::fs::canonicalize(&mmproj_path)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
         );
     }
 
