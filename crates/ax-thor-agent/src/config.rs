@@ -9,27 +9,41 @@ const DEFAULT_NODE_CLASS: &str = "thor";
 const DEFAULT_RUNTIME: &str = "vllm";
 
 fn load_first_optional_string_env(keys: &[&str]) -> Option<String> {
+    load_first_optional_string_env_with_key(keys).map(|(_, value)| value)
+}
+
+fn load_first_optional_string_env_with_key<'a>(keys: &'a [&str]) -> Option<(&'a str, String)> {
     keys.iter().find_map(|key| {
         std::env::var(key)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+            .map(|value| (*key, value))
     })
 }
 
-fn parse_first_env<T>(keys: &[&str]) -> Option<T>
+fn parse_first_env<T>(keys: &[&str]) -> Result<Option<T>>
 where
     T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
-    load_first_optional_string_env(keys).and_then(|v| v.parse::<T>().ok())
+    load_first_optional_string_env_with_key(keys)
+        .map(|(key, value)| {
+            value
+                .parse::<T>()
+                .map_err(|err| anyhow::anyhow!("invalid {key}: {value}: {err}"))
+        })
+        .transpose()
 }
 
-fn parse_first_bool_env(keys: &[&str]) -> Option<bool> {
-    load_first_optional_string_env(keys).and_then(|v| match v.to_ascii_lowercase().as_str() {
-        "true" | "1" => Some(true),
-        "false" | "0" => Some(false),
-        _ => None,
-    })
+fn parse_first_bool_env(keys: &[&str]) -> Result<Option<bool>> {
+    load_first_optional_string_env_with_key(keys)
+        .map(|(key, value)| match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => bail!("invalid {key}: {value}; expected true, false, 1, or 0"),
+        })
+        .transpose()
 }
 
 fn load_optional_string_env(key: &str) -> Option<String> {
@@ -120,7 +134,7 @@ impl ThorConfig {
             );
         }
         let max_inflight =
-            parse_first_env::<usize>(&["AXS_NODE_MAX_INFLIGHT", "AXS_THOR_MAX_INFLIGHT"])
+            parse_first_env::<usize>(&["AXS_NODE_MAX_INFLIGHT", "AXS_THOR_MAX_INFLIGHT"])?
                 .unwrap_or(DEFAULT_MAX_INFLIGHT)
                 .max(1);
         let worker_pool =
@@ -137,10 +151,11 @@ impl ThorConfig {
         let shutdown_timeout_secs = parse_first_env::<u64>(&[
             "AXS_NODE_SHUTDOWN_TIMEOUT_SECS",
             "AXS_THOR_SHUTDOWN_TIMEOUT_SECS",
-        ]);
-        let max_context = parse_first_env::<u32>(&["AXS_NODE_MAX_CONTEXT", "AXS_THOR_MAX_CONTEXT"]);
-        let embedding = parse_first_bool_env(&["AXS_NODE_EMBEDDING", "AXS_THOR_EMBEDDING"]);
-        let vision = parse_first_bool_env(&["AXS_NODE_VISION", "AXS_THOR_VISION"]);
+        ])?;
+        let max_context =
+            parse_first_env::<u32>(&["AXS_NODE_MAX_CONTEXT", "AXS_THOR_MAX_CONTEXT"])?;
+        let embedding = parse_first_bool_env(&["AXS_NODE_EMBEDDING", "AXS_THOR_EMBEDDING"])?;
+        let vision = parse_first_bool_env(&["AXS_NODE_VISION", "AXS_THOR_VISION"])?;
 
         Ok(Self {
             control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
@@ -284,5 +299,29 @@ mod tests {
         let err = ThorConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("advertised address"));
         assert!(err.to_string().contains("wildcard"));
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_numeric_overrides() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _max_inflight = EnvGuard::set("AXS_NODE_MAX_INFLIGHT", "many");
+
+        let err = ThorConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("AXS_NODE_MAX_INFLIGHT"));
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_bool_overrides() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _embedding = EnvGuard::set("AXS_NODE_EMBEDDING", "sure");
+
+        let err = ThorConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("AXS_NODE_EMBEDDING"));
     }
 }
