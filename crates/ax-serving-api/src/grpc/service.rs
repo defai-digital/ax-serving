@@ -277,7 +277,7 @@ impl AxServingServiceTrait for AxServingService {
                             text: String::new(),
                             token_id: 0,
                             finished: true,
-                            finish_reason: proto::FinishReason::Eos as i32,
+                            finish_reason: grpc_finish_reason(&stats.stop_reason) as i32,
                             metrics: Some(proto::GenerationMetrics {
                                 prefill_tokens: usize_to_u32_saturating(stats.prompt_tokens),
                                 decode_tokens: usize_to_u32_saturating(stats.completion_tokens),
@@ -522,6 +522,18 @@ fn engine_thermal_to_proto(state: ThermalState) -> proto::ThermalState {
     }
 }
 
+fn grpc_finish_reason(reason: &str) -> proto::FinishReason {
+    match reason {
+        "length" => proto::FinishReason::MaxTokens,
+        // The engine's `"stop"` reason currently covers both natural EOS and
+        // backend stop-sequence termination. Preserve the legacy EOS mapping
+        // unless the backend can expose a distinct stop-sequence reason.
+        "stop_sequence" => proto::FinishReason::StopSequence,
+        "stop" | "" => proto::FinishReason::Eos,
+        _ => proto::FinishReason::Unspecified,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -687,6 +699,25 @@ mod tests {
     #[test]
     fn grpc_usage_conversion_saturates_u32_fields() {
         assert_eq!(usize_to_u32_saturating(u32::MAX as usize + 1), u32::MAX);
+    }
+
+    #[test]
+    fn grpc_finish_reason_maps_backend_stop_reasons() {
+        assert_eq!(grpc_finish_reason(""), proto::FinishReason::Eos);
+        assert_eq!(grpc_finish_reason("stop"), proto::FinishReason::Eos);
+        assert_eq!(grpc_finish_reason("length"), proto::FinishReason::MaxTokens);
+        assert_eq!(
+            grpc_finish_reason("stop_sequence"),
+            proto::FinishReason::StopSequence
+        );
+        assert_eq!(
+            grpc_finish_reason("content_filter"),
+            proto::FinishReason::Unspecified
+        );
+        assert_eq!(
+            grpc_finish_reason("tool_calls"),
+            proto::FinishReason::Unspecified
+        );
     }
 
     #[test]
