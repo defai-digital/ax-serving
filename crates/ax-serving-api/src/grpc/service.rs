@@ -237,43 +237,7 @@ impl AxServingServiceTrait for AxServingService {
             .await
             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
-        let s = req.sampling.as_ref();
-        let params = GenerationParams {
-            stream: true,
-            temperature: s.map(|p| p.temperature as f64).filter(|&t| t > 0.0),
-            top_p: s.and_then(|p| {
-                if p.top_p > 0.0 {
-                    Some(p.top_p as f64)
-                } else {
-                    None
-                }
-            }),
-            top_k: s.and_then(|p| {
-                if p.top_k > 0 {
-                    Some(p.top_k as usize)
-                } else {
-                    None
-                }
-            }),
-            max_tokens: {
-                // proto3 uses 0 as the default (field omitted by client).
-                // Apply the same server-side cap as the REST path: fall back to
-                // `default_max_tokens` when the client sends 0; a configured
-                // default of 0 means "no cap" (pass None to the backend).
-                let d = self.layer.default_max_tokens;
-                if req.max_tokens > 0 {
-                    Some(req.max_tokens as usize)
-                } else if d > 0 {
-                    Some(d as usize)
-                } else {
-                    None
-                }
-            },
-            stop_seqs: Vec::new(),
-            seed: None,
-            repeat_penalty: None,
-            ..Default::default()
-        };
+        let params = infer_generation_params(&req, self.layer.default_max_tokens);
 
         let (engine_tx, mut engine_rx) = mpsc::channel::<GenerateEvent>(INFER_CHANNEL_CAPACITY);
 
@@ -393,6 +357,23 @@ fn validate_infer_request(req: &proto::InferRequest) -> Option<Status> {
         )));
     }
 
+    if let Some(sampling) = req.sampling.as_ref() {
+        if !sampling.temperature.is_finite() || !(0.0..=2.0).contains(&sampling.temperature) {
+            return Some(Status::invalid_argument("temperature must be in [0, 2]"));
+        }
+        if !sampling.top_p.is_finite() || !(0.0..=1.0).contains(&sampling.top_p) {
+            return Some(Status::invalid_argument("top_p must be in [0, 1]"));
+        }
+        if !sampling.repeat_penalty.is_finite()
+            || sampling.repeat_penalty < 0.0
+            || sampling.repeat_penalty > 10.0
+        {
+            return Some(Status::invalid_argument(
+                "repeat_penalty must be 0 or in (0, 10]",
+            ));
+        }
+    }
+
     if !req.messages.is_empty() {
         if req.messages.len() > MAX_MESSAGES {
             return Some(Status::invalid_argument(format!(
@@ -422,6 +403,59 @@ fn validate_infer_request(req: &proto::InferRequest) -> Option<Status> {
     }
 
     None
+}
+
+fn infer_generation_params(req: &proto::InferRequest, default_max_tokens: u32) -> GenerationParams {
+    let sampling = req.sampling.as_ref();
+    GenerationParams {
+        stream: true,
+        temperature: sampling
+            .map(|params| params.temperature as f64)
+            .filter(|temperature| *temperature > 0.0),
+        top_p: sampling.and_then(|params| {
+            if params.top_p > 0.0 {
+                Some(params.top_p as f64)
+            } else {
+                None
+            }
+        }),
+        top_k: sampling.and_then(|params| {
+            if params.top_k > 0 {
+                Some(params.top_k as usize)
+            } else {
+                None
+            }
+        }),
+        max_tokens: {
+            // proto3 uses 0 as the default (field omitted by client). Apply
+            // the same server-side cap as the REST path: fall back to
+            // `default_max_tokens` when the client sends 0; a configured
+            // default of 0 means "no cap" (pass None to the backend).
+            if req.max_tokens > 0 {
+                Some(req.max_tokens as usize)
+            } else if default_max_tokens > 0 {
+                Some(default_max_tokens as usize)
+            } else {
+                None
+            }
+        },
+        stop_seqs: Vec::new(),
+        seed: sampling.and_then(|params| {
+            if params.seed > 0 {
+                Some(params.seed)
+            } else {
+                None
+            }
+        }),
+        repeat_penalty: sampling.and_then(|params| {
+            if params.repeat_penalty > 0.0 {
+                Some(params.repeat_penalty as f64)
+            } else {
+                None
+            }
+        }),
+        ..Default::default()
+    }
 }
 
 fn validate_grpc_model_id(model_id: &str) -> Option<Status> {
@@ -723,6 +757,100 @@ mod tests {
         let status = validate_infer_request(&req).unwrap();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("max_tokens exceeds"));
+    }
+
+    #[test]
+    fn infer_validation_rejects_invalid_sampling_ranges() {
+        let mut req = valid_infer_request();
+        req.sampling = Some(proto::SamplingParams {
+            temperature: 2.5,
+            top_k: 0,
+            top_p: 0.9,
+            repeat_penalty: 1.1,
+            seed: 0,
+        });
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("temperature"));
+
+        req.sampling = Some(proto::SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            top_p: 1.5,
+            repeat_penalty: 1.1,
+            seed: 0,
+        });
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("top_p"));
+
+        req.sampling = Some(proto::SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            top_p: 0.9,
+            repeat_penalty: 11.0,
+            seed: 0,
+        });
+
+        let status = validate_infer_request(&req).unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("repeat_penalty"));
+    }
+
+    #[test]
+    fn infer_generation_params_preserve_sampling_seed_and_repeat_penalty() {
+        let mut req = valid_infer_request();
+        req.max_tokens = 0;
+        req.sampling = Some(proto::SamplingParams {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.95,
+            repeat_penalty: 1.15,
+            seed: 12345,
+        });
+
+        let params = infer_generation_params(&req, 2048);
+
+        assert!(params.stream);
+        assert!(
+            (params.temperature.unwrap() - 0.7).abs() < 0.000001,
+            "temperature should be preserved"
+        );
+        assert_eq!(params.top_k, Some(40));
+        assert!(
+            (params.top_p.unwrap() - 0.95).abs() < 0.000001,
+            "top_p should be preserved"
+        );
+        assert_eq!(params.max_tokens, Some(2048));
+        assert_eq!(params.seed, Some(12345));
+        assert!(
+            (params.repeat_penalty.unwrap() - 1.15).abs() < 0.000001,
+            "repeat_penalty should be preserved"
+        );
+    }
+
+    #[test]
+    fn infer_generation_params_treat_proto_zero_sampling_values_as_omitted() {
+        let mut req = valid_infer_request();
+        req.max_tokens = 0;
+        req.sampling = Some(proto::SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            repeat_penalty: 0.0,
+            seed: 0,
+        });
+
+        let params = infer_generation_params(&req, 0);
+
+        assert_eq!(params.temperature, None);
+        assert_eq!(params.top_k, None);
+        assert_eq!(params.top_p, None);
+        assert_eq!(params.max_tokens, None);
+        assert_eq!(params.seed, None);
+        assert_eq!(params.repeat_penalty, None);
     }
 
     #[tokio::test]
