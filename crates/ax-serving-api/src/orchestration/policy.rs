@@ -531,7 +531,7 @@ impl DispatchPolicy for CacheAffinityPolicy {
 ///
 /// Returns an error for unknown policy names.
 pub fn policy_from_str(name: &str) -> anyhow::Result<Box<dyn DispatchPolicy>> {
-    match name {
+    match name.trim().to_lowercase().as_str() {
         "least_inflight" => Ok(Box::new(LeastInflightPolicy)),
         "weighted_round_robin" => Ok(Box::new(WeightedRoundRobinPolicy::new())),
         "model_affinity" => Ok(Box::new(ModelAffinityPolicy::new())),
@@ -808,6 +808,12 @@ mod tests {
         assert!(policy_from_str("model_affinity").is_ok());
         assert!(policy_from_str("token_cost").is_ok());
         assert!(policy_from_str("cache_affinity").is_ok());
+    }
+
+    #[test]
+    fn policy_from_str_normalizes_operator_input() {
+        assert!(policy_from_str(" TOKEN_COST ").is_ok());
+        assert!(policy_from_str("Cache_Affinity").is_ok());
     }
 
     #[test]

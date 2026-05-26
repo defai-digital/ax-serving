@@ -129,7 +129,7 @@ impl SchedulerConfig {
             max_inflight: max_inflight.max(1),
             max_queue,
             max_wait_ms,
-            overload_policy: match overload_policy.to_lowercase().as_str() {
+            overload_policy: match overload_policy.trim().to_lowercase().as_str() {
                 "shed_oldest" | "shed-oldest" => OverloadPolicy::ShedOldest,
                 "reject" => OverloadPolicy::Reject,
                 _ => OverloadPolicy::Queue,
@@ -1315,6 +1315,8 @@ mod tests {
         assert_eq!(shed.overload_policy, OverloadPolicy::ShedOldest);
         let shed2 = SchedulerConfig::from_serve_config(4, 32, 200, "shed-oldest");
         assert_eq!(shed2.overload_policy, OverloadPolicy::ShedOldest);
+        let shed3 = SchedulerConfig::from_serve_config(4, 32, 200, " Shed-Oldest ");
+        assert_eq!(shed3.overload_policy, OverloadPolicy::ShedOldest);
         let rej = SchedulerConfig::from_serve_config(4, 32, 200, "reject");
         assert_eq!(rej.overload_policy, OverloadPolicy::Reject);
         let queue = SchedulerConfig::from_serve_config(4, 32, 200, "queue");

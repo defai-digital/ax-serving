@@ -375,6 +375,35 @@ fn env_bool(name: &str) -> Result<Option<bool>> {
     }
 }
 
+fn normalize_config_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn is_valid_scheduler_overload_policy(value: &str) -> bool {
+    matches!(
+        normalize_config_token(value).as_str(),
+        "queue" | "reject" | "shed_oldest" | "shed-oldest"
+    )
+}
+
+fn is_valid_global_queue_policy(value: &str) -> bool {
+    matches!(
+        normalize_config_token(value).as_str(),
+        "queue" | "reject" | "shed_oldest" | "shed-oldest" | "shedoldest"
+    )
+}
+
+fn is_valid_dispatch_policy(value: &str) -> bool {
+    matches!(
+        normalize_config_token(value).as_str(),
+        "least_inflight"
+            | "weighted_round_robin"
+            | "model_affinity"
+            | "token_cost"
+            | "cache_affinity"
+    )
+}
+
 // ── ServeConfig methods ───────────────────────────────────────────────────────
 
 impl ServeConfig {
@@ -398,10 +427,9 @@ impl ServeConfig {
                 crate::rest::schema::MAX_MAX_TOKENS
             );
         }
-        const VALID_OVERLOAD: &[&str] = &["queue", "reject", "shed_oldest"];
-        if !VALID_OVERLOAD.contains(&self.sched_overload_policy.as_str()) {
+        if !is_valid_scheduler_overload_policy(&self.sched_overload_policy) {
             anyhow::bail!(
-                "unknown sched_overload_policy '{}'; valid: queue, reject, shed_oldest",
+                "unknown sched_overload_policy '{}'; valid: queue, reject, shed_oldest, shed-oldest",
                 self.sched_overload_policy
             );
         }
@@ -470,21 +498,13 @@ impl ServeConfig {
         if self.orchestrator.global_queue_wait_ms == 0 {
             anyhow::bail!("global_queue_wait_ms must be > 0");
         }
-        const VALID_GLOBAL_QUEUE_POLICIES: &[&str] = &["queue", "reject", "shed_oldest"];
-        if !VALID_GLOBAL_QUEUE_POLICIES.contains(&self.orchestrator.global_queue_policy.as_str()) {
+        if !is_valid_global_queue_policy(&self.orchestrator.global_queue_policy) {
             anyhow::bail!(
-                "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest",
+                "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest, shed-oldest",
                 self.orchestrator.global_queue_policy
             );
         }
-        const VALID_DISPATCH: &[&str] = &[
-            "least_inflight",
-            "weighted_round_robin",
-            "model_affinity",
-            "token_cost",
-            "cache_affinity",
-        ];
-        if !VALID_DISPATCH.contains(&self.orchestrator.dispatch_policy.as_str()) {
+        if !is_valid_dispatch_policy(&self.orchestrator.dispatch_policy) {
             anyhow::bail!(
                 "unknown dispatch_policy '{}'; valid: least_inflight, weighted_round_robin, model_affinity, token_cost, cache_affinity",
                 self.orchestrator.dispatch_policy
@@ -843,11 +863,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_trimmed_case_insensitive_overload_alias() {
+        let mut cfg = valid_cfg();
+        cfg.sched_overload_policy = " Shed-Oldest ".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn validate_rejects_unknown_dispatch_policy() {
         let mut cfg = valid_cfg();
         cfg.orchestrator.dispatch_policy = "random".into();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("dispatch_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_trimmed_case_insensitive_dispatch_policy() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.dispatch_policy = " TOKEN_COST ".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -982,6 +1016,13 @@ mod tests {
         cfg.orchestrator.global_queue_policy = "drop_newest".into();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("global_queue_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_trimmed_case_insensitive_global_queue_alias() {
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.global_queue_policy = " Shed-Oldest ".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

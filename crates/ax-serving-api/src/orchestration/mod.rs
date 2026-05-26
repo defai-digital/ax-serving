@@ -73,12 +73,12 @@ fn is_loopback_bind_host(host: &str) -> bool {
 }
 
 fn parse_global_queue_policy(raw: &str) -> Result<OverloadPolicy> {
-    match raw.to_lowercase().as_str() {
+    match raw.trim().to_lowercase().as_str() {
         "queue" => Ok(OverloadPolicy::Queue),
         "reject" => Ok(OverloadPolicy::Reject),
-        "shed_oldest" | "shedoldest" => Ok(OverloadPolicy::ShedOldest),
+        "shed_oldest" | "shed-oldest" | "shedoldest" => Ok(OverloadPolicy::ShedOldest),
         other => anyhow::bail!(
-            "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest",
+            "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest, shed-oldest",
             other
         ),
     }
@@ -426,5 +426,22 @@ mod tests {
         };
 
         assert!(err.contains("global_queue_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn orchestrator_layer_accepts_global_queue_policy_aliases() {
+        let config = OrchestratorConfig {
+            global_queue_policy: " Shed-Oldest ".into(),
+            ..Default::default()
+        };
+
+        assert!(
+            OrchestratorLayer::new(
+                config,
+                LicenseConfig::default(),
+                ProjectPolicyConfig::default(),
+            )
+            .is_ok()
+        );
     }
 }
