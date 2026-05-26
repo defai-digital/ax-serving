@@ -451,21 +451,38 @@ impl Scheduler {
         thermal: Arc<ThermalMonitor>,
         split_enabled: bool,
     ) -> Self {
-        let adaptive = std::env::var("AXS_TARGET_P99_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(|target_ms| {
-                let probe_interval = std::env::var("AXS_ADAPTIVE_PROBE_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(50);
-                Arc::new(AdaptiveController::new(
-                    config.max_inflight,
-                    target_ms,
-                    probe_interval,
-                ))
-            });
+        let adaptive = match adaptive_from_env(&config) {
+            Ok(adaptive) => adaptive,
+            Err(err) => {
+                tracing::warn!(
+                    "invalid adaptive scheduler env ignored by infallible Scheduler::new: {err}"
+                );
+                None
+            }
+        };
+        Self::new_with_split_and_adaptive(config, thermal, split_enabled, adaptive)
+    }
+
+    fn try_new_with_split_enabled(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+    ) -> Result<Self> {
+        let adaptive = adaptive_from_env(&config)?;
+        Ok(Self::new_with_split_and_adaptive(
+            config,
+            thermal,
+            split_enabled,
+            adaptive,
+        ))
+    }
+
+    fn new_with_split_and_adaptive(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+        adaptive: Option<Arc<AdaptiveController>>,
+    ) -> Self {
         if let Some(ref a) = adaptive {
             tracing::info!(
                 target_p99_ms = a.target_p99_ms(),
@@ -500,6 +517,26 @@ impl Scheduler {
         thermal: Arc<ThermalMonitor>,
     ) -> Self {
         Self::new_with_split_enabled(
+            SchedulerConfig::from_serve_config(
+                max_inflight,
+                max_queue,
+                max_wait_ms,
+                overload_policy,
+            ),
+            thermal,
+            split_enabled,
+        )
+    }
+
+    pub fn try_from_serve_config(
+        max_inflight: usize,
+        max_queue: usize,
+        max_wait_ms: u64,
+        overload_policy: &str,
+        split_enabled: bool,
+        thermal: Arc<ThermalMonitor>,
+    ) -> Result<Self> {
+        Self::try_new_with_split_enabled(
             SchedulerConfig::from_serve_config(
                 max_inflight,
                 max_queue,
@@ -794,6 +831,38 @@ fn split_scheduler_from_env() -> bool {
         .unwrap_or(false)
 }
 
+fn adaptive_from_env(config: &SchedulerConfig) -> Result<Option<Arc<AdaptiveController>>> {
+    let Some(target_ms) = env_u64("AXS_TARGET_P99_MS")? else {
+        return Ok(None);
+    };
+    if target_ms == 0 {
+        return Ok(None);
+    }
+
+    let probe_interval = env_u64("AXS_ADAPTIVE_PROBE_INTERVAL")?.unwrap_or(50).max(1);
+    Ok(Some(Arc::new(AdaptiveController::new(
+        config.max_inflight,
+        target_ms,
+        probe_interval,
+    ))))
+}
+
+fn env_u64(name: &str) -> Result<Option<u64>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
+}
+
 struct QueueDepthGuard {
     metrics: Arc<SchedulerMetrics>,
 }
@@ -1018,7 +1087,24 @@ impl LatencyWindow {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{MutexGuard, OnceLock};
+
     use super::*;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn test_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_inflight: 4,
+            max_queue: 4,
+            max_wait_ms: 100,
+            overload_policy: OverloadPolicy::Queue,
+        }
+    }
 
     #[tokio::test]
     async fn permit_raii_decrements_inflight() {
@@ -1038,6 +1124,66 @@ mod tests {
         assert_eq!(s.metrics.inflight_count.load(Ordering::Relaxed), 1);
         drop(p2);
         assert_eq!(s.metrics.inflight_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn try_from_serve_config_rejects_malformed_adaptive_target_env() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "soon") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+
+        let err = match Scheduler::try_from_serve_config(
+            4,
+            4,
+            100,
+            "queue",
+            false,
+            Arc::new(ThermalMonitor::new()),
+        ) {
+            Ok(_) => panic!("malformed adaptive target should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        assert!(err.contains("AXS_TARGET_P99_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_from_serve_config_rejects_malformed_adaptive_probe_env() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "250") };
+        unsafe { std::env::set_var("AXS_ADAPTIVE_PROBE_INTERVAL", "often") };
+
+        let err = match Scheduler::try_new_with_split_enabled(
+            test_config(),
+            Arc::new(ThermalMonitor::new()),
+            false,
+        ) {
+            Ok(_) => panic!("malformed adaptive probe interval should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+        assert!(err.contains("AXS_ADAPTIVE_PROBE_INTERVAL"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_probe_interval_env_clamps_zero_to_one() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "250") };
+        unsafe { std::env::set_var("AXS_ADAPTIVE_PROBE_INTERVAL", "0") };
+
+        let scheduler = Scheduler::try_new_with_split_enabled(
+            test_config(),
+            Arc::new(ThermalMonitor::new()),
+            false,
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+        assert_eq!(scheduler.adaptive.unwrap().probe_interval, 1);
     }
 
     #[tokio::test]

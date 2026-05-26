@@ -89,18 +89,23 @@ pub struct ServingLayer {
 impl ServingLayer {
     pub fn new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Self {
         let registry = ModelRegistry::new(config.registry.max_loaded_models);
-        Self::from_registry(backend, config, registry)
+        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
+        let scheduler = scheduler_from_config(&config, thermal);
+        Self::from_registry(backend, config, registry, scheduler)
     }
 
     pub fn try_new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Result<Self> {
         let registry = ModelRegistry::try_new(config.registry.max_loaded_models)?;
-        Ok(Self::from_registry(backend, config, registry))
+        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
+        let scheduler = try_scheduler_from_config(&config, thermal)?;
+        Ok(Self::from_registry(backend, config, registry, scheduler))
     }
 
     fn from_registry(
         backend: Arc<dyn InferenceBackend>,
         config: ServeConfig,
         registry: ModelRegistry,
+        scheduler: Scheduler,
     ) -> Self {
         let cache = if config.cache.enabled {
             match ResponseCache::new(&config.cache) {
@@ -117,21 +122,12 @@ impl ServingLayer {
             .as_ref()
             .map(|c| c.metrics())
             .unwrap_or_else(|| Arc::new(CacheMetrics::default()));
-        // ThermalMonitor poll interval from config (or env fallback via new()).
-        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
         let cache_inflight_max_retries = config.dispatcher.cache_inflight_max_retries;
         let layer = Self {
             registry,
             metrics: Arc::new(MetricsStore::new()),
             config: Arc::new(config.clone()),
-            scheduler: Scheduler::from_serve_config(
-                config.sched_max_inflight,
-                config.sched_max_queue,
-                config.sched_max_wait_ms,
-                &config.sched_overload_policy,
-                config.split_scheduler,
-                thermal,
-            ),
+            scheduler,
             per_model_scheduler: PerModelScheduler::new(config.sched_per_model_max_inflight),
             backend,
             cache,
@@ -161,6 +157,31 @@ impl ServingLayer {
     pub fn set_public_auth_required(&self, required: bool) {
         self.public_auth_required.store(required, Ordering::Relaxed);
     }
+}
+
+fn scheduler_from_config(config: &ServeConfig, thermal: Arc<ThermalMonitor>) -> Scheduler {
+    Scheduler::from_serve_config(
+        config.sched_max_inflight,
+        config.sched_max_queue,
+        config.sched_max_wait_ms,
+        &config.sched_overload_policy,
+        config.split_scheduler,
+        thermal,
+    )
+}
+
+fn try_scheduler_from_config(
+    config: &ServeConfig,
+    thermal: Arc<ThermalMonitor>,
+) -> Result<Scheduler> {
+    Scheduler::try_from_serve_config(
+        config.sched_max_inflight,
+        config.sched_max_queue,
+        config.sched_max_wait_ms,
+        &config.sched_overload_policy,
+        config.split_scheduler,
+        thermal,
+    )
 }
 
 /// Start both REST and gRPC servers, running until shutdown signal.
