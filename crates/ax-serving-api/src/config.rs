@@ -530,6 +530,16 @@ impl ServeConfig {
                         project
                     );
                 }
+                if rule
+                    .allowed_models
+                    .iter()
+                    .any(|pattern| pattern.trim().is_empty())
+                {
+                    anyhow::bail!(
+                        "project_policy rule '{}' allowed_models entries must not be empty",
+                        project
+                    );
+                }
                 if let Some(limit) = rule.max_tokens_limit
                     && limit == 0
                 {
@@ -538,9 +548,17 @@ impl ServeConfig {
                         project
                     );
                 }
+                if let Some(worker_pool) = rule.worker_pool.as_deref()
+                    && worker_pool.trim().is_empty()
+                {
+                    anyhow::bail!(
+                        "project_policy rule '{}' worker_pool must not be empty",
+                        project
+                    );
+                }
             }
             if let Some(default_project) = self.project_policy.default_project.as_deref()
-                && !seen.contains(default_project)
+                && !seen.contains(default_project.trim())
             {
                 anyhow::bail!(
                     "project_policy.default_project '{}' must match a declared rule",
@@ -1070,6 +1088,21 @@ mod tests {
         assert!(err.contains("default_project"), "got: {err}");
     }
 
+    #[test]
+    fn validate_accepts_trimmed_default_project() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.default_project = Some(" fabric ".into());
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec!["*".into()],
+            max_tokens_limit: None,
+            worker_pool: Some(" blue ".into()),
+        }];
+
+        assert!(cfg.validate().is_ok());
+    }
+
     // ── apply_env_overrides ────────────────────────────────────────────────────
     // Env var mutations are process-global and `unsafe` in edition 2024.
     // Serialize all env-mutating tests through the crate-level lock to avoid
@@ -1490,6 +1523,34 @@ mod tests {
         }];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("allowed model"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_project_policy_empty_allowed_model_pattern() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec!["   ".into()],
+            max_tokens_limit: None,
+            worker_pool: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("allowed_models"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_project_policy_empty_worker_pool() {
+        let mut cfg = valid_cfg();
+        cfg.project_policy.enabled = true;
+        cfg.project_policy.rules = vec![ProjectRuleConfig {
+            project: "fabric".into(),
+            allowed_models: vec!["*".into()],
+            max_tokens_limit: None,
+            worker_pool: Some("   ".into()),
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("worker_pool"), "got: {err}");
     }
 
     #[test]
