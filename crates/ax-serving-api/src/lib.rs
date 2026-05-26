@@ -129,6 +129,7 @@ impl ServingLayer {
                 config.sched_max_queue,
                 config.sched_max_wait_ms,
                 &config.sched_overload_policy,
+                config.split_scheduler,
                 thermal,
             ),
             per_model_scheduler: PerModelScheduler::new(config.sched_per_model_max_inflight),

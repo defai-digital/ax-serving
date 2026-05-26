@@ -442,6 +442,15 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig, thermal: Arc<ThermalMonitor>) -> Self {
+        let split_enabled = split_scheduler_from_env();
+        Self::new_with_split_enabled(config, thermal, split_enabled)
+    }
+
+    fn new_with_split_enabled(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+    ) -> Self {
         let adaptive = std::env::var("AXS_TARGET_P99_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -470,9 +479,6 @@ impl Scheduler {
                  the oldest waiting request will be evicted (503) to make room for the new one."
             );
         }
-        let split_enabled = std::env::var("AXS_SPLIT_SCHEDULER")
-            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
         let semaphore = Arc::new(Semaphore::new(config.max_inflight));
         Self {
             config,
@@ -490,9 +496,10 @@ impl Scheduler {
         max_queue: usize,
         max_wait_ms: u64,
         overload_policy: &str,
+        split_enabled: bool,
         thermal: Arc<ThermalMonitor>,
     ) -> Self {
-        Self::new(
+        Self::new_with_split_enabled(
             SchedulerConfig::from_serve_config(
                 max_inflight,
                 max_queue,
@@ -500,6 +507,7 @@ impl Scheduler {
                 overload_policy,
             ),
             thermal,
+            split_enabled,
         )
     }
 
@@ -778,6 +786,12 @@ impl Scheduler {
         let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
         waiters.retain(|tx| !tx.is_closed());
     }
+}
+
+fn split_scheduler_from_env() -> bool {
+    std::env::var("AXS_SPLIT_SCHEDULER")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
 }
 
 struct QueueDepthGuard {
@@ -1169,6 +1183,35 @@ mod tests {
     fn scheduler_config_enforces_min_inflight() {
         let cfg = SchedulerConfig::from_serve_config(0, 32, 200, "queue");
         assert_eq!(cfg.max_inflight, 1, "min inflight should be 1");
+    }
+
+    #[test]
+    fn scheduler_from_serve_config_uses_loaded_split_scheduler_setting() {
+        let enabled = Scheduler::from_serve_config(
+            4,
+            32,
+            200,
+            "queue",
+            true,
+            Arc::new(ThermalMonitor::new()),
+        );
+        assert!(
+            enabled.split_enabled,
+            "config-file split_scheduler=true should enable split tracking"
+        );
+
+        let disabled = Scheduler::from_serve_config(
+            4,
+            32,
+            200,
+            "queue",
+            false,
+            Arc::new(ThermalMonitor::new()),
+        );
+        assert!(
+            !disabled.split_enabled,
+            "config-file split_scheduler=false should disable split tracking"
+        );
     }
 
     #[test]
