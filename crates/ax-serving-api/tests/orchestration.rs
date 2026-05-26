@@ -2421,6 +2421,83 @@ async fn test_proxy_embeddings_does_not_route_to_legacy_llm_only_worker() {
 }
 
 #[tokio::test]
+async fn test_proxy_chat_with_image_routes_to_vision_worker() {
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let text_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"text-only"}}]}"#).await
+    );
+    let vision_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"vision"}}]}"#).await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: text_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["vision-route-model".into()],
+                max_context: None,
+            }),
+            supported_operations: vec!["llm".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: vision_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: true,
+                models: vec!["vision-route-model".into()],
+                max_context: None,
+            }),
+            supported_operations: vec!["llm".into(), "vision".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "vision-route-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "vision");
+}
+
+#[tokio::test]
 async fn test_proxy_embeddings_routes_by_input_context() {
     let layer = Arc::new(
         OrchestratorLayer::new(

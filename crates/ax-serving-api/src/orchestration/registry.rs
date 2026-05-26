@@ -218,6 +218,7 @@ enum CapabilitySource {
 pub enum RequestKind {
     Llm,
     Embedding,
+    Vision,
 }
 
 // ── WorkerHealth ──────────────────────────────────────────────────────────────
@@ -1484,6 +1485,7 @@ fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool
         CapabilitySource::Structured => match request_kind {
             RequestKind::Llm => entry.capabilities.llm,
             RequestKind::Embedding => entry.capabilities.embedding,
+            RequestKind::Vision => entry.capabilities.vision,
         },
     }
 }
@@ -1493,6 +1495,7 @@ impl RequestKind {
         match self {
             Self::Llm => "llm",
             Self::Embedding => "embedding",
+            Self::Vision => "vision",
         }
     }
 }
@@ -1792,6 +1795,56 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn vision_requests_require_vision_operation() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["vision-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["llm".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: true,
+                    models: vec!["vision-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["llm".into(), "vision".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_for("vision-model", RequestKind::Llm)
+                .len(),
+            2
+        );
+        let vision_workers = r.eligible_workers_for("vision-model", RequestKind::Vision);
+        assert_eq!(vision_workers.len(), 1);
+        assert_eq!(vision_workers[0].addr.to_string(), "127.0.0.1:8082");
     }
 
     #[test]

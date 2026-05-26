@@ -19,7 +19,7 @@ use super::queue::AcquireResult;
 use super::registry::{BackendKind, RequestKind, RuntimeKind};
 use crate::auth::RequestId;
 use crate::project_policy;
-use crate::rest::schema::{EmbeddingsInput, InputMessage, MAX_MODEL_ID_BYTES};
+use crate::rest::schema::{EmbeddingsInput, InputMessage, MAX_MODEL_ID_BYTES, MessageContent};
 use crate::utils::request_meta::{
     audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u32,
     estimate_embedding_input_max_tokens_u32, estimate_text_prompt_tokens_u32,
@@ -85,6 +85,11 @@ async fn proxy_inference(
     };
     let stream = meta.stream;
     let max_tokens = meta.max_tokens;
+    let request_kind = match worker_path {
+        "/v1/embeddings" => RequestKind::Embedding,
+        _ if request_has_images(&meta.messages) => RequestKind::Vision,
+        _ => RequestKind::Llm,
+    };
     let min_context = if worker_path == "/v1/embeddings" {
         meta.input
             .as_ref()
@@ -166,10 +171,7 @@ async fn proxy_inference(
             &layer.registry,
             layer.policy.as_ref(),
             &model_id,
-            match worker_path {
-                "/v1/embeddings" => RequestKind::Embedding,
-                _ => RequestKind::Llm,
-            },
+            request_kind,
             backend_hint.as_deref(),
             min_context,
             stream,
@@ -222,6 +224,12 @@ async fn proxy_inference(
         drop(permit);
         resp
     }
+}
+
+fn request_has_images(messages: &[InputMessage]) -> bool {
+    messages
+        .iter()
+        .any(|msg| msg.content.as_ref().is_some_and(MessageContent::has_images))
 }
 
 fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode, String)> {
