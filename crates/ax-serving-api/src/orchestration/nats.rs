@@ -321,6 +321,24 @@ fn build_complete_nats_response(request_id: &str, resp: NatsResponse) -> Respons
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+fn build_non_streaming_nats_response(
+    request_id: &str,
+    resp: NatsResponse,
+    reroute_total: &Arc<AtomicU64>,
+) -> Response {
+    let status = nats_status(resp.status);
+
+    if let Some(err) = resp.error.as_deref() {
+        warn!(%request_id, %err, "NATS: worker returned error");
+    }
+
+    if status.is_server_error() {
+        reroute_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    build_complete_nats_response(request_id, resp)
+}
+
 fn stream_frames_from_nats_response(
     request_id: &str,
     resp: NatsResponse,
@@ -630,48 +648,7 @@ impl NatsDispatcher {
                     return (StatusCode::BAD_GATEWAY, "NATS: response ID mismatch").into_response();
                 }
 
-                if let Some(err) = resp.error {
-                    warn!(%request_id, %err, "NATS: worker returned error");
-                    self.reroute_total.fetch_add(1, Ordering::Relaxed);
-                    return (StatusCode::BAD_GATEWAY, err).into_response();
-                }
-
-                let status =
-                    StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                if status.is_server_error() {
-                    self.reroute_total.fetch_add(1, Ordering::Relaxed);
-                }
-
-                let body_bytes = match decode_body_hex_limited(
-                    resp.data_hex.as_deref(),
-                    MAX_NATS_RESPONSE_BODY_BYTES,
-                ) {
-                    Ok(body) => body,
-                    Err(NatsBodyDecodeError::InvalidHex(e)) => {
-                        error!(%request_id, %e, "NATS: failed to decode response body hex");
-                        return (StatusCode::BAD_GATEWAY, "NATS: bad response body encoding")
-                            .into_response();
-                    }
-                    Err(NatsBodyDecodeError::TooLarge) => {
-                        error!(
-                            %request_id,
-                            limit = MAX_NATS_RESPONSE_BODY_BYTES,
-                            "NATS: response body exceeded size limit"
-                        );
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            "NATS response body exceeded size limit",
-                        )
-                            .into_response();
-                    }
-                };
-
-                axum::response::Response::builder()
-                    .status(status)
-                    .header("content-type", resp.content_type)
-                    .body(Body::from(body_bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                build_non_streaming_nats_response(request_id, resp, &self.reroute_total)
             }
         }
     }
@@ -763,8 +740,8 @@ mod tests {
 
     use super::{
         NatsBodyDecodeError, NatsConfig, NatsRequest, NatsResponse, build_complete_nats_response,
-        decode_body_hex_limited, decode_stream_body_hex_limited, is_event_stream,
-        relay_streaming_nats_responses, sanitize_subject_component,
+        build_non_streaming_nats_response, decode_body_hex_limited, decode_stream_body_hex_limited,
+        is_event_stream, relay_streaming_nats_responses, sanitize_subject_component,
         stream_frames_from_nats_response,
     };
 
@@ -939,6 +916,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], br#"{"error":"bad request"}"#);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_error_response_preserves_worker_status() {
+        let reroutes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let resp =
+            NatsResponse::error_response("req-1".to_string(), 400, "bad request".to_string());
+
+        let response = build_non_streaming_nats_response("req-1", resp, &reroutes);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(reroutes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "bad request");
     }
 
     #[test]
