@@ -235,7 +235,7 @@ fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeC
 
     (
         "environment/defaults".to_string(),
-        Ok(ServeConfig::from_env()),
+        ServeConfig::try_from_env(),
     )
 }
 

@@ -170,53 +170,49 @@ impl Default for LlamaCppConfig {
 impl LlamaCppConfig {
     /// Apply `AXS_*` env var overrides on top of YAML-loaded values.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_TOKEN_BATCH")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Err(err) = self.try_apply_env_overrides() {
+            tracing::warn!(
+                "invalid env override ignored by infallible LlamaCppConfig::apply_env_overrides: {err}"
+            );
+        }
+    }
+
+    /// Apply `AXS_*` env var overrides, returning an error for malformed values.
+    pub fn try_apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(n) = env_parse::<usize>("AXS_LLAMACPP_TOKEN_BATCH")? {
             self.token_batch_size = n.clamp(1, self.token_batch_max);
         }
-        if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_CB_TRIP_THRESHOLD")? {
             self.circuit_breaker_trip_threshold = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_CB_RECOVERY_MS")? {
             self.circuit_breaker_recovery_ms = ms.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_CACHE_PROMPT") {
-            self.cache_prompt = v != "0" && v.to_lowercase() != "false";
+        if let Some(enabled) = env_bool("AXS_LLAMACPP_CACHE_PROMPT")? {
+            self.cache_prompt = enabled;
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_THREADS")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_THREADS")? {
             self.n_threads = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_FLASH_ATTN") {
-            self.flash_attn = v != "0" && v.to_lowercase() != "false";
+        if let Some(enabled) = env_bool("AXS_LLAMACPP_FLASH_ATTN")? {
+            self.flash_attn = enabled;
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_KV_TYPE") {
             self.kv_cache_type = Some(v);
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_N_BATCH")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_N_BATCH")? {
             self.n_batch = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_N_UBATCH")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_N_UBATCH")? {
             self.n_ubatch = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_PARALLEL")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_PARALLEL")? {
             self.n_parallel = n.max(1);
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_MMPROJ") {
             self.mmproj_path = Some(v);
         }
+        Ok(())
     }
 
     /// Create from env vars only (no YAML), using struct defaults as the base.
@@ -226,9 +222,46 @@ impl LlamaCppConfig {
         cfg
     }
 
+    /// Create from env vars only, returning an error for malformed overrides.
+    pub fn try_from_env() -> Result<Self> {
+        let mut cfg = Self::default();
+        cfg.try_apply_env_overrides()?;
+        Ok(cfg)
+    }
+
     /// Effective batch size, clamped to `[1, token_batch_max]`.
     pub fn effective_batch_size(&self) -> usize {
         self.token_batch_size.clamp(1, self.token_batch_max)
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(Some(true)),
+        "false" | "0" | "no" => Ok(Some(false)),
+        "" => anyhow::bail!("{name} must not be empty"),
+        _ => anyhow::bail!("invalid {name}: {raw:?}"),
     }
 }
 
@@ -2674,5 +2707,27 @@ mod tests {
         unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
         unsafe { std::env::remove_var("AXS_LLAMACPP_N_BATCH") };
         unsafe { std::env::remove_var("AXS_LLAMACPP_N_UBATCH") };
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "many") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
+        assert!(err.contains("AXS_LLAMACPP_THREADS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_bools() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_FLASH_ATTN", "sometimes") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_FLASH_ATTN") };
+        assert!(err.contains("AXS_LLAMACPP_FLASH_ATTN"), "got: {err}");
     }
 }

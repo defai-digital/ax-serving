@@ -483,8 +483,8 @@ impl RouterBackend {
     pub fn try_from_env() -> Result<Self> {
         Ok(Self::new(
             RoutingConfig::try_load_default()?,
-            LlamaCppConfig::from_env(),
-            MlxConfig::from_env(),
+            LlamaCppConfig::try_from_env()?,
+            MlxConfig::try_from_env()?,
         ))
     }
 

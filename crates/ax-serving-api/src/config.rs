@@ -328,21 +328,39 @@ pub struct ProjectRuleConfig {
 // ── Env-var parsing helpers ──────────────────────────────────────────────────
 
 /// Read an env var as a string, returning None if unset.
-fn env_str(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+fn env_str(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("invalid {name}")),
+    }
 }
 
 /// Read an env var and parse it as type T.
-fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok()?.parse().ok()
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    let Some(raw) = env_str(name)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
 }
 
 /// Read an env var as a boolean.
-fn env_bool(name: &str) -> Option<bool> {
-    match std::env::var(name).ok()?.trim().to_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Some(raw) = env_str(name)? else {
+        return Ok(None);
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(Some(true)),
+        "false" | "0" | "no" => Ok(Some(false)),
+        "" => anyhow::bail!("{name} must not be empty"),
+        _ => anyhow::bail!("invalid {name}: {raw:?}"),
     }
 }
 
@@ -530,177 +548,194 @@ impl ServeConfig {
             _ => toml::from_str::<Self>(&text)
                 .with_context(|| format!("parsing toml config {}", path.display()))?,
         };
-        cfg.apply_env_overrides();
+        cfg.try_apply_env_overrides()?;
         Ok(cfg)
     }
 
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        cfg.apply_env_overrides();
+        if let Err(err) = cfg.try_apply_env_overrides() {
+            tracing::warn!(
+                "invalid env override ignored by infallible ServeConfig::from_env: {err}"
+            );
+        }
         cfg
     }
 
+    pub fn try_from_env() -> Result<Self> {
+        let mut cfg = Self::default();
+        cfg.try_apply_env_overrides()?;
+        Ok(cfg)
+    }
+
     pub fn apply_env_overrides(&mut self) {
+        if let Err(err) = self.try_apply_env_overrides() {
+            tracing::warn!("invalid env override ignored by infallible apply_env_overrides: {err}");
+        }
+    }
+
+    pub fn try_apply_env_overrides(&mut self) -> Result<()> {
         // ── REST / gRPC ───────────────────────────────────────────────────────
-        if let Some(port) = env_parse::<u16>("AXS_REST_PORT") {
+        if let Some(port) = env_parse::<u16>("AXS_REST_PORT")? {
             self.rest_addr = format!("{DEFAULT_BIND_HOST}:{port}");
         }
         if let Ok(v) = std::env::var("AXS_REST_HOST") {
             let port = self.rest_addr.rsplit(':').next().unwrap_or("18080");
             self.rest_addr = format!("{v}:{port}");
         }
-        if let Some(v) = env_str("AXS_GRPC_SOCKET") {
+        if let Some(v) = env_str("AXS_GRPC_SOCKET")? {
             self.grpc_socket = v;
         }
-        if let Some(v) = env_str("AXS_GRPC_HOST") {
+        if let Some(v) = env_str("AXS_GRPC_HOST")? {
             self.grpc_host = v;
         }
-        if let Some(port) = env_parse::<u16>("AXS_GRPC_PORT") {
+        if let Some(port) = env_parse::<u16>("AXS_GRPC_PORT")? {
             self.grpc_port = Some(port);
         }
 
         // ── Scheduler ─────────────────────────────────────────────────────────
-        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_INFLIGHT") {
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_INFLIGHT")? {
             self.sched_max_inflight = n.max(1);
         }
-        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_QUEUE") {
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_QUEUE")? {
             self.sched_max_queue = n.max(1);
         }
-        if let Some(ms) = env_parse::<u64>("AXS_SCHED_MAX_WAIT_MS") {
+        if let Some(ms) = env_parse::<u64>("AXS_SCHED_MAX_WAIT_MS")? {
             self.sched_max_wait_ms = ms.max(1);
         }
-        if let Some(v) = env_str("AXS_OVERLOAD_POLICY") {
+        if let Some(v) = env_str("AXS_OVERLOAD_POLICY")? {
             self.sched_overload_policy = v;
         }
-        if let Some(n) = env_parse::<u32>("AXS_DEFAULT_MAX_TOKENS") {
+        if let Some(n) = env_parse::<u32>("AXS_DEFAULT_MAX_TOKENS")? {
             self.default_max_tokens = n;
         }
-        if let Some(n) = env_parse::<usize>("AXS_PER_MODEL_MAX_INFLIGHT") {
+        if let Some(n) = env_parse::<usize>("AXS_PER_MODEL_MAX_INFLIGHT")? {
             self.sched_per_model_max_inflight = n.max(1);
         }
-        if let Some(b) = env_bool("AXS_SPLIT_SCHEDULER") {
+        if let Some(b) = env_bool("AXS_SPLIT_SCHEDULER")? {
             self.split_scheduler = b;
         }
-        if let Some(n) = env_parse::<u64>("AXS_SCHED_MAX_PREFILL_TOKENS") {
+        if let Some(n) = env_parse::<u64>("AXS_SCHED_MAX_PREFILL_TOKENS")? {
             self.sched_max_prefill_tokens = n;
         }
-        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_DECODE_SEQUENCES") {
+        if let Some(n) = env_parse::<usize>("AXS_SCHED_MAX_DECODE_SEQUENCES")? {
             self.sched_max_decode_sequences = n;
         }
 
         // ── Idle eviction & thermal ───────────────────────────────────────────
-        if let Some(n) = env_parse::<u64>("AXS_IDLE_TIMEOUT_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_IDLE_TIMEOUT_SECS")? {
             self.idle_timeout_secs = n;
         }
-        if let Some(n) = env_parse::<u64>("AXS_THERMAL_POLL_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_THERMAL_POLL_SECS")? {
             self.thermal_poll_secs = n.max(1);
         }
 
         // ── Cache ─────────────────────────────────────────────────────────────
-        if let Some(enabled) = env_bool("AXS_CACHE_ENABLED") {
+        if let Some(enabled) = env_bool("AXS_CACHE_ENABLED")? {
             self.cache.enabled = enabled;
         }
-        if let Some(v) = env_str("AXS_CACHE_URL") {
+        if let Some(v) = env_str("AXS_CACHE_URL")? {
             self.cache.url = v;
         }
-        if let Some(v) = env_str("AXS_CACHE_KEY_PREFIX") {
+        if let Some(v) = env_str("AXS_CACHE_KEY_PREFIX")? {
             self.cache.key_prefix = v;
         }
-        if let Some(v) = env_str("AXS_CACHE_DEFAULT_TTL") {
+        if let Some(v) = env_str("AXS_CACHE_DEFAULT_TTL")? {
             self.cache.default_ttl = v;
         }
-        if let Some(v) = env_str("AXS_CACHE_MAX_TTL") {
+        if let Some(v) = env_str("AXS_CACHE_MAX_TTL")? {
             self.cache.max_ttl = v;
         }
 
         // ── Registry ─────────────────────────────────────────────────────────
-        if let Some(n) = env_parse::<usize>("AXS_MAX_LOADED_MODELS") {
+        if let Some(n) = env_parse::<usize>("AXS_MAX_LOADED_MODELS")? {
             self.registry.max_loaded_models = n.max(1);
         }
-        if let Some(n) = env_parse::<u64>("AXS_IDLE_CHECK_INTERVAL_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_IDLE_CHECK_INTERVAL_SECS")? {
             self.registry.idle_check_interval_secs = n.max(1);
         }
 
         // ── Dispatcher ───────────────────────────────────────────────────────
-        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE") {
+        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE")? {
             self.dispatcher.pool_max_idle_per_host = n.max(1);
         }
-        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS")? {
             self.dispatcher.request_timeout_secs = n.max(1);
         }
-        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS")? {
             self.dispatcher.retry_after_secs = n;
         }
-        if let Some(n) = env_parse::<usize>("AXS_CACHE_INFLIGHT_MAX_RETRIES") {
+        if let Some(n) = env_parse::<usize>("AXS_CACHE_INFLIGHT_MAX_RETRIES")? {
             self.dispatcher.cache_inflight_max_retries = n.max(1);
         }
 
         // ── LlamaCpp ─────────────────────────────────────────────────────────
-        self.llamacpp.apply_env_overrides();
+        self.llamacpp.try_apply_env_overrides()?;
 
         // ── MLX ───────────────────────────────────────────────────────────────
-        self.mlx.apply_env_overrides();
+        self.mlx.try_apply_env_overrides()?;
 
         // ── Orchestrator ──────────────────────────────────────────────────────
-        if let Some(v) = env_str("AXS_ORCHESTRATOR_HOST") {
+        if let Some(v) = env_str("AXS_ORCHESTRATOR_HOST")? {
             self.orchestrator.host = v;
         }
-        if let Some(p) = env_parse::<u16>("AXS_ORCHESTRATOR_PORT") {
+        if let Some(p) = env_parse::<u16>("AXS_ORCHESTRATOR_PORT")? {
             self.orchestrator.port = p;
         }
-        if let Some(p) = env_parse::<u16>("AXS_INTERNAL_PORT") {
+        if let Some(p) = env_parse::<u16>("AXS_INTERNAL_PORT")? {
             self.orchestrator.internal_port = p;
         }
-        if let Some(v) = env_str("AXS_INTERNAL_BIND_ADDR") {
+        if let Some(v) = env_str("AXS_INTERNAL_BIND_ADDR")? {
             self.orchestrator.internal_bind_addr = v;
         }
-        if let Some(v) = env_str("AXS_ALLOWED_NODE_CIDRS") {
+        if let Some(v) = env_str("AXS_ALLOWED_NODE_CIDRS")? {
             self.orchestrator.allowed_node_cidrs = v;
         }
-        if let Some(ms) = env_parse::<u64>("AXS_WORKER_HEARTBEAT_MS") {
+        if let Some(ms) = env_parse::<u64>("AXS_WORKER_HEARTBEAT_MS")? {
             self.orchestrator.worker_heartbeat_ms = ms.max(MIN_WORKER_HEARTBEAT_MS);
         }
-        if let Some(ms) = env_parse::<u64>("AXS_WORKER_TTL_MS") {
+        if let Some(ms) = env_parse::<u64>("AXS_WORKER_TTL_MS")? {
             self.orchestrator.worker_ttl_ms = ms.max(MIN_WORKER_TTL_MS);
         }
-        if let Some(v) = env_str("AXS_DISPATCH_POLICY") {
+        if let Some(v) = env_str("AXS_DISPATCH_POLICY")? {
             self.orchestrator.dispatch_policy = v;
         }
-        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_MAX") {
+        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_MAX")? {
             self.orchestrator.global_queue_max = n.max(1);
         }
-        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_DEPTH") {
+        if let Some(n) = env_parse::<usize>("AXS_GLOBAL_QUEUE_DEPTH")? {
             self.orchestrator.global_queue_depth = n;
         }
-        if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS") {
+        if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS")? {
             self.orchestrator.global_queue_wait_ms = ms.max(1);
         }
-        if let Some(v) = env_str("AXS_GLOBAL_QUEUE_POLICY") {
+        if let Some(v) = env_str("AXS_GLOBAL_QUEUE_POLICY")? {
             self.orchestrator.global_queue_policy = v;
         }
-        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_RETRY_AFTER_SECS")? {
             self.orchestrator.retry_after_secs = n;
         }
-        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE") {
+        if let Some(n) = env_parse::<usize>("AXS_DISPATCHER_POOL_MAX_IDLE")? {
             self.orchestrator.pool_max_idle_per_host = n.max(1);
         }
-        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS") {
+        if let Some(n) = env_parse::<u64>("AXS_DISPATCHER_TIMEOUT_SECS")? {
             self.orchestrator.request_timeout_secs = n.max(1);
         }
 
         // ── License / dashboard ───────────────────────────────────────────────
-        if let Some(v) = env_str("AXS_LICENSE_BUY_LINK") {
+        if let Some(v) = env_str("AXS_LICENSE_BUY_LINK")? {
             self.license.buy_link = v;
         }
-        if let Some(v) = env_str("AXS_LICENSE_CONFIG_DIR") {
+        if let Some(v) = env_str("AXS_LICENSE_CONFIG_DIR")? {
             self.license.config_dir = v;
         }
-        if let Some(v) = env_str("AXS_LICENSE_KEY_FILE") {
+        if let Some(v) = env_str("AXS_LICENSE_KEY_FILE")? {
             self.license.key_file = v;
         }
-        if let Some(ms) = env_parse::<u64>("AXS_DASHBOARD_POLL_MS") {
+        if let Some(ms) = env_parse::<u64>("AXS_DASHBOARD_POLL_MS")? {
             self.license.dashboard_poll_ms = ms.max(MIN_DASHBOARD_POLL_MS);
         }
+        Ok(())
     }
 
     /// Load from the default config file path, falling back to env-only defaults
@@ -739,7 +774,7 @@ impl ServeConfig {
             }
         }
 
-        Ok(Self::from_env())
+        Self::try_from_env()
     }
 }
 
@@ -1134,6 +1169,33 @@ mod tests {
         cfg.apply_env_overrides();
         unsafe { std::env::remove_var("AXS_SCHED_MAX_QUEUE") };
         assert_eq!(cfg.sched_max_queue, ServeConfig::default().sched_max_queue);
+    }
+
+    #[test]
+    fn try_from_env_rejects_invalid_numeric_override() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_SCHED_MAX_QUEUE", "not_a_number") };
+        let err = ServeConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_SCHED_MAX_QUEUE") };
+        assert!(err.contains("AXS_SCHED_MAX_QUEUE"), "got: {err}");
+    }
+
+    #[test]
+    fn try_from_env_rejects_invalid_bool_override() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_SPLIT_SCHEDULER", "not_bool") };
+        let err = ServeConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_SPLIT_SCHEDULER") };
+        assert!(err.contains("AXS_SPLIT_SCHEDULER"), "got: {err}");
+    }
+
+    #[test]
+    fn try_from_env_rejects_invalid_backend_override() {
+        let _g = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "many") };
+        let err = ServeConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
+        assert!(err.contains("AXS_LLAMACPP_THREADS"), "got: {err}");
     }
 
     // ── ServeConfig::load_default ──────────────────────────────────────────────

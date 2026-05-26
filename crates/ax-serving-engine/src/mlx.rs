@@ -129,30 +129,32 @@ impl Default for MlxConfig {
 impl MlxConfig {
     /// Apply `AXS_MLX_*` env var overrides.
     pub fn apply_env_overrides(&mut self) {
+        if let Err(err) = self.try_apply_env_overrides() {
+            tracing::warn!(
+                "invalid env override ignored by infallible MlxConfig::apply_env_overrides: {err}"
+            );
+        }
+    }
+
+    /// Apply `AXS_MLX_*` env var overrides, returning an error for malformed values.
+    pub fn try_apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(v) = std::env::var("AXS_MLX_BIN") {
             self.bin = v;
         }
-        if let Ok(v) = std::env::var("AXS_MLX_TOKEN_BATCH")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_MLX_TOKEN_BATCH")? {
             self.token_batch_size = n.clamp(1, self.token_batch_max);
         }
-        if let Ok(v) = std::env::var("AXS_MLX_DECODE_CONCURRENCY")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_MLX_DECODE_CONCURRENCY")? {
             self.decode_concurrency = Some(n.max(1));
         }
         // Circuit breaker — shared env vars with LlamaCppBackend.
-        if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_CB_TRIP_THRESHOLD")? {
             self.circuit_breaker_trip_threshold = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_CB_RECOVERY_MS")? {
             self.circuit_breaker_recovery_ms = ms.max(1);
         }
+        Ok(())
     }
 
     /// Create from env vars only (no YAML), using struct defaults as base.
@@ -162,9 +164,32 @@ impl MlxConfig {
         cfg
     }
 
+    /// Create from env vars only, returning an error for malformed overrides.
+    pub fn try_from_env() -> Result<Self> {
+        let mut cfg = Self::default();
+        cfg.try_apply_env_overrides()?;
+        Ok(cfg)
+    }
+
     pub fn effective_batch_size(&self) -> usize {
         self.token_batch_size.clamp(1, self.token_batch_max)
     }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
 }
 
 // ── Model detection ────────────────────────────────────────────────────────────
@@ -1594,6 +1619,17 @@ mod tests {
 
         unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
         unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_MLX_DECODE_CONCURRENCY", "many") };
+
+        let err = MlxConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_MLX_DECODE_CONCURRENCY") };
+        assert!(err.contains("AXS_MLX_DECODE_CONCURRENCY"), "got: {err}");
     }
 
     #[test]
