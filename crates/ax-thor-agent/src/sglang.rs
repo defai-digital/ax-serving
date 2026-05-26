@@ -118,15 +118,27 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
 fn string_alias(entry: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         entry.get(*key).and_then(|value| {
-            value.as_str().map(str::to_string).or_else(|| {
-                value
-                    .as_object()
-                    .and_then(|obj| obj.get("type").or_else(|| obj.get("name")))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
+            value
+                .as_str()
+                .and_then(trimmed_non_empty_string)
+                .or_else(|| {
+                    value
+                        .as_object()
+                        .and_then(|obj| obj.get("type").or_else(|| obj.get("name")))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(trimmed_non_empty_string)
+                })
         })
     })
+}
+
+fn trimmed_non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn string_array_alias(entry: &serde_json::Value, keys: &[&str]) -> Vec<String> {
@@ -137,11 +149,27 @@ fn string_array_alias(entry: &serde_json::Value, keys: &[&str]) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(serde_json::Value::as_str)
-        .map(str::to_string)
+        .filter_map(trimmed_non_empty_string)
         .collect::<Vec<_>>();
     values.sort();
     values.dedup();
     values
+}
+
+fn normalized_metadata_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn normalize_operation_token(value: &str) -> Option<String> {
+    let normalized = normalized_metadata_token(value);
+    let operation = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(operation.to_string())
 }
 
 fn operations_from_model_entry<'a>(
@@ -156,7 +184,10 @@ fn operations_from_model_entry<'a>(
             "tasks",
             "capabilities",
         ],
-    );
+    )
+    .into_iter()
+    .filter_map(|operation| normalize_operation_token(&operation))
+    .collect::<Vec<_>>();
     if entry
         .get("embedding")
         .or_else(|| entry.get("supports_embeddings"))
@@ -174,7 +205,7 @@ fn operations_from_model_entry<'a>(
         operations.push("vision".to_string());
     }
     for modality in modalities {
-        match modality {
+        match normalized_metadata_token(modality).as_str() {
             "embedding" | "embeddings" => operations.push("embedding".to_string()),
             "vision" | "image" | "multimodal" => operations.push("vision".to_string()),
             "text" | "llm" | "chat" | "completion" => operations.push("llm".to_string()),
@@ -1050,6 +1081,40 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(models[0].supported_operations, vec!["llm", "vision"]);
         assert_eq!(models[1].quantization.as_deref(), Some("int8"));
         assert_eq!(models[1].artifact_format.as_deref(), Some("gguf"));
+        assert_eq!(models[1].supported_operations, vec!["embedding"]);
+    }
+
+    #[test]
+    fn normalizes_runtime_model_inventory_metadata_strings() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "mixed",
+                    "quantization_config": {"name": " AWQ "},
+                    "model_format": " safetensors ",
+                    "modalities": [" Text ", "Vision", "", "vision"]
+                },
+                {
+                    "id": "embed",
+                    "quantization": "   ",
+                    "capabilities": [" Embeddings "]
+                }
+            ]
+        }));
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].quantization.as_deref(), Some("AWQ"));
+        assert_eq!(models[0].artifact_format.as_deref(), Some("safetensors"));
+        assert_eq!(
+            models[0].modalities,
+            vec![
+                "Text".to_string(),
+                "Vision".to_string(),
+                "vision".to_string()
+            ]
+        );
+        assert_eq!(models[0].supported_operations, vec!["llm", "vision"]);
+        assert_eq!(models[1].quantization, None);
         assert_eq!(models[1].supported_operations, vec!["embedding"]);
     }
 
