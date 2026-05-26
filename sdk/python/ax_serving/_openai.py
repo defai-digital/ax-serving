@@ -21,42 +21,70 @@ _GRPC_GENERATION_KEYS = {
 class _CompletionChunk:
     """Minimal OpenAI ChatCompletionChunk-compatible object."""
 
-    def __init__(self, text: str, model: str, finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        text: str | None,
+        model: str,
+        finish_reason: str | None = None,
+        tool_calls: Any | None = None,
+    ) -> None:
         self.model = model
-        self.choices = [_ChunkChoice(text, finish_reason)]
+        self.choices = [_ChunkChoice(text, finish_reason, tool_calls)]
 
 
 class _ChunkChoice:
-    def __init__(self, text: str, finish_reason: str | None) -> None:
-        self.delta = _Delta(text)
+    def __init__(
+        self,
+        text: str | None,
+        finish_reason: str | None,
+        tool_calls: Any | None = None,
+    ) -> None:
+        self.delta = _Delta(text, tool_calls)
         self.finish_reason = finish_reason
 
 
 class _Delta:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str | None, tool_calls: Any | None = None) -> None:
         self.content = content
         self.role = "assistant"
+        if tool_calls is not None:
+            self.tool_calls = tool_calls
 
 
 class _ChatCompletionResponse:
     """Minimal OpenAI ChatCompletion-compatible object."""
 
-    def __init__(self, text: str, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+    def __init__(
+        self,
+        text: str | None,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: str = "stop",
+        tool_calls: Any | None = None,
+    ) -> None:
         self.model = model
-        self.choices = [_Choice(text)]
+        self.choices = [_Choice(text, finish_reason, tool_calls)]
         self.usage = _Usage(prompt_tokens, completion_tokens)
 
 
 class _Choice:
-    def __init__(self, content: str) -> None:
-        self.message = _Message(content)
-        self.finish_reason = "stop"
+    def __init__(
+        self,
+        content: str | None,
+        finish_reason: str,
+        tool_calls: Any | None = None,
+    ) -> None:
+        self.message = _Message(content, tool_calls)
+        self.finish_reason = finish_reason
 
 
 class _Message:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str | None, tool_calls: Any | None = None) -> None:
         self.content = content
         self.role = "assistant"
+        if tool_calls is not None:
+            self.tool_calls = tool_calls
 
 
 class _Usage:
@@ -138,7 +166,8 @@ class _Completions:
         result = grpc_client.infer_full(model, messages=messages, **grpc_kwargs)
         pt = result.metrics.prefill_tokens if result.metrics else 0
         ct = result.metrics.decode_tokens if result.metrics else 0
-        return _ChatCompletionResponse(result.text, model, pt, ct)
+        finish_reason = getattr(result, "finish_reason", "stop")
+        return _ChatCompletionResponse(result.text, model, pt, ct, finish_reason)
 
     def _create_rest(
         self,
@@ -181,12 +210,15 @@ class _Completions:
         resp.raise_for_status()
         data = resp.json()
         choice = data["choices"][0]
+        message = choice.get("message", {})
         usage = data.get("usage", {})
         return _ChatCompletionResponse(
-            choice["message"]["content"],
+            message.get("content"),
             model,
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
+            choice.get("finish_reason") or "stop",
+            message.get("tool_calls"),
         )
 
     def _rest_stream(
@@ -214,9 +246,14 @@ class _Completions:
                 data = json.loads(raw)
                 choice = data["choices"][0]
                 delta = choice.get("delta", {})
-                content = delta.get("content", "")
+                content = delta.get("content")
                 finish = choice.get("finish_reason")
-                yield _CompletionChunk(content, model, finish_reason=finish)
+                yield _CompletionChunk(
+                    content,
+                    model,
+                    finish_reason=finish,
+                    tool_calls=delta.get("tool_calls"),
+                )
 
 
 class _Chat:
