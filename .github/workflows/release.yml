@@ -93,12 +93,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           PAYLOAD="packaging/payload/usr/local/bin"
+          CONFIG_PAYLOAD="packaging/payload/etc/ax-serving"
           rm -rf packaging/payload
           mkdir -p "$PAYLOAD"
+          mkdir -p "$CONFIG_PAYLOAD"
           cp target/release/ax-serving     "$PAYLOAD/"
           cp target/release/ax-serving-api "$PAYLOAD/"
           cp target/release/ax-runtime-agent "$PAYLOAD/"
           cp target/release/ax-thor-agent "$PAYLOAD/"
+          cp config/backends.yaml          "$CONFIG_PAYLOAD/"
+          cp config/serving.yaml           "$CONFIG_PAYLOAD/"
 
           pkgbuild \
             --root packaging/payload \
