@@ -526,10 +526,7 @@ pub(crate) fn run_serve(
     // serving layer's own admission limits or the orchestrator will route
     // requests that the worker immediately rejects with 503.  Clamp the
     // advertised value to the effective scheduler capacity.
-    let requested_max_inflight: usize = std::env::var("AXS_WORKER_MAX_INFLIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| default_advertised_max_inflight(&config));
+    let requested_max_inflight = requested_max_inflight_from_env(&config)?;
     let max_inflight = clamp_advertised_max_inflight(
         requested_max_inflight,
         config.sched_max_inflight,
@@ -691,6 +688,23 @@ fn default_advertised_max_inflight(config: &ax_serving_api::config::ServeConfig)
         .min(config.sched_per_model_max_inflight.max(1))
 }
 
+fn requested_max_inflight_from_env(config: &ax_serving_api::config::ServeConfig) -> Result<usize> {
+    match std::env::var("AXS_WORKER_MAX_INFLIGHT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(default_advertised_max_inflight(config))
+            } else {
+                trimmed
+                    .parse::<usize>()
+                    .context("invalid AXS_WORKER_MAX_INFLIGHT")
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default_advertised_max_inflight(config)),
+        Err(err) => Err(err).context("invalid AXS_WORKER_MAX_INFLIGHT"),
+    }
+}
+
 fn clamp_advertised_max_inflight(
     requested: usize,
     sched_max_inflight: usize,
@@ -730,9 +744,10 @@ mod tests {
     use super::{
         EmbeddedRuntimePolicy, clamp_advertised_max_inflight, default_advertised_max_inflight,
         derive_worker_runtime_metadata, ensure_embedded_runtime_allowed, parse_rest_addr,
-        preload_load_config_for_path,
+        preload_load_config_for_path, requested_max_inflight_from_env,
     };
     use ax_serving_api::config::ServeConfig;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn parse_rest_addr_accepts_ipv4() {
@@ -783,6 +798,38 @@ mod tests {
             ..ServeConfig::default()
         };
         assert_eq!(default_advertised_max_inflight(&cfg), 4);
+    }
+
+    #[test]
+    fn requested_max_inflight_defaults_to_scheduler_limits_when_env_unset() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::unset("AXS_WORKER_MAX_INFLIGHT");
+        let cfg = ServeConfig {
+            sched_max_inflight: 16,
+            sched_per_model_max_inflight: 4,
+            ..ServeConfig::default()
+        };
+
+        assert_eq!(requested_max_inflight_from_env(&cfg).unwrap(), 4);
+    }
+
+    #[test]
+    fn requested_max_inflight_parses_trimmed_env_value() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("AXS_WORKER_MAX_INFLIGHT", " 3 ");
+        let cfg = ServeConfig::default();
+
+        assert_eq!(requested_max_inflight_from_env(&cfg).unwrap(), 3);
+    }
+
+    #[test]
+    fn requested_max_inflight_rejects_malformed_env_value() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("AXS_WORKER_MAX_INFLIGHT", "many");
+        let cfg = ServeConfig::default();
+
+        let err = requested_max_inflight_from_env(&cfg).unwrap_err();
+        assert!(err.to_string().contains("AXS_WORKER_MAX_INFLIGHT"));
     }
 
     #[test]
@@ -890,6 +937,12 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -899,5 +952,10 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 }
