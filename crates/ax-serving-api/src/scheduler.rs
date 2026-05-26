@@ -615,14 +615,15 @@ impl Scheduler {
         // atomically under the shed_waiters lock to prevent TOCTOU races where a
         // request claims a queue slot but isn't yet visible to shed_oldest eviction.
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let queue_len = {
+        {
             let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
             waiters.retain(|tx| !tx.is_closed());
             // Register *before* checking capacity so this request is visible to
             // concurrent shed_oldest callers from the moment it claims a slot.
             waiters.push_back(cancel_tx);
-            let queue_len = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
-            if queue_len >= self.config.max_queue as i64 {
+            let _queue_depth_before = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
+            let live_waiters = waiters.len();
+            if live_waiters > self.config.max_queue {
                 if self.config.overload_policy == OverloadPolicy::ShedOldest {
                     // Evict the oldest waiter to make room for the incoming request.
                     // We need len > 1 so pop_front returns someone *other* than us
@@ -648,7 +649,7 @@ impl Scheduler {
                             .rejected_requests
                             .fetch_add(1, Ordering::Relaxed);
                         return Err(SchedulerError::QueueFull {
-                            waiting: queue_len,
+                            waiting: live_waiters.saturating_sub(1) as i64,
                             max: self.config.max_queue,
                         }
                         .into());
@@ -661,15 +662,13 @@ impl Scheduler {
                         .rejected_requests
                         .fetch_add(1, Ordering::Relaxed);
                     return Err(SchedulerError::QueueFull {
-                        waiting: queue_len,
+                        waiting: live_waiters.saturating_sub(1) as i64,
                         max: self.config.max_queue,
                     }
                     .into());
                 }
             }
-            queue_len
-        };
-        let _ = queue_len;
+        }
         let _queue_depth_guard = QueueDepthGuard::new(Arc::clone(&self.metrics));
 
         // Count requests that actually enter the wait queue (used as denominator
@@ -1569,6 +1568,34 @@ mod tests {
             .expect("next waiter should not be rejected by leaked queue depth");
         assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
         drop(p2);
+    }
+
+    #[tokio::test]
+    async fn stale_queue_depth_metric_does_not_reject_live_capacity() {
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5,
+                overload_policy: OverloadPolicy::Queue,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+
+        let _held = Arc::clone(&s.semaphore).try_acquire_owned().unwrap();
+        s.metrics.queue_depth.store(1, Ordering::SeqCst);
+
+        let err = match s.acquire().await {
+            Ok(_) => {
+                panic!("stale queue_depth metric must not grant a permit while semaphore is held")
+            }
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("timed out"),
+            "request should queue against the live waiter set instead of rejecting on stale metric: {err}"
+        );
     }
 
     #[tokio::test]
