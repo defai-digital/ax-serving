@@ -120,7 +120,11 @@ fn resolve_model_dir(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
         anyhow::bail!(
             "native ax-engine v4.10.0 requires an AX MLX model artifact directory, not a .gguf file: {}",
             path.display()
@@ -1129,6 +1133,19 @@ mod tests {
     fn gguf_native_loads_are_rejected_for_v4_sdk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
+        std::fs::write(&path, "").unwrap();
+
+        let err = super::resolve_model_dir(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an AX MLX model artifact directory")
+        );
+    }
+
+    #[test]
+    fn uppercase_gguf_native_loads_are_rejected_for_v4_sdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.GGUF");
         std::fs::write(&path, "").unwrap();
 
         let err = super::resolve_model_dir(&path).unwrap_err();
