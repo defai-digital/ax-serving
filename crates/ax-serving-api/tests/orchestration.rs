@@ -2271,6 +2271,43 @@ async fn test_project_policy_enforces_worker_pool() {
 }
 
 #[tokio::test]
+async fn test_project_policy_worker_pool_does_not_fallback() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            sample_project_policy(None),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-project", "fabric")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn test_proxy_embeddings_route_and_project_policy() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -2535,6 +2572,7 @@ async fn test_structured_embedding_worker_is_not_used_for_chat() {
             None,
             false,
             None,
+            false,
             "/v1/embeddings",
             axum::body::Bytes::from(r#"{"model":"embed-only","input":"hello"}"#),
             None,

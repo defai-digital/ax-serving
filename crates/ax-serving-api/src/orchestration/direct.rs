@@ -290,6 +290,7 @@ impl DirectDispatcher {
             None,
             stream,
             preferred_pool,
+            false,
             path,
             body,
             auth_header,
@@ -308,16 +309,18 @@ impl DirectDispatcher {
         min_context: Option<u32>,
         stream: bool,
         preferred_pool: Option<&str>,
+        require_preferred_pool: bool,
         path: &str,
         body: Bytes,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let workers = registry.dispatch_workers_filtered(
+        let workers = registry.dispatch_workers_filtered_with_pool_mode(
             model_id,
             request_kind,
             backend_hint,
             min_context,
             preferred_pool,
+            require_preferred_pool,
             None,
         );
         if workers.is_empty() {
@@ -392,6 +395,7 @@ impl DirectDispatcher {
                     path,
                     retry_body,
                     selected_id,
+                    require_preferred_pool,
                     auth_header,
                 )
                 .await;
@@ -427,6 +431,7 @@ impl DirectDispatcher {
                     path,
                     retry_body,
                     selected_id,
+                    require_preferred_pool,
                     auth_header,
                 )
                 .await;
@@ -485,6 +490,7 @@ impl DirectDispatcher {
                     path,
                     retry_body,
                     selected_id,
+                    require_preferred_pool,
                     auth_header,
                 )
                 .await;
@@ -516,14 +522,16 @@ impl DirectDispatcher {
         path: &str,
         body: Bytes,
         excluded_id: WorkerId,
+        require_preferred_pool: bool,
         auth_header: Option<&HeaderValue>,
     ) -> Response {
-        let candidates = registry.dispatch_workers_filtered(
+        let candidates = registry.dispatch_workers_filtered_with_pool_mode(
             ctx.model_id,
             request_kind,
             backend_hint,
             min_context,
             ctx.preferred_pool,
+            require_preferred_pool,
             Some(excluded_id),
         );
 

@@ -103,10 +103,11 @@ async fn proxy_inference(
             Ok(v) => v,
             Err(resp) => return resp.into_response(),
         };
-    let preferred_pool = resolved_policy
+    let policy_pool = resolved_policy
         .as_ref()
-        .and_then(|v| v.worker_pool.as_deref())
-        .or(requested_pool);
+        .and_then(|v| v.worker_pool.as_deref());
+    let preferred_pool = policy_pool.or(requested_pool);
+    let require_preferred_pool = policy_pool.is_some();
 
     // Admission control: acquire a queue slot before dispatching.
     let permit = match layer
@@ -169,6 +170,7 @@ async fn proxy_inference(
             min_context,
             stream,
             preferred_pool,
+            require_preferred_pool,
             worker_path,
             body,
             auth_header,

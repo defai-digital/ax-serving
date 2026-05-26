@@ -685,28 +685,13 @@ impl WorkerRegistry {
                 existing.last_heartbeat = Instant::now();
                 existing.drain = false;
                 existing.supported_operations = supported_operations.clone();
-                // Preserve richer identity fields if re-registering with them.
-                if runtime_version.is_some() {
-                    existing.runtime_version = runtime_version.clone();
-                }
-                if hardware_class.is_some() {
-                    existing.hardware_class = hardware_class.clone();
-                }
-                if runtime_endpoint.is_some() {
-                    existing.runtime_endpoint = runtime_endpoint.clone();
-                }
-                if friendly_name.is_some() {
-                    existing.friendly_name = friendly_name.clone();
-                }
-                if chip_model.is_some() {
-                    existing.chip_model = chip_model.clone();
-                }
-                if worker_pool.is_some() {
-                    existing.worker_pool = worker_pool.clone();
-                }
-                if node_class.is_some() {
-                    existing.node_class = node_class.clone();
-                }
+                existing.runtime_version = runtime_version.clone();
+                existing.hardware_class = hardware_class.clone();
+                existing.runtime_endpoint = runtime_endpoint.clone();
+                existing.friendly_name = friendly_name.clone();
+                existing.chip_model = chip_model.clone();
+                existing.worker_pool = worker_pool.clone();
+                existing.node_class = node_class.clone();
             })
             .or_insert_with(|| WorkerEntry {
                 id,
@@ -885,6 +870,28 @@ impl WorkerRegistry {
         preferred_pool: Option<&str>,
         excluded_id: Option<WorkerId>,
     ) -> Vec<WorkerStatus> {
+        self.dispatch_workers_filtered_with_pool_mode(
+            model_id,
+            request_kind,
+            backend_hint,
+            min_context,
+            preferred_pool,
+            false,
+            excluded_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_workers_filtered_with_pool_mode(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+        preferred_pool: Option<&str>,
+        require_preferred_pool: bool,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerStatus> {
         let backend_filter = backend_filter_from_hint(backend_hint);
         let runtime_filter = runtime_filter_from_hint(backend_hint);
         let preferred_pool = preferred_pool
@@ -944,7 +951,7 @@ impl WorkerRegistry {
             }
         }
 
-        if preferred_pool_exists {
+        if require_preferred_pool || preferred_pool_exists {
             preferred_workers
         } else {
             fallback_workers
@@ -2486,6 +2493,63 @@ mod tests {
         assert_eq!(snap.chip_model.as_deref(), Some("Apple M3 Pro"));
         assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
         assert_eq!(snap.node_class.as_deref(), Some("m3-pro"));
+    }
+
+    #[test]
+    fn reregister_clears_stale_identity_and_routing_fields() {
+        let r = WorkerRegistry::new();
+        let req = RegisterRequest {
+            worker_id: None,
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "vllm".into(),
+            runtime: Some("vllm".into()),
+            runtime_mode: Some("adapter".into()),
+            runtime_version: Some("0.13.0".into()),
+            hardware_class: Some("pc-cuda".into()),
+            runtime_endpoint: Some("http://127.0.0.1:8000".into()),
+            max_inflight: 4,
+            friendly_name: Some("node-a".to_string()),
+            chip_model: Some("NVIDIA L40S".to_string()),
+            worker_pool: Some("blue".to_string()),
+            node_class: Some("pc-cuda".to_string()),
+            ..Default::default()
+        };
+        let resp = r.register(req, 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let req = RegisterRequest {
+            worker_id: Some(resp.worker_id),
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "vllm".into(),
+            runtime: Some("vllm".into()),
+            runtime_mode: Some("adapter".into()),
+            max_inflight: 4,
+            ..Default::default()
+        };
+        r.register(req, 5000);
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.runtime_version, None);
+        assert_eq!(snap.hardware_class, None);
+        assert_eq!(snap.runtime_endpoint, None);
+        assert_eq!(snap.friendly_name, None);
+        assert_eq!(snap.chip_model, None);
+        assert_eq!(snap.worker_pool, None);
+        assert_eq!(snap.node_class, None);
+        assert!(
+            r.dispatch_workers_filtered_with_pool_mode(
+                "m1",
+                RequestKind::Llm,
+                None,
+                None,
+                Some("blue"),
+                true,
+                None,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
