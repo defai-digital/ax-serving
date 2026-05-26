@@ -1223,10 +1223,21 @@ fn normalize_supported_operations(operations: Vec<String>) -> Vec<String> {
     let mut seen = FxHashSet::default();
     operations
         .into_iter()
-        .map(|op| op.trim().to_ascii_lowercase().replace('-', "_"))
-        .filter(|op| !op.is_empty())
+        .filter_map(|op| normalize_supported_operation(&op))
         .filter(|op| seen.insert(op.clone()))
         .collect()
+}
+
+fn normalize_supported_operation(operation: &str) -> Option<String> {
+    let normalized = operation.trim().to_ascii_lowercase().replace('-', "_");
+    let canonical = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(canonical.to_string())
 }
 
 fn normalize_model_inventory(
@@ -1900,8 +1911,9 @@ mod tests {
                 }),
                 supported_operations: vec![
                     " LLM ".into(),
-                    "embedding".into(),
+                    "Embeddings".into(),
                     "llm".into(),
+                    "completion".into(),
                     "text-generation".into(),
                     "text_generation".into(),
                 ],
@@ -1921,6 +1933,43 @@ mod tests {
                 "embedding".to_string(),
                 "text_generation".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn inventory_operations_are_normalized_to_routing_operations() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["Embeddings".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
         );
     }
 
