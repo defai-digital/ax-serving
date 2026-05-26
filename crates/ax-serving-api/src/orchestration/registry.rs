@@ -683,6 +683,7 @@ impl WorkerRegistry {
         } else {
             normalize_supported_operations(supported_operations)
         };
+        refresh_capabilities_from_operation_summary(&mut capabilities, &supported_operations);
 
         self.inner
             .entry(id)
@@ -1244,6 +1245,17 @@ fn refresh_capabilities_from_inventory_summary(
     }
     if max_context.is_some() || clear_missing_max_context {
         capabilities.max_context = max_context;
+    }
+}
+
+fn refresh_capabilities_from_operation_summary(
+    capabilities: &mut WorkerCapabilities,
+    operations: &[String],
+) {
+    if !operations.is_empty() {
+        capabilities.llm = operations.iter().any(|op| op == "llm");
+        capabilities.embedding = operations.iter().any(|op| op == "embedding");
+        capabilities.vision = operations.iter().any(|op| op == "vision");
     }
 }
 
@@ -1991,6 +2003,43 @@ mod tests {
                 "embedding".to_string(),
                 "text_generation".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn explicit_operations_refresh_structured_capability_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["Embeddings".into()],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "explicit embedding-only operations must not leave stale llm routing enabled"
         );
     }
 
