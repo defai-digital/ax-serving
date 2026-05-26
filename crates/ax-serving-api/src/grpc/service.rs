@@ -76,15 +76,17 @@ impl AxServingServiceTrait for AxServingService {
 
         let path = std::path::Path::new(&req.model_path);
         let file_size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let backend_hint = infer_backend_hint_from_path(path);
 
         let config = LoadConfig {
             context_length: req.context_length,
             backend_type: proto_backend_to_engine(req.backend),
             llama_cpp_n_gpu_layers: None,
             mmproj_path: None,
-            // Keep runtime serving behavior aligned with REST defaults: let
-            // the router pick native artifact directories or GGUF compatibility.
-            backend_hint: Some("auto".to_string()),
+            // Keep runtime serving behavior aligned with REST defaults: route
+            // artifact directories via policy, but keep GGUF on explicit
+            // compatibility loading so public native defaults do not select it.
+            backend_hint: Some(backend_hint.to_string()),
             enable_embeddings: None,
             pooling_type: None,
         };
@@ -457,6 +459,18 @@ fn proto_backend_to_engine(backend: i32) -> BackendType {
     }
 }
 
+fn infer_backend_hint_from_path(path: &std::path::Path) -> &'static str {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        "llama_cpp"
+    } else {
+        "auto"
+    }
+}
+
 fn engine_backend_type_to_proto(backend: BackendType) -> proto::BackendType {
     match backend {
         BackendType::Metal => proto::BackendType::Metal,
@@ -793,6 +807,22 @@ mod tests {
         );
         // Unknown value must fall back to Auto.
         assert_eq!(proto_backend_to_engine(999), BackendType::Auto);
+    }
+
+    #[test]
+    fn grpc_load_infers_llama_cpp_for_gguf_paths() {
+        assert_eq!(
+            infer_backend_hint_from_path(Path::new("/models/model.gguf")),
+            "llama_cpp"
+        );
+        assert_eq!(
+            infer_backend_hint_from_path(Path::new("/models/model.GGUF")),
+            "llama_cpp"
+        );
+        assert_eq!(
+            infer_backend_hint_from_path(Path::new("/models/ax-artifacts")),
+            "auto"
+        );
     }
 
     #[test]

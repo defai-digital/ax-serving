@@ -987,7 +987,40 @@ async fn embeddings_project_policy_requires_header_before_model_lookup() {
 }
 
 #[tokio::test]
-async fn load_model_defaults_to_auto_backend_hint() {
+async fn load_model_defaults_artifact_directory_to_auto_backend_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("model-manifest.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+
+    let observed = Arc::new(Mutex::new(None::<String>));
+    let backend: Arc<CaptureBackend> = Arc::new(CaptureBackend {
+        observed_backend_hint: Arc::clone(&observed),
+    });
+    let layer = make_layer_with_backend(backend);
+    let keys = Arc::new(std::collections::HashSet::<String>::new());
+
+    let load_body =
+        serde_json::json!({"model_id": "capture", "path": dir.path().to_string_lossy()})
+            .to_string();
+
+    let resp = rest::router(layer, keys)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/models")
+                .header("Content-Type", "application/json")
+                .body(Body::from(load_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("auto"));
+}
+
+#[tokio::test]
+async fn load_model_infers_llama_cpp_for_gguf_without_backend() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("capture.gguf");
     std::fs::write(&path, b"dummy").unwrap();
@@ -1015,7 +1048,7 @@ async fn load_model_defaults_to_auto_backend_hint() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(observed.lock().unwrap().as_deref(), Some("auto"));
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("llama_cpp"));
 }
 
 #[tokio::test]

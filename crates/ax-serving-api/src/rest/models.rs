@@ -1,5 +1,6 @@
 //! Model management route handlers.
 
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use ax_serving_engine::{BackendType, LoadConfig};
@@ -34,7 +35,7 @@ pub async fn list_models(State(layer): State<Arc<ServingLayer>>) -> Json<ModelsR
     })
 }
 
-/// POST /v1/models — load a model from a GGUF file.
+/// POST /v1/models — load a model file or supported artifact directory.
 pub async fn rest_load_model(
     State(layer): State<Arc<ServingLayer>>,
     req_id: Option<Extension<RequestId>>,
@@ -63,14 +64,8 @@ pub async fn rest_load_model(
     let path = std::path::PathBuf::from(&req.path);
 
     // Resolve backend hint: explicit `backend` field takes priority; then `mlx: true`
-    // flag; then default to "auto" (routing config decides).
-    let raw_hint = if let Some(ref b) = req.backend {
-        b.trim().to_ascii_lowercase()
-    } else if req.mlx == Some(true) {
-        "mlx".to_string()
-    } else {
-        "auto".to_string()
-    };
+    // flag; then path-shape compatibility for GGUF; then routing config.
+    let raw_hint = infer_backend_hint(req.backend.as_deref(), req.mlx, &path);
     let backend_hint = match raw_hint.as_str() {
         "native" | "llama_cpp" | "mlx" | "lib_llama" | "auto" => raw_hint,
         other => {
@@ -165,6 +160,23 @@ pub async fn rest_load_model(
         )
             .into_response(),
     }
+}
+
+fn infer_backend_hint(backend: Option<&str>, mlx: Option<bool>, path: &FsPath) -> String {
+    if let Some(raw) = backend {
+        return raw.trim().to_ascii_lowercase();
+    }
+    if mlx == Some(true) {
+        return "mlx".to_string();
+    }
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        return "llama_cpp".to_string();
+    }
+    "auto".to_string()
 }
 
 pub(crate) fn is_valid_pooling_type(s: &str) -> bool {
