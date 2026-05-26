@@ -2,8 +2,11 @@ import { z } from "zod";
 
 export const ChatMessageSchema = z.object({
   role: z.string(),
-  content: z.union([z.string(), z.array(z.unknown())]),
-});
+  content: z.union([z.string(), z.array(z.unknown()), z.null()]).optional(),
+  tool_calls: z.array(z.unknown()).optional(),
+  tool_call_id: z.string().optional(),
+  name: z.string().optional(),
+}).passthrough();
 
 export const ChatCompletionRequestSchema = z.object({
   model: z.string().min(1),

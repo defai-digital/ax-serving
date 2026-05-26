@@ -86,6 +86,10 @@ jobs:
         working-directory: sdk/javascript
         run: npm run typecheck
 
+      - name: Test JS SDK
+        working-directory: sdk/javascript
+        run: npm test
+
   python-sdk:
     name: Python SDK Tests
     runs-on: ubuntu-latest
