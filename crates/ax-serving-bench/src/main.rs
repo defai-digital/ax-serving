@@ -190,6 +190,9 @@ enum Command {
         /// Allowed regression tolerance (percent).
         #[arg(long, default_value = "10.0")]
         tolerance_pct: f64,
+        /// Fail if the baseline has no established metrics.
+        #[arg(long)]
+        require_baseline: bool,
     },
     /// Concurrent multi-worker load benchmark against a live orchestrator.
     ///
@@ -357,7 +360,8 @@ fn main() -> Result<()> {
             results,
             baseline,
             tolerance_pct,
-        } => regression::check(results, baseline, tolerance_pct),
+            require_baseline,
+        } => regression::check(results, baseline, tolerance_pct, require_baseline),
         Command::MultiWorker {
             url,
             workers,

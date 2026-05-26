@@ -261,7 +261,8 @@ jobs:
         run: |
           cargo run -p ax-serving-bench --bin ax-serving-bench -- regression-check \
             --results "${{ inputs.results }}" \
-            --baseline benchmarks/baseline-mixed.json
+            --baseline benchmarks/baseline-mixed.json \
+            --require-baseline
 
   # ── Smoke soak (manual — requires live server + GGUF model) ──────────────────
   smoke-soak:
