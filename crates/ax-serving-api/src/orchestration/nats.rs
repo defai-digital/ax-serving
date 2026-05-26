@@ -89,6 +89,17 @@ impl Default for NatsConfig {
 impl NatsConfig {
     /// Read configuration from `AXS_NATS_*` environment variables.
     pub fn from_env() -> Self {
+        match Self::try_from_env() {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warn!(%err, "invalid NATS env override ignored by infallible constructor");
+                Self::default()
+            }
+        }
+    }
+
+    /// Read configuration from `AXS_NATS_*` environment variables.
+    pub fn try_from_env() -> anyhow::Result<Self> {
         let mut cfg = Self::default();
         if let Ok(v) = std::env::var("AXS_NATS_URL") {
             cfg.nats_url = v;
@@ -96,18 +107,30 @@ impl NatsConfig {
         if let Ok(v) = std::env::var("AXS_NATS_STREAM") {
             cfg.stream_name = v;
         }
-        if let Ok(v) = std::env::var("AXS_NATS_MAX_DELIVER")
-            && let Ok(n) = v.parse::<i64>()
-        {
+        if let Some(n) = env_parse::<i64>("AXS_NATS_MAX_DELIVER")? {
             cfg.max_deliver = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_GLOBAL_QUEUE_WAIT_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
+        if let Some(ms) = env_parse::<u64>("AXS_GLOBAL_QUEUE_WAIT_MS")? {
             cfg.wait_ms = ms.max(1);
         }
-        cfg
+        Ok(cfg)
     }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
 }
 
 // ── Wire protocol types ───────────────────────────────────────────────────────
@@ -760,10 +783,30 @@ mod tests {
     fn nats_config_clamps_zero_wait_ms_from_env() {
         let _guard = crate::test_env::lock();
         unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "0") };
-        let cfg = NatsConfig::from_env();
+        let cfg = NatsConfig::try_from_env().unwrap();
         unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
 
         assert_eq!(cfg.wait_ms, 1);
+    }
+
+    #[test]
+    fn nats_config_rejects_malformed_max_deliver_env() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_NATS_MAX_DELIVER", "many") };
+        let err = NatsConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_NATS_MAX_DELIVER") };
+
+        assert!(err.contains("AXS_NATS_MAX_DELIVER"), "got: {err}");
+    }
+
+    #[test]
+    fn nats_config_rejects_malformed_wait_ms_env() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_GLOBAL_QUEUE_WAIT_MS", "soon") };
+        let err = NatsConfig::try_from_env().unwrap_err().to_string();
+        unsafe { std::env::remove_var("AXS_GLOBAL_QUEUE_WAIT_MS") };
+
+        assert!(err.contains("AXS_GLOBAL_QUEUE_WAIT_MS"), "got: {err}");
     }
 
     #[test]
