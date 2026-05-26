@@ -985,7 +985,6 @@ impl WorkerRegistry {
                 })
                 .collect();
         };
-        let mut preferred_pool_exists = false;
         let mut preferred_workers = Vec::new();
         let mut fallback_workers = Vec::new();
 
@@ -1005,9 +1004,6 @@ impl WorkerRegistry {
             if !matches_without_exclusion {
                 continue;
             }
-            if in_preferred_pool {
-                preferred_pool_exists = true;
-            }
             if excluded_id == Some(e.id) {
                 continue;
             }
@@ -1020,7 +1016,7 @@ impl WorkerRegistry {
             }
         }
 
-        if require_preferred_pool || preferred_pool_exists {
+        if require_preferred_pool || !preferred_workers.is_empty() {
             preferred_workers
         } else {
             fallback_workers
@@ -1606,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_workers_apply_exclusion_after_pool_preference() {
+    fn dispatch_workers_fall_back_when_soft_preferred_pool_is_excluded() {
         let r = WorkerRegistry::new();
         let blue = r.register(
             RegisterRequest {
@@ -1615,7 +1611,7 @@ mod tests {
             },
             5000,
         );
-        r.register(
+        let green = r.register(
             RegisterRequest {
                 worker_pool: Some("green".into()),
                 ..reg_req("127.0.0.1:8082", &["m1"], 4)
@@ -1632,10 +1628,8 @@ mod tests {
             Some(WorkerId::parse(&blue.worker_id).unwrap()),
         );
 
-        assert!(
-            workers.is_empty(),
-            "preferred-pool filtering must still win before exclusion"
-        );
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, WorkerId::parse(&green.worker_id).unwrap());
     }
 
     #[test]

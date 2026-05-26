@@ -360,29 +360,15 @@ impl DirectDispatcher {
 
         let selected_id = selected.id;
         let url = worker_url(selected.addr, path);
-        // Only pre-clone the body when reroute is possible.
-        let can_reroute = candidate_count > 1;
-        let retry_body = if can_reroute {
-            Some(body.clone())
-        } else {
-            None
-        };
+        // `Bytes::clone` is shallow, and soft pool preferences can hide fallback
+        // candidates from the initial selection set. Keep a retry body so the
+        // reroute pass can relax soft preferences after excluding the failed worker.
+        let retry_body = body.clone();
         let Some(inflight_counter) = registry.inflight_counter(selected_id) else {
             warn!(
                 worker_id = %selected_id,
                 "selected worker disappeared before dispatch"
             );
-            let Some(retry_body) = retry_body else {
-                return trace_response(
-                    worker_failure_response(format!(
-                        "selected worker unavailable for '{}'",
-                        ctx.model_id
-                    )),
-                    candidate_count,
-                    Some(selected_id),
-                    "selected_worker_unavailable",
-                );
-            };
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
             return self
                 .reroute(
@@ -407,18 +393,6 @@ impl DirectDispatcher {
                 max_inflight = selected.max_inflight,
                 "selected worker reached capacity before dispatch"
             );
-            let Some(retry_body) = retry_body else {
-                return trace_response(
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("all workers for '{}' are at capacity", ctx.model_id),
-                    )
-                        .into_response(),
-                    candidate_count,
-                    Some(selected_id),
-                    "selected_at_capacity",
-                );
-            };
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
             return self
                 .reroute(
@@ -466,18 +440,6 @@ impl DirectDispatcher {
             drop(guard);
             registry.mark_unhealthy(selected_id);
             self.reroute_total.fetch_add(1, Ordering::Relaxed);
-
-            let Some(retry_body) = retry_body else {
-                return trace_response(
-                    worker_failure_response(format!(
-                        "no alternative worker for '{}' after reroute",
-                        ctx.model_id
-                    )),
-                    candidate_count,
-                    Some(selected_id),
-                    "reroute_exhausted",
-                );
-            };
 
             return self
                 .reroute(

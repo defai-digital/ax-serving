@@ -2183,6 +2183,56 @@ async fn test_pool_header_prefers_matching_worker_pool() {
 }
 
 #[tokio::test]
+async fn test_pool_header_reroute_falls_back_after_preferred_worker_failure() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    let green = skip_if_no_socket!(spawn_mock_worker(500, r#"{"error":"down"}"#).await);
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["pool-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-worker-pool", "green")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("blue"),
+        "expected fallback blue-pool worker response after green failed, got {text}"
+    );
+}
+
+#[tokio::test]
 async fn test_project_policy_proxy_requires_header() {
     let layer = Arc::new(
         OrchestratorLayer::new(
