@@ -222,6 +222,11 @@ fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeC
         return (path.display().to_string(), ServeConfig::from_file(&path));
     }
 
+    if let Ok(path) = std::env::var("AXS_CONFIG") {
+        let path = PathBuf::from(path);
+        return (path.display().to_string(), ServeConfig::from_file(&path));
+    }
+
     for path in default_config_candidates() {
         if path.exists() {
             return (path.display().to_string(), ServeConfig::from_file(&path));
@@ -1515,9 +1520,6 @@ fn trimmed_non_empty(value: String) -> Option<String> {
 
 fn default_config_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("AXS_CONFIG") {
-        candidates.push(PathBuf::from(path));
-    }
     candidates.push(PathBuf::from("config/serving.yaml"));
     candidates.push(PathBuf::from("serving.yaml"));
     if let Ok(home) = std::env::var("HOME") {
@@ -1528,7 +1530,14 @@ fn default_config_candidates() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn normalizes_base_url() {
@@ -1563,6 +1572,26 @@ mod tests {
 
         assert!(!report.valid);
         assert_eq!(report.status, STATUS_FAIL);
+        assert!(report.error.is_some());
+        assert!(report.summary.is_none());
+    }
+
+    #[test]
+    fn missing_axs_config_does_not_emit_fallback_summary() {
+        let path = std::env::temp_dir().join(format!(
+            "ax-serving-missing-config-{}.yaml",
+            std::process::id()
+        ));
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::set_var("AXS_CONFIG", &path) };
+
+        let report = build_config_validate_report(None);
+
+        unsafe { std::env::remove_var("AXS_CONFIG") };
+
+        assert!(!report.valid);
+        assert_eq!(report.status, STATUS_FAIL);
+        assert_eq!(report.source, path.display().to_string());
         assert!(report.error.is_some());
         assert!(report.summary.is_none());
     }

@@ -5,6 +5,7 @@
 #
 # Auto-loaded from (first match):
 #   $AXS_CONFIG  >  config/serving.yaml  >  serving.yaml  >  ~/.config/ax-serving/serving.yaml
+# If $AXS_CONFIG is set, the path must exist; startup fails closed otherwise.
 #
 # All values below show the built-in defaults.
 

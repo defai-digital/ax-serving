@@ -707,19 +707,29 @@ impl ServeConfig {
     /// only when no candidate file exists.
     ///
     /// Search order: `AXS_CONFIG` env var → `config/serving.yaml` → `serving.yaml` → `~/.config/ax-serving/serving.yaml`.
+    /// If `AXS_CONFIG` is set, the path must exist; otherwise startup fails
+    /// instead of silently falling through to another config.
     pub fn load_default() -> Result<Self> {
-        let candidates: Vec<std::path::PathBuf> = {
-            let mut v = Vec::new();
-            if let Ok(p) = std::env::var("AXS_CONFIG") {
-                v.push(std::path::PathBuf::from(p));
+        if let Ok(path) = std::env::var("AXS_CONFIG") {
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                anyhow::bail!(
+                    "AXS_CONFIG points to missing config file {}",
+                    path.display()
+                );
             }
-            v.push(std::path::PathBuf::from("config/serving.yaml"));
-            v.push(std::path::PathBuf::from("serving.yaml"));
-            if let Ok(home) = std::env::var("HOME") {
-                v.push(std::path::PathBuf::from(home).join(".config/ax-serving/serving.yaml"));
-            }
-            v
-        };
+            let cfg = Self::from_file(&path)?;
+            tracing::info!("serve config loaded from {}", path.display());
+            return Ok(cfg);
+        }
+
+        let mut candidates = vec![
+            std::path::PathBuf::from("config/serving.yaml"),
+            std::path::PathBuf::from("serving.yaml"),
+        ];
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(std::path::PathBuf::from(home).join(".config/ax-serving/serving.yaml"));
+        }
 
         for path in &candidates {
             if path.exists() {
@@ -1147,21 +1157,14 @@ mod tests {
     }
 
     #[test]
-    fn load_default_falls_back_to_env_when_no_file_exists() {
+    fn load_default_returns_error_for_missing_axs_config() {
         let _g = crate::test_env::lock();
-        // Point AXS_CONFIG to a nonexistent path → load_default falls back to
-        // env-only defaults (from_env). We verify a known default survives.
         unsafe { std::env::set_var("AXS_CONFIG", "/nonexistent/path/serving.yaml") };
-        // Ensure the two CWD candidates don't accidentally exist.
-        let cfg = ServeConfig::load_default().unwrap();
+        let result = ServeConfig::load_default();
         unsafe { std::env::remove_var("AXS_CONFIG") };
 
-        // Default sched_max_inflight is 16; nothing else overrides it here.
-        assert_eq!(
-            cfg.sched_max_inflight,
-            ServeConfig::default().sched_max_inflight,
-            "must fall back to defaults when no config file is found"
-        );
+        let err = result.expect_err("missing explicit config must fail closed");
+        assert!(err.to_string().contains("AXS_CONFIG"), "got: {err}");
     }
 
     #[test]
