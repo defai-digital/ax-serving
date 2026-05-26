@@ -665,12 +665,10 @@ impl WorkerRegistry {
             );
             operations
         };
-        if !incoming_model_inventory_empty {
-            capabilities.models = model_inventory
-                .iter()
-                .map(|model| model.id.clone())
-                .collect();
-        }
+        capabilities.models = model_inventory
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
         let supported_operations = if supported_operations.is_empty() {
             if !inventory_supported_operations.is_empty() {
                 inventory_supported_operations
@@ -1263,11 +1261,12 @@ fn normalize_model_inventory(
         by_id.insert(item.id.clone(), item);
     }
     for id in model_ids {
-        if !id.trim().is_empty() {
+        let id = id.trim();
+        if !id.is_empty() {
             by_id
-                .entry(id.clone())
+                .entry(id.to_string())
                 .or_insert_with(|| ModelInventoryEntry {
-                    id: id.clone(),
+                    id: id.to_string(),
                     ..Default::default()
                 });
         }
@@ -1281,7 +1280,7 @@ fn retain_model_inventory_for_ids(
 ) -> Vec<ModelInventoryEntry> {
     let retained = previous
         .iter()
-        .filter(|entry| model_ids.iter().any(|id| id == &entry.id))
+        .filter(|entry| model_ids.iter().any(|id| id.trim() == entry.id))
         .cloned()
         .collect();
     normalize_model_inventory(model_ids, retained)
@@ -2558,6 +2557,70 @@ mod tests {
             r.eligible_workers("m1").is_empty(),
             "empty model_ids heartbeat must clear stale capabilities"
         );
+    }
+
+    #[test]
+    fn model_ids_are_trimmed_for_registration_and_heartbeat_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &[" m1 "], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+        assert_eq!(
+            r.get_snapshot(id).unwrap().model_inventory[0].id.as_str(),
+            "m1"
+        );
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec![" m2 ".to_string()],
+                rss_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            }
+        ));
+
+        assert!(r.eligible_workers("m1").is_empty());
+        assert_eq!(r.eligible_workers("m2").len(), 1);
+        assert_eq!(
+            r.get_snapshot(id).unwrap().model_inventory[0].id.as_str(),
+            "m2"
+        );
+    }
+
+    #[test]
+    fn heartbeat_retains_inventory_when_model_ids_need_trimming() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                ..reg_req("127.0.0.1:8081", &[], 4)
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec![" m1 ".to_string()],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.model_inventory[0].id, "m1");
+        assert_eq!(snapshot.model_inventory[0].max_context, Some(8192));
     }
 
     #[test]
