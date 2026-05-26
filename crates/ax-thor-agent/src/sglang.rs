@@ -85,7 +85,7 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
     let entries = raw["data"].as_array().cloned().unwrap_or_default();
     let mut models = Vec::with_capacity(entries.len());
     for entry in entries {
-        if let Some(id) = entry["id"].as_str() {
+        if let Some(id) = entry["id"].as_str().and_then(trimmed_non_empty_string) {
             let max_model_len = entry["max_model_len"]
                 .as_u64()
                 .or_else(|| entry["context_length"].as_u64())
@@ -109,7 +109,9 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
                 supported_operations,
             });
         } else {
-            tracing::warn!("runtime /v1/models entry missing 'id' field, skipping: {entry}");
+            tracing::warn!(
+                "runtime /v1/models entry missing non-empty 'id' field, skipping: {entry}"
+            );
         }
     }
     models
@@ -1089,7 +1091,7 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         let models = parse_model_info_response(&serde_json::json!({
             "data": [
                 {
-                    "id": "mixed",
+                    "id": " mixed ",
                     "quantization_config": {"name": " AWQ "},
                     "model_format": " safetensors ",
                     "modalities": [" Text ", "Vision", "", "vision"]
@@ -1098,11 +1100,16 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
                     "id": "embed",
                     "quantization": "   ",
                     "capabilities": [" Embeddings "]
+                },
+                {
+                    "id": "   ",
+                    "max_model_len": 4096
                 }
             ]
         }));
 
         assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "mixed");
         assert_eq!(models[0].quantization.as_deref(), Some("AWQ"));
         assert_eq!(models[0].artifact_format.as_deref(), Some("safetensors"));
         assert_eq!(
