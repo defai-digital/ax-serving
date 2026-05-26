@@ -166,7 +166,7 @@ fn check_hardware() -> CheckResult {
 }
 
 fn check_llama_server() -> CheckResult {
-    let worker_runtime = std::env::var("AXS_WORKER_RUNTIME").ok();
+    let worker_runtime = runtime_node_runtime_from_env();
     let embedded_runtime_policy = std::env::var("AXS_EMBEDDED_RUNTIME_POLICY").ok();
     if !llama_server_required(
         worker_runtime.as_deref(),
@@ -225,12 +225,34 @@ fn llama_server_required(
 
 fn check_runtime_boundary() -> CheckResult {
     runtime_boundary_result(
-        std::env::var("AXS_ORCHESTRATOR_ADDR").ok().as_deref(),
-        std::env::var("AXS_WORKER_RUNTIME").ok().as_deref(),
+        runtime_node_control_plane_from_env().as_deref(),
+        runtime_node_runtime_from_env().as_deref(),
         std::env::var("AXS_ROUTING_CONFIG").ok().as_deref(),
         std::env::var("AXS_LLAMA_CPP_BIN").ok().as_deref(),
         std::env::var("AXS_EMBEDDED_RUNTIME_POLICY").ok().as_deref(),
     )
+}
+
+fn runtime_node_control_plane_from_env() -> Option<String> {
+    first_non_empty_env(&["AXS_ORCHESTRATOR_ADDR", "AXS_CONTROL_PLANE_URL"])
+}
+
+fn runtime_node_runtime_from_env() -> Option<String> {
+    first_non_empty_env(&[
+        "AXS_WORKER_RUNTIME",
+        "AXS_NODE_RUNTIME",
+        "AXS_THOR_RUNTIME",
+        "AXS_THOR_BACKEND",
+    ])
+}
+
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn runtime_boundary_result(
@@ -470,6 +492,7 @@ fn check_thermal() -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn check_platform_on_current_host() {
@@ -520,6 +543,26 @@ mod tests {
 
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.contains("vllm"));
+    }
+
+    #[test]
+    fn runtime_node_env_helpers_accept_generic_runtime_agent_names() {
+        let _lock = env_lock().lock().expect("env lock");
+        let _clear_orchestrator = EnvGuard::unset("AXS_ORCHESTRATOR_ADDR");
+        let _clear_worker_runtime = EnvGuard::unset("AXS_WORKER_RUNTIME");
+        let _clear_thor_runtime = EnvGuard::unset("AXS_THOR_RUNTIME");
+        let _clear_thor_backend = EnvGuard::unset("AXS_THOR_BACKEND");
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", " http://127.0.0.1:19090/ ");
+        let _runtime = EnvGuard::set("AXS_NODE_RUNTIME", " ax_engine ");
+
+        assert_eq!(
+            runtime_node_control_plane_from_env().as_deref(),
+            Some("http://127.0.0.1:19090/")
+        );
+        assert_eq!(
+            runtime_node_runtime_from_env().as_deref(),
+            Some("ax_engine")
+        );
     }
 
     #[test]
@@ -581,5 +624,38 @@ mod tests {
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.detail.contains("explicitly allowed"));
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }
