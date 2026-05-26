@@ -18,8 +18,8 @@ Target runtime nodes:
 - NVIDIA Thor nodes running `vLLM`
 
 The `ax-serving serve` local worker path is still available for Mac
-compatibility, but it should be treated as a migration bridge while dedicated
-ax-engine node adapters mature.
+compatibility with ax-engine artifact directories, but it should be treated as
+a migration bridge while dedicated ax-engine node adapters mature.
 
 ### Prerequisites
 
@@ -31,7 +31,8 @@ ax-engine node adapters mature.
   `target/release/`.
 - Orchestrator running (see §2)
 - Runtime node available:
-  - `ax-serving serve` compatibility worker for local Mac testing
+  - `ax-serving serve` compatibility worker for local Mac testing with
+    ax-engine artifact directories
   - ax-engine node adapter for Mac runtime-node deployments
   - vLLM node/agent for PC CUDA or NVIDIA Thor runtime-node deployments
 
@@ -45,7 +46,7 @@ AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
 AXS_WORKER_RUNTIME=ax_engine \
 AXS_WORKER_HARDWARE_CLASS=mac \
 ax-serving serve \
-  -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id llama3-8b \
   --port 18081
 
@@ -54,7 +55,7 @@ AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
 AXS_WORKER_RUNTIME=ax_engine \
 AXS_WORKER_HARDWARE_CLASS=mac \
 ax-serving serve \
-  -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id llama3-8b \
   --port 8082
 
@@ -68,7 +69,7 @@ Production gateway-only deployments can block embedded compatibility workers:
 
 ```bash
 AXS_EMBEDDED_RUNTIME_POLICY=deny ax-serving serve \
-  -m ./models/llama3.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id llama3-8b \
   --port 18081
 # Expected: startup fails and asks for ax-serving-api plus ax-engine/vLLM runtime nodes.
@@ -228,7 +229,7 @@ Runtime nodes can join a running gateway at any time.
 AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
 AXS_WORKER_RUNTIME=ax_engine \
 AXS_WORKER_HARDWARE_CLASS=mac \
-ax-serving serve -m ./models/llama3.gguf --model-id llama3-8b --port 8085
+ax-serving serve -m ./models/<ax-engine-artifact-dir> --model-id llama3-8b --port 8085
 
 # Verify it appeared within one heartbeat interval (~5 s):
 curl -s http://127.0.0.1:19090/internal/workers | jq '[.workers[] | select(.health == "healthy")] | length'
@@ -263,7 +264,7 @@ curl -s -X POST http://127.0.0.1:19090/internal/workers/${WORKER_ID}/drain-compl
 # Returns 204 on success.
 
 # 4. Restart the worker (it will re-register automatically).
-ax-serving serve -m ./models/llama3.gguf --model-id llama3-8b --port 18081
+ax-serving serve -m ./models/<ax-engine-artifact-dir> --model-id llama3-8b --port 18081
 ```
 
 > **Note:** If the worker crashes before calling drain-complete, the

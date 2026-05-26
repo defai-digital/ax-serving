@@ -80,7 +80,7 @@
 
 ## Getting Started Paths
 
-1. **Local testing**: `cargo run -p ax-serving-cli --bin ax-serving -- serve -m model.gguf`
+1. **Local testing**: run `ax-serving-api` with `ax-runtime-agent`, or use `ax-serving serve -m <ax-engine-artifact-dir>` for the embedded compatibility path.
 2. **With Python**: See `docs/python-sdk.md`
 3. **Production multi-worker**: See `docs/runbooks/multi-worker.md`
 4. **Runtime-node adapter**: Use `ax-runtime-agent` with `AXS_NODE_*` config

@@ -1,14 +1,15 @@
 # AX Serving backend routing configuration
 #
-# CURRENT POLICY: route all models through llama.cpp by default.
-# ax-engine remains available for AX MLX artifact directories or explicit
-# per-load override (`native`).
+# CURRENT POLICY: AX Serving is the serving/orchestration layer, not the
+# token-generation engine. Default embedded local loading should target
+# ax-engine artifact directories. GGUF / llama.cpp remains a compatibility
+# path only when explicitly requested by an operator.
 #
 # Backends:
 #   native    — ax-engine SDK v4 session (requires AX MLX artifacts + Metal)
-#   llama_cpp — llama-server subprocess (requires llama-server on PATH via brew install llama.cpp)
+#   llama_cpp — legacy llama-server subprocess compatibility path
 #   lib_llama — direct libllama C API, no subprocess (requires `libllama` feature; Phase 2)
-#   auto      — AX MLX artifact directories use native; GGUF uses llama_cpp
+#   auto      — AX artifact directories use native; GGUF compatibility uses llama_cpp
 #
 # Family detection:
 #   Primary:  reads `general.architecture` from the GGUF header (authoritative).
@@ -20,25 +21,16 @@
 #   3. default_backend
 #
 # Loading order for this config file:
-#   1. $AXS_ROUTING_CONFIG env var path
-#   2. ./backends.yaml in CWD
-#   3. Built-in defaults (default_backend: llama_cpp)
+#   1. Explicit --routing-config path
+#   2. $AXS_ROUTING_CONFIG env var path
+#   3. ./backends.yaml in CWD
+#   4. Built-in defaults
+#
+# To opt into the embedded llama.cpp compatibility path, use an explicit
+# per-load backend (`llama_cpp`) or provide an override routing file that maps
+# the relevant families to `llama_cpp`.
 
-# Unknown families: route to llama.cpp.
-default_backend: llama_cpp
+# Unknown families: use ax-engine artifact loading by default.
+default_backend: native
 
-families:
-  # ── explicit routing (llama.cpp) ─────────────────────────────────────────
-  llama:     llama_cpp   # LLaMA / LLaMA 3 / CodeLlama
-  qwen:      llama_cpp   # Qwen 2/3
-  gemma:     llama_cpp   # Gemma 2/3
-  mistral:   llama_cpp   # Mistral / Mistral 3
-  deepseek:  llama_cpp   # Distilled models.
-  phi:       llama_cpp   # phi2 / phi3
-  falcon:    llama_cpp   # Falcon
-  glm:       llama_cpp   # GLM / ChatGLM
-  mixtral:   llama_cpp   # Mixtral
-  starcoder: llama_cpp   # StarCoder2
-  gptj:      llama_cpp   # GPT-J
-  gpt_neox:  llama_cpp   # GPT-NeoX / Pythia / RedPajama
-  minimax:   llama_cpp   # MiniMax
+families: {}

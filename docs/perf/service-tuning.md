@@ -29,7 +29,7 @@ Notes:
 AXS_SCHED_MAX_INFLIGHT=8 \
 AXS_SCHED_MAX_QUEUE=64 \
 AXS_SCHED_MAX_WAIT_MS=250 \
-cargo run -p ax-serving-cli --release -- serve -m ./models/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf --port 18080
+cargo run -p ax-serving-cli --release -- serve -m ./models/<ax-engine-artifact-dir> --port 18080
 ```
 
 2. Run load test:
@@ -55,4 +55,3 @@ python3 scripts/load_test_chat.py \
 - Error rate (`429` + `5xx`) < 1% under expected peak load.
 - p95 latency meets product SLO.
 - p99 remains stable across 30+ minute sustained test.
-

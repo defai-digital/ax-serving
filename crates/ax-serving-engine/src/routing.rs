@@ -1052,4 +1052,18 @@ families:
         assert_eq!(cfg2.native_families.len(), 3);
         assert_eq!(cfg2.families.len(), 2);
     }
+
+    #[test]
+    fn public_backends_config_does_not_default_to_llama_cpp() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/backends.yaml");
+        let cfg = RoutingConfig::from_file(&path).unwrap();
+
+        assert_ne!(cfg.default_backend, BackendChoice::LlamaCpp);
+        assert!(
+            cfg.families
+                .values()
+                .all(|choice| *choice != BackendChoice::LlamaCpp),
+            "public backends.yaml should not force llama.cpp; keep it explicit compatibility"
+        );
+    }
 }

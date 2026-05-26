@@ -184,7 +184,7 @@ Compatibility local worker:
 AXS_ALLOW_NO_AUTH=true \
 AXS_WORKER_RUNTIME=ax_engine \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id default \
   --host 127.0.0.1 \
   --port 18080
@@ -301,7 +301,7 @@ cargo run -p ax-serving-cli --bin ax-serving -- \
 ```bash
 AXS_ALLOW_NO_AUTH=true \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id default \
   --port 18080
 ```
@@ -323,7 +323,7 @@ Worker:
 ```bash
 AXS_ALLOW_NO_AUTH=true \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
+  -m ./models/<ax-engine-artifact-dir> \
   --model-id default \
   --port 18081 \
   --orchestrator http://127.0.0.1:19090
@@ -419,12 +419,12 @@ AXS_CONFIG=config/serving.offline-enterprise.yaml \
 AXS_API_KEY="change-me" \
 AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
 cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m /absolute/path/to/models/<model>.gguf \
+  -m /absolute/path/to/models/<ax-engine-artifact-dir> \
   --model-id default
 ```
 
 ```bash
-AXS_API_KEY="token1,token2" cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/<model>.gguf
+AXS_API_KEY="token1,token2" cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/<ax-engine-artifact-dir>
 ```
 
 Client header:
