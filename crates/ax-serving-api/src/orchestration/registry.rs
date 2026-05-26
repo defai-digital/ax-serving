@@ -1279,12 +1279,32 @@ fn dispatch_filter_matches(
         && model_inventory_supports_request_kind(entry, model_id, request_kind)
         && backend_filter.is_none_or(|kind| &entry.backend == kind)
         && runtime_filter.is_none_or(|kind| &entry.runtime == kind)
-        && min_context.is_none_or(|required| {
-            entry
-                .capabilities
-                .max_context
-                .is_none_or(|worker_max| worker_max >= required)
-        })
+        && model_context_supports_request(entry, model_id, min_context)
+}
+
+fn model_context_supports_request(
+    entry: &WorkerEntry,
+    model_id: &str,
+    min_context: Option<u32>,
+) -> bool {
+    let Some(required) = min_context else {
+        return true;
+    };
+
+    let worker_context_ok = entry
+        .capabilities
+        .max_context
+        .is_none_or(|worker_max| worker_max >= required);
+    if !worker_context_ok {
+        return false;
+    }
+
+    entry
+        .model_inventory
+        .iter()
+        .find(|model| model.id == model_id)
+        .and_then(|model| model.max_context)
+        .is_none_or(|model_max| model_max >= required)
 }
 
 fn model_inventory_supports_request_kind(
@@ -1992,6 +2012,45 @@ mod tests {
             r.eligible_workers_filtered("ctx-model", RequestKind::Llm, None, Some(20000))
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn min_context_respects_model_inventory_context_limit() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["short-model".into()],
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "short-model".into(),
+                    max_context: Some(4096),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_filtered("short-model", RequestKind::Llm, None, Some(4096))
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers_filtered("short-model", RequestKind::Llm, None, Some(8000))
+                .is_empty(),
+            "per-model context limit must override broader worker context"
         );
     }
 
