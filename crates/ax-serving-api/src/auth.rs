@@ -53,6 +53,21 @@ pub(crate) fn has_valid_api_key(candidate: &str, keys: &HashSet<String>) -> bool
         .any(|expected| constant_time_eq_str(candidate, expected))
 }
 
+/// Extract a bearer token from an Authorization header value.
+///
+/// HTTP authentication schemes are case-insensitive. Require at least one
+/// whitespace separator between the scheme and token.
+pub(crate) fn bearer_token_from_authorization(value: &str) -> Option<&str> {
+    let mut parts = value.trim_start().splitn(2, char::is_whitespace);
+    let scheme = parts.next()?;
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 /// Returns `true` if the given path is exempt from authentication.
 ///
 /// Monitoring endpoints remain unauthenticated so Prometheus scrapers,
@@ -96,7 +111,7 @@ pub async fn auth_middleware(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_token_from_authorization)
         .map(|key| has_valid_api_key(key.trim(), &keys))
         .unwrap_or(false);
 
@@ -172,24 +187,29 @@ mod tests {
     }
 
     #[test]
-    fn bearer_token_trim_after_prefix_strip() {
-        // Simulate what auth_middleware does: strip prefix then trim.
+    fn bearer_token_parser_accepts_case_insensitive_scheme_and_whitespace() {
         let cases = [
-            ("Bearer secret", Some("secret")),   // normal
-            ("Bearer  secret", Some("secret")),  // double space after Bearer
-            ("Bearer secret ", Some("secret")),  // trailing space on token
-            ("Bearer  secret ", Some("secret")), // both
-            ("Token secret", None),              // wrong scheme
-            ("secret", None),                    // no scheme
+            ("Bearer secret", Some("secret")),
+            ("bearer secret", Some("secret")),
+            ("BEARER secret", Some("secret")),
+            ("Bearer  secret", Some("secret")),
+            ("Bearer\tsecret", Some("secret")),
+            ("Bearer secret ", Some("secret")),
+            (" Bearer secret", Some("secret")),
+            ("Token secret", None),
+            ("Bearer", None),
+            ("Bearer ", None),
+            ("Bearersecret", None),
+            ("secret", None),
         ];
         let mut keys = std::collections::HashSet::new();
         keys.insert("secret".to_string());
         for (header, expected_key) in cases {
-            let result = header.strip_prefix("Bearer ").map(|k| k.trim().to_string());
-            assert_eq!(result.as_deref(), expected_key, "header: {header:?}");
+            let result = bearer_token_from_authorization(header);
+            assert_eq!(result, expected_key, "header: {header:?}");
             if let Some(k) = result {
                 assert!(
-                    has_valid_api_key(&k, &keys),
+                    has_valid_api_key(k, &keys),
                     "trimmed key should be found in set"
                 );
             }
@@ -254,6 +274,19 @@ mod tests {
         let req = axum::http::Request::builder()
             .uri("/v1/models")
             .header("Authorization", "Bearer correct-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_lowercase_bearer_scheme() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&["correct-key"]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("Authorization", "bearer correct-key")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
