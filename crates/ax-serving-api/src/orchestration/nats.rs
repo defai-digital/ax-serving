@@ -409,6 +409,17 @@ fn subscriber_response_stream(
     }))
 }
 
+fn build_streaming_nats_response(
+    status: u16,
+    rx: futures::channel::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+) -> Response {
+    axum::response::Response::builder()
+        .status(nats_status(status))
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(rx))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn relay_streaming_nats_responses<S>(
     first: NatsResponse,
     mut rest: S,
@@ -703,6 +714,7 @@ impl NatsDispatcher {
         let (tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         let reroute_total = Arc::clone(&self.reroute_total);
         let request_id = request_id.to_string();
+        let response_status = first.status;
         let rest = subscriber_response_stream(sub);
 
         tokio::spawn(async move {
@@ -710,11 +722,7 @@ impl NatsDispatcher {
                 .await;
         });
 
-        axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/event-stream")
-            .body(Body::from_stream(rx))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        build_streaming_nats_response(response_status, rx)
     }
 }
 
@@ -740,9 +748,9 @@ mod tests {
 
     use super::{
         NatsBodyDecodeError, NatsConfig, NatsRequest, NatsResponse, build_complete_nats_response,
-        build_non_streaming_nats_response, decode_body_hex_limited, decode_stream_body_hex_limited,
-        is_event_stream, relay_streaming_nats_responses, sanitize_subject_component,
-        stream_frames_from_nats_response,
+        build_non_streaming_nats_response, build_streaming_nats_response, decode_body_hex_limited,
+        decode_stream_body_hex_limited, is_event_stream, relay_streaming_nats_responses,
+        sanitize_subject_component, stream_frames_from_nats_response,
     };
 
     #[test]
@@ -933,6 +941,19 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "bad request");
+    }
+
+    #[test]
+    fn streaming_response_preserves_first_worker_status() {
+        let (_tx, rx) = futures::channel::mpsc::channel(1);
+
+        let response = build_streaming_nats_response(429, rx);
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
     }
 
     #[test]
