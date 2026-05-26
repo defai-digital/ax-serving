@@ -641,6 +641,13 @@ impl WorkerRegistry {
             .filter(|runtime| *runtime != RuntimeKind::Unknown)
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let runtime_mode = normalize_runtime_mode(runtime_mode);
+        let runtime_version = normalize_optional_string(runtime_version);
+        let hardware_class = normalize_optional_string(hardware_class);
+        let runtime_endpoint = normalize_optional_string(runtime_endpoint);
+        let friendly_name = normalize_optional_string(friendly_name);
+        let chip_model = normalize_optional_string(chip_model);
+        let worker_pool = normalize_optional_string(worker_pool);
+        let node_class = normalize_optional_string(node_class);
         let (mut capabilities, capability_source) = capabilities.into_parts();
         let incoming_model_inventory = model_inventory;
         let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
@@ -1287,6 +1294,17 @@ fn normalize_runtime_mode(mode: Option<String>) -> Option<String> {
             None
         } else {
             Some(normalized)
+        }
+    })
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     })
 }
@@ -2759,6 +2777,55 @@ mod tests {
         assert_eq!(snap.chip_model.as_deref(), Some("Apple M3 Pro"));
         assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
         assert_eq!(snap.node_class.as_deref(), Some("m3-pro"));
+    }
+
+    #[test]
+    fn register_normalizes_optional_metadata_fields() {
+        let r = WorkerRegistry::new();
+        let req = RegisterRequest {
+            worker_id: None,
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "auto".into(),
+            runtime_mode: Some(" Adapter ".into()),
+            runtime_version: Some(" 0.13.0 ".into()),
+            hardware_class: Some(" pc-cuda ".into()),
+            runtime_endpoint: Some(" http://127.0.0.1:8000 ".into()),
+            max_inflight: 4,
+            friendly_name: Some(" node-a ".into()),
+            chip_model: Some(" NVIDIA L40S ".into()),
+            worker_pool: Some(" blue ".into()),
+            node_class: Some(" pc-cuda ".into()),
+            ..Default::default()
+        };
+        let resp = r.register(req, 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.runtime_mode.as_deref(), Some("adapter"));
+        assert_eq!(snap.runtime_version.as_deref(), Some("0.13.0"));
+        assert_eq!(snap.hardware_class.as_deref(), Some("pc-cuda"));
+        assert_eq!(
+            snap.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(snap.friendly_name.as_deref(), Some("node-a"));
+        assert_eq!(snap.chip_model.as_deref(), Some("NVIDIA L40S"));
+        assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
+        assert_eq!(snap.node_class.as_deref(), Some("pc-cuda"));
+        assert_eq!(
+            r.dispatch_workers_filtered_with_pool_mode(
+                "m1",
+                RequestKind::Llm,
+                None,
+                None,
+                Some("blue"),
+                true,
+                None,
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
