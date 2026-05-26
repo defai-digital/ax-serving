@@ -1430,10 +1430,13 @@ fn parse_mlx_sse_reader<R: std::io::Read>(
         let _ = tx.blocking_send(GenerateEvent::Token(buf));
     }
 
-    emit_accumulated_tool_calls(tool_call_acc, tx);
+    let emitted_tool_call = emit_accumulated_tool_calls(tool_call_acc, tx);
 
     if stop_reason.is_empty() {
         stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
     }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens: prompt_tokens as usize,
@@ -1486,7 +1489,7 @@ fn emit_non_streaming_response(
 
     let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
     let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
-    let stop_reason = val["choices"][0]["finish_reason"]
+    let mut stop_reason = val["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("")
         .to_string();
@@ -1522,7 +1525,13 @@ fn emit_non_streaming_response(
         let _ = tx.blocking_send(GenerateEvent::Token(text));
     }
 
-    emit_non_stream_tool_calls(val, tx);
+    let emitted_tool_call = emit_non_stream_tool_calls(val, tx);
+    if stop_reason.is_empty() {
+        stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
+    }
 
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
@@ -1536,10 +1545,11 @@ fn emit_non_streaming_response(
 fn emit_non_stream_tool_calls(
     val: &serde_json::Value,
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
-) {
+) -> bool {
     let Some(tool_calls) = val["choices"][0]["message"]["tool_calls"].as_array() else {
-        return;
+        return false;
     };
+    let mut emitted = false;
     for tc in tool_calls {
         let Some(name) = tc["function"]["name"]
             .as_str()
@@ -1561,15 +1571,18 @@ fn emit_non_stream_tool_calls(
             name: name.to_string(),
             arguments,
         });
+        emitted = true;
     }
+    emitted
 }
 
 fn emit_accumulated_tool_calls(
     mut tool_calls: HashMap<u64, (String, String, String)>,
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
-) {
+) -> bool {
     let mut sorted = tool_calls.drain().collect::<Vec<_>>();
     sorted.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut emitted = false;
     for (_, (id, name, arguments)) in sorted {
         if name.is_empty() {
             continue;
@@ -1580,7 +1593,9 @@ fn emit_accumulated_tool_calls(
             name,
             arguments,
         });
+        emitted = true;
     }
+    emitted
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1781,7 +1796,7 @@ mod tests {
             "]},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
             "{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}",
-            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "]},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -1823,7 +1838,7 @@ mod tests {
                         }
                     }]
                 },
-                "finish_reason": "tool_calls"
+                "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 2, "completion_tokens": 3}
         });

@@ -1775,6 +1775,7 @@ fn complete_chat_completions(
         let _ = tx.blocking_send(GenerateEvent::Token(text.to_string()));
     }
 
+    let mut emitted_tool_call = false;
     if let Some(tool_calls) = val["choices"][0]["message"]["tool_calls"].as_array() {
         for tc in tool_calls {
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
@@ -1796,15 +1797,19 @@ fn complete_chat_completions(
                 name,
                 arguments,
             });
+            emitted_tool_call = true;
         }
     }
 
     let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
     let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
-    let stop_reason = val["choices"][0]["finish_reason"]
+    let mut stop_reason = val["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("stop")
         .to_string();
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
+    }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
         completion_tokens,
@@ -2122,6 +2127,7 @@ fn parse_chat_sse_reader<R: std::io::Read>(
     let mut sorted_calls: Vec<(u64, (String, String, String))> =
         tool_call_acc.into_iter().collect();
     sorted_calls.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut emitted_tool_call = false;
     for (_, (id, name, arguments)) in sorted_calls {
         if !name.is_empty() {
             let call_id = if id.is_empty() {
@@ -2134,11 +2140,15 @@ fn parse_chat_sse_reader<R: std::io::Read>(
                 name,
                 arguments,
             });
+            emitted_tool_call = true;
         }
     }
 
     if stop_reason.is_empty() {
         stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
     }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
@@ -2546,7 +2556,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
             "{\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},",
             "{\"id\":\"call_b\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}}",
-            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "]},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
