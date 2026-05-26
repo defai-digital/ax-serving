@@ -840,6 +840,7 @@ fn stream_response(
             0u8,
             true,
             0u32,
+            false,
             Some(model_entry),
             Some(permit),
             Some(pm_permit),
@@ -855,6 +856,7 @@ fn stream_response(
             phase,
             first_token,
             next_tool_call_index,
+            saw_tool_call,
             model_entry,
             permit,
             pm,
@@ -877,6 +879,7 @@ fn stream_response(
                             2,
                             false,
                             next_tool_call_index,
+                            saw_tool_call,
                             None,
                             None,
                             None,
@@ -956,6 +959,7 @@ fn stream_response(
                                     0,
                                     false,
                                     next_tool_call_index,
+                                    saw_tool_call,
                                     model_entry,
                                     permit,
                                     pm,
@@ -1013,6 +1017,7 @@ fn stream_response(
                                     0,
                                     false,
                                     next_tool_call_index,
+                                    true,
                                     model_entry,
                                     permit,
                                     pm,
@@ -1024,6 +1029,11 @@ fn stream_response(
                         }
                         GenerateEvent::Done(stats) => {
                             record_generation_stats(metrics.as_ref(), &stats);
+                            let finish_reason = if saw_tool_call {
+                                "tool_calls"
+                            } else {
+                                map_stop_reason(&stats.stop_reason)
+                            };
                             let chunk = StreamChatChunk {
                                 id: &id,
                                 object: "chat.completion.chunk",
@@ -1036,7 +1046,7 @@ fn stream_response(
                                         content: None,
                                         tool_calls: None,
                                     },
-                                    finish_reason: Some(map_stop_reason(&stats.stop_reason)),
+                                    finish_reason: Some(finish_reason),
                                     logprobs: None,
                                 }],
                                 usage: Some(stream_usage_from_generation_stats(&stats)),
@@ -1053,6 +1063,7 @@ fn stream_response(
                                     1,
                                     false,
                                     next_tool_call_index,
+                                    saw_tool_call,
                                     model_entry,
                                     None,
                                     None,
@@ -1082,6 +1093,7 @@ fn stream_response(
                                     1,
                                     false,
                                     next_tool_call_index,
+                                    saw_tool_call,
                                     model_entry,
                                     None,
                                     None,
@@ -1113,6 +1125,7 @@ fn stream_response(
                                     1,
                                     false,
                                     next_tool_call_index,
+                                    saw_tool_call,
                                     model_entry,
                                     None,
                                     None,
@@ -2367,7 +2380,7 @@ mod tests {
         .await
         .unwrap();
         tx.send(GenerateEvent::Done(GenerationStats {
-            stop_reason: "tool_calls".into(),
+            stop_reason: "stop".into(),
             ..GenerationStats::default()
         }))
         .await
