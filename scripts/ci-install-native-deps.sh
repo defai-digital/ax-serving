@@ -16,6 +16,7 @@ HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-$(brew --prefix)}"
 brew list protobuf >/dev/null 2>&1 || brew install protobuf
 brew list mlx >/dev/null 2>&1 || brew install mlx
 brew list mlx-c >/dev/null 2>&1 || brew install mlx-c
+brew list llama.cpp >/dev/null 2>&1 || brew install llama.cpp
 
 brew link --overwrite mlx || true
 brew link --overwrite mlx-c || true
@@ -28,6 +29,18 @@ if [[ ! -f "${MLX_C_HEADER}" ]]; then
   exit 1
 fi
 
+LLAMA_PREFIX="$(brew --prefix llama.cpp)"
+LLAMA_INCLUDE_DIR="${LLAMA_PREFIX}/include"
+LLAMA_LIB_DIR="${LLAMA_PREFIX}/lib"
+if [[ ! -f "${LLAMA_INCLUDE_DIR}/llama.h" ]]; then
+  echo "error: llama.cpp header not found at ${LLAMA_INCLUDE_DIR}/llama.h" >&2
+  exit 1
+fi
+if ! ls "${LLAMA_LIB_DIR}"/libllama.* >/dev/null 2>&1; then
+  echo "error: libllama not found in ${LLAMA_LIB_DIR}" >&2
+  exit 1
+fi
+
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   {
     echo "HOMEBREW_PREFIX=${HOMEBREW_PREFIX}"
@@ -35,5 +48,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "LIBRARY_PATH=${HOMEBREW_PREFIX}/lib"
     echo "CXXFLAGS=-I${HOMEBREW_PREFIX}/include"
     echo "LDFLAGS=-L${HOMEBREW_PREFIX}/lib"
+    echo "AXS_LLAMA_INCLUDE_DIR=${LLAMA_INCLUDE_DIR}"
+    echo "AXS_LLAMA_LIB_DIR=${LLAMA_LIB_DIR}"
   } >> "${GITHUB_ENV}"
 fi

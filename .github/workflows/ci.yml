@@ -113,6 +113,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-features
+      - name: Build native Python compatibility extension
+        run: |
+          PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release -p ax-serving-py
+          mkdir -p "$RUNNER_TEMP/ax-serving-native-smoke"
+          ln -s "$GITHUB_WORKSPACE/target/release/libax_serving.dylib" \
+            "$RUNNER_TEMP/ax-serving-native-smoke/ax_serving.so"
+          PYTHONPATH="$RUNNER_TEMP/ax-serving-native-smoke" \
+            python -c 'import ax_serving; assert ax_serving.AxModel.__name__ == "AxModel"'
 
   sdk:
     name: SDK conformance

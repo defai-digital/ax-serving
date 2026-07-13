@@ -94,7 +94,7 @@ impl AxModel {
 
     /// Generate text from a raw prompt string.
     ///
-    /// Releases the GIL during inference so other Python threads can run.
+    /// Detaches from the Python interpreter during inference.
     /// Returns the full generated text as a single string.
     #[pyo3(signature = (prompt, max_tokens=None, temperature=None))]
     fn generate(
@@ -123,7 +123,7 @@ impl AxModel {
     /// `messages` is a list of `(role, content)` tuples, e.g.
     /// `[("system", "You are helpful."), ("user", "Hello!")]`.
     ///
-    /// Releases the GIL during inference.
+    /// Detaches from the Python interpreter during inference.
     #[pyo3(signature = (messages, max_tokens=None, temperature=None))]
     fn chat(
         &self,
@@ -178,8 +178,8 @@ impl AxModel {
 impl AxModel {
     /// Drain the generate event channel into a complete string.
     ///
-    /// Releases the Python GIL for the duration of the blocking wait so that
-    /// other Python threads (e.g. a GUI or another model) can run.
+    /// Detaches from the Python interpreter for the blocking wait so other
+    /// Python threads (e.g. a GUI or another model) can run.
     fn collect_events(
         &self,
         py: Python<'_>,
@@ -191,7 +191,7 @@ impl AxModel {
             .map_err(|_| PyRuntimeError::new_err("runtime lock poisoned"))?;
         let runtime = &self.runtime;
 
-        let result: Result<String, String> = py.allow_threads(move || {
+        let result: Result<String, String> = py.detach(move || {
             runtime.block_on(async move {
                 let mut output = String::new();
                 while let Some(event) = rx.recv().await {

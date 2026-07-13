@@ -67,6 +67,7 @@ cargo fmt --all -- --check
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo check --workspace --all-targets --all-features --offline
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --workspace --all-features --offline
+PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release -p ax-serving-py --offline
 npm test
 npm run typecheck
 python -m pytest -q
@@ -77,12 +78,17 @@ jq empty deploy/monitoring/grafana-dashboard.json
 The all-feature Rust run listed 1,054 test cases and passed 1,052, with one model-dependent shim
 test and one doctest ignored. JavaScript passed its build/typecheck and one contract test; Python
 passed nine tests, and its sdist/base wheel smoke test passed without installing the optional gRPC
-extra.
+extra. The separate macOS native compatibility extension built and imported successfully under
+Python 3.14.
 The Redis test in a developer run skips when `AXS_TEST_REDIS_URL` is absent; CI supplies a real
 Redis service and treats that conformance test as required.
 
 The local container build is not evidence because the configured Colima Docker daemon was stopped.
 CI builds both `gateway` and `agent` image targets and verifies their non-root configuration.
+
+The dependency lock uses the patched PyO3 0.29.0, crossbeam-epoch 0.9.20, anyhow 1.0.103, and
+memmap2 0.9.11 releases. Remote RustSec remains the authoritative dependency-audit gate; the
+unmaintained-only `paste` notice is inherited by the frozen embedded AX Engine compatibility graph.
 
 ## Release blockers
 
