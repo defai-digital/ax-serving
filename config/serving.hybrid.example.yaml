@@ -1,0 +1,121 @@
+# AX Serving explicit hybrid-fleet example.
+#
+# This file demonstrates one logical alias backed by AX Engine on Apple
+# Silicon and vLLM on CUDA. Replace every identity value and certification
+# path with artifacts produced for your exact deployments. Do not copy the
+# placeholder digests into production.
+
+orchestrator:
+  host: "0.0.0.0"
+  port: 18080
+  internal_bind_addr: "0.0.0.0"
+  internal_port: 19090
+  allowed_node_cidrs: "10.20.0.0/16"
+  worker_heartbeat_ms: 5000
+  worker_ttl_ms: 15000
+  dispatch_policy: "inference_aware"
+  deployment_mode: "explicit"
+  telemetry_stale_ms: 10000
+  max_dispatch_attempts: 2
+  tls_profile: "trusted_mesh"
+  fleet_store: "memory" # Set AXS_FLEET_STORE=redis and secret AXS_REDIS_URL for HA.
+  fleet_key_prefix: "axs:fleet:v1"
+  gateway_id: "gateway-hybrid-1"
+  retry_after_secs: 5
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  first_byte_timeout_ms: 120000
+  stream_idle_timeout_ms: 30000
+  global_queue_max: 128
+  global_queue_depth: 256
+  global_queue_wait_ms: 10000
+  global_queue_policy: "queue"
+  tenant_max_concurrent: 64
+  # Set AXS_CACHE_AFFINITY_SECRET (32+ random bytes) for x-ax-cache-affinity.
+
+  pools:
+    - id: "mac-mlx"
+      runtime_kind: "ax_engine"
+      hardware_class: "mac"
+      trust_domain: "private"
+      selector:
+        worker_pool: "mac-mlx"
+    - id: "cuda-vllm"
+      runtime_kind: "vllm"
+      hardware_class: "pc-cuda"
+      trust_domain: "private"
+      selector:
+        worker_pool: "cuda-vllm"
+
+  deployments:
+    - id: "qwen-mlx"
+      logical_model: "qwen/code"
+      pool: "mac-mlx"
+      runtime_model_id: "mlx-community/Qwen3-Coder-Next-4bit"
+      equivalence_class: "qwen-code-v1"
+      expected_identity:
+        runtime_kind: "ax_engine"
+        runtime_version: "6.8.2"
+        revision: "qwen-code-release-1"
+        artifact_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        tokenizer_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        template_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        quantization: "int4"
+      required_identity:
+        required_matching_fields:
+          - revision
+          - tokenizer_digest
+          - template_digest
+          - quantization
+      required_capabilities: []
+      enabled: true
+    - id: "qwen-cuda"
+      logical_model: "qwen/code"
+      pool: "cuda-vllm"
+      runtime_model_id: "Qwen/Qwen3-Coder-Next"
+      equivalence_class: "qwen-code-v1"
+      expected_identity:
+        runtime_kind: "vllm"
+        runtime_version: "0.9.0"
+        revision: "qwen-code-release-1"
+        artifact_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        tokenizer_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        template_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        quantization: "int4"
+      required_identity:
+        required_matching_fields:
+          - revision
+          - tokenizer_digest
+          - template_digest
+          - quantization
+      required_capabilities: []
+      enabled: true
+
+  equivalence_classes:
+    - id: "qwen-code-v1"
+      identity_policy:
+        required_matching_fields:
+          - revision
+          - tokenizer_digest
+          - template_digest
+          - quantization
+      certified_deployments:
+        - "qwen-mlx"
+        - "qwen-cuda"
+      certification_artifact: "certifications/qwen-code-v1.json"
+
+# Required secret environment variables for a remote fleet:
+#   AXS_API_KEY=<public-client-secret>
+#   AXS_ADMIN_API_KEY=<operator-secret>
+#   AXS_INTERNAL_API_TOKEN=<gateway-registration-control-secret>
+#   AXS_DISPATCH_TOKEN=<gateway-to-agent-secret>
+# Agents use AXS_WORKER_TOKEN with the same control-plane credential. HA also
+# requires a secret AXS_REDIS_URL and AXS_FLEET_STORE=redis.
+#
+# Each agent also declares the observed model identity, for example:
+#   AXS_MODEL_REVISION=qwen-code-release-1
+#   AXS_MODEL_ARTIFACT_DIGEST=sha256:<deployment-artifact-digest>
+#   AXS_MODEL_TOKENIZER_DIGEST=sha256:<tokenizer-digest>
+#   AXS_MODEL_TEMPLATE_DIGEST=sha256:<template-digest>
+#   AXS_MODEL_QUANTIZATION=int4
+#   AXS_MODEL_MAX_OUTPUT_TOKENS=4096

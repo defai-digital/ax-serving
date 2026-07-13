@@ -23,40 +23,71 @@
 //! start_servers(layer, &config).await?;
 //! ```
 
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-compile_error!("ax-serving-api only supports aarch64-apple-darwin (Apple Silicon M3+)");
+#[cfg(all(
+    feature = "embedded-compat",
+    not(all(target_arch = "aarch64", target_os = "macos"))
+))]
+compile_error!("the embedded compatibility API only supports aarch64-apple-darwin");
 
 pub mod audit;
 pub mod auth;
 pub mod cache;
 pub mod config;
+#[cfg(feature = "embedded-compat")]
 pub mod embedding_batcher;
+#[cfg(feature = "embedded-compat")]
 pub mod grpc;
 pub mod license;
+#[cfg(feature = "embedded-compat")]
 pub mod metrics;
 pub mod orchestration;
 pub mod project_policy;
+#[cfg(feature = "embedded-compat")]
 pub mod registry;
+#[cfg(feature = "embedded-compat")]
 pub mod rest;
+#[cfg(not(feature = "embedded-compat"))]
+pub mod rest {
+    pub use crate::openai_schema as schema;
+}
+#[cfg(not(feature = "embedded-compat"))]
+#[path = "rest/schema.rs"]
+pub mod openai_schema;
+#[cfg(feature = "embedded-compat")]
+pub use rest::schema as openai_schema;
+#[cfg(feature = "embedded-compat")]
 pub mod scheduler;
 pub mod utils;
 
+#[cfg(feature = "embedded-compat")]
 use std::sync::Arc;
+#[cfg(feature = "embedded-compat")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "embedded-compat")]
 use anyhow::Result;
+#[cfg(feature = "embedded-compat")]
 use ax_serving_engine::{InferenceBackend, ThermalMonitor};
+#[cfg(feature = "embedded-compat")]
 use tracing::{info, warn};
 
+#[cfg(feature = "embedded-compat")]
 use crate::audit::AuditLog;
+#[cfg(feature = "embedded-compat")]
 use crate::cache::{CacheInflight, CacheMetrics, ResponseCache};
+#[cfg(feature = "embedded-compat")]
 use crate::config::ServeConfig;
+#[cfg(feature = "embedded-compat")]
 use crate::license::LicenseState;
+#[cfg(feature = "embedded-compat")]
 use crate::metrics::MetricsStore;
+#[cfg(feature = "embedded-compat")]
 use crate::registry::ModelRegistry;
+#[cfg(feature = "embedded-compat")]
 use crate::scheduler::{PerModelScheduler, Scheduler};
 
 /// Shared serving state — held by both the gRPC and REST servers.
+#[cfg(feature = "embedded-compat")]
 pub struct ServingLayer {
     pub registry: ModelRegistry,
     pub metrics: Arc<MetricsStore>,
@@ -86,8 +117,28 @@ pub struct ServingLayer {
     pub audit: Arc<AuditLog>,
 }
 
+#[cfg(feature = "embedded-compat")]
 impl ServingLayer {
     pub fn new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Self {
+        let registry = ModelRegistry::new(config.registry.max_loaded_models);
+        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
+        let scheduler = scheduler_from_config(&config, thermal);
+        Self::from_registry(backend, config, registry, scheduler)
+    }
+
+    pub fn try_new(backend: Arc<dyn InferenceBackend>, config: ServeConfig) -> Result<Self> {
+        let registry = ModelRegistry::try_new(config.registry.max_loaded_models)?;
+        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
+        let scheduler = try_scheduler_from_config(&config, thermal)?;
+        Ok(Self::from_registry(backend, config, registry, scheduler))
+    }
+
+    fn from_registry(
+        backend: Arc<dyn InferenceBackend>,
+        config: ServeConfig,
+        registry: ModelRegistry,
+        scheduler: Scheduler,
+    ) -> Self {
         let cache = if config.cache.enabled {
             match ResponseCache::new(&config.cache) {
                 Ok(c) => Some(c),
@@ -103,20 +154,12 @@ impl ServingLayer {
             .as_ref()
             .map(|c| c.metrics())
             .unwrap_or_else(|| Arc::new(CacheMetrics::default()));
-        // ThermalMonitor poll interval from config (or env fallback via new()).
-        let thermal = Arc::new(ThermalMonitor::with_poll(config.thermal_poll_secs));
         let cache_inflight_max_retries = config.dispatcher.cache_inflight_max_retries;
         let layer = Self {
-            registry: ModelRegistry::new(config.registry.max_loaded_models),
+            registry,
             metrics: Arc::new(MetricsStore::new()),
             config: Arc::new(config.clone()),
-            scheduler: Scheduler::from_serve_config(
-                config.sched_max_inflight,
-                config.sched_max_queue,
-                config.sched_max_wait_ms,
-                &config.sched_overload_policy,
-                thermal,
-            ),
+            scheduler,
             per_model_scheduler: PerModelScheduler::new(config.sched_per_model_max_inflight),
             backend,
             cache,
@@ -148,10 +191,38 @@ impl ServingLayer {
     }
 }
 
+#[cfg(feature = "embedded-compat")]
+fn scheduler_from_config(config: &ServeConfig, thermal: Arc<ThermalMonitor>) -> Scheduler {
+    Scheduler::from_serve_config(
+        config.sched_max_inflight,
+        config.sched_max_queue,
+        config.sched_max_wait_ms,
+        &config.sched_overload_policy,
+        config.split_scheduler,
+        thermal,
+    )
+}
+
+#[cfg(feature = "embedded-compat")]
+fn try_scheduler_from_config(
+    config: &ServeConfig,
+    thermal: Arc<ThermalMonitor>,
+) -> Result<Scheduler> {
+    Scheduler::try_from_serve_config(
+        config.sched_max_inflight,
+        config.sched_max_queue,
+        config.sched_max_wait_ms,
+        &config.sched_overload_policy,
+        config.split_scheduler,
+        thermal,
+    )
+}
+
 /// Start both REST and gRPC servers, running until shutdown signal.
 ///
 /// If `config.idle_timeout_secs` > 0, also spawns a background task that
 /// evicts models idle longer than that threshold (checked every `registry.idle_check_interval_secs`).
+#[cfg(feature = "embedded-compat")]
 pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Result<()> {
     info!("starting REST server on {}", config.rest_addr);
     info!("starting gRPC server on {}", config.grpc_socket);
@@ -246,6 +317,8 @@ pub(crate) mod test_env {
     /// readers and writers can race across threads.
     pub(crate) fn lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

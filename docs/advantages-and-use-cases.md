@@ -1,118 +1,61 @@
-# AX Serving Advantages and Use Cases
+# AX Serving use cases and tradeoffs
 
-## Core Advantages
+AX Serving is useful when one client endpoint must operate multiple inference
+runtimes without moving runtime-specific scheduling into the gateway.
 
-### 1. Runtime-Node Control Plane
-- One serving surface across Mac ax-engine, PC CUDA vLLM, and Thor vLLM nodes
-- Runtime and hardware-class inventory for placement decisions
-- Thin adapter boundary that keeps inference execution inside the runtime node
+## Strong fits
 
-### 2. Production-Grade Orchestration
-- **Multi-worker gateway** with intelligent routing (`least_inflight`, `model_affinity`, `token_cost`)
-- **Adaptive scheduling** with queue management and admission control
-- **Response cache** (Valkey/Redis) for exact prompt caching — dramatically improves repeated queries
-- **Thermal protection** — automatically degrades gracefully under heat
+- A private fleet containing AX Engine/MLX and vLLM or SGLang/CUDA pools.
+- Multiple immutable runtime deployments published behind logical model names.
+- Central authentication, tenant admission, drain, rollout, and diagnostics.
+- Active-active gateways with Redis/Valkey-backed worker leases and capacity.
+- Applications that need OpenAI-compatible chat, completion, embedding, and
+  incremental SSE while runtimes remain independently deployable.
+- Operators who need failover to stop at model/tokenizer/template/quantization
+  equivalence boundaries.
 
-### 3. Developer Experience
-- **OpenAI compatible API** — works with existing clients and LangChain/LlamaIndex
-- **Official Python and JavaScript SDKs**
-- **gRPC + REST** dual support
-- **Rich observability** — detailed metrics, dashboard, audit logs
+## Poor fits
 
-### 4. Operational Excellence
-- Runtime-node registration, heartbeat, drain, and recovery workflows
-- License management and commercial features
-- Comprehensive health checks and diagnostics
-- Enterprise-ready authentication and policy controls
+- One local model with no fleet operations: use AX Engine, llama.cpp, or the
+  selected runtime server directly.
+- A requirement to split one model or KV cache across MLX and CUDA: AX Serving
+  routes whole attempts and does not implement distributed tensor execution.
+- A need for CUDA token scheduling itself: use vLLM or SGLang; AX Serving can
+  manage those endpoints but does not replace them.
+- Hyperscale or feature claims that have not passed this project's published
+  validation envelope.
 
-### 5. Runtime-Neutral Adapter Strategy
-- Mac inference through ax-engine runtime nodes
-- PC CUDA and NVIDIA Thor inference through vLLM runtime nodes
-- Embedded llama.cpp, MLX, libllama, and native paths kept as compatibility
-  bridges rather than the product direction
+## Architectural advantages
 
-## Target Use Cases
+- The portable gateway does not link AX Engine, MLX, CUDA, or llama.cpp.
+- Runtime adapters use a versioned protocol and runtime-authoritative
+  readiness/inventory rather than gateway-side model parsing.
+- Hard eligibility and explicit equivalence prevent best-effort routing from
+  becoming silent semantic failover.
+- Retry is conservative: one pre-commit retry only for connect failure or
+  authenticated typed non-admission.
+- Public, admin, control-plane, dispatch, and runtime credentials are distinct.
+- Small deployments retain an in-memory profile; HA deployments add shared
+  state without changing the public API.
 
-### Department-Scale Private AI
-- Internal company chat, RAG, and agent workflows
-- 10–200 concurrent users on Mac infrastructure
-- Full data sovereignty and compliance
+## Tradeoffs
 
-### Mac Grid / Private Cloud
-- Multiple Mac Studios or Mac Pros working together
-- Centralized gateway with automatic worker registration
-- Load balancing across heterogeneous hardware
+- An agent adds one network hop and an adapter certification obligation.
+- Explicit identity and equivalence require operational discipline.
+- Redis/Valkey becomes a production dependency for active-active gateways.
+- AX Serving cannot optimize inside a runtime as deeply as that runtime's own
+  scheduler, so telemetry must remain conservative.
+- A passing source test suite is not live runtime or performance certification.
 
-### Embedded / Offline Enterprise
-- Air-gapped deployments
-- Secure offline inference with commercial license
-- Integration with AX Fabric for grounded agents
+## Positioning
 
-### Developer & Research Workstations
-- Local serving for prototyping
-- Benchmarking and performance tuning
-- Education and internal tool development
+| Question | Correct comparison |
+| --- | --- |
+| Is MLX execution competitive with a local runtime? | Benchmark AX Engine versus llama.cpp under a matched artifact contract. |
+| What is the cost of the gateway? | Compare the same runtime directly and through AX Serving. |
+| Does a mixed fleet improve availability or cost? | Compare homogeneous and mixed fleets under drain/failure/overload scenarios. |
+| Does AX Serving replace vLLM? | No. vLLM remains the CUDA execution and token-scheduling runtime. |
 
-## Comparison to Alternatives
-
-| Feature                    | AX Serving          | llama.cpp server | vLLM / TGI     |
-|---------------------------|---------------------|------------------|----------------|
-| Fleet control plane       | Built-in            | No               | Runtime-centric |
-| Runtime-node inventory    | Built-in            | No               | Partial         |
-| Response cache            | Yes (exact match)   | No               | Limited         |
-| Placement and drain policy| Built-in            | No               | Runtime-specific |
-| Python SDK                | Official + rich     | Basic            | Official        |
-| Diagnostics and audit     | Gateway-level       | Basic            | Runtime-specific |
-| Commercial licensing path | Yes                 | No               | Yes             |
-
-## When to Use AX Serving
-
-**Use AX Serving when you need:**
-- A private serving control plane above ax-engine and vLLM runtime nodes
-- Multiple models, workers, pools, or hardware classes
-- Caching for cost/latency optimization
-- Strong operational controls and observability
-- OpenAI compatibility + advanced features (logprobs, tools, grammar, vision)
-
-**Consider alternatives when:**
-- You only need single-process local inference → use `llama-server` directly
-- Running on NVIDIA GPUs at hyperscale → consider vLLM/TGI
-
-## Getting Started Paths
-
-1. **Local testing**: `cargo run -p ax-serving-cli --bin ax-serving -- serve -m model.gguf`
-2. **With Python**: See `docs/python-sdk.md`
-3. **Production multi-worker**: See `docs/runbooks/multi-worker.md`
-4. **Runtime-node adapter**: Use `ax-runtime-agent` with `AXS_NODE_*` config
-
-## Best Practices
-
-### Deployment
-- Use dedicated orchestrator (`ax-serving-api`) + runtime-node adapters
-- Prefer `least_inflight` or `model_affinity` dispatch policy
-- Enable response caching for repetitive prompts
-
-### Performance & Reliability
-- Tune `AXS_SCHED_MAX_INFLIGHT`, `AXS_SCHED_MAX_QUEUE`, `AXS_SCHED_MAX_WAIT_MS` per hardware (see `docs/perf/service-tuning.md`)
-- Set `AXS_MODEL_ALLOWED_DIRS` to restrict model paths
-- Monitor thermal state and adjust concurrency during high load
-- Use `--release` builds in production
-
-### Operations
-- Always use API keys (`AXS_API_KEY`) in production
-- Implement graceful drain before restarting workers
-- Set up monitoring on `/v1/admin/status` and `/v1/metrics`
-- Keep warm models in memory using warm pool configuration
-
-### Security
-- Never expose internal port (`19090`) publicly
-- Use allowlist directories for models
-- Rotate API keys regularly
-
----
-
-**See also:**
-- [QUICKSTART.md](../QUICKSTART.md)
-- [python-sdk.md](python-sdk.md)
-- [market-positioning.md](market-positioning.md)
-- [AX Serving Public Contract Inventory](contracts/ax-serving-public-contract-inventory.md)
+See the [quick start](../QUICKSTART.md),
+[operations runbook](runbooks/multi-worker.md), and
+[performance evidence guide](perf/service-tuning.md).

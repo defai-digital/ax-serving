@@ -1,7 +1,7 @@
 //! ax-serving-api: multi-worker API gateway for ax-serving.
 //!
 //! Starts the orchestrator that proxies inference requests across registered
-//! `ax-serving serve` worker nodes. Holds no model weights and no Metal context.
+//! runtime-agent nodes. Holds no model weights and no accelerator context.
 //!
 //! # Usage
 //!
@@ -13,18 +13,14 @@
 //!   AXS_ORCHESTRATOR_HOST   — public proxy host (default: 127.0.0.1)
 //!   AXS_ORCHESTRATOR_PORT   — public proxy port (default: 18080)
 //!   AXS_INTERNAL_PORT       — loopback-only internal API port (default: 19090)
-//!   AXS_DISPATCH_POLICY     — worker selection policy (default: least_inflight)
-//!                             choices: least_inflight | weighted_round_robin | model_affinity | token_cost
+//!   AXS_DISPATCH_POLICY     — worker selection policy (default: inference_aware)
+//!                             choices: inference_aware | least_inflight | weighted_round_robin |
+//!                                      model_affinity | token_cost | cache_affinity
 //!   AXS_WORKER_HEARTBEAT_MS — heartbeat interval hint sent to workers (default: 5000)
 //!   AXS_WORKER_TTL_MS       — eviction TTL for silent workers (default: 15000)
 //!   AXS_GLOBAL_QUEUE_MAX    — max concurrent requests before overload policy triggers (default: 128)
 //!   AXS_GLOBAL_QUEUE_WAIT_MS — max queue wait before 503 (default: 10000)
 //!   AXS_LOG                 — tracing filter, e.g. "debug" or "ax_serving_api=trace"
-
-mod logging;
-
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-compile_error!("ax-serving-api only supports aarch64-apple-darwin (Apple Silicon M3+)");
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,12 +28,13 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(
     name = "ax-serving-api",
-    about = "AX Serving API gateway — routes requests across ax-serving worker nodes",
+    version,
+    about = "AX Serving API gateway — routes requests across runtime nodes",
     long_about = "\
 Start the multi-worker API gateway. The gateway is a pure dispatch process:\n\
-it holds no model weights and starts no Metal context. Worker nodes are\n\
+it holds no model weights and starts no accelerator context. Runtime nodes are\n\
 registered via POST /internal/workers/register (done automatically by\n\
-`ax-serving serve --orchestrator <addr>`).\n\
+`ax-runtime-agent`).\n\
 \n\
 Mode: direct (default) — proxies over loopback HTTP, zero external deps.\n\
 See docs/runbooks/multi-worker.md for the full deployment guide."
@@ -60,7 +57,8 @@ struct Cli {
     internal_port: Option<u16>,
 
     /// Worker selection policy.
-    /// Choices: least_inflight (default), weighted_round_robin, model_affinity, token_cost.
+    /// Choices: inference_aware (default), least_inflight, weighted_round_robin,
+    /// model_affinity, token_cost, cache_affinity.
     /// Overrides AXS_DISPATCH_POLICY.
     #[arg(long)]
     policy: Option<String>,
@@ -68,13 +66,13 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    logging::init_logging(false);
+    let _telemetry = ax_serving_observability::init("ax-serving-api", tracing::Level::INFO)?;
 
     use ax_serving_api::config::ServeConfig;
     use ax_serving_api::orchestration::start_orchestrator;
 
     // Load config from YAML (with env-var overrides).
-    let mut serve_config = ServeConfig::load_default();
+    let mut serve_config = ServeConfig::load_default()?;
     if let Some(h) = cli.host {
         serve_config.orchestrator.host = h;
     }

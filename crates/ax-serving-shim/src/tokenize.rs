@@ -1,6 +1,6 @@
 //! llama_tokenize / llama_token_to_piece C API functions.
 
-use std::ffi::CStr;
+use std::str;
 
 use crate::types::LlamaModel;
 
@@ -11,39 +11,46 @@ pub type LlamaToken = i32;
 /// Returns the number of tokens written, or a negative value on error.
 ///
 /// # Safety
-/// - `text` must be a valid null-terminated UTF-8 C string.
+/// - `text` must point to at least `text_len` bytes of valid UTF-8.
 /// - `tokens` must point to a buffer of at least `n_tokens_max` `i32` elements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn llama_tokenize(
     model: *const LlamaModel,
     text: *const libc::c_char,
-    _text_len: i32,
+    text_len: i32,
     tokens: *mut LlamaToken,
     n_tokens_max: i32,
     add_bos: bool,
     _special: bool,
 ) -> i32 {
-    if model.is_null() || text.is_null() || tokens.is_null() {
+    if model.is_null() || text.is_null() {
         return -1;
     }
-    if n_tokens_max <= 0 {
+    if text_len < 0 || n_tokens_max < 0 {
         return -1;
     }
 
-    let text_str = match unsafe { CStr::from_ptr(text) }.to_str() {
+    let text_bytes = unsafe { std::slice::from_raw_parts(text as *const u8, text_len as usize) };
+    let text_str = match str::from_utf8(text_bytes) {
         Ok(s) => s,
         Err(_) => return -1,
     };
 
     let m = unsafe { &*model };
-    let result = m.backend.tokenize(m.handle, text_str, add_bos);
+    let result = m.inner.backend.tokenize(m.inner.handle, text_str, add_bos);
 
     match result {
         Ok(ids) => {
+            if ids.iter().any(|&id| id > i32::MAX as u32) {
+                return -1;
+            }
             // llama.h contract: return -(n_needed) when buffer is too small.
             // Callers use the negative value to learn the required size and retry.
             if ids.len() > n_tokens_max as usize {
                 return -(ids.len().min(i32::MAX as usize) as i32);
+            }
+            if !ids.is_empty() && tokens.is_null() {
+                return -1;
             }
             for (i, id) in ids.iter().enumerate() {
                 unsafe {
@@ -72,23 +79,30 @@ pub unsafe extern "C" fn llama_token_to_piece(
     buf: *mut libc::c_char,
     length: i32,
 ) -> i32 {
-    if model.is_null() || buf.is_null() || length <= 0 {
+    if model.is_null() || length < 0 || token < 0 {
         return -1;
     }
 
     let m = unsafe { &*model };
-    match m.backend.decode_tokens(m.handle, &[token as u32]) {
+    match m
+        .inner
+        .backend
+        .decode_tokens(m.inner.handle, &[token as u32])
+    {
         Ok(piece) => {
             let bytes = piece.as_bytes();
             let n = bytes.len();
             // llama.h contract: return -(n_needed) when buffer too small.
-            // `n + 1` is needed (n bytes + null terminator); length must be > n.
-            if n >= length as usize {
+            // The buffer is byte-counted output, not a C string; exact-size
+            // buffers are valid and no trailing nul is written.
+            if n > length as usize {
                 return -(n.min(i32::MAX as usize) as i32);
+            }
+            if n > 0 && buf.is_null() {
+                return -1;
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-                *buf.add(n) = 0; // null terminator
             }
             n as i32
         }
@@ -96,5 +110,279 @@ pub unsafe extern "C" fn llama_token_to_piece(
             tracing::error!("llama_token_to_piece: {e}");
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use ax_serving_engine::{
+        GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
+        ModelMetadata, ThermalState,
+    };
+
+    use super::*;
+    use crate::types::LlamaModel;
+
+    struct RecordingBackend {
+        observed: Arc<Mutex<Option<String>>>,
+        decoded: String,
+        token_ids: Vec<u32>,
+        decode_calls: Arc<AtomicUsize>,
+    }
+
+    impl InferenceBackend for RecordingBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _handle: ModelHandle,
+            _input: GenerateInput,
+            _params: GenerationParams,
+            _tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not used in tests")
+        }
+
+        fn tokenize(
+            &self,
+            _handle: ModelHandle,
+            text: &str,
+            _add_bos: bool,
+        ) -> anyhow::Result<Vec<u32>> {
+            *self.observed.lock().unwrap() = Some(text.to_string());
+            Ok(self.token_ids.clone())
+        }
+
+        fn decode_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> anyhow::Result<String> {
+            self.decode_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.decoded.clone())
+        }
+
+        fn eos_tokens(&self, _handle: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            1
+        }
+    }
+
+    fn recording_backend(
+        observed: Arc<Mutex<Option<String>>>,
+        decoded: impl Into<String>,
+    ) -> Arc<RecordingBackend> {
+        Arc::new(RecordingBackend {
+            observed,
+            decoded: decoded.into(),
+            token_ids: vec![1, 2],
+            decode_calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[test]
+    fn llama_tokenize_respects_text_len_without_requiring_nul_termination() {
+        let observed = Arc::new(Mutex::new(None));
+        let backend = recording_backend(Arc::clone(&observed), "");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"helloTRAILING\0";
+        let mut out = [0_i32; 4];
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                5,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, 2);
+        assert_eq!(&out[..2], &[1, 2]);
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn llama_tokenize_rejects_negative_text_len() {
+        let observed = Arc::new(Mutex::new(None));
+        let backend = recording_backend(Arc::clone(&observed), "");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+        let mut out = [0_i32; 4];
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                -1,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -1);
+        assert!(observed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn llama_tokenize_allows_null_output_size_query() {
+        let observed = Arc::new(Mutex::new(None));
+        let backend = recording_backend(Arc::clone(&observed), "");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -2);
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn llama_tokenize_rejects_null_output_when_buffer_is_claimed_large_enough() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                4,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -1);
+    }
+
+    #[test]
+    fn llama_tokenize_rejects_ids_that_do_not_fit_llama_token() {
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: String::new(),
+            token_ids: vec![i32::MAX as u32 + 1],
+            decode_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let bytes = b"hello";
+        let mut out = [0_i32; 4];
+
+        let n = unsafe {
+            llama_tokenize(
+                &model,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(n, -1);
+        assert_eq!(out, [0_i32; 4]);
+    }
+
+    #[test]
+    fn llama_token_to_piece_accepts_exact_size_buffer() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 5];
+
+        let n = unsafe { llama_token_to_piece(&model, 1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, 5);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len()) },
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn llama_token_to_piece_reports_required_size_when_buffer_too_small() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 4];
+
+        let n = unsafe { llama_token_to_piece(&model, 1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, -5);
+        assert_eq!(out, [0_i8; 4]);
+    }
+
+    #[test]
+    fn llama_token_to_piece_allows_null_output_size_query() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+
+        let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 0) };
+
+        assert_eq!(n, -5);
+    }
+
+    #[test]
+    fn llama_token_to_piece_rejects_null_output_when_buffer_is_claimed_large_enough() {
+        let backend = recording_backend(Arc::new(Mutex::new(None)), "hello");
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+
+        let n = unsafe { llama_token_to_piece(&model, 1, std::ptr::null_mut(), 8) };
+
+        assert_eq!(n, -1);
+    }
+
+    #[test]
+    fn llama_token_to_piece_rejects_negative_token_without_backend_call() {
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(RecordingBackend {
+            observed: Arc::new(Mutex::new(None)),
+            decoded: "hello".to_string(),
+            token_ids: vec![1, 2],
+            decode_calls: Arc::clone(&decode_calls),
+        });
+        let model = LlamaModel::new(ModelHandle(1), backend, 8, 16, -1, -1, -1);
+        let mut out = [0_i8; 5];
+
+        let n = unsafe { llama_token_to_piece(&model, -1, out.as_mut_ptr(), out.len() as i32) };
+
+        assert_eq!(n, -1);
+        assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(out, [0_i8; 5]);
     }
 }

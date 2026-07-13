@@ -1,571 +1,461 @@
-# Multi-Worker Orchestration Runbook
+# Hybrid fleet operations runbook
 
-**Version:** 1.2
-**Contract:** [AX Serving Node Contract](../contracts/ax-serving-node-contract.md)
-**Date:** 2026-03-03
+| Field | Value |
+| --- | --- |
+| Applies to | Portable `ax-serving-api` gateway and `ax-runtime-agent` |
+| Architecture | Runtime-neutral REST/SSE data path, protocol-v1 control plane |
+| Last updated | 2026-07-12 |
 
----
+This runbook operates AX Engine/MLX and vLLM or SGLang/CUDA endpoints as one
+fleet. It does not apply to the embedded macOS compatibility server except
+where explicitly noted.
 
-## 1. Starting a Runtime Node Pool (direct mode)
+## 1. Ownership boundary
 
-AX Serving is the API gateway and control plane. Runtime nodes own inference
-execution and register themselves with the gateway on startup.
+AX Serving owns public authentication, admission, logical-model resolution,
+endpoint selection, safe retry, fleet leases, shared capacity reservations,
+drain, desired deployment state, and diagnostics.
 
-Target runtime nodes:
+The runtime owns tokenization, chat templates, model loading, batching, KV
+cache, token scheduling, distributed execution, and kernels. The runtime agent
+normalizes discovery/readiness/metrics and proxies bytes; it must remain thin.
 
-- Mac nodes running `ax-engine`
-- PC CUDA nodes running `vLLM`
-- NVIDIA Thor nodes running `vLLM`
+One request attempt runs on one endpoint. “Hybrid” means mixed endpoint pools,
+not a graph or KV cache split between MLX and CUDA.
 
-The `ax-serving serve` local worker path is still available for Mac
-compatibility, but it should be treated as a migration bridge while dedicated
-ax-engine node adapters mature.
+## 2. Deployment profiles
 
-### Prerequisites
+### Loopback development
 
-- Binaries built: `cargo build -p ax-serving-cli --release`
-  This produces both `ax-serving` and `ax-serving-api` in `target/release/`.
-- Runtime adapter built when using external runtimes:
-  `cargo build -p ax-thor-agent --release`
-  This produces `ax-runtime-agent` and the legacy `ax-thor-agent` alias in
-  `target/release/`.
-- Orchestrator running (see §2)
-- Runtime node available:
-  - `ax-serving serve` compatibility worker for local Mac testing
-  - ax-engine node adapter for Mac runtime-node deployments
-  - vLLM node/agent for PC CUDA or NVIDIA Thor runtime-node deployments
+- one gateway;
+- `fleet_store: memory`;
+- `deployment_mode: legacy_compat` or explicit test declarations;
+- `AXS_TLS_PROFILE=loopback_dev`;
+- `AXS_ALLOW_NO_AUTH=true` only by explicit operator choice.
 
-### Start compatibility Mac workers
+### Remote production candidate
 
-Open multiple terminals (or use a process supervisor):
+- two or more gateways with unique `AXS_GATEWAY_ID` values;
+- durable Redis/Valkey shared state;
+- `deployment_mode: explicit`;
+- authenticated public, admin, worker-control, dispatch, and runtime hops;
+- TLS at ingress and mTLS or an equivalent trusted private mesh internally;
+- immutable runtime images and complete deployment identities;
+- retained conformance, performance, failure, and soak evidence.
+
+The source tree is not a production certification. Complete every PRD release
+gate before applying that label to a deployment.
+
+## 3. Start the gateway
+
+Build only the portable target:
 
 ```bash
-# Worker 1 — port 18081
-AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
-AXS_WORKER_RUNTIME=ax_engine \
-AXS_WORKER_HARDWARE_CLASS=mac \
-ax-serving serve \
-  -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
-  --model-id llama3-8b \
-  --port 18081
-
-# Worker 2 — port 8082
-AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
-AXS_WORKER_RUNTIME=ax_engine \
-AXS_WORKER_HARDWARE_CLASS=mac \
-ax-serving serve \
-  -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
-  --model-id llama3-8b \
-  --port 8082
-
-# Workers 3 and 4: repeat on ports 8083, 8084
+cargo build --locked --release -p ax-serving-cli --bin ax-serving-api
 ```
 
-Each worker auto-registers with the orchestrator through
-`AXS_ORCHESTRATOR_ADDR` or the equivalent `--orchestrator` CLI flag.
-
-Production gateway-only deployments can block embedded compatibility workers:
+Development:
 
 ```bash
-AXS_EMBEDDED_RUNTIME_POLICY=deny ax-serving serve \
-  -m ./models/llama3.gguf \
-  --model-id llama3-8b \
-  --port 18081
-# Expected: startup fails and asks for ax-serving-api plus ax-engine/vLLM runtime nodes.
+AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
 ```
 
-Use `AXS_EMBEDDED_RUNTIME_POLICY=warn` for migration and local testing, or
-`allow` only when the compatibility path is intentionally accepted.
-
-### Start a Mac ax-engine runtime node
-
-Run ax-engine with an OpenAI-compatible endpoint, then place `ax-runtime-agent`
-in front of it so AX Serving only owns serving policy and routing:
+Remote active-active example:
 
 ```bash
-AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
+AXS_CONFIG=/etc/ax-serving/serving.yaml \
+AXS_FLEET_STORE=redis \
+AXS_REDIS_URL='rediss://user:password@redis.example:6379/0' \
+AXS_GATEWAY_ID='gateway-a' \
+AXS_TLS_PROFILE=trusted_mesh \
+AXS_API_KEY='public-client-key' \
+AXS_ADMIN_API_KEY='admin-key' \
+AXS_INTERNAL_API_TOKEN='worker-control-key' \
+AXS_DISPATCH_TOKEN='gateway-agent-key' \
+target/release/ax-serving-api
+```
+
+Start another replica as `gateway-b` with the same configuration and fleet
+key prefix. Never duplicate a gateway ID.
+
+The default endpoint policy is `inference_aware`. It applies hard eligibility
+filters first, then conservatively scores fresh runtime capacity, queue, KV,
+batch, TTFT, error, and cache signals. Unknown and stale signals are penalized.
+Compatibility policies remain available for rollback:
+
+- `least_inflight`;
+- `weighted_round_robin`;
+- `model_affinity`;
+- `token_cost`;
+- `cache_affinity`.
+
+## 4. Start runtime agents
+
+Build:
+
+```bash
+cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent
+```
+
+AX Engine example:
+
+Start the current AX Engine server as the runtime owner. Keep it on loopback
+when the agent is colocated:
+
+```bash
+AX_ENGINE_API_KEY='runtime-only-key' \
+/Users/akiralam/code/ax-engine/target/release/ax-engine-server \
+  --host 127.0.0.1 --port 8000 \
+  --model-id 'replace-with-runtime-model-id' \
+  --mlx \
+  --mlx-model-artifacts-dir '/replace/with/model-artifacts'
+```
+
+Then attach the portable agent:
+
+```bash
+AXS_CONTROL_PLANE_URL=https://ax-serving-control.example \
 AXS_NODE_RUNTIME=ax_engine \
+AXS_RUNTIME_VERSION='6.8.2' \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_ADVERTISED_ADDR=10.20.1.10:18081 \
+AXS_NODE_ID=mac-mlx-01 \
+AXS_NODE_WORKER_POOL=mac-mlx \
 AXS_NODE_HARDWARE_CLASS=mac \
-AXS_NODE_CLASS=mac-studio \
-AXS_NODE_WORKER_POOL=mac \
-AXS_NODE_MAX_INFLIGHT=8 \
+AXS_TRUST_DOMAIN=private \
+AXS_TLS_PROFILE=trusted_mesh \
+AXS_WORKER_TOKEN='worker-control-key' \
+AXS_DISPATCH_TOKEN='gateway-agent-key' \
+AXS_RUNTIME_API_KEY='runtime-only-key' \
 target/release/ax-runtime-agent
 ```
 
-The agent reads `/v1/models` from the runtime endpoint, registers the adapter
-address with AX Serving, sends heartbeats, and proxies OpenAI-compatible
-inference requests to ax-engine. Adapter registrations include
-`runtime_mode=adapter`; the legacy `ax-serving serve` worker path registers as
-`runtime_mode=embedded` so diagnostics can identify compatibility workers
-without guessing from backend names.
+AX Engine 6.8.2 exposes generation and multimodal capability metadata from
+`/v1/models`; the agent consumes that metadata directly. The current AX Engine
+model card does not distinguish an embedding-only deployment, so set
+`AXS_NODE_EMBEDDING=true` for a certified embedding deployment and
+`AXS_NODE_EMBEDDING=false` when an explicit fail-closed override is required.
+Do not infer embedding equivalence from a model name.
 
-When `/v1/models` exposes runtime metadata, the agent also reports structured
-`model_inventory` entries to the gateway. Supported metadata includes
-`max_context`, `quantization`, `artifact_format`, `modalities`, and
-`supported_operations`. The gateway keeps id-only inventory for runtimes that
-only expose OpenAI-compatible model ids.
+The current server exposes authoritative readiness at `/health`, inventory at
+`/v1/models`, inference through OpenAI-compatible REST/SSE, and aggregate
+telemetry at `/metrics`. AX Serving maps only the metrics whose semantics are
+defined by AX Engine 6.8.2; unavailable TTFT or throughput observations remain
+unknown and therefore cannot improve an endpoint's routing score.
 
-If the runtime exposes `/metrics`, the agent translates common Prometheus
-gauges such as `ax_runtime_active_sequences`, `ax_runtime_queue_depth`,
-`ax_runtime_decode_tok_per_sec`, `ax_runtime_ttft_p95_ms`, and
-`ax_runtime_kv_pages_used` into AX Serving heartbeat telemetry. For ax-engine
-or AX Serving-compatible runtimes, it also accepts `axs_*` gauges such as
-`axs_scheduler_queue_depth`, `axs_scheduler_inflight_count`, and
-`axs_ttft_p95_us`. If Prometheus metrics are unavailable, the agent falls back
-to `/v1/metrics` JSON and reads fields such as `scheduler.queue_depth`,
-`scheduler.inflight_count`, `scheduler.ttft_p95_us`, `kv_cache.utilization`,
-and `batch.utilization`. Missing metrics are safe; the node remains routable
-with fallback heartbeat values.
-
-### Start a PC CUDA vLLM runtime node
-
-Run vLLM's OpenAI-compatible server on the CUDA node, then start the adapter:
+vLLM example:
 
 ```bash
-AXS_CONTROL_PLANE_URL=http://<gateway-host>:19090 \
+AXS_CONTROL_PLANE_URL=https://ax-serving-control.example \
 AXS_NODE_RUNTIME=vllm \
+AXS_RUNTIME_VERSION='replace-with-certified-version' \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=<cuda-node-ip>:18081 \
+AXS_NODE_ADVERTISED_ADDR=10.20.2.10:18081 \
+AXS_NODE_ID=cuda-vllm-01 \
+AXS_NODE_WORKER_POOL=cuda-vllm \
 AXS_NODE_HARDWARE_CLASS=pc-cuda \
-AXS_NODE_CLASS=pc-cuda \
-AXS_NODE_WORKER_POOL=cuda \
-AXS_NODE_MAX_INFLIGHT=16 \
+AXS_TRUST_DOMAIN=private \
+AXS_TLS_PROFILE=trusted_mesh \
+AXS_WORKER_TOKEN='worker-control-key' \
+AXS_DISPATCH_TOKEN='gateway-agent-key' \
+AXS_RUNTIME_API_KEY='runtime-only-key' \
 target/release/ax-runtime-agent
 ```
 
-AX Serving sees this as the same node contract as a Mac node, with a different
-runtime and hardware class.
+For every deployment, set the observed identity fields used by its policy:
 
-### Start a NVIDIA Thor vLLM runtime node
+```text
+AXS_MODEL_REVISION
+AXS_MODEL_ARTIFACT_DIGEST
+AXS_MODEL_TOKENIZER_DIGEST
+AXS_MODEL_TEMPLATE_DIGEST
+AXS_MODEL_QUANTIZATION
+AXS_MODEL_MAX_OUTPUT_TOKENS
+AXS_MODEL_CAPABILITIES
+```
 
-Thor deployments should also use vLLM as the runtime owner. The legacy
-`ax-thor-agent` binary and `AXS_THOR_*` variables remain available, but the
-generic runtime-node form is preferred for new deployments:
+The agent becomes ready only when the upstream runtime is ready and inventory
+has been observed. Agent process health alone is not routing readiness. A
+runtime failure, stale observation, protocol mismatch, drain state, or expired
+lease removes the endpoint from eligibility.
+
+## 5. Configure deployment identity
+
+Use [`../../config/serving.hybrid.example.yaml`](../../config/serving.hybrid.example.yaml)
+as a schema example only. Replace all placeholder digests and certification
+paths.
+
+An explicit deployment declares:
+
+- logical client model alias;
+- runtime model ID;
+- pool, runtime kind, hardware class, and trust domain;
+- runtime/version, model revision or artifact digest;
+- tokenizer and template digests;
+- quantization, operations, context/output limits, modalities, and capabilities;
+- required matching fields;
+- optional equivalence class.
+
+Cross-pool failover is permitted only when source and target are both listed
+in the same equivalence policy and match every required identity field. A
+shared model name is not equivalence. Different quantizers or formats must be
+recorded and tested; do not call them exact when they are not.
+
+## 6. Validate startup
+
+Public probes:
 
 ```bash
-AXS_CONTROL_PLANE_URL=http://<gateway-host>:19090 \
-AXS_NODE_RUNTIME=vllm \
-AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
-AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=<thor-node-ip>:18081 \
-AXS_NODE_HARDWARE_CLASS=thor \
-AXS_NODE_CLASS=thor \
-AXS_NODE_WORKER_POOL=thor \
-AXS_NODE_MAX_INFLIGHT=16 \
-target/release/ax-runtime-agent
+curl -fsS http://gateway:18080/livez
+curl -fsS http://gateway:18080/readyz
+curl -sS http://gateway:18080/health | jq .
+curl -sS http://gateway:18080/v1/models \
+  -H 'Authorization: Bearer public-client-key' | jq .
 ```
 
-### Verify workers are registered
+Admin and control detail:
 
 ```bash
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers | length'
-# Expected: 4
-
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, runtime, hardware_class, health}'
-
-curl -s http://127.0.0.1:18080/health | jq '.workers'
-# Expected: { "total": 4, "healthy": 4, "unhealthy": 0, "dead": 0 }
+curl -sS http://gateway:18080/v1/admin/fleet \
+  -H 'Authorization: Bearer admin-key' | jq .
+curl -sS http://gateway:18080/admin/v1/deployments \
+  -H 'Authorization: Bearer admin-key' | jq .
+curl -sS http://gateway:19090/internal/workers \
+  -H 'X-Internal-Token: worker-control-key' | jq .
 ```
 
----
+Expected before traffic:
 
-## 2. Starting the API Gateway (`ax-serving-api`)
+- `/livez` is `200` on every process;
+- `/readyz` is `200` only on gateways with at least one eligible endpoint;
+- every worker has a current protocol lease and ready runtime observation;
+- explicit deployment identity matches the catalog;
+- no unexpected legacy registration participates in certified routing.
 
-The API gateway is a pure dispatch process — it holds no model weights and
-starts no Metal context.
+## 7. Request and retry contract
+
+The gateway creates one request ID and a unique attempt ID per dispatch. It
+may perform at most two attempts.
+
+A second attempt is allowed only when all conditions hold:
+
+1. no response headers or body bytes were committed to the client;
+2. the first attempt failed to connect, or the authenticated agent returned a
+   typed `not-admitted` result;
+3. another deployment is eligible and retry-compatible, including explicit
+   equivalence for cross-pool routing;
+4. the absolute request deadline has not expired.
+
+AX Serving never retries an arbitrary runtime `5xx`, an ambiguous transport
+failure after admission, or a stream after its first committed byte. A rising
+retry counter therefore indicates connect failures or trusted pre-admission
+capacity rejection—not generic runtime errors.
+
+## 8. Admission and tenant controls
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `AXS_GLOBAL_QUEUE_MAX` | `128` | Active gateway requests |
+| `AXS_GLOBAL_QUEUE_DEPTH` | `256` | Waiting requests |
+| `AXS_GLOBAL_QUEUE_WAIT_MS` | `10000` | Maximum queue wait |
+| `AXS_GLOBAL_QUEUE_POLICY` | `queue` | `queue`, `reject`, or `shed_oldest` |
+| `AXS_TENANT_MAX_CONCURRENT` | `0` | Per-tenant active cap; zero disables |
+
+Priority is `low`, `normal`, or `high` through `x-ax-priority`. Priority aging
+and cross-client handoff prevent indefinite starvation. The gateway does not
+perform token-level scheduling.
+
+If cache affinity is needed, configure a 32-byte-or-longer random
+`AXS_CACHE_AFFINITY_SECRET` and send an opaque `x-ax-cache-affinity` value.
+The derived key is tenant-scoped; raw hints and prompt text are neither stored
+nor forwarded.
+
+## 9. Drain a worker
+
+Preferred agent-controlled shutdown:
+
+1. stop renewing ready heartbeats;
+2. send drain;
+3. reject new dispatch with typed `not-admitted`;
+4. wait for inflight streams to reach zero or the hard timeout;
+5. send drain-complete and terminate.
+
+Manual emergency drain:
 
 ```bash
-# Defaults: direct mode, least_inflight policy, port 18080, internal 19090
-ax-serving-api
+curl -sS -X POST http://gateway:18080/v1/workers/WORKER_ID/drain \
+  -H 'Authorization: Bearer admin-key'
 ```
 
-### Key environment variables
+Watch `inflight` and drain state. Do not delete a worker merely to accelerate a
+normal drain; force removal can terminate active work and is an incident action.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AXS_ORCHESTRATOR_HOST` | `127.0.0.1` | Public proxy bind host. Set to `0.0.0.0` to expose externally. |
-| `AXS_WORKER_MODE` | `direct` | **Default.** Loopback HTTP proxy to workers. |
-| `AXS_ORCHESTRATOR_PORT` | `18080` | Public proxy port (clients send requests here). |
-| `AXS_INTERNAL_PORT` | `19090` | Internal API port, loopback only. |
-| `AXS_INTERNAL_API_TOKEN` | unset | Optional shared token required for `/internal/*` calls and worker registration. |
-| `AXS_DISPATCH_POLICY` | `least_inflight` | Worker selection algorithm. |
-| `AXS_WORKER_HEARTBEAT_MS` | `5000` | Heartbeat interval hint sent to workers (ms). |
-| `AXS_WORKER_TTL_MS` | `15000` | Age after which a silent worker is evicted (ms). |
-| `AXS_GLOBAL_QUEUE_MAX` | `128` | Max concurrent requests before overload policy triggers. |
-| `AXS_GLOBAL_QUEUE_WAIT_MS` | `10000` | Max queue wait before returning 503 (ms). |
+## 10. Roll a deployment
 
-### Dispatch policies
+In explicit mode, create or update the replacement identity first. Then submit
+a roll action naming the replacement deployment. The lifecycle state machine:
+
+1. enables the replacement desired state;
+2. waits until at least one replacement endpoint is ready;
+3. disables the source deployment;
+4. rolls desired state back if readiness does not arrive before the timeout.
+
+All mutations return a job. Poll it until `succeeded` or `failed`:
 
 ```bash
-# Least-inflight (default) — routes to the least-loaded worker
-AXS_DISPATCH_POLICY=least_inflight ax-serving-api
-
-# Weighted round-robin — proportional to available capacity
-AXS_DISPATCH_POLICY=weighted_round_robin ax-serving-api
-
-# Model affinity — prefers workers that have previously served the model
-AXS_DISPATCH_POLICY=model_affinity ax-serving-api
+curl -sS http://gateway:18080/admin/v1/jobs/JOB_ID \
+  -H 'Authorization: Bearer admin-key' | jq .
 ```
 
-### Override ports via flags
+These jobs coordinate AX Serving desired state. The external orchestrator or
+runtime adapter still owns image rollout, model download, GPU allocation, and
+process lifecycle.
+
+## 11. Gateway upgrade and rollback
+
+Preconditions:
+
+- CI, protocol fixtures, Redis conformance, and dependency-boundary checks pass;
+- protocol major version is compatible with active agents;
+- database/key-prefix migration is backward compatible;
+- the prior immutable image and configuration are retained.
+
+Procedure:
+
+1. add one new gateway replica with a unique ID;
+2. verify `/livez`, `/readyz`, shared workers, deployments, reservations, and
+   metrics;
+3. send canary traffic and compare error/retry/latency signals;
+4. replace remaining replicas one at a time with `maxUnavailable=0`;
+5. retain the previous replicas until streams drain.
 
-```bash
-ax-serving-api --port 9000 --internal-port 9001 --policy weighted_round_robin
-```
+Rollback by restoring the previous immutable image while keeping the same
+compatible shared-state key prefix. If the new version wrote an incompatible
+protocol or state schema, stop and follow the release-specific migration plan;
+never clear Redis as a routine rollback.
 
----
+## 12. Credential rotation
 
-## 3. Adding a Worker to a Running Pool
+Rotate one trust boundary at a time. Use overlap only where comma-separated
+key sets are supported.
 
-Runtime nodes can join a running gateway at any time.
+1. add the new public/admin key, deploy gateways, update clients, remove old;
+2. add the new worker-control key, deploy gateways and agents in a coordinated
+   window, then remove old;
+3. rotate dispatch credentials by updating gateways and agents together;
+4. rotate runtime credentials only on agents and runtimes;
+5. rotate Redis credentials through a new URL, verify replica reconciliation,
+   then revoke old access;
+6. rotate affinity secret only when losing old cache locality is acceptable.
 
-```bash
-# Start new worker on port 8085
-AXS_ORCHESTRATOR_ADDR=http://127.0.0.1:19090 \
-AXS_WORKER_RUNTIME=ax_engine \
-AXS_WORKER_HARDWARE_CLASS=mac \
-ax-serving serve -m ./models/llama3.gguf --model-id llama3-8b --port 8085
+Never place secrets in YAML, logs, command output retained by CI, images, or
+Prometheus labels.
 
-# Verify it appeared within one heartbeat interval (~5 s):
-curl -s http://127.0.0.1:19090/internal/workers | jq '[.workers[] | select(.health == "healthy")] | length'
-```
+## 13. Observability and alerts
 
-If a worker with the same address re-registers (e.g. after a crash), the
-registry treats it as idempotent and resets its heartbeat timer.
+Scrape `GET /metrics` with the admin bearer credential; use authenticated
+`GET /v1/metrics` for JSON diagnostics. Required baseline signals include:
 
-**Orchestrator restart recovery:** if `ax-serving-api` is restarted and loses
-its worker registry, each running worker detects the 404 on its next heartbeat
-and automatically re-registers — no worker restart required. Workers are back
-in the eligible pool within one heartbeat interval (~5 s by default).
+- `axs_gateway_requests_total`;
+- `axs_gateway_dispatch_attempts_total`;
+- completed, failed, cancelled, and retry counters;
+- admitted/rejected counters and queue state;
+- healthy, unhealthy, draining, and eligible worker gauges;
+- aggregate worker inflight;
+- endpoint-selection and upstream-response-header latency histograms;
+- bounded endpoint-selection outcome counters.
 
----
+Worker IDs, request IDs, prompts, model paths, and credentials are not metric
+labels. Use bounded audit/log records with request IDs for individual cases.
 
-## 4. Draining a Worker for Restart
+Recommended alerts:
 
-Use the drain flow to gracefully remove a worker without dropping in-flight
-requests.
+- no eligible worker for a published logical model;
+- readiness failures on enough gateways to violate redundancy;
+- heartbeat/observation age approaching TTL;
+- sustained queue depth, rejection, or tenant quota pressure;
+- safe retries above the established baseline;
+- failed or timed-out lifecycle jobs;
+- Redis connectivity or latency failure;
+- gateway RSS growth during the validated soak window.
 
-```bash
-WORKER_ID="<uuid from /internal/workers>"
+Alert thresholds must come from retained workload evidence, not generic
+defaults.
 
-# 1. Signal drain — gateway stops routing new requests to this worker.
-curl -s -X POST http://127.0.0.1:19090/internal/workers/${WORKER_ID}/drain
+For distributed traces, configure `OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` on each gateway and runtime agent. The
+portable exporter supports `http/json`; optional collector credentials use
+`OTEL_EXPORTER_OTLP_HEADERS` and are redacted from diagnostics. W3C
+`traceparent`/`tracestate` continuity remains enabled when export is disabled.
+Built-in spans exclude prompt/output content, tools, images, paths, and
+credentials.
 
-# 2. Monitor: wait until inflight reaches 0.
-watch -n 1 "curl -s http://127.0.0.1:19090/internal/workers/${WORKER_ID} | jq '.inflight'"
+## 14. Incident response
 
-# 3. Once inflight == 0, call drain-complete to evict.
-curl -s -X POST http://127.0.0.1:19090/internal/workers/${WORKER_ID}/drain-complete
-# Returns 204 on success.
+### `/readyz` is `503`
 
-# 4. Restart the worker (it will re-register automatically).
-ax-serving serve -m ./models/llama3.gguf --model-id llama3-8b --port 18081
-```
+Check, in order:
 
-> **Note:** If the worker crashes before calling drain-complete, the
-> gateway's health ticker evicts it after `AXS_WORKER_TTL_MS` (default 15 s).
+1. runtime process readiness and `/v1/models`;
+2. agent heartbeat and observation timestamp;
+3. protocol major compatibility and required capabilities;
+4. worker drain/lease state;
+5. deployment identity/equivalence mismatch;
+6. capacity reservations and tenant/global admission;
+7. Redis connectivity and clock-independent TTL behavior.
 
----
+Do not bypass identity or readiness filters to restore traffic. Pin a known
+safe deployment or roll back the runtime artifact.
 
-## 5. Switching to NATS Mode
+### Retry counter rises
 
-NATS mode requires the `nats-dispatch` Cargo feature and a running NATS server
-with JetStream enabled.
+Inspect gateway route diagnostics and agent admission state. Valid causes are
+connection failures and typed pre-admission rejection. Runtime `5xx` should be
+returned on the original attempt and must not increment safe retries. If they
+do, treat it as a correctness regression.
 
-### Prerequisites
+### Redis/Valkey is unavailable
 
-```bash
-# Install nats-server (brew or GitHub releases)
-brew install nats-server
+Existing streams may continue locally. New explicit admissions fail closed
+when shared reservation or fleet state cannot be proven. Restore the durable
+store; do not switch live active-active replicas to unrelated in-memory state.
 
-# Start with JetStream enabled
-nats-server --jetstream
-```
+### Runtime returns errors after admission
 
-### Build with NATS support
+Do not reroute. Drain or disable the deployment, inspect runtime logs using the
+request/attempt IDs, and roll back the runtime/model artifact. A duplicate
+attempt could create double cost or divergent output.
 
-```bash
-cargo build -p ax-serving-api --features nats-dispatch --release
-cargo build -p ax-serving-cli --release
-```
+### Queue overload
 
-### Configuration
+Determine whether pressure is gateway admission, worker capacity, or runtime
+queue/KV saturation. Add compatible endpoints or reduce admission only after
+checking runtime goodput. Increasing gateway concurrency can worsen runtime
+tail latency.
 
-```bash
-# Worker side — run the NatsWorker sidecar alongside ax-serving serve
-AXS_NATS_URL=nats://127.0.0.1:4222 \
-AXS_NATS_STREAM=ax-serving \
-AXS_NATS_MAX_DELIVER=3 \
-<your worker process>
+## 15. Shutdown
 
-# Gateway side — set mode to nats in the requesting code path
-# (NatsDispatcher is used programmatically; ax-serving-api remains in direct mode)
-AXS_NATS_URL=nats://127.0.0.1:4222
-AXS_GLOBAL_QUEUE_WAIT_MS=10000
-```
+Remove a gateway from the load balancer before termination. It stops new
+admission, allows accepted streams to complete, and exits at its hard deadline.
+Worker agents stop ready heartbeats, drain, and report drain-complete.
 
-### Verify NATS connectivity
+After planned maintenance verify:
 
-```bash
-nats stream ls   # should show ax-serving stream after first request
-nats consumer ls ax-serving
-```
+- no leaked local or shared reservations;
+- no stale worker lease remains eligible;
+- deployment desired and observed state agree;
+- retry/cancellation counters match the event;
+- public credentials were not observed at runtimes.
 
----
-
-## 6. Monitoring
+## 16. Compatibility transports
 
-### Health and metrics endpoints
-
-```bash
-# Gateway health (workers + queue summary)
-curl -s http://127.0.0.1:18080/health | jq .
-
-# Authenticated admin status (queue, dispatch, license, worker summary)
-curl -s http://127.0.0.1:18080/v1/admin/status \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
-
-curl -s http://127.0.0.1:18080/v1/admin/status \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.workers.runtimes'
-
-# Runtime diagnostics with model inventory, endpoint, operations, and issues.
-curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.runtimes'
-
-# Actionable recovery hints derived from runtime diagnostics.
-curl -s http://127.0.0.1:18080/v1/admin/diagnostics \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtime_diagnostics.recommended_actions'
-
-# CLI status with gateway diagnostics and recovery actions.
-ax-serving status --url http://127.0.0.1:18080 --diagnostics --api-key "${AXS_API_KEY}"
-
-# AX Fabric read-side contract validation.
-ax-serving fabric validate --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-
-# Check whether production can switch to AXS_EMBEDDED_RUNTIME_POLICY=deny.
-ax-serving migration embedded-readiness --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-
-# Redacted support bundle for escalation.
-ax-serving support-bundle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}" --output support-bundle.json
-
-# CLI worker lifecycle commands for recovery workflows.
-ax-serving workers list --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers drain "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers drain "${WORKER_ID}" --complete-when-idle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-
-# Detailed metrics including per-worker inflight and reroute count
-curl -s http://127.0.0.1:18080/v1/metrics | jq .
-
-# Public worker inventory for dashboards and operator tooling
-curl -s http://127.0.0.1:18080/v1/workers \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
-
-# Internal worker list (loopback only)
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | {id, runtime, hardware_class, health, inflight, addr}'
-
-# Runtime-level fleet summary
-curl -s http://127.0.0.1:18080/v1/admin/fleet \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq '.runtimes'
-
-# Routable model list — only healthy, non-draining workers contribute
-# If a model is missing here, the serving worker is unhealthy or draining.
-curl -s http://127.0.0.1:18080/v1/models | jq '.data[].id'
-```
-
-### Key metrics to watch
-
-| Metric | Field | Alert threshold |
-|--------|-------|-----------------|
-| Healthy workers | `workers.healthy` | < 1 → degraded |
-| Queue depth | `queue.queued` | > 80% of `AXS_GLOBAL_QUEUE_MAX` |
-| Rejected requests | `queue.rejected_total` | Rising rate → increase queue or add workers |
-| Reroute total | `reroute_total` | Rising rate → workers returning 5xx |
-| Worker inflight | per-worker `inflight` | Near `max_inflight` → add capacity |
-
-### Runtime diagnostic actions
-
-`/v1/admin/diagnostics` emits machine-readable recommended actions:
-
-| Action | Operator response |
-|---|---|
-| `restore_runtime_capacity` | Start or recover at least one healthy non-draining runtime node. |
-| `replace_unhealthy_workers` | Drain or remove unhealthy workers, restart the runtime node, then verify heartbeat. |
-| `complete_drain_when_idle` | Run `ax-serving workers drain <id> --complete-when-idle`, or wait for inflight to reach zero and call drain-complete. |
-| `fix_runtime_endpoint_registration` | Restart the adapter with `AXS_NODE_RUNTIME_URL` or `AXS_WORKER_RUNTIME_ENDPOINT`. |
-| `refresh_model_inventory` | Check runtime `/v1/models`, load the model, then restart or re-register the adapter. |
-| `fix_runtime_class` | Register with `runtime=ax_engine` or `runtime=vllm`. |
-| `fix_hardware_class` | Register ax-engine nodes as `hardware_class=mac`; register vLLM nodes as `pc-cuda` or `thor`. |
-| `investigate_runtime_errors` | Check runtime logs and recent failed requests before returning affected workers to normal routing. |
-| `relieve_runtime_pressure` | Reduce admission pressure, add runtime capacity, or drain and replace overloaded nodes. |
-| `migrate_embedded_compatibility_path` | Move inference to `ax-runtime-agent` plus ax-engine/vLLM and use `AXS_EMBEDDED_RUNTIME_POLICY=deny` in production. |
-
-Actions that can be advanced through AX Serving CLI include
-`suggested_commands`. `ax-serving status --diagnostics` prints those commands
-under each action so operators can move from diagnosis to drain, inspection, or
-replacement verification without manually translating worker IDs.
-
-Runtime-specific expectations are included under
-`.runtime_diagnostics.runtimes.<runtime>.runtime_guidance`. Use that block to
-verify that ax-engine nodes are registered as Mac nodes and vLLM nodes are
-registered as PC CUDA or Thor nodes.
-
-`ax-serving fabric validate` checks that AX Fabric can rely on `/health`,
-`/v1/models`, and `/v1/metrics`. The command accepts both single-runtime and
-gateway metrics profiles, and exits non-zero when a documented contract field is
-missing.
-
-`ax-serving migration embedded-readiness` reads gateway diagnostics and reports
-whether the fleet is ready for `AXS_EMBEDDED_RUNTIME_POLICY=deny`. It requires
-registered adapter workers, no `runtime_mode=embedded` workers, no unknown
-runtime-mode workers, and at least one eligible healthy non-draining worker.
-
-Telemetry-based issues such as `high_runtime_error_rate`,
-`runtime_queue_backlog`, `high_runtime_kv_pressure`, and
-`high_runtime_batch_pressure` come from worker heartbeat fields. Adapters can
-report either counter fields such as `kv_pages_used` and `active_batch_size`, or
-ratio fields such as `kv_utilization` and `batch_utilization`. Missing telemetry
-is treated as unknown rather than failed so older adapters can remain compatible.
-The runtime agent can derive these fields from common `ax_runtime_*`, `axs_*`,
-vLLM, and `/v1/metrics` JSON aliases.
-
-### Support escalation bundle
-
-Use `ax-serving support-bundle` when a runtime issue needs handoff to the
-platform or support team. The bundle collects gateway health, model inventory,
-metrics, admin status, diagnostics, fleet, worker inventory, and recent audit
-events. Sensitive keys such as API keys, tokens, secrets, authorization
-headers, passwords, and license keys are recursively redacted before output.
+Direct HTTP/SSE is the production data-path target. NATS remains a
+compatibility transport and is configured with `max_deliver=1`; ambiguous
+token-stream redelivery is not safe retry. Do not use durable broker replay as
+an inference failover mechanism.
 
-```bash
-ax-serving support-bundle \
-  --url http://127.0.0.1:18080 \
-  --api-key "${AXS_API_KEY}" \
-  --output support-bundle.json
-
-ax-serving support-bundle \
-  --url http://127.0.0.1:18080 \
-  --api-key "${AXS_API_KEY}" \
-  --json | jq '.endpoints[] | {name, ok, status_code}'
-```
-
-### Log fields
-
-```
-# Enable debug logging
-AXS_LOG=debug ax-serving-api
-
-# Key structured log fields:
-#   worker_id, model_id, inflight, policy, reroute, request_id
-```
-
-### Public admin worker lifecycle
-
-Use the authenticated public API when operations tooling or browser dashboards
-cannot reach the loopback-only internal router.
-
-Equivalent CLI commands are available for operator workflows:
-
-```bash
-ax-serving workers list --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers get "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers drain "${WORKER_ID}" --complete-when-idle --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers drain-complete "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-ax-serving workers remove "${WORKER_ID}" --url http://127.0.0.1:18080 --api-key "${AXS_API_KEY}"
-```
-
-```bash
-WORKER_ID="<uuid from /v1/workers>"
-
-# Start graceful drain
-curl -s -X POST http://127.0.0.1:18080/v1/workers/${WORKER_ID}/drain \
-  -H "Authorization: Bearer ${AXS_API_KEY}"
-
-# Inspect a single worker snapshot
-curl -s http://127.0.0.1:18080/v1/workers/${WORKER_ID} \
-  -H "Authorization: Bearer ${AXS_API_KEY}" | jq .
-
-# Complete drain and remove worker from registry
-curl -i -X POST http://127.0.0.1:18080/v1/workers/${WORKER_ID}/drain-complete \
-  -H "Authorization: Bearer ${AXS_API_KEY}"
-```
-
----
-
-## 7. Troubleshooting
-
-### Worker not appearing in eligible set or model list
-
-`GET /v1/models` on the gateway and the dispatch-eligible set use the same
-filter: **healthy + not draining**. If a model disappears from the model list,
-the serving worker has gone unhealthy.
-
-1. Check the worker registered: `GET /internal/workers` — is the worker present?
-2. Check health state: `health` field must be `"healthy"`. Unhealthy and dead workers are excluded from both dispatch and the model list.
-3. Check capabilities: the worker's `capabilities` must include the requested `model_id`.
-4. Check heartbeat: if `last_heartbeat_age_ms > AXS_WORKER_TTL_MS`, the worker will be evicted.
-5. Check drain flag: a draining worker (`drain: true`) is excluded from the eligible set.
-
-```bash
-curl -s http://127.0.0.1:19090/internal/workers | jq '
-  .workers[] | {id, health, drain, capabilities, last_heartbeat_age_ms: .heartbeat_age_ms}
-'
-```
-
-### Orchestrator restarted — workers not routing
-
-After an orchestrator restart, workers auto re-register when their next
-heartbeat returns 404. This takes at most one heartbeat interval
-(`AXS_WORKER_HEARTBEAT_MS`, default 5 s). No worker restart is needed.
-
-To verify recovery:
-
-```bash
-# Wait ~5 s, then check:
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers | length'
-curl -s http://127.0.0.1:18080/v1/models | jq '.data[].id'
-```
-
-If workers are not recovering, check that `AXS_ORCHESTRATOR_ADDR` or
-`--orchestrator` on each worker points to the correct internal port of the
-restarted gateway.
-
-### Queue overflow (429 or 503 responses)
-
-- `429 Too Many Requests` — `max_concurrent` limit reached with `Reject` policy.
-- `503 Service Unavailable` + "request shed" — `ShedOldest` policy dropped an older request.
-- `503 Service Unavailable` + "timed out" — request waited > `AXS_GLOBAL_QUEUE_WAIT_MS`.
-
-**Remedies:**
-- Add more workers to absorb load.
-- Increase `AXS_GLOBAL_QUEUE_MAX` (watch RSS — queue holds in-memory byte buffers).
-- Reduce client concurrency upstream.
-
-### NATS consumer lag
-
-```bash
-# Check consumer lag (pending messages)
-nats consumer info ax-serving worker-<uuid>-llama3-8b
-
-# If NumPending > 0 and workers are healthy, check:
-#   1. Worker pull batch size (default 8 messages per fetch)
-#   2. Worker inflight vs max_inflight
-#   3. Inference backend throughput
-```
-
-### High reroute rate
-
-```bash
-curl -s http://127.0.0.1:18080/v1/metrics | jq .reroute_total
-```
-
-A rising `reroute_total` means workers are returning 5xx. Check worker logs for
-inference errors, memory pressure, or Metal context failures.
-
-```bash
-# Check per-worker health in detail
-curl -s http://127.0.0.1:19090/internal/workers | jq '.workers[] | select(.health != "healthy")'
-```
+The embedded gRPC v1 API is macOS compatibility-only. It carries local model
+paths, backend enums, and token-ID semantics that cannot be translated
+losslessly by the portable hybrid gateway.

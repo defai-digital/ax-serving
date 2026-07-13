@@ -9,8 +9,12 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGES: usize = 100;
 pub const MAX_CONTENT_BYTES: usize = 32 * 1024; // 32 KB per message
+pub const MAX_HTTP_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 pub const MAX_MAX_TOKENS: u32 = 32_768;
 pub const MAX_MODEL_ID_BYTES: usize = 128;
+pub const MAX_EMBEDDING_INPUTS: usize = 2048;
+pub const MAX_EMBEDDING_TOTAL_BYTES: usize = MAX_CONTENT_BYTES * MAX_MESSAGES;
+pub const MAX_EMBEDDING_TOTAL_TOKENS: usize = MAX_MAX_TOKENS as usize;
 
 // ── Content size estimation ────────────────────────────────────────────────────
 
@@ -87,10 +91,17 @@ pub struct ImageUrl {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InputMessage {
     pub role: String,
-    pub content: MessageContent,
+    #[serde(default)]
+    pub content: Option<MessageContent>,
     /// Optional display name for the speaker (used in system prompts).
     #[serde(default)]
     pub name: Option<String>,
+    /// Tool calls from a prior assistant turn.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool call ID for `tool` role messages.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 /// Message in a chat response — content is always a plain string.
@@ -341,15 +352,16 @@ pub struct ModelEntry {
 
 /// POST /v1/models — load a model.
 ///
-/// Supports GGUF files (llama.cpp / native) and MLX model directories
-/// (SafeTensors format, `mlx_lm.server` backend).
+/// Supports ax-engine artifact directories, explicit GGUF compatibility loads
+/// (`llama_cpp` / `lib_llama`), and MLX model directories.
 #[derive(Debug, Deserialize)]
 pub struct LoadModelRequest {
     /// Model ID to register (1–128 chars, alphanumeric/dash/underscore/dot).
     pub model_id: String,
     /// Path to the model.
     ///
-    /// - GGUF backends: path to a `.gguf` file.
+    /// - Native backend: path to an ax-engine artifact directory.
+    /// - GGUF compatibility backends: path to a `.gguf` file.
     /// - MLX backend: path to an MLX model directory (`config.json` + `*.safetensors`).
     pub path: String,
     /// Override context length (0 / omit = use model default).
@@ -362,7 +374,7 @@ pub struct LoadModelRequest {
     /// Enable MLX backend (`mlx_lm.server`).
     ///
     /// When `true`, ax-serving routes to `mlx_lm.server` if the path is an MLX
-    /// model directory; otherwise falls back to llama.cpp automatically.
+    /// model directory; otherwise it uses the explicit compatibility fallback.
     /// Ignored when `backend` is explicitly set.
     #[serde(default)]
     pub mlx: Option<bool>,

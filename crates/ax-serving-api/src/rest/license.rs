@@ -11,7 +11,7 @@ use crate::ServingLayer;
 use crate::auth::RequestId;
 use crate::utils::request_meta::audit_actor;
 
-/// `GET /dashboard` — embedded monitoring dashboard (no auth required).
+/// `GET /dashboard` — embedded monitoring dashboard (operator-authenticated when configured).
 pub async fn dashboard() -> impl IntoResponse {
     axum::response::Html(include_str!("../dashboard.html"))
 }

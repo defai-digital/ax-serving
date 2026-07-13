@@ -3,7 +3,7 @@
 //! Each test spins up real in-process axum servers bound to ephemeral ports
 //! so that `DirectDispatcher` exercises actual HTTP round-trips.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use ax_serving_api::orchestration::{
     LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     direct::DirectDispatcher,
+    fleet_state::{FleetStateStore, MemoryFleetStateStore},
     internal_routes::{
         InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
         router as internal_router,
@@ -23,6 +24,14 @@ use ax_serving_api::orchestration::{
         WorkerCapabilities, WorkerId, WorkerRegistry, WorkerStatus,
     },
     start_orchestrator,
+};
+use ax_serving_api::rest::schema::MAX_CONTENT_BYTES;
+use ax_serving_protocol::{
+    AgentDescriptor, CURRENT_PROTOCOL, CapacityObservation, DeploymentIdentity, DeploymentSpec,
+    HardwareDescriptor, LogicalModelId, NegotiatedProtocol, Operation, PoolId, PoolSpec,
+    ProtocolDescriptor, RegisterWorkerRequest as ProtocolRegisterRequest, RuntimeDescriptor,
+    RuntimeModelDescriptor, RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId,
+    WorkerDescriptor as ProtocolWorkerDescriptor, WorkerId as ProtocolWorkerId, WorkerInstanceId,
 };
 use axum::{Router, middleware, routing::post};
 use reqwest::Client;
@@ -149,6 +158,70 @@ async fn spawn_mock_worker(status: u16, body: &'static str) -> Option<SocketAddr
     Some(addr)
 }
 
+async fn spawn_not_admitted_worker() -> Option<SocketAddr> {
+    let response = || async move {
+        axum::response::Response::builder()
+            .status(503)
+            .header("content-type", "application/json")
+            .header("x-ax-admission-state", "not-admitted")
+            .body(axum::body::Body::from(
+                r#"{"error":{"code":"AXS_WORKER_CAPACITY","retryable":true,"phase":"pre_admission"}}"#,
+            ))
+            .unwrap()
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(response))
+        .route("/v1/completions", post(response))
+        .route("/v1/embeddings", post(response));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    Some(addr)
+}
+
+#[derive(Default)]
+struct EchoWorkerState {
+    models: Mutex<Vec<String>>,
+    public_authorization_seen: Mutex<bool>,
+}
+
+async fn spawn_echo_model_worker() -> Option<(SocketAddr, Arc<EchoWorkerState>)> {
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+
+    async fn echo(
+        State(state): State<Arc<EchoWorkerState>>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
+        state.models.lock().unwrap().push(model.clone());
+        if headers.contains_key(axum::http::header::AUTHORIZATION) {
+            *state.public_authorization_seen.lock().unwrap() = true;
+        }
+        Json(serde_json::json!({
+            "id": "echo",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+        }))
+    }
+
+    let state = Arc::new(EchoWorkerState::default());
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo))
+        .with_state(Arc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    Some((addr, state))
+}
+
 fn proxy_router_with_key(layer: Arc<OrchestratorLayer>, key: &str) -> Router {
     layer.set_public_auth_required(true);
     let mut keys = HashSet::new();
@@ -190,6 +263,60 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
         node_class: None,
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = ax_serving_api::orchestration::proxy_router(layer);
+    let readiness = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        readiness.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("axs_gateway_requests_total 0"));
+    assert!(body.contains("axs_gateway_endpoint_selection_duration_seconds_count 0"));
+    assert!(body.contains("axs_gateway_time_to_first_byte_seconds_count 0"));
+    assert!(body.contains("axs_gateway_stream_duration_seconds_count 0"));
+    assert!(body.contains("axs_gateway_endpoint_selections_total{outcome=\"no_candidate\"} 0"));
+    assert!(body.contains("axs_gateway_workers{state=\"eligible\"} 0"));
+    assert!(!body.contains("worker_id="));
 }
 
 fn sample_project_policy(default_project: Option<&str>) -> ProjectPolicyConfig {
@@ -302,6 +429,233 @@ async fn test_dispatch_to_mock_worker() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_credentials() {
+    let (worker_addr, worker_state) = skip_if_no_socket!(spawn_echo_model_worker().await);
+    let pool_id = PoolId::new("cuda").unwrap();
+    let logical_model = LogicalModelId::new("public/qwen").unwrap();
+    let runtime_model = RuntimeModelId::new("Qwen/Qwen3-32B").unwrap();
+    let config = OrchestratorConfig {
+        deployment_mode: "explicit".into(),
+        pools: vec![PoolSpec {
+            id: pool_id.clone(),
+            runtime_kind: "vllm".into(),
+            hardware_class: Some("cuda".into()),
+            trust_domain: TrustDomainId::new("private").unwrap(),
+            selector: BTreeMap::new(),
+        }],
+        deployments: vec![DeploymentSpec {
+            id: ax_serving_protocol::DeploymentId::new("qwen-cuda").unwrap(),
+            logical_model: logical_model.clone(),
+            pool: pool_id.clone(),
+            runtime_model_id: runtime_model.clone(),
+            equivalence_class: None,
+            expected_identity: None,
+            required_identity: Default::default(),
+            required_capabilities: BTreeSet::new(),
+            enabled: true,
+        }],
+        ..OrchestratorConfig::default()
+    };
+    let fleet_store: Arc<dyn FleetStateStore> = MemoryFleetStateStore::shared();
+    let gateway_a = Arc::new(
+        OrchestratorLayer::new_with_fleet_store(
+            config.clone(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+            Arc::clone(&fleet_store),
+        )
+        .unwrap(),
+    );
+    let layer = Arc::new(
+        OrchestratorLayer::new_with_fleet_store(
+            config,
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+            Arc::clone(&fleet_store),
+        )
+        .unwrap(),
+    );
+    let protocol = ProtocolDescriptor::current(Vec::new());
+    gateway_a
+        .registry
+        .register_protocol(
+            ProtocolRegisterRequest {
+                protocol: protocol.clone(),
+                agent: AgentDescriptor {
+                    name: "test-agent".into(),
+                    version: "1.0.0".into(),
+                    build_sha: None,
+                },
+                worker: ProtocolWorkerDescriptor {
+                    id: ProtocolWorkerId::new("cuda-worker").unwrap(),
+                    instance_id: WorkerInstanceId::new(),
+                    advertise_url: format!("http://{worker_addr}"),
+                    pool_id,
+                    trust_domain: TrustDomainId::new("private").unwrap(),
+                    labels: BTreeMap::new(),
+                },
+                runtime: RuntimeDescriptor {
+                    kind: "vllm".into(),
+                    version: "0.9.0".into(),
+                    api: "openai-http".into(),
+                },
+                hardware: HardwareDescriptor {
+                    platform: "linux".into(),
+                    accelerator: "nvidia-gpu".into(),
+                    device_count: 1,
+                    memory_bytes: Some(80 * 1024 * 1024 * 1024),
+                    hardware_class: Some("cuda".into()),
+                },
+                observation: RuntimeObservation {
+                    observed_at: time::OffsetDateTime::now_utc(),
+                    runtime: RuntimeStatus::ready(),
+                    inventory_generation: 1,
+                    models: vec![RuntimeModelDescriptor {
+                        runtime_model_id: runtime_model,
+                        identity: DeploymentIdentity {
+                            runtime_kind: "vllm".into(),
+                            runtime_version: Some("0.9.0".into()),
+                            revision: None,
+                            artifact_digest: None,
+                            tokenizer_digest: None,
+                            template_digest: None,
+                            quantization: None,
+                        },
+                        operations: BTreeSet::from([Operation::chat_completions()]),
+                        capabilities: BTreeSet::new(),
+                        max_context_tokens: Some(32_768),
+                        max_output_tokens: Some(4_096),
+                    }],
+                    capacity: Some(CapacityObservation {
+                        active_requests: Some(0),
+                        max_concurrent_requests: Some(4),
+                        waiting_requests: Some(0),
+                        ..Default::default()
+                    }),
+                },
+            },
+            worker_addr,
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities: BTreeSet::new(),
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+    let protocol_worker_id = ProtocolWorkerId::new("cuda-worker").unwrap();
+    let record = gateway_a
+        .registry
+        .export_protocol_record(&protocol_worker_id)
+        .unwrap();
+    fleet_store.put(&record).await.unwrap();
+    gateway_a.reconcile_deployment_state().await.unwrap();
+    layer.reconcile_fleet_state().await.unwrap();
+    layer.reconcile_deployment_state().await.unwrap();
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "public-secret");
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer public-secret")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{ "model" : "public/qwen", "messages":[{"role":"user","content":"hi"}], "extension":1.2300 }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["model"], "Qwen/Qwen3-32B");
+    assert_eq!(
+        worker_state.models.lock().unwrap().as_slice(),
+        ["Qwen/Qwen3-32B"]
+    );
+    assert!(!*worker_state.public_authorization_seen.lock().unwrap());
+
+    let models = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/models")
+                .header(axum::http::header::AUTHORIZATION, "Bearer public-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(models.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(models["data"][0]["id"], "public/qwen");
+}
+
+/// Dispatcher must re-check worker capacity after policy selection. Policies
+/// operate on snapshots, so a worker can become full between selection and
+/// dispatch under concurrent load.
+#[tokio::test]
+async fn test_dispatch_rejects_worker_that_fills_after_selection() {
+    let addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"hi"}}]}"#).await
+    );
+
+    let registry = WorkerRegistry::new();
+    let mut req = reg_req(addr, &["race-model"]);
+    req.max_inflight = 1;
+    let registered = registry.register(req, 5000);
+    let worker_id = WorkerId::parse(&registered.worker_id).unwrap();
+    let counter = registry
+        .inflight_counter(worker_id)
+        .expect("registered worker counter");
+
+    // Simulate a concurrent dispatch that filled the worker after a policy saw
+    // an older eligible snapshot.
+    counter.fetch_add(1, Ordering::Relaxed);
+
+    let recorded = Arc::new(AtomicUsize::new(0));
+    let policy = CountingPolicy {
+        recorded: Arc::clone(&recorded),
+    };
+    let dispatcher = DirectDispatcher::new(8, 300);
+
+    let response = dispatcher
+        .forward(
+            &registry,
+            &policy,
+            "race-model",
+            false,
+            None,
+            "/v1/chat/completions",
+            axum::body::Bytes::from(r#"{"model":"race-model","messages":[]}"#),
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "failed dispatch must not over-increment worker inflight"
+    );
+    assert_eq!(
+        recorded.load(Ordering::Relaxed),
+        0,
+        "capacity rejection must not be recorded as a successful dispatch"
+    );
+}
+
 /// Primary 4xx responses must not be recorded as successful dispatches for
 /// model-affinity accounting.
 #[tokio::test]
@@ -338,39 +692,27 @@ async fn test_no_affinity_record_on_primary_4xx() {
     );
 }
 
-/// The dispatcher should reroute to a second worker when the first returns 5xx.
+/// A trusted typed pre-admission rejection may be retried once.
 #[tokio::test]
-async fn test_reroute_on_5xx() {
-    // First worker: always 500.
-    let bad_addr = skip_if_no_socket!(spawn_mock_worker(500, r#"{"error":"internal"}"#).await);
-    // Second worker: healthy 200.
+async fn test_reroute_on_typed_not_admitted() {
+    let rejected_addr = skip_if_no_socket!(spawn_not_admitted_worker().await);
     let good_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
     let good_addr = skip_if_no_socket!(spawn_mock_worker(200, good_body).await);
 
     let registry = WorkerRegistry::new();
-    let bad_resp = registry.register(reg_req(bad_addr, &["m"]), 5000);
-    registry.register(reg_req(good_addr, &["m"]), 5000);
-
-    // Force bad worker to be selected first: give it 0 inflight (good worker
-    // gets 1) so LeastInflightPolicy always picks the bad worker on the first
-    // attempt, guaranteeing the reroute path is exercised.
-    let bad_id =
-        ax_serving_api::orchestration::registry::WorkerId::parse(&bad_resp.worker_id).unwrap();
+    registry.register(reg_req(rejected_addr, &["m"]), 5000);
+    let good = registry.register(reg_req(good_addr, &["m"]), 5000);
+    let good_id = WorkerId::parse(&good.worker_id).unwrap();
     registry.heartbeat(
-        bad_id,
+        good_id,
         HeartbeatRequest {
-            inflight: 0,
+            inflight: 1,
             thermal_state: "nominal".into(),
-            model_ids: vec![],
+            model_ids: vec!["m".into()],
             rss_bytes: 0,
             ..Default::default()
         },
     );
-    // The good worker already has inflight=0 too; bump it via heartbeat so bad wins tie-break.
-    // Actually, register order matters for UUID tie-break in LeastInflightPolicy.
-    // Instead we rely on the fact that if bad wins (inflight=0 tie), reroute delivers 200;
-    // if good wins directly, reroute_total=0 and response is still 200.
-    // The definitive assertion is reroute_total >= 0 AND status == 200.
 
     let policy = policy_from_str("least_inflight").unwrap();
     let dispatcher = DirectDispatcher::new(8, 300);
@@ -389,20 +731,13 @@ async fn test_reroute_on_5xx() {
         )
         .await;
 
-    // Final status must be 200: either good worker chosen directly, or bad
-    // chosen first and rerouted to good.
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    // At least one of the two workers was used successfully.
-    assert!(
-        dispatcher.reroutes() <= 1,
-        "at most one reroute expected, got {}",
-        dispatcher.reroutes()
-    );
+    assert_eq!(dispatcher.reroutes(), 1);
 }
 
-/// When a worker returns 5xx and there is no alternative, return 503.
+/// Generic runtime failures are preserved and never retried.
 #[tokio::test]
-async fn test_reroute_no_alternative_returns_503() {
+async fn test_generic_5xx_is_not_retried() {
     let bad_addr = skip_if_no_socket!(spawn_mock_worker(500, r#"{"error":"down"}"#).await);
 
     let registry = WorkerRegistry::new();
@@ -427,10 +762,9 @@ async fn test_reroute_no_alternative_returns_503() {
 
     assert_eq!(
         response.status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
     );
-    // reroute_total incremented even when no alternative exists.
-    assert_eq!(dispatcher.reroutes(), 1);
+    assert_eq!(dispatcher.reroutes(), 0);
 }
 
 /// GlobalQueue rejects requests when the concurrency limit is full and depth=0.
@@ -505,10 +839,10 @@ async fn test_health_ttl_eviction() {
     assert!(registry.eligible_workers("m1").is_empty());
 }
 
-/// Verify that reroute counter increments on the dispatcher.
+/// Verify that a typed pre-admission rejection increments the reroute counter.
 #[tokio::test]
 async fn test_reroute_counter_increments() {
-    let bad_addr = skip_if_no_socket!(spawn_mock_worker(503, r#"{"error":"busy"}"#).await);
+    let bad_addr = skip_if_no_socket!(spawn_not_admitted_worker().await);
 
     let registry = WorkerRegistry::new();
     registry.register(reg_req(bad_addr, &["mdl"]), 5000);
@@ -533,7 +867,7 @@ async fn test_reroute_counter_increments() {
     assert_eq!(
         dispatcher.reroutes(),
         1,
-        "reroute counter should be 1 after one 5xx"
+        "typed pre-admission rejection should count as one reroute"
     );
 }
 
@@ -652,6 +986,7 @@ async fn test_internal_router_real_server_enforces_token_and_allowlist() {
     );
     let state = InternalState {
         registry: layer.registry.clone(),
+        fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
         license: Arc::clone(&layer.license),
     };
@@ -1041,7 +1376,10 @@ async fn test_token_cost_dispatch_prefers_lower_cost_worker() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"tc-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "tc-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
@@ -1063,6 +1401,7 @@ async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
     );
     let state = InternalState {
         registry: layer.registry.clone(),
+        fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
         license: Arc::clone(&layer.license),
     };
@@ -1438,6 +1777,7 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
         artifact_format: Some("safetensors".into()),
         modalities: vec!["text".into()],
         supported_operations: vec!["llm".into()],
+        ..Default::default()
     }];
     let vllm_resp = layer.registry.register(vllm_req, 5000);
     let vllm_id = WorkerId::parse(&vllm_resp.worker_id).unwrap();
@@ -2125,6 +2465,56 @@ async fn test_pool_header_prefers_matching_worker_pool() {
 }
 
 #[tokio::test]
+async fn test_pool_header_does_not_retry_generic_worker_failure() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    let green = skip_if_no_socket!(spawn_mock_worker(500, r#"{"error":"down"}"#).await);
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    layer.registry.register(
+        reg_req_with_pool(green, &["pool-model"], Some("green"), Some("m3-pro")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-worker-pool", "green")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("down"),
+        "generic worker failure should be returned without cross-pool retry, got {text}"
+    );
+}
+
+#[tokio::test]
 async fn test_project_policy_proxy_requires_header() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -2213,6 +2603,43 @@ async fn test_project_policy_enforces_worker_pool() {
 }
 
 #[tokio::test]
+async fn test_project_policy_worker_pool_does_not_fallback() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            sample_project_policy(None),
+        )
+        .unwrap(),
+    );
+    let blue = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
+    );
+    layer.registry.register(
+        reg_req_with_pool(blue, &["pool-model"], Some("blue"), Some("m3-max")),
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .header("x-ax-project", "fabric")
+                .body(axum::body::Body::from(
+                    r#"{"model":"pool-model","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn test_proxy_embeddings_route_and_project_policy() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -2282,6 +2709,221 @@ async fn test_proxy_embeddings_route_and_project_policy() {
 }
 
 #[tokio::test]
+async fn test_proxy_embeddings_does_not_route_to_legacy_llm_only_worker() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let worker_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.1],"index":0}],"model":"embed-main"}"#
+        )
+        .await
+    );
+    let mut req = reg_req(worker_addr, &["embed-main"]);
+    req.supported_operations = vec!["llm".into()];
+    layer.registry.register(req, 5000);
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/embeddings")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"model":"embed-main","input":"hello"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "llm-only legacy workers must not receive embedding requests"
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_chat_with_image_routes_to_vision_worker() {
+    let cfg = OrchestratorConfig {
+        dispatch_policy: "least_inflight".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+
+    let text_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"text-only"}}]}"#).await
+    );
+    let vision_addr = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"vision"}}]}"#).await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: text_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["vision-route-model".into()],
+                max_context: None,
+            }),
+            supported_operations: vec!["llm".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: vision_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: true,
+                models: vec!["vision-route-model".into()],
+                max_context: None,
+            }),
+            supported_operations: vec!["llm".into(), "vision".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "vision-route-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "vision");
+}
+
+#[tokio::test]
+async fn test_proxy_embeddings_routes_by_input_context() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let small_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.1],"index":0}],"model":"small"}"#
+        )
+        .await
+    );
+    let large_addr = skip_if_no_socket!(
+        spawn_mock_worker(
+            200,
+            r#"{"data":[{"embedding":[0.2],"index":0}],"model":"large"}"#
+        )
+        .await
+    );
+
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: small_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: false,
+                embedding: true,
+                vision: false,
+                models: vec!["embed-main".into()],
+                max_context: Some(8),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            worker_pool: Some("small".into()),
+            ..Default::default()
+        },
+        5000,
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: large_addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: false,
+                embedding: true,
+                vision: false,
+                models: vec!["embed-main".into()],
+                max_context: Some(4096),
+            }),
+            backend: "sglang".into(),
+            max_inflight: 4,
+            ..Default::default()
+        },
+        5000,
+    );
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/embeddings")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .header("x-ax-worker-pool", "small")
+                .header("x-ax-minimum-context-tokens", "128")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "embed-main",
+                        "input": "x".repeat(128),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["model"], "large",
+        "declared context requirement should filter the preferred small worker"
+    );
+}
+
+#[tokio::test]
 async fn test_structured_embedding_worker_is_not_used_for_chat() {
     let worker_addr = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#).await
@@ -2340,6 +2982,7 @@ async fn test_structured_embedding_worker_is_not_used_for_chat() {
             None,
             false,
             None,
+            false,
             "/v1/embeddings",
             axum::body::Bytes::from(r#"{"model":"embed-only","input":"hello"}"#),
             None,
@@ -2424,6 +3067,206 @@ async fn test_backend_hint_routes_to_matching_worker() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "sglang");
+}
+
+#[tokio::test]
+async fn test_invalid_backend_or_runtime_hint_returns_422() {
+    let (addr, _layer) =
+        skip_if_no_socket!(spawn_orchestrator_with_layer(OrchestratorConfig::default()).await);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for body in [
+        serde_json::json!({
+            "model": "shared-backend-model",
+            "backend": "definitely-not-a-backend",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+        serde_json::json!({
+            "model": "shared-backend-model",
+            "runtime": "definitely-not-a-runtime",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_requires_valid_model_field() {
+    let (addr, _layer) =
+        skip_if_no_socket!(spawn_orchestrator_with_layer(OrchestratorConfig::default()).await);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for (body, expected_status) in [
+        (
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({
+                "model": " ",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({
+                "model": "bad model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), expected_status);
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_rejects_invalid_endpoint_bodies_before_dispatch() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let worker = skip_if_no_socket!(
+        spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"unexpected"}}]}"#).await
+    );
+    layer.registry.register(
+        RegisterRequest {
+            worker_id: None,
+            addr: worker.to_string(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: true,
+                vision: false,
+                models: vec!["shape-model".into()],
+                max_context: Some(4096),
+            }),
+            supported_operations: vec!["llm".into(), "embedding".into()],
+            backend: "sglang".into(),
+            max_inflight: 4,
+            friendly_name: None,
+            chip_model: None,
+            worker_pool: None,
+            node_class: Some("thor".into()),
+            ..Default::default()
+        },
+        5000,
+    );
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "shape-model", "messages": []}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "shape-model", "messages": [{"role": "user"}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "shape-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 0
+            }),
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "shape-model", "prompt": ""}),
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "shape-model", "input": []}),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(path)
+                    .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "path {path} with body {body} should be rejected before dispatch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_accepts_valid_body_above_axum_default_limit() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let app = ax_serving_api::orchestration::proxy_router(layer);
+    let messages: Vec<serde_json::Value> = (0..80)
+        .map(|_| {
+            serde_json::json!({
+                "role": "user",
+                "content": "x".repeat(MAX_CONTENT_BYTES)
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": "missing-worker-model",
+        "messages": messages
+    })
+    .to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -2552,7 +3395,7 @@ async fn test_routing_trace_header_on_no_eligible_worker() {
 }
 
 #[tokio::test]
-async fn test_prompt_size_routes_to_sufficient_context_worker() {
+async fn test_declared_context_routes_to_sufficient_context_worker() {
     let cfg = OrchestratorConfig {
         dispatch_policy: "least_inflight".into(),
         ..OrchestratorConfig::default()
@@ -2616,6 +3459,7 @@ async fn test_prompt_size_routes_to_sufficient_context_worker() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-ax-minimum-context-tokens", "100")
         .json(&serde_json::json!({
             "model":"ctx-route-model",
             "messages":[{"role":"user","content": long_prompt}]
@@ -2627,6 +3471,25 @@ async fn test_prompt_size_routes_to_sufficient_context_worker() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "long-ctx");
+
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-ax-minimum-context-tokens", "64")
+        .json(&serde_json::json!({
+            "model":"ctx-route-model",
+            "messages":[{"role":"user","content": "short"}],
+            "max_tokens": 64
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "long-ctx",
+        "the client-declared context requirement must be enforced"
+    );
 }
 
 #[tokio::test]
@@ -2839,7 +3702,10 @@ async fn test_overload_queue_full_429() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"overload-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "overload-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
@@ -2885,7 +3751,10 @@ async fn test_overload_shed_oldest_503() {
     let req1 = tokio::spawn(async move {
         client1
             .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model":"shed-model","messages":[]}))
+            .json(&serde_json::json!({
+                "model": "shed-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
             .send()
             .await
             .unwrap()
@@ -2900,7 +3769,10 @@ async fn test_overload_shed_oldest_503() {
     let req2 = tokio::spawn(async move {
         client2
             .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model":"shed-model","messages":[]}))
+            .json(&serde_json::json!({
+                "model": "shed-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
             .send()
             .await
             .unwrap()
@@ -2924,9 +3796,9 @@ async fn test_overload_shed_oldest_503() {
     assert_eq!(r2.status(), 200, "req2 must complete after permit released");
 }
 
-/// Queue timeout: request waits past wait_ms → 503 X-Reason:queue_timeout.
+/// Queue deadline: request waits past wait_ms → 504 X-Reason:queue_timeout.
 #[tokio::test]
-async fn test_overload_queue_timeout_503() {
+async fn test_overload_queue_timeout_504() {
     use ax_serving_api::orchestration::OrchestratorConfig;
 
     let cfg = OrchestratorConfig {
@@ -2954,15 +3826,18 @@ async fn test_overload_queue_timeout_503() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"timeout-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "timeout-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
 
     assert_eq!(
         resp.status(),
-        503,
-        "timed-out queued request must return 503"
+        504,
+        "timed-out queued request must return 504"
     );
     assert_eq!(
         resp.headers().get("x-reason").and_then(|v| v.to_str().ok()),
@@ -2971,9 +3846,43 @@ async fn test_overload_queue_timeout_503() {
     );
 }
 
-/// Reroute storm: both workers return 5xx → final 503 from proxy.
 #[tokio::test]
-async fn test_overload_reroute_storm_503() {
+async fn test_request_deadline_caps_queue_wait() {
+    let cfg = OrchestratorConfig {
+        global_queue_max: 1,
+        global_queue_depth: 1,
+        global_queue_wait_ms: 5_000,
+        global_queue_policy: "queue".into(),
+        ..OrchestratorConfig::default()
+    };
+    let (addr, layer) = skip_if_no_socket!(spawn_orchestrator_with_layer(cfg).await);
+    let worker_addr = skip_if_no_socket!(spawn_mock_worker(200, r#"{"choices":[]}"#).await);
+    layer
+        .registry
+        .register(reg_req(worker_addr, &["deadline-model"]), 5000);
+    let AcquireResult::Permit(_permit) = layer.queue.acquire("holder".into()).await else {
+        panic!("expected permit");
+    };
+
+    let response = Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-ax-request-timeout-ms", "25")
+        .json(&serde_json::json!({
+            "model": "deadline-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 504);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "AXS_REQUEST_DEADLINE");
+    assert_eq!(body["ax"]["retryable"], false);
+}
+
+/// Generic runtime 5xx does not trigger a reroute storm.
+#[tokio::test]
+async fn test_generic_5xx_does_not_create_reroute_storm() {
     use ax_serving_api::orchestration::OrchestratorConfig;
 
     let cfg = OrchestratorConfig {
@@ -2998,17 +3907,22 @@ async fn test_overload_reroute_storm_503() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"model":"storm-model","messages":[]}))
+        .json(&serde_json::json!({
+            "model": "storm-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
         .send()
         .await
         .unwrap();
 
-    // Primary fails → reroute to second → second also fails → 503.
-    assert_eq!(resp.status(), 503, "all workers failing must produce 503");
+    assert_eq!(resp.status(), 500, "runtime 500 should be preserved");
 
     let (healthy, unhealthy, _draining) = layer.registry.counts();
-    assert_eq!(healthy, 0, "both failing workers should leave healthy set");
-    assert_eq!(unhealthy, 2, "both workers should be marked unhealthy");
+    assert_eq!(
+        healthy, 2,
+        "generic runtime errors do not prove worker failure"
+    );
+    assert_eq!(unhealthy, 0);
 }
 
 // ── Step 5: SSE chaos helper ──────────────────────────────────────────────────
@@ -3052,6 +3966,104 @@ async fn spawn_sse_worker(
     Some(addr)
 }
 
+async fn spawn_delayed_first_byte_worker(delay: std::time::Duration) -> Option<SocketAddr> {
+    let handler = move || {
+        let delay = delay;
+        async move {
+            let stream = futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                    b"data: {\"choices\":[]}\n\n",
+                ))
+            });
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }
+    };
+    let app = Router::new().route("/v1/chat/completions", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    Some(addr)
+}
+
+#[tokio::test]
+async fn test_stream_first_byte_deadline_releases_worker_reservation() {
+    let addr = skip_if_no_socket!(
+        spawn_delayed_first_byte_worker(std::time::Duration::from_millis(80)).await
+    );
+    let registry = WorkerRegistry::new();
+    let registration = registry.register(reg_req(addr, &["slow-stream"]), 5000);
+    let worker_id = WorkerId::parse(&registration.worker_id).unwrap();
+    let dispatcher = DirectDispatcher::try_new_with_timeouts(8, 300, 20, 20, None).unwrap();
+    let policy = policy_from_str("least_inflight").unwrap();
+    let response = dispatcher
+        .forward(
+            &registry,
+            policy.as_ref(),
+            "slow-stream",
+            true,
+            None,
+            "/v1/chat/completions",
+            axum::body::Bytes::from(
+                r#"{"model":"slow-stream","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .is_err(),
+        "a stream that misses the first-byte deadline must terminate with a body error"
+    );
+    assert_eq!(registry.get_snapshot(worker_id).unwrap().inflight, 0);
+    let metrics = dispatcher.metrics();
+    assert_eq!(metrics.failed_total, 1);
+    assert_eq!(metrics.stream_duration.count, 1);
+    assert_eq!(metrics.time_to_first_byte.count, 0);
+}
+
+#[tokio::test]
+async fn test_client_stream_cancellation_releases_worker_reservation() {
+    let addr = skip_if_no_socket!(
+        spawn_delayed_first_byte_worker(std::time::Duration::from_millis(500)).await
+    );
+    let registry = WorkerRegistry::new();
+    let registration = registry.register(reg_req(addr, &["cancel-stream"]), 5000);
+    let worker_id = WorkerId::parse(&registration.worker_id).unwrap();
+    let dispatcher = DirectDispatcher::try_new_with_timeouts(8, 300, 1_000, 1_000, None).unwrap();
+    let policy = policy_from_str("least_inflight").unwrap();
+    let response = dispatcher
+        .forward(
+            &registry,
+            policy.as_ref(),
+            "cancel-stream",
+            true,
+            None,
+            "/v1/chat/completions",
+            axum::body::Bytes::from(
+                r#"{"model":"cancel-stream","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(registry.get_snapshot(worker_id).unwrap().inflight, 1);
+    drop(response);
+    tokio::task::yield_now().await;
+    assert_eq!(registry.get_snapshot(worker_id).unwrap().inflight, 0);
+    let metrics = dispatcher.metrics();
+    assert_eq!(metrics.cancelled_total, 1);
+    assert_eq!(metrics.stream_duration.count, 1);
+    assert_eq!(metrics.time_to_first_byte.count, 0);
+}
+
 // ── Step 5: Chaos integration tests ───────────────────────────────────────────
 
 /// Worker drops SSE stream mid-generation (no [DONE] marker).
@@ -3089,28 +4101,26 @@ async fn test_chaos_mid_stream_crash() {
     let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
 }
 
-/// Primary worker returns 5xx; secondary is healthy.
-/// Dispatcher reroutes and the final response is 200.
+/// A restarting worker rejects before admission; a healthy peer receives the safe retry.
 #[tokio::test]
 async fn test_chaos_restart_reroutes_to_healthy_worker() {
-    let crashed = skip_if_no_socket!(spawn_mock_worker(500, r#"{"error":"crashed"}"#).await);
+    let crashed = skip_if_no_socket!(spawn_not_admitted_worker().await);
     let healthy = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#).await
     );
 
     let registry = WorkerRegistry::new();
-    let crashed_resp = registry.register(reg_req(crashed, &["restart-chaos"]), 5000);
-    registry.register(reg_req(healthy, &["restart-chaos"]), 5000);
+    registry.register(reg_req(crashed, &["restart-chaos"]), 5000);
+    let healthy_resp = registry.register(reg_req(healthy, &["restart-chaos"]), 5000);
 
-    // Ensure crashed worker is selected first (lowest inflight = 0).
-    let crashed_id =
-        ax_serving_api::orchestration::registry::WorkerId::parse(&crashed_resp.worker_id).unwrap();
+    // Ensure the pre-admission rejection is selected first.
+    let healthy_id = WorkerId::parse(&healthy_resp.worker_id).unwrap();
     registry.heartbeat(
-        crashed_id,
+        healthy_id,
         HeartbeatRequest {
-            inflight: 0,
+            inflight: 1,
             thermal_state: "nominal".into(),
-            model_ids: vec![],
+            model_ids: vec!["restart-chaos".into()],
             rss_bytes: 0,
             ..Default::default()
         },

@@ -17,18 +17,27 @@
 //! a missed heartbeat, not on every tick for healthy workers).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use super::fleet_state::FleetStateStore;
 use super::registry::{WorkerId, WorkerRegistry};
+
+struct ProbeOwnership {
+    store: Arc<dyn FleetStateStore>,
+    owner: String,
+    lease_ttl_ms: u64,
+}
 
 pub struct HealthTicker {
     registry: WorkerRegistry,
     tick_interval: Duration,
     ttl_ms: u64,
+    probe_ownership: Option<ProbeOwnership>,
 }
 
 impl HealthTicker {
@@ -43,7 +52,55 @@ impl HealthTicker {
             // causes tokio::time::interval to panic.
             tick_interval: Duration::from_millis((heartbeat_ms / 2).max(1)),
             ttl_ms,
+            probe_ownership: None,
         }
+    }
+
+    pub fn with_probe_ownership(
+        mut self,
+        store: Arc<dyn FleetStateStore>,
+        owner: String,
+        lease_ttl_ms: u64,
+    ) -> Self {
+        self.probe_ownership = Some(ProbeOwnership {
+            store,
+            owner,
+            lease_ttl_ms: lease_ttl_ms.max(1_000),
+        });
+        self
+    }
+
+    async fn owned_probe_candidates(
+        &self,
+        candidates: Vec<(WorkerId, SocketAddr)>,
+    ) -> Vec<(WorkerId, SocketAddr)> {
+        let Some(ownership) = self.probe_ownership.as_ref() else {
+            return candidates;
+        };
+        let mut owned = Vec::with_capacity(candidates.len());
+        for (internal_id, address) in candidates {
+            let Some((worker_id, _)) = self.registry.protocol_identity_for_internal(internal_id)
+            else {
+                // Legacy registrations are local to one gateway and do not
+                // need distributed probe coordination.
+                owned.push((internal_id, address));
+                continue;
+            };
+            match ownership
+                .store
+                .try_acquire_probe_lease(&worker_id, &ownership.owner, ownership.lease_ttl_ms)
+                .await
+            {
+                Ok(true) => owned.push((internal_id, address)),
+                Ok(false) => {}
+                Err(error) => warn!(
+                    %worker_id,
+                    %error,
+                    "shared probe ownership unavailable; skipping active probe"
+                ),
+            }
+        }
+        owned
     }
 
     /// Run the ticker until `shutdown` emits `true`.
@@ -70,7 +127,9 @@ impl HealthTicker {
                     // Only probe workers that have already missed at least one
                     // heartbeat — healthy workers are left untouched to keep
                     // overhead minimal.
-                    let candidates = self.registry.list_unhealthy_addrs();
+                    let candidates = self
+                        .owned_probe_candidates(self.registry.list_unhealthy_addrs())
+                        .await;
                     if !candidates.is_empty() {
                         probe_and_evict(&self.registry, candidates).await;
                     }
@@ -144,9 +203,8 @@ async fn probe_and_evict(registry: &WorkerRegistry, candidates: Vec<(WorkerId, S
     for (id, addr, reachable) in
         probe_candidates(candidates, probe_timeout, MAX_CONCURRENT_TCP_PROBES).await
     {
-        if !reachable {
+        if !reachable && registry.evict_if_unhealthy_at_addr(id, addr) {
             warn!(%id, %addr, "worker evicted: TCP probe failed (unreachable)");
-            registry.evict(id);
         }
     }
 }
@@ -248,5 +306,29 @@ mod tests {
             registry.get_snapshot(closed_id).is_none(),
             "unreachable worker should be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_and_evict_does_not_remove_worker_recovered_by_heartbeat() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed listener");
+        let closed_addr = closed_listener
+            .local_addr()
+            .expect("closed listener local addr");
+        drop(closed_listener);
+
+        let registry = WorkerRegistry::new();
+        let recovered_id = register_worker(&registry, closed_addr);
+        registry.mark_unhealthy(recovered_id);
+        let stale_candidates = registry.list_unhealthy_addrs();
+
+        assert!(registry.heartbeat(recovered_id, Default::default()));
+        probe_and_evict(&registry, stale_candidates).await;
+
+        let snapshot = registry
+            .get_snapshot(recovered_id)
+            .expect("recovered worker must not be evicted by a stale probe");
+        assert_eq!(snapshot.health, "healthy");
     }
 }

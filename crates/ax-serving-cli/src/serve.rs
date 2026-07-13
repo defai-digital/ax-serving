@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::sync::atomic::Ordering;
@@ -167,6 +167,17 @@ fn derive_worker_runtime_metadata(
             .unwrap_or_else(|| "mac".to_string()),
         runtime_endpoint: runtime_endpoint.unwrap_or_else(|| format!("http://{self_addr}")),
         supported_operations: vec!["llm".to_string()],
+    }
+}
+
+fn preload_load_config_for_path(path: &Path) -> LoadConfig {
+    LoadConfig {
+        backend_hint: path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            .then(|| "llama_cpp".to_string()),
+        ..LoadConfig::default()
     }
 }
 
@@ -427,13 +438,13 @@ pub(crate) fn run_serve(
         RoutingConfig::from_file(&path)
             .with_context(|| format!("loading routing config from {}", path.display()))?
     } else {
-        RoutingConfig::load_default()
+        RoutingConfig::try_load_default()?
     };
 
     let config_base = if let Some(path) = serve_config_path {
         ServeConfig::from_file(&path)?
     } else {
-        ServeConfig::load_default()
+        ServeConfig::load_default()?
     };
     let (cfg_host, cfg_port) = parse_rest_addr(&config_base.rest_addr)?;
     let host = host.unwrap_or(cfg_host);
@@ -449,7 +460,7 @@ pub(crate) fn run_serve(
         config.mlx.clone(),
     ));
 
-    let layer = Arc::new(ServingLayer::new(backend.clone(), config.clone()));
+    let layer = Arc::new(ServingLayer::try_new(backend.clone(), config.clone())?);
 
     // Print identity info to stderr so operators can identify this worker node.
     tracing::info!(%host, %port, "worker starting");
@@ -462,7 +473,7 @@ pub(crate) fn run_serve(
         embedded_runtime_policy_from_env()?
     };
     let capabilities: Vec<String> = if let Some(path) = model {
-        let load_config = LoadConfig::default();
+        let load_config = preload_load_config_for_path(&path);
         layer
             .registry
             .load(&model_id, &path, load_config, backend.as_ref())?;
@@ -515,10 +526,7 @@ pub(crate) fn run_serve(
     // serving layer's own admission limits or the orchestrator will route
     // requests that the worker immediately rejects with 503.  Clamp the
     // advertised value to the effective scheduler capacity.
-    let requested_max_inflight: usize = std::env::var("AXS_WORKER_MAX_INFLIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| default_advertised_max_inflight(&config));
+    let requested_max_inflight = requested_max_inflight_from_env(&config)?;
     let max_inflight = clamp_advertised_max_inflight(
         requested_max_inflight,
         config.sched_max_inflight,
@@ -680,6 +688,23 @@ fn default_advertised_max_inflight(config: &ax_serving_api::config::ServeConfig)
         .min(config.sched_per_model_max_inflight.max(1))
 }
 
+fn requested_max_inflight_from_env(config: &ax_serving_api::config::ServeConfig) -> Result<usize> {
+    match std::env::var("AXS_WORKER_MAX_INFLIGHT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(default_advertised_max_inflight(config))
+            } else {
+                trimmed
+                    .parse::<usize>()
+                    .context("invalid AXS_WORKER_MAX_INFLIGHT")
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default_advertised_max_inflight(config)),
+        Err(err) => Err(err).context("invalid AXS_WORKER_MAX_INFLIGHT"),
+    }
+}
+
 fn clamp_advertised_max_inflight(
     requested: usize,
     sched_max_inflight: usize,
@@ -719,8 +744,10 @@ mod tests {
     use super::{
         EmbeddedRuntimePolicy, clamp_advertised_max_inflight, default_advertised_max_inflight,
         derive_worker_runtime_metadata, ensure_embedded_runtime_allowed, parse_rest_addr,
+        preload_load_config_for_path, requested_max_inflight_from_env,
     };
     use ax_serving_api::config::ServeConfig;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn parse_rest_addr_accepts_ipv4() {
@@ -774,6 +801,38 @@ mod tests {
     }
 
     #[test]
+    fn requested_max_inflight_defaults_to_scheduler_limits_when_env_unset() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::unset("AXS_WORKER_MAX_INFLIGHT");
+        let cfg = ServeConfig {
+            sched_max_inflight: 16,
+            sched_per_model_max_inflight: 4,
+            ..ServeConfig::default()
+        };
+
+        assert_eq!(requested_max_inflight_from_env(&cfg).unwrap(), 4);
+    }
+
+    #[test]
+    fn requested_max_inflight_parses_trimmed_env_value() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("AXS_WORKER_MAX_INFLIGHT", " 3 ");
+        let cfg = ServeConfig::default();
+
+        assert_eq!(requested_max_inflight_from_env(&cfg).unwrap(), 3);
+    }
+
+    #[test]
+    fn requested_max_inflight_rejects_malformed_env_value() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("AXS_WORKER_MAX_INFLIGHT", "many");
+        let cfg = ServeConfig::default();
+
+        let err = requested_max_inflight_from_env(&cfg).unwrap_err();
+        assert!(err.to_string().contains("AXS_WORKER_MAX_INFLIGHT"));
+    }
+
+    #[test]
     fn clamp_advertised_max_inflight_caps_to_per_model_limit() {
         assert_eq!(clamp_advertised_max_inflight(8, 16, 4), 4);
     }
@@ -814,6 +873,18 @@ mod tests {
         assert_eq!(metadata.runtime_version.as_deref(), Some("0.13.0"));
         assert_eq!(metadata.hardware_class, "pc-cuda");
         assert_eq!(metadata.runtime_endpoint, "http://10.0.0.12:8000");
+    }
+
+    #[test]
+    fn preload_load_config_routes_gguf_to_llama_cpp() {
+        let config = preload_load_config_for_path(std::path::Path::new("/models/model.GGUF"));
+        assert_eq!(config.backend_hint.as_deref(), Some("llama_cpp"));
+    }
+
+    #[test]
+    fn preload_load_config_keeps_artifact_directories_on_router_default() {
+        let config = preload_load_config_for_path(std::path::Path::new("/models/ax-artifact"));
+        assert_eq!(config.backend_hint, None);
     }
 
     #[test]
@@ -866,6 +937,12 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -875,5 +952,10 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 }

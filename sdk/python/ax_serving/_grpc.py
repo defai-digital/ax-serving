@@ -1,4 +1,4 @@
-"""Low-level gRPC client wrapping AxServingService."""
+"""Low-level client for the embedded-compatibility AxServingService v1."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _make_channel(socket: str | None, host: str | None, port: int) -> grpc.Chann
 
 
 class GrpcClient:
-    """Synchronous gRPC client for ax-serving.
+    """Synchronous client for the macOS embedded-compatibility service.
 
     Connection priority:
     1. UDS socket (if ``socket`` is set and the path exists)

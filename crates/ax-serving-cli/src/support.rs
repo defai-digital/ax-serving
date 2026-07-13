@@ -222,6 +222,11 @@ fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeC
         return (path.display().to_string(), ServeConfig::from_file(&path));
     }
 
+    if let Ok(path) = std::env::var("AXS_CONFIG") {
+        let path = PathBuf::from(path);
+        return (path.display().to_string(), ServeConfig::from_file(&path));
+    }
+
     for path in default_config_candidates() {
         if path.exists() {
             return (path.display().to_string(), ServeConfig::from_file(&path));
@@ -230,27 +235,35 @@ fn load_config_for_validation(config: Option<PathBuf>) -> (String, Result<ServeC
 
     (
         "environment/defaults".to_string(),
-        Ok(ServeConfig::from_env()),
+        ServeConfig::try_from_env(),
     )
 }
 
 pub fn run_status(
     url: String,
     api_key: Option<String>,
+    admin_key: Option<String>,
     diagnostics: bool,
     json: bool,
 ) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let public_token = effective_api_key(api_key);
+    let admin_token = effective_admin_key(admin_key);
     let mut endpoints = vec![
-        get_json_endpoint(&client, &base_url, "/health", token.as_deref(), "health"),
-        get_json_endpoint(&client, &base_url, "/v1/models", token.as_deref(), "models"),
+        get_json_endpoint(&client, &base_url, "/health", None, "health"),
+        get_json_endpoint(
+            &client,
+            &base_url,
+            "/v1/models",
+            public_token.as_deref(),
+            "models",
+        ),
         get_json_endpoint(
             &client,
             &base_url,
             "/v1/metrics",
-            token.as_deref(),
+            admin_token.as_deref(),
             "metrics",
         ),
     ];
@@ -259,7 +272,7 @@ pub fn run_status(
             &client,
             &base_url,
             "/v1/admin/diagnostics",
-            token.as_deref(),
+            admin_token.as_deref(),
             ENDPOINT_DIAGNOSTICS,
         ));
     }
@@ -328,15 +341,26 @@ pub fn run_smoke_test(
 pub fn run_support_bundle(
     url: String,
     api_key: Option<String>,
+    admin_key: Option<String>,
     output: Option<PathBuf>,
     json: bool,
 ) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let public_token = effective_api_key(api_key);
+    let admin_token = effective_admin_key(admin_key);
     let mut endpoints = support_bundle_endpoints()
         .into_iter()
-        .map(|(name, path)| get_json_endpoint(&client, &base_url, path, token.as_deref(), name))
+        .map(|(name, path)| {
+            let token = if path == "/health" {
+                None
+            } else if path == "/v1/models" {
+                public_token.as_deref()
+            } else {
+                admin_token.as_deref()
+            };
+            get_json_endpoint(&client, &base_url, path, token, name)
+        })
         .collect::<Vec<_>>();
     for endpoint in &mut endpoints {
         if let Some(body) = &mut endpoint.body {
@@ -369,13 +393,26 @@ pub fn run_support_bundle(
     Ok(())
 }
 
-pub fn run_fabric_validate(url: String, api_key: Option<String>, json: bool) -> Result<()> {
+pub fn run_fabric_validate(
+    url: String,
+    api_key: Option<String>,
+    admin_key: Option<String>,
+    json: bool,
+) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let public_token = effective_api_key(api_key);
+    let admin_token = effective_admin_key(admin_key);
     let endpoints = fabric_validate_endpoints()
         .into_iter()
-        .map(|(name, path)| get_json_endpoint(&client, &base_url, path, token.as_deref(), name))
+        .map(|(name, path)| {
+            let token = match path {
+                "/health" => None,
+                "/v1/models" => public_token.as_deref(),
+                _ => admin_token.as_deref(),
+            };
+            get_json_endpoint(&client, &base_url, path, token, name)
+        })
         .collect::<Vec<_>>();
     let report = build_fabric_validate_report(base_url, endpoints);
 
@@ -391,7 +428,7 @@ pub fn run_migration_embedded_readiness(
 ) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let token = effective_admin_key(api_key);
     let diagnostics = get_json_endpoint(
         &client,
         &base_url,
@@ -416,14 +453,8 @@ pub fn run_worker_get(
     api_key: Option<String>,
     json: bool,
 ) -> Result<()> {
-    run_worker_get_like(
-        url,
-        Some(worker_id.clone()),
-        api_key,
-        "get",
-        worker_path(&worker_id, ""),
-        json,
-    )
+    let path = worker_path(&worker_id, "")?;
+    run_worker_get_like(url, Some(worker_id.clone()), api_key, "get", path, json)
 }
 
 pub fn run_worker_drain(
@@ -435,15 +466,17 @@ pub fn run_worker_drain(
     poll_interval_ms: u64,
     json: bool,
 ) -> Result<()> {
+    validate_worker_id(&worker_id)?;
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let token = effective_admin_key(api_key);
     let mut steps = Vec::new();
+    let drain_path = worker_path_unchecked(&worker_id, "/drain");
 
     steps.push(send_worker_step(
         &client,
         &base_url,
-        &worker_path(&worker_id, "/drain"),
+        &drain_path,
         token.as_deref(),
         "drain",
         WorkerHttpMethod::Post,
@@ -519,7 +552,7 @@ fn run_worker_get_like(
 ) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let token = effective_admin_key(api_key);
     let steps = vec![send_worker_step(
         &client,
         &base_url,
@@ -545,11 +578,12 @@ fn run_worker_mutation(
 ) -> Result<()> {
     let base_url = normalize_base_url(&url);
     let client = support_client()?;
-    let token = effective_api_key(api_key);
+    let token = effective_admin_key(api_key);
+    let path = worker_path(&worker_id, suffix)?;
     let steps = vec![send_worker_step(
         &client,
         &base_url,
-        &worker_path(&worker_id, suffix),
+        &path,
         token.as_deref(),
         operation,
         method,
@@ -659,7 +693,7 @@ fn wait_for_worker_idle_and_complete(
         let inspect = send_worker_step(
             client,
             base_url,
-            &worker_path(worker_id, ""),
+            &worker_path_unchecked(worker_id, ""),
             token,
             "wait-idle",
             WorkerHttpMethod::Get,
@@ -675,7 +709,7 @@ fn wait_for_worker_idle_and_complete(
             let step = send_worker_step(
                 client,
                 base_url,
-                &worker_path(worker_id, "/drain-complete"),
+                &worker_path_unchecked(worker_id, "/drain-complete"),
                 token,
                 "drain-complete",
                 WorkerHttpMethod::Post,
@@ -1399,6 +1433,16 @@ fn effective_api_key(api_key: Option<String>) -> Option<String> {
     })
 }
 
+fn effective_admin_key(admin_key: Option<String>) -> Option<String> {
+    admin_key.and_then(trimmed_non_empty).or_else(|| {
+        std::env::var("AXS_ADMIN_API_KEY").ok().and_then(|value| {
+            value
+                .split(',')
+                .find_map(|part| trimmed_non_empty(part.to_string()))
+        })
+    })
+}
+
 fn diagnostics_recommended_actions(endpoints: &[EndpointReport]) -> Vec<StatusRecommendedAction> {
     let Some(diagnostics) = endpoints.iter().find(|e| e.name == ENDPOINT_DIAGNOSTICS) else {
         return Vec::new();
@@ -1477,7 +1521,27 @@ fn current_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn worker_path(worker_id: &str, suffix: &str) -> String {
+fn validate_worker_id(worker_id: &str) -> Result<()> {
+    if worker_id.is_empty() {
+        anyhow::bail!("worker_id is empty");
+    }
+    if !worker_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "worker_id '{worker_id}' contains characters that are not safe for URL path segments"
+        );
+    }
+    Ok(())
+}
+
+fn worker_path(worker_id: &str, suffix: &str) -> Result<String> {
+    validate_worker_id(worker_id)?;
+    Ok(worker_path_unchecked(worker_id, suffix))
+}
+
+fn worker_path_unchecked(worker_id: &str, suffix: &str) -> String {
     format!("/v1/workers/{worker_id}{suffix}")
 }
 
@@ -1498,9 +1562,6 @@ fn trimmed_non_empty(value: String) -> Option<String> {
 
 fn default_config_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("AXS_CONFIG") {
-        candidates.push(PathBuf::from(path));
-    }
     candidates.push(PathBuf::from("config/serving.yaml"));
     candidates.push(PathBuf::from("serving.yaml"));
     if let Ok(home) = std::env::var("HOME") {
@@ -1511,7 +1572,14 @@ fn default_config_candidates() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn normalizes_base_url() {
@@ -1531,7 +1599,7 @@ mod tests {
         let summary = config_summary(&cfg);
 
         assert_eq!(summary.rest_addr, "127.0.0.1:18080");
-        assert_eq!(summary.dispatch_policy, "least_inflight");
+        assert_eq!(summary.dispatch_policy, "inference_aware");
         assert_eq!(summary.sched_max_inflight, 16);
     }
 
@@ -1551,10 +1619,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_axs_config_does_not_emit_fallback_summary() {
+        let path = std::env::temp_dir().join(format!(
+            "ax-serving-missing-config-{}.yaml",
+            std::process::id()
+        ));
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe { std::env::set_var("AXS_CONFIG", &path) };
+
+        let report = build_config_validate_report(None);
+
+        unsafe { std::env::remove_var("AXS_CONFIG") };
+
+        assert!(!report.valid);
+        assert_eq!(report.status, STATUS_FAIL);
+        assert_eq!(report.source, path.display().to_string());
+        assert!(report.error.is_some());
+        assert!(report.summary.is_none());
+    }
+
+    #[test]
     fn explicit_api_key_wins_without_env_lookup() {
         assert_eq!(
             effective_api_key(Some("  token-a  ".into())).as_deref(),
             Some("token-a")
+        );
+    }
+
+    #[test]
+    fn explicit_admin_key_wins_without_env_lookup() {
+        assert_eq!(
+            effective_admin_key(Some("  admin-token  ".into())).as_deref(),
+            Some("admin-token")
         );
     }
 
@@ -1869,11 +1965,19 @@ mod tests {
 
     #[test]
     fn worker_paths_target_public_worker_api() {
-        assert_eq!(worker_path("worker-1", ""), "/v1/workers/worker-1");
+        assert_eq!(worker_path("worker-1", "").unwrap(), "/v1/workers/worker-1");
         assert_eq!(
-            worker_path("worker-1", "/drain-complete"),
+            worker_path("worker-1", "/drain-complete").unwrap(),
             "/v1/workers/worker-1/drain-complete"
         );
+    }
+
+    #[test]
+    fn worker_path_rejects_unsafe_worker_id_segments() {
+        assert!(worker_path("", "").is_err());
+        assert!(worker_path("../workers/other", "").is_err());
+        assert!(worker_path("worker-1/drain-complete", "").is_err());
+        assert!(worker_path("worker?x=1", "").is_err());
     }
 
     #[test]

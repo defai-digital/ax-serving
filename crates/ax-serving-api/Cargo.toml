@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["gateway"]
+gateway = []
+embedded-compat = [
+    "dep:ax-serving-engine",
+    "dep:ax-serving-grpc-compat",
+    "dep:tonic",
+]
 ## Enable the NATS JetStream dispatcher and worker sidecar.
 ##
 ## Adds `async-nats` as a dependency.  The feature is opt-in so that the
@@ -13,18 +20,30 @@ edition.workspace = true
 ## Env vars (when mode=nats):
 ##   AXS_NATS_URL=nats://127.0.0.1:4222
 ##   AXS_NATS_STREAM=ax-serving
-##   AXS_NATS_MAX_DELIVER=3
-nats-dispatch = ["dep:async-nats"]
+##   AXS_NATS_MAX_DELIVER=1
+##   AXS_NATS_WAIT_MS=10000
+nats-dispatch = ["gateway", "dep:async-nats"]
+
+[[test]]
+name = "graceful_shutdown"
+path = "tests/graceful_shutdown.rs"
+required-features = ["embedded-compat"]
+
+[[test]]
+name = "model_management"
+path = "tests/model_management.rs"
+required-features = ["embedded-compat"]
 
 [dependencies]
 ## Optional: NATS JetStream client (only compiled with the `nats-dispatch` feature).
 async-nats = { version = "0.48", optional = true }
-ax-serving-engine = { path = "../ax-serving-engine" }
+ax-serving-engine = { path = "../ax-serving-engine", optional = true }
+ax-serving-grpc-compat = { path = "../ax-serving-grpc-compat", optional = true }
+ax-serving-protocol = { path = "../ax-serving-protocol" }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
+tonic = { workspace = true, optional = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,9 +52,12 @@ serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 rustc-hash = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+time = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
@@ -45,9 +67,6 @@ tower-http = { workspace = true }
 hdrhistogram = { workspace = true }
 dashmap = { workspace = true }
 ipnet = { workspace = true }
-
-[build-dependencies]
-tonic-build = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

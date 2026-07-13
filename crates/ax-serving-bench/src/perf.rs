@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ax_serving_engine::{
-    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, ModelHandle,
-    RouterBackend,
+    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, ModelHandle, RouterBackend,
 };
 use tokio::sync::mpsc;
+
+use crate::load_config;
 
 const MEASURE_ITERS: usize = 5;
 const DECODE_TOKENS: usize = 64;
@@ -35,8 +36,8 @@ pub async fn run(
 ) -> Result<()> {
     // load_model calls block_on internally — must run on a non-tokio thread.
     let (backend, handle, meta) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let backend = RouterBackend::from_env();
-        let (handle, meta) = backend.load_model(&model, LoadConfig::default())?;
+        let backend = RouterBackend::try_from_env()?;
+        let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
         Ok((backend, handle, meta))
     })
     .await??;

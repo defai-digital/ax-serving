@@ -8,33 +8,31 @@
 .LSOverride
 ._*
 
-# IDE
+# IDE and local tooling
 .idea/
 .vscode/
 *.swp
 *.swo
+.venv/
 
-# Models
-models
-models/
+# Local model artifacts
+/models/
+/models-local/
 *.gguf
 
-# AI agent instruction/config files
+# Agent-local instruction and scratch files
 AGENTS.md
 CLAUDE.md
 GEMINI.md
 opencode.json
-
-# Logs and artifacts
-*.log
-.internal/
 automatosx/
 .automatosx/
 .ax-grok/
 .gemini/
 Archived/
 
-# JavaScript / TypeScript
+# Generated logs and language artifacts
+*.log
 node_modules/
 dist/
 __pycache__/

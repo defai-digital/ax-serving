@@ -15,15 +15,18 @@
 //! | GET  | `/internal/workers` | List all workers |
 //! | GET  | `/internal/workers/{id}` | Get single worker |
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::ConnectInfo,
+    extract::DefaultBodyLimit,
     extract::Request,
     extract::{Path, State},
-    http::HeaderValue,
     http::StatusCode,
+    http::{HeaderMap, HeaderValue},
     middleware::Next,
     response::IntoResponse,
     response::Response,
@@ -34,9 +37,19 @@ use tracing::info;
 use std::net::SocketAddr;
 
 use super::OrchestratorConfig;
-use super::registry::{HeartbeatRequest, RegisterRequest, WorkerId, WorkerRegistry};
+use super::fleet_state::{FleetMutationResult, FleetStateStore, unix_time_millis};
+use super::registry::{
+    HeartbeatRequest, ProtocolRegistryError, RegisterRequest, WorkerId, WorkerRegistry,
+};
 use crate::license::LicenseState;
+use ax_serving_protocol::{
+    CURRENT_PROTOCOL, ProtocolCapability, RegisterWorkerRequest, WorkerId as ProtocolWorkerId,
+    negotiate_protocol,
+};
 use ipnet::IpNet;
+
+const MAX_INTERNAL_BODY_BYTES: usize = 2 * 1024 * 1024;
+const LEASE_TOKEN_HEADER: &str = "x-ax-lease-token";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -44,6 +57,7 @@ use ipnet::IpNet;
 #[derive(Clone)]
 pub struct InternalState {
     pub registry: WorkerRegistry,
+    pub fleet_store: Arc<dyn FleetStateStore>,
     pub config: Arc<OrchestratorConfig>,
     pub license: Arc<LicenseState>,
 }
@@ -73,6 +87,7 @@ pub fn router(state: InternalState) -> Router {
             "/internal/workers/{id}",
             get(handle_get).delete(handle_delete),
         )
+        .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY_BYTES))
         .with_state(state)
 }
 
@@ -150,17 +165,259 @@ pub fn parse_allowed_node_cidrs(raw: &str) -> anyhow::Result<Vec<IpNet>> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn parse_worker_id(id_str: &str) -> Result<WorkerId, StatusCode> {
-    WorkerId::parse(id_str).ok_or(StatusCode::BAD_REQUEST)
+fn parse_worker_id(registry: &WorkerRegistry, id_str: &str) -> Result<WorkerId, StatusCode> {
+    registry
+        .resolve_worker_id(id_str)
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+fn gateway_protocol_capabilities() -> BTreeSet<ProtocolCapability> {
+    [
+        ProtocolCapability::CONTROL_DRAIN,
+        ProtocolCapability::CONTROL_INVENTORY_DELTA,
+        ProtocolCapability::DISPATCH_CANCEL,
+        ProtocolCapability::DISPATCH_TYPED_ADMISSION,
+        ProtocolCapability::TELEMETRY_CAPACITY,
+        ProtocolCapability::TELEMETRY_KV_CACHE,
+        ProtocolCapability::TELEMETRY_PREFIX_CACHE,
+    ]
+    .into_iter()
+    .map(|capability| ProtocolCapability::new(capability).expect("static protocol capability"))
+    .collect()
+}
+
+fn advertised_socket_addr(raw: &str) -> Result<SocketAddr, String> {
+    let url =
+        reqwest::Url::parse(raw).map_err(|error| format!("invalid advertise_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("advertise_url must use http or https".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("advertise_url must not contain credentials".into());
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("advertise_url must not contain a path, query, or fragment".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "advertise_url is missing a host".to_string())?;
+    let ip = host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "advertise_url must use an IP address in protocol v1".to_string())?;
+    if ip.is_unspecified() || ip.is_multicast() || is_link_local(ip) {
+        return Err("advertise_url uses a disallowed destination address".into());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "advertise_url is missing a port".to_string())?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn is_link_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => ip.is_unicast_link_local(),
+    }
+}
+
+fn validate_observation_age(observed_at: time::OffsetDateTime) -> Result<(), String> {
+    const MAX_CLOCK_SKEW_SECS: i64 = 300;
+    let now = time::OffsetDateTime::now_utc();
+    let age = (now - observed_at).whole_seconds();
+    if age.unsigned_abs() > MAX_CLOCK_SKEW_SECS as u64 {
+        return Err(format!(
+            "runtime observation exceeds the allowed {MAX_CLOCK_SKEW_SECS}s clock skew"
+        ));
+    }
+    Ok(())
+}
+
+fn protocol_registry_error_response(error: ProtocolRegistryError) -> Response {
+    let (status, code) = match &error {
+        ProtocolRegistryError::NotRegistered => (StatusCode::NOT_FOUND, "AXS_WORKER_NOT_FOUND"),
+        ProtocolRegistryError::InvalidLeaseToken => {
+            (StatusCode::UNAUTHORIZED, "AXS_INVALID_LEASE_TOKEN")
+        }
+        ProtocolRegistryError::InstanceMismatch | ProtocolRegistryError::RegistrationMismatch => {
+            (StatusCode::CONFLICT, "AXS_STALE_REGISTRATION")
+        }
+        ProtocolRegistryError::ReplayedHeartbeat { .. } => {
+            (StatusCode::CONFLICT, "AXS_REPLAYED_HEARTBEAT")
+        }
+        ProtocolRegistryError::InvalidObservation(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "AXS_INVALID_OBSERVATION")
+        }
+        ProtocolRegistryError::InternalRegistration => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "AXS_REGISTRATION_FAILED")
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": error.to_string(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn fleet_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "code": "AXS_FLEET_STATE_UNAVAILABLE",
+                "message": "shared fleet state is temporarily unavailable",
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn fleet_fencing_response(result: FleetMutationResult) -> Response {
+    let (code, message) = match result {
+        FleetMutationResult::Missing => (
+            "AXS_LEASE_EXPIRED",
+            "worker lease is missing or expired; re-registration is required",
+        ),
+        FleetMutationResult::Fenced => (
+            "AXS_STALE_REGISTRATION",
+            "worker registration has been superseded",
+        ),
+        FleetMutationResult::StaleSequence => (
+            "AXS_REPLAYED_HEARTBEAT",
+            "a newer worker heartbeat has already been accepted",
+        ),
+        FleetMutationResult::Applied => (
+            "AXS_INTERNAL_ERROR",
+            "unexpected fleet-state mutation result",
+        ),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn synchronize_protocol_worker(
+    state: &InternalState,
+    worker_id: &ProtocolWorkerId,
+) -> Result<(), Response> {
+    let record = state
+        .fleet_store
+        .get(worker_id)
+        .await
+        .map_err(|_| fleet_unavailable_response())?;
+    let Some(record) = record else {
+        state.registry.evict_protocol(worker_id);
+        return Err(protocol_registry_error_response(
+            ProtocolRegistryError::NotRegistered,
+        ));
+    };
+    if !record.is_fresh(unix_time_millis()) {
+        let _ = state
+            .fleet_store
+            .remove_if_registration(worker_id, record.registration_id)
+            .await;
+        state.registry.evict_protocol(worker_id);
+        return Err(fleet_fencing_response(FleetMutationResult::Missing));
+    }
+    state
+        .registry
+        .restore_protocol_record_if_newer(record)
+        .map_err(protocol_registry_error_response)?;
+    Ok(())
+}
+
+async fn persist_protocol_record(
+    state: &InternalState,
+    worker_id: &ProtocolWorkerId,
+) -> Result<(), Response> {
+    let record = state
+        .registry
+        .export_protocol_record(worker_id)
+        .ok_or_else(|| protocol_registry_error_response(ProtocolRegistryError::NotRegistered))?;
+    let result = state
+        .fleet_store
+        .compare_and_put(&record)
+        .await
+        .map_err(|_| fleet_unavailable_response())?;
+    if result == FleetMutationResult::Applied {
+        return Ok(());
+    }
+    // Pull the winning lease into the local mirror before returning the fence.
+    let _ = synchronize_protocol_worker(state, worker_id).await;
+    Err(fleet_fencing_response(result))
+}
+
+fn worker_id_for_control_action(
+    registry: &WorkerRegistry,
+    raw: &str,
+    headers: &HeaderMap,
+) -> Result<WorkerId, Box<Response>> {
+    if let Some(id) = WorkerId::parse(raw) {
+        return Ok(id);
+    }
+    let protocol_id = raw
+        .parse::<ProtocolWorkerId>()
+        .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid worker id").into_response()))?;
+    let token = headers
+        .get(LEASE_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    registry
+        .validate_protocol_lease(&protocol_id, token)
+        .map_err(|error| Box::new(protocol_registry_error_response(error)))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// `POST /internal/workers/register`
-async fn handle_register(
-    State(s): State<InternalState>,
-    Json(req): Json<RegisterRequest>,
-) -> impl IntoResponse {
+async fn handle_register(State(s): State<InternalState>, body: Bytes) -> impl IntoResponse {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid worker registration JSON: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    if value.get("protocol").is_some() {
+        let request: RegisterWorkerRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid protocol-v1 registration: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        return handle_protocol_register(&s, request).await;
+    }
+
+    let req: RegisterRequest = match serde_json::from_value(value) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid legacy worker registration: {error}"),
+            )
+                .into_response();
+        }
+    };
     // Validate addr before registering — a malformed addr would silently route
     // to 127.0.0.1:1 in the registry, accepting the worker but never sending it traffic.
     let Ok(addr) = req.addr.parse::<SocketAddr>() else {
@@ -183,13 +440,136 @@ async fn handle_register(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
+async fn handle_protocol_register(
+    state: &InternalState,
+    request: RegisterWorkerRequest,
+) -> Response {
+    let addr = match advertised_socket_addr(&request.worker.advertise_url) {
+        Ok(addr) => addr,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = validate_observation_age(request.observation.observed_at) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
+    }
+    let capabilities = gateway_protocol_capabilities();
+    let negotiated = match negotiate_protocol(
+        &request.protocol,
+        CURRENT_PROTOCOL.major,
+        0,
+        CURRENT_PROTOCOL.minor,
+        &capabilities,
+    ) {
+        Ok(negotiated) => negotiated,
+        Err(error) => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "AXS_PROTOCOL_INCOMPATIBLE",
+                        "message": error.to_string(),
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !addr.ip().is_loopback() {
+        state.license.mark_remote_worker_seen();
+    }
+    let stable_id = request.worker.id.clone();
+    let response = match state.registry.register_protocol(
+        request,
+        addr,
+        negotiated,
+        state.config.worker_heartbeat_ms,
+        state.config.worker_ttl_ms,
+    ) {
+        Ok(response) => response,
+        Err(error) => return protocol_registry_error_response(error),
+    };
+    let Some(record) = state.registry.export_protocol_record(&stable_id) else {
+        state.registry.evict_protocol(&stable_id);
+        return protocol_registry_error_response(ProtocolRegistryError::InternalRegistration);
+    };
+    if state.fleet_store.put(&record).await.is_err() {
+        state.registry.evict_protocol(&stable_id);
+        return fleet_unavailable_response();
+    }
+    info!(worker_id = %stable_id, "protocol-v1 worker registered");
+    (StatusCode::OK, Json(response)).into_response()
+}
+
 /// `POST /internal/workers/{id}/heartbeat`
 async fn handle_heartbeat(
     State(s): State<InternalState>,
     Path(id_str): Path<String>,
-    Json(req): Json<HeartbeatRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let id = match parse_worker_id(&id_str) {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid heartbeat JSON: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    if value.get("registration_id").is_some() {
+        let worker_id = match id_str.parse::<ProtocolWorkerId>() {
+            Ok(worker_id) => worker_id,
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "invalid protocol worker id").into_response();
+            }
+        };
+        let request: ax_serving_protocol::HeartbeatRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid protocol-v1 heartbeat: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(error) = validate_observation_age(request.observed_at) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
+        }
+        let lease_token = headers
+            .get(LEASE_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .unwrap_or("");
+        if let Err(response) = synchronize_protocol_worker(&s, &worker_id).await {
+            return response;
+        }
+        let response = match s
+            .registry
+            .heartbeat_protocol(&worker_id, lease_token, request)
+        {
+            Ok(response) => response,
+            Err(error) => return protocol_registry_error_response(error),
+        };
+        if let Err(response) = persist_protocol_record(&s, &worker_id).await {
+            return response;
+        }
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
+    let req: HeartbeatRequest = match serde_json::from_value(value) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid legacy heartbeat: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let id = match parse_worker_id(&s.registry, &id_str) {
         Ok(id) => id,
         Err(status) => return (status, "invalid worker id").into_response(),
     };
@@ -204,12 +584,27 @@ async fn handle_heartbeat(
 async fn handle_drain(
     State(s): State<InternalState>,
     Path(id_str): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let id = match parse_worker_id(&id_str) {
+    let protocol_worker_id = WorkerId::parse(&id_str)
+        .is_none()
+        .then(|| id_str.parse::<ProtocolWorkerId>().ok())
+        .flatten();
+    if let Some(worker_id) = &protocol_worker_id
+        && let Err(response) = synchronize_protocol_worker(&s, worker_id).await
+    {
+        return response;
+    }
+    let id = match worker_id_for_control_action(&s.registry, &id_str, &headers) {
         Ok(id) => id,
-        Err(status) => return (status, "invalid worker id").into_response(),
+        Err(response) => return *response,
     };
     if s.registry.mark_drain(id) {
+        if let Some(worker_id) = &protocol_worker_id
+            && let Err(response) = persist_protocol_record(&s, worker_id).await
+        {
+            return response;
+        }
         info!(%id, "worker marked for drain");
         StatusCode::OK.into_response()
     } else {
@@ -221,11 +616,41 @@ async fn handle_drain(
 async fn handle_drain_complete(
     State(s): State<InternalState>,
     Path(id_str): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let id = match parse_worker_id(&id_str) {
+    let protocol_worker_id = WorkerId::parse(&id_str)
+        .is_none()
+        .then(|| id_str.parse::<ProtocolWorkerId>().ok())
+        .flatten();
+    if let Some(worker_id) = &protocol_worker_id
+        && let Err(response) = synchronize_protocol_worker(&s, worker_id).await
+    {
+        return response;
+    }
+    let id = match worker_id_for_control_action(&s.registry, &id_str, &headers) {
         Ok(id) => id,
-        Err(status) => return (status, "invalid worker id").into_response(),
+        Err(response) => return *response,
     };
+    if s.registry.get_snapshot(id).is_none() {
+        return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
+    if let Some(worker_id) = &protocol_worker_id {
+        let Some((_, registration_id)) = s.registry.protocol_identity_for_internal(id) else {
+            return protocol_registry_error_response(ProtocolRegistryError::NotRegistered);
+        };
+        let result = match s
+            .fleet_store
+            .remove_if_registration(worker_id, registration_id)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => return fleet_unavailable_response(),
+        };
+        if result != FleetMutationResult::Applied {
+            let _ = synchronize_protocol_worker(&s, worker_id).await;
+            return fleet_fencing_response(result);
+        }
+    }
     s.registry.evict(id);
     info!(%id, "worker drain complete, evicted");
     StatusCode::NO_CONTENT.into_response()
@@ -242,7 +667,7 @@ async fn handle_get(
     State(s): State<InternalState>,
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
-    let id = match parse_worker_id(&id_str) {
+    let id = match parse_worker_id(&s.registry, &id_str) {
         Ok(id) => id,
         Err(status) => return (status, "invalid worker id").into_response(),
     };
@@ -260,12 +685,26 @@ async fn handle_delete(
     State(s): State<InternalState>,
     Path(id_str): Path<String>,
 ) -> impl IntoResponse {
-    let id = match parse_worker_id(&id_str) {
+    let id = match parse_worker_id(&s.registry, &id_str) {
         Ok(id) => id,
         Err(status) => return (status, "invalid worker id").into_response(),
     };
     if !s.registry.mark_drain(id) {
         return (StatusCode::NOT_FOUND, "worker not found").into_response();
+    }
+    if let Some((worker_id, registration_id)) = s.registry.protocol_identity_for_internal(id) {
+        let result = match s
+            .fleet_store
+            .remove_if_registration(&worker_id, registration_id)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => return fleet_unavailable_response(),
+        };
+        if result != FleetMutationResult::Applied {
+            let _ = synchronize_protocol_worker(&s, &worker_id).await;
+            return fleet_fencing_response(result);
+        }
     }
     s.registry.evict(id);
     info!(%id, "worker force-removed");
@@ -275,8 +714,22 @@ async fn handle_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LicenseConfig;
     use axum::{Router, middleware, routing::get};
     use tower::ServiceExt;
+
+    fn test_state() -> InternalState {
+        test_state_with_store(super::super::fleet_state::MemoryFleetStateStore::shared())
+    }
+
+    fn test_state_with_store(fleet_store: Arc<dyn FleetStateStore>) -> InternalState {
+        InternalState {
+            registry: WorkerRegistry::new(),
+            fleet_store,
+            config: Arc::new(OrchestratorConfig::default()),
+            license: LicenseState::new(&LicenseConfig::default()),
+        }
+    }
 
     #[test]
     fn parse_allowed_node_cidrs_accepts_ip_and_cidr() {
@@ -365,5 +818,288 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn drain_complete_returns_404_for_unknown_worker() {
+        let id = WorkerId::new();
+        let response =
+            handle_drain_complete(State(test_state()), Path(id.to_string()), HeaderMap::new())
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn drain_complete_evicts_known_worker() {
+        let state = test_state();
+        let register = state.registry.register(
+            RegisterRequest {
+                addr: "127.0.0.1:18081".into(),
+                capabilities: super::super::registry::RegisterCapabilities::Legacy(vec![
+                    "m1".into(),
+                ]),
+                max_inflight: 1,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&register.worker_id).unwrap();
+
+        let response = handle_drain_complete(
+            State(state.clone()),
+            Path(register.worker_id),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.registry.get_snapshot(id).is_none());
+    }
+
+    fn current_rfc3339() -> String {
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn protocol_registration() -> serde_json::Value {
+        serde_json::json!({
+            "protocol": {
+                "version": {"major": 1, "minor": 0},
+                "capabilities": [
+                    "control.drain",
+                    "dispatch.typed-admission",
+                    "telemetry.capacity"
+                ]
+            },
+            "agent": {"name": "ax-runtime-agent", "version": "3.0.0"},
+            "worker": {
+                "id": "mac-worker-1",
+                "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+                "advertise_url": "http://127.0.0.1:18081",
+                "pool_id": "mac-qwen",
+                "trust_domain": "private-prod",
+                "labels": {"node_class": "m3-ultra"}
+            },
+            "runtime": {"kind": "ax_engine", "version": "6.8.2", "api": "openai-v1"},
+            "hardware": {
+                "platform": "macos",
+                "accelerator": "apple-gpu",
+                "device_count": 1,
+                "hardware_class": "m3-ultra"
+            },
+            "observation": {
+                "observed_at": current_rfc3339(),
+                "runtime": {"ready": true, "state": "ready"},
+                "inventory_generation": 1,
+                "models": [{
+                    "runtime_model_id": "qwen-main",
+                    "identity": {"runtime_kind": "ax_engine", "runtime_version": "6.8.2"},
+                    "operations": ["chat_completions"],
+                    "capabilities": [],
+                    "max_context_tokens": 32768,
+                    "max_output_tokens": 4096
+                }],
+                "capacity": {"active_requests": 0, "max_concurrent_requests": 8}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn protocol_registration_and_lease_heartbeat_are_fenced() {
+        let state = test_state();
+        let app = router(state.clone());
+        let register_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(protocol_registration().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let register_body = axum::body::to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registration: serde_json::Value = serde_json::from_slice(&register_body).unwrap();
+        let lease_token = registration["lease_token"].as_str().unwrap();
+        let registration_id = registration["registration_id"].as_str().unwrap();
+
+        let heartbeat = serde_json::json!({
+            "registration_id": registration_id,
+            "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+            "sequence": 1,
+            "observed_at": current_rfc3339(),
+            "runtime": {
+                "ready": false,
+                "state": "unavailable",
+                "reason_code": "runtime_connect_failed"
+            },
+            "inventory_generation": 1,
+            "capacity": {"active_requests": 0, "max_concurrent_requests": 8}
+        });
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/mac-worker-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(LEASE_TOKEN_HEADER, "wrong-lease-token")
+                    .body(axum::body::Body::from(heartbeat.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/mac-worker-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(LEASE_TOKEN_HEADER, lease_token)
+                    .body(axum::body::Body::from(heartbeat.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let internal_id = state.registry.resolve_worker_id("mac-worker-1").unwrap();
+        let snapshot = state.registry.get_snapshot(internal_id).unwrap();
+        assert_eq!(snapshot.protocol_worker_id.as_deref(), Some("mac-worker-1"));
+        assert_eq!(snapshot.runtime_ready, Some(false));
+        assert!(state.registry.eligible_workers("qwen-main").is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_fleet_state_restores_worker_on_another_gateway() {
+        let store: Arc<dyn FleetStateStore> =
+            super::super::fleet_state::MemoryFleetStateStore::shared();
+        let gateway_a = test_state_with_store(Arc::clone(&store));
+        let gateway_b = test_state_with_store(store);
+        let register_response = router(gateway_a)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(protocol_registration().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let register_body = axum::body::to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registration: serde_json::Value = serde_json::from_slice(&register_body).unwrap();
+
+        let heartbeat = serde_json::json!({
+            "registration_id": registration["registration_id"],
+            "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+            "sequence": 1,
+            "observed_at": current_rfc3339(),
+            "runtime": {"ready": true, "state": "ready"},
+            "inventory_generation": 1,
+            "capacity": {"active_requests": 1, "max_concurrent_requests": 8}
+        });
+        let heartbeat_response = router(gateway_b.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/mac-worker-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(
+                        LEASE_TOKEN_HEADER,
+                        registration["lease_token"].as_str().unwrap(),
+                    )
+                    .body(axum::body::Body::from(heartbeat.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+        let internal_id = gateway_b
+            .registry
+            .resolve_worker_id("mac-worker-1")
+            .unwrap();
+        let snapshot = gateway_b.registry.get_snapshot(internal_id).unwrap();
+        assert_eq!(snapshot.protocol_worker_id.as_deref(), Some("mac-worker-1"));
+        assert_eq!(snapshot.runtime_ready, Some(true));
+        assert_eq!(snapshot.inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn newer_registration_fences_old_gateway_lease() {
+        let store: Arc<dyn FleetStateStore> =
+            super::super::fleet_state::MemoryFleetStateStore::shared();
+        let gateway_a = test_state_with_store(Arc::clone(&store));
+        let gateway_b = test_state_with_store(store);
+
+        let first = router(gateway_a.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(protocol_registration().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_registration: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+
+        let second = router(gateway_b)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(protocol_registration().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let old_heartbeat = serde_json::json!({
+            "registration_id": first_registration["registration_id"],
+            "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+            "sequence": 1,
+            "observed_at": current_rfc3339(),
+            "runtime": {"ready": true, "state": "ready"},
+            "inventory_generation": 1
+        });
+        let rejected = router(gateway_a)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/mac-worker-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(
+                        LEASE_TOKEN_HEADER,
+                        first_registration["lease_token"].as_str().unwrap(),
+                    )
+                    .body(axum::body::Body::from(old_heartbeat.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
     }
 }

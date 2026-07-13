@@ -2,12 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 
 pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
-    const DEFAULT_TIMEOUT_SECS: u64 = 120;
-    let timeout_secs = std::env::var("AXS_NODE_STARTUP_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("AXS_THOR_STARTUP_TIMEOUT_SECS"))
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout_secs = runtime_startup_timeout_secs()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let url = format!("{base_url}/health");
     loop {
@@ -25,6 +20,40 @@ pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Resul
     }
 }
 
+/// Perform one authoritative runtime readiness probe.
+pub async fn probe_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
+    client
+        .get(format!("{base_url}/health"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .context("runtime health probe failed")?
+        .error_for_status()
+        .context("runtime health endpoint is not ready")?;
+    Ok(())
+}
+
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
+
+fn runtime_startup_timeout_secs() -> Result<u64> {
+    for key in [
+        "AXS_NODE_STARTUP_TIMEOUT_SECS",
+        "AXS_THOR_STARTUP_TIMEOUT_SECS",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let secs = trimmed
+                .parse::<u64>()
+                .with_context(|| format!("invalid {key}: {trimmed}"))?;
+            return Ok(secs.max(1));
+        }
+    }
+    Ok(DEFAULT_STARTUP_TIMEOUT_SECS)
+}
+
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
     wait_for_runtime(client, base_url).await
 }
@@ -34,6 +63,7 @@ pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result
 pub struct ModelInfo {
     pub id: String,
     pub max_model_len: Option<u32>,
+    pub max_output_tokens: Option<u32>,
     pub quantization: Option<String>,
     pub artifact_format: Option<String>,
     pub modalities: Vec<String>,
@@ -53,6 +83,7 @@ pub async fn get_model_info(client: &reqwest::Client, base_url: &str) -> Result<
     let url = format!("{base_url}/v1/models");
     let resp = client
         .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .context("failed to fetch runtime model list")?
@@ -69,31 +100,41 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
     let entries = raw["data"].as_array().cloned().unwrap_or_default();
     let mut models = Vec::with_capacity(entries.len());
     for entry in entries {
-        if let Some(id) = entry["id"].as_str() {
+        if let Some(id) = entry["id"].as_str().and_then(trimmed_non_empty_string) {
             let max_model_len = entry["max_model_len"]
                 .as_u64()
                 .or_else(|| entry["context_length"].as_u64())
                 .or_else(|| entry["max_context"].as_u64())
-                .map(|v| v as u32);
+                .map(clamp_u64_to_u32);
+            let max_output_tokens = entry["max_output_tokens"]
+                .as_u64()
+                .or_else(|| entry["max_tokens"].as_u64())
+                .map(clamp_u64_to_u32);
             let quantization = string_alias(
                 &entry,
                 &["quantization", "quantization_format", "quantization_config"],
             );
             let artifact_format =
                 string_alias(&entry, &["artifact_format", "model_format", "format"]);
-            let modalities = string_array_alias(&entry, &["modalities", "model_modalities"]);
+            let mut modalities = string_array_alias(&entry, &["modalities", "model_modalities"]);
+            modalities.extend(nested_input_modalities(&entry));
+            modalities.sort();
+            modalities.dedup();
             let supported_operations =
                 operations_from_model_entry(&entry, modalities.iter().map(String::as_str));
             models.push(ModelInfo {
                 id: id.to_string(),
                 max_model_len,
+                max_output_tokens,
                 quantization,
                 artifact_format,
                 modalities,
                 supported_operations,
             });
         } else {
-            tracing::warn!("runtime /v1/models entry missing 'id' field, skipping: {entry}");
+            tracing::warn!(
+                "runtime /v1/models entry missing non-empty 'id' field, skipping: {entry}"
+            );
         }
     }
     models
@@ -102,15 +143,27 @@ fn parse_model_info_response(raw: &serde_json::Value) -> Vec<ModelInfo> {
 fn string_alias(entry: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         entry.get(*key).and_then(|value| {
-            value.as_str().map(str::to_string).or_else(|| {
-                value
-                    .as_object()
-                    .and_then(|obj| obj.get("type").or_else(|| obj.get("name")))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
+            value
+                .as_str()
+                .and_then(trimmed_non_empty_string)
+                .or_else(|| {
+                    value
+                        .as_object()
+                        .and_then(|obj| obj.get("type").or_else(|| obj.get("name")))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(trimmed_non_empty_string)
+                })
         })
     })
+}
+
+fn trimmed_non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn string_array_alias(entry: &serde_json::Value, keys: &[&str]) -> Vec<String> {
@@ -121,11 +174,46 @@ fn string_array_alias(entry: &serde_json::Value, keys: &[&str]) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(serde_json::Value::as_str)
-        .map(str::to_string)
+        .filter_map(trimmed_non_empty_string)
         .collect::<Vec<_>>();
     values.sort();
     values.dedup();
     values
+}
+
+fn normalized_metadata_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn nested_input_modalities(entry: &serde_json::Value) -> Vec<String> {
+    ["text", "audio", "image", "video", "pdf"]
+        .into_iter()
+        .filter(|modality| {
+            entry
+                .pointer(&format!("/capabilities/input/{modality}"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn bool_at_any(entry: &serde_json::Value, pointers: &[&str]) -> bool {
+    pointers
+        .iter()
+        .any(|pointer| entry.pointer(pointer).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+fn normalize_operation_token(value: &str) -> Option<String> {
+    let normalized = normalized_metadata_token(value);
+    let operation = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(operation.to_string())
 }
 
 fn operations_from_model_entry<'a>(
@@ -140,7 +228,10 @@ fn operations_from_model_entry<'a>(
             "tasks",
             "capabilities",
         ],
-    );
+    )
+    .into_iter()
+    .filter_map(|operation| normalize_operation_token(&operation))
+    .collect::<Vec<_>>();
     if entry
         .get("embedding")
         .or_else(|| entry.get("supports_embeddings"))
@@ -157,8 +248,41 @@ fn operations_from_model_entry<'a>(
     {
         operations.push("vision".to_string());
     }
+    if bool_at_any(
+        entry,
+        &[
+            "/capabilities/embedding",
+            "/capabilities/embeddings",
+            "/capabilities/input/embedding",
+        ],
+    ) {
+        operations.push("embedding".to_string());
+    }
+    if bool_at_any(
+        entry,
+        &[
+            "/ax_engine/openai_completions_supported",
+            "/ax_engine/openai_chat_completions_supported",
+            "/capabilities/input/text",
+        ],
+    ) {
+        operations.push("llm".to_string());
+    }
+    if bool_at_any(
+        entry,
+        &[
+            "/capabilities/attachment",
+            "/capabilities/input/audio",
+            "/capabilities/input/image",
+            "/capabilities/input/video",
+            "/ax_engine/native_multimodal_input_supported",
+            "/ax_engine/openai_tokenized_multimodal_input_supported",
+        ],
+    ) {
+        operations.push("vision".to_string());
+    }
     for modality in modalities {
-        match modality {
+        match normalized_metadata_token(modality).as_str() {
             "embedding" | "embeddings" => operations.push("embedding".to_string()),
             "vision" | "image" | "multimodal" => operations.push("vision".to_string()),
             "text" | "llm" | "chat" | "completion" => operations.push("llm".to_string()),
@@ -264,7 +388,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
         ],
         0.95,
     )
-    .map(seconds_to_ms);
+    .and_then(seconds_to_ms);
     RuntimeTelemetry {
         active_sequences: sum_usize(
             &samples,
@@ -272,6 +396,8 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
                 "ax_runtime_active_sequences",
                 "axs_scheduler_decode_sequences_active",
                 "axs_scheduler_inflight_count",
+                "ax_engine_jobs_in_flight",
+                "ax_engine_generation_jobs_pending",
                 "vllm:num_requests_running",
                 "vllm_num_requests_running",
                 "sglang:num_running_reqs",
@@ -307,6 +433,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
             &[
                 "ax_runtime_queue_depth",
                 "axs_scheduler_queue_depth",
+                "ax_engine_generation_commands_queued",
                 "vllm:num_requests_waiting",
                 "vllm_num_requests_waiting",
                 "sglang:num_queue_reqs",
@@ -314,7 +441,10 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
             ],
         ),
         error_rate: max_f64(&samples, &["ax_runtime_error_rate", "axs_slo_error_rate"]),
-        kv_pages_used: sum_u64(&samples, &["ax_runtime_kv_pages_used"]),
+        kv_pages_used: sum_u64(
+            &samples,
+            &["ax_runtime_kv_pages_used", "ax_engine_step_kv_usage_blocks"],
+        ),
         kv_pages_total: sum_u64(&samples, &["ax_runtime_kv_pages_total"]),
         kv_utilization: max_ratio(
             &samples,
@@ -341,6 +471,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
             &samples,
             &[
                 "ax_runtime_active_batch_size",
+                "ax_engine_step_scheduled_requests",
                 "vllm:num_requests_running",
                 "vllm_num_requests_running",
             ],
@@ -475,6 +606,9 @@ fn parse_prometheus_sample(line: &str) -> Option<(String, f64)> {
     let mut parts = line.split_whitespace();
     let metric = parts.next()?;
     let value = parts.next()?.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
     let name = metric
         .split_once('{')
         .map(|(name, _)| name)
@@ -535,7 +669,7 @@ fn max_f64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64
 fn max_ratio(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
     max_f64(samples, aliases).map(|value| {
         let normalized = if value > 1.0 { value / 100.0 } else { value };
-        normalized.clamp(0.0, 1.0)
+        ratio_or_zero(normalized)
     })
 }
 
@@ -621,11 +755,11 @@ fn prometheus_histogram_quantile_seconds(
 }
 
 fn sum_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
-    sum_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
+    sum_f64(samples, aliases).and_then(f64_to_u64)
 }
 
 fn max_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
-    max_f64(samples, aliases).map(|v| v.max(0.0).round() as u64)
+    max_f64(samples, aliases).and_then(f64_to_u64)
 }
 
 /// Sums per-label samples within each alias (label stripping collapses per-model values
@@ -646,19 +780,51 @@ fn sum_per_alias_max_across(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&st
 }
 
 fn sum_usize(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<usize> {
-    sum_per_alias_max_across(samples, aliases).map(|v| v.max(0.0).round() as usize)
+    sum_per_alias_max_across(samples, aliases).and_then(f64_to_usize)
 }
 
 fn max_u32(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u32> {
     max_u64(samples, aliases).map(|v| v.min(u32::MAX as u64) as u32)
 }
 
+fn clamp_u64_to_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 fn us_to_ms(value: u64) -> u64 {
     value.div_ceil(1_000)
 }
 
-fn seconds_to_ms(value: f64) -> u64 {
-    (value.max(0.0) * 1_000.0).round() as u64
+fn seconds_to_ms(value: f64) -> Option<u64> {
+    let millis = value.max(0.0) * 1_000.0;
+    f64_to_u64(millis)
+}
+
+fn f64_to_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value <= 0.0 {
+        return Some(0);
+    }
+    let rounded = value.round();
+    if rounded > u64::MAX as f64 {
+        None
+    } else {
+        Some(rounded as u64)
+    }
+}
+
+fn f64_to_usize(value: f64) -> Option<usize> {
+    f64_to_u64(value).and_then(|value| usize::try_from(value).ok())
+}
+
+fn ratio_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn json_f64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
@@ -667,16 +833,17 @@ fn json_f64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
             value
                 .as_f64()
                 .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+                .filter(|value| value.is_finite())
         })
     })
 }
 
 fn json_u64_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u64> {
-    json_f64_any(body, pointers).map(|value| value.max(0.0).round() as u64)
+    json_f64_any(body, pointers).and_then(f64_to_u64)
 }
 
 fn json_usize_any(body: &serde_json::Value, pointers: &[&str]) -> Option<usize> {
-    json_u64_any(body, pointers).map(|value| value as usize)
+    json_u64_any(body, pointers).and_then(|value| usize::try_from(value).ok())
 }
 
 fn json_u32_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u32> {
@@ -686,7 +853,7 @@ fn json_u32_any(body: &serde_json::Value, pointers: &[&str]) -> Option<u32> {
 fn json_ratio_any(body: &serde_json::Value, pointers: &[&str]) -> Option<f64> {
     json_f64_any(body, pointers).map(|value| {
         let normalized = if value > 1.0 { value / 100.0 } else { value };
-        normalized.clamp(0.0, 1.0)
+        ratio_or_zero(normalized)
     })
 }
 
@@ -703,9 +870,69 @@ fn json_duration_ms_any(
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeTelemetry, parse_json_telemetry, parse_model_info_response,
-        parse_prometheus_telemetry,
+        DEFAULT_STARTUP_TIMEOUT_SECS, RuntimeTelemetry, parse_json_telemetry,
+        parse_model_info_response, parse_prometheus_telemetry, runtime_startup_timeout_secs,
     };
+    use std::ffi::OsString;
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn startup_timeout_defaults_when_env_unset() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::remove("AXS_NODE_STARTUP_TIMEOUT_SECS");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        assert_eq!(
+            runtime_startup_timeout_secs().unwrap(),
+            DEFAULT_STARTUP_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn startup_timeout_clamps_zero_to_one() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::set("AXS_NODE_STARTUP_TIMEOUT_SECS", "0");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        assert_eq!(runtime_startup_timeout_secs().unwrap(), 1);
+    }
+
+    #[test]
+    fn startup_timeout_rejects_invalid_explicit_env() {
+        let _lock = crate::test_env::lock();
+        let _node = EnvGuard::set("AXS_NODE_STARTUP_TIMEOUT_SECS", "soon");
+        let _thor = EnvGuard::remove("AXS_THOR_STARTUP_TIMEOUT_SECS");
+
+        let err = runtime_startup_timeout_secs().unwrap_err();
+        assert!(err.to_string().contains("AXS_NODE_STARTUP_TIMEOUT_SECS"));
+    }
 
     #[test]
     fn parses_common_runtime_prometheus_metrics() {
@@ -763,6 +990,62 @@ vllm:batch_utilization 0.5
         assert_eq!(telemetry.decode_tok_per_sec, Some(91.5));
         assert_eq!(telemetry.kv_utilization, Some(0.87));
         assert_eq!(telemetry.batch_utilization, Some(0.5));
+    }
+
+    #[test]
+    fn parses_current_ax_engine_prometheus_metrics() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_engine_jobs_in_flight 3
+ax_engine_generation_jobs_pending 2
+ax_engine_generation_commands_queued 4
+ax_engine_step_scheduled_requests 2
+ax_engine_step_kv_usage_blocks 96
+"#,
+        );
+
+        assert_eq!(telemetry.active_sequences, Some(3));
+        assert_eq!(telemetry.queue_depth, Some(4));
+        assert_eq!(telemetry.active_batch_size, Some(2));
+        assert_eq!(telemetry.kv_pages_used, Some(96));
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.ttft_p95_ms, None);
+    }
+
+    #[test]
+    fn ignores_non_finite_runtime_metric_values() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_runtime_decode_tok_per_sec NaN
+ax_runtime_error_rate +Inf
+ax_runtime_kv_utilization -Inf
+ax_runtime_batch_utilization NaN
+ax_runtime_queue_depth 3
+"#,
+        );
+
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.error_rate, None);
+        assert_eq!(telemetry.kv_utilization, None);
+        assert_eq!(telemetry.batch_utilization, None);
+        assert_eq!(telemetry.queue_depth, Some(3));
+    }
+
+    #[test]
+    fn ignores_runtime_metric_values_outside_integer_range() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_runtime_active_sequences 1e40
+ax_runtime_queue_depth 1e40
+ax_runtime_ttft_p95_ms 1e40
+ax_runtime_kv_pages_used 1e40
+"#,
+        );
+
+        assert_eq!(telemetry.active_sequences, None);
+        assert_eq!(telemetry.queue_depth, None);
+        assert_eq!(telemetry.ttft_p95_ms, None);
+        assert_eq!(telemetry.kv_pages_used, None);
     }
 
     #[test]
@@ -838,6 +1121,40 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
     }
 
     #[test]
+    fn ignores_non_finite_json_metric_strings() {
+        let telemetry = parse_json_telemetry(&serde_json::json!({
+            "decode_tok_per_sec": "NaN",
+            "error_rate": "inf",
+            "kv_utilization": "-inf",
+            "batch_utilization": "NaN",
+            "queue_depth": 2
+        }));
+
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.error_rate, None);
+        assert_eq!(telemetry.kv_utilization, None);
+        assert_eq!(telemetry.batch_utilization, None);
+        assert_eq!(telemetry.queue_depth, Some(2));
+    }
+
+    #[test]
+    fn ignores_json_metric_values_outside_integer_range() {
+        let telemetry = parse_json_telemetry(&serde_json::json!({
+            "active_sequences": "1e40",
+            "queue_depth": "1e40",
+            "ttft_p95_ms": "1e40",
+            "kv_cache": {
+                "pages_used": "1e40"
+            }
+        }));
+
+        assert_eq!(telemetry.active_sequences, None);
+        assert_eq!(telemetry.queue_depth, None);
+        assert_eq!(telemetry.ttft_p95_ms, None);
+        assert_eq!(telemetry.kv_pages_used, None);
+    }
+
+    #[test]
     fn parses_runtime_model_inventory_metadata() {
         let models = parse_model_info_response(&serde_json::json!({
             "data": [
@@ -869,5 +1186,109 @@ vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
         assert_eq!(models[1].quantization.as_deref(), Some("int8"));
         assert_eq!(models[1].artifact_format.as_deref(), Some("gguf"));
         assert_eq!(models[1].supported_operations, vec!["embedding"]);
+    }
+
+    #[test]
+    fn parses_current_ax_engine_model_inventory() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": "qwen3-coder-next",
+                "object": "model",
+                "owned_by": "ax-engine",
+                "context_length": 131072,
+                "max_output_tokens": 32768,
+                "capabilities": {
+                    "temperature": true,
+                    "attachment": true,
+                    "toolcall": true,
+                    "input": {
+                        "text": true,
+                        "audio": false,
+                        "image": true,
+                        "video": true,
+                        "pdf": false
+                    },
+                    "output": {
+                        "text": true,
+                        "audio": false,
+                        "image": false,
+                        "video": false,
+                        "pdf": false
+                    }
+                },
+                "ax_engine": {
+                    "openai_completions_supported": true,
+                    "openai_chat_completions_supported": true,
+                    "native_multimodal_input_supported": true,
+                    "openai_tokenized_multimodal_input_supported": true
+                },
+                "runtime": {
+                    "selected_backend": "mlx"
+                }
+            }]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3-coder-next");
+        assert_eq!(models[0].max_model_len, Some(131072));
+        assert_eq!(models[0].max_output_tokens, Some(32768));
+        assert_eq!(models[0].modalities, vec!["image", "text", "video"]);
+        assert_eq!(models[0].supported_operations, vec!["llm", "vision"]);
+        assert_eq!(models[0].quantization, None);
+    }
+
+    #[test]
+    fn normalizes_runtime_model_inventory_metadata_strings() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": " mixed ",
+                    "quantization_config": {"name": " AWQ "},
+                    "model_format": " safetensors ",
+                    "modalities": [" Text ", "Vision", "", "vision"]
+                },
+                {
+                    "id": "embed",
+                    "quantization": "   ",
+                    "capabilities": [" Embeddings "]
+                },
+                {
+                    "id": "   ",
+                    "max_model_len": 4096
+                }
+            ]
+        }));
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "mixed");
+        assert_eq!(models[0].quantization.as_deref(), Some("AWQ"));
+        assert_eq!(models[0].artifact_format.as_deref(), Some("safetensors"));
+        assert_eq!(
+            models[0].modalities,
+            vec![
+                "Text".to_string(),
+                "Vision".to_string(),
+                "vision".to_string()
+            ]
+        );
+        assert_eq!(models[0].supported_operations, vec!["llm", "vision"]);
+        assert_eq!(models[1].quantization, None);
+        assert_eq!(models[1].supported_operations, vec!["embedding"]);
+    }
+
+    #[test]
+    fn model_inventory_context_length_clamps_oversized_u32() {
+        let models = parse_model_info_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "oversized",
+                    "max_model_len": u32::MAX as u64 + 1
+                }
+            ]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_model_len, Some(u32::MAX));
     }
 }

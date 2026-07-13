@@ -1,259 +1,144 @@
-# AX Fabric Runtime Contract
+# AX Fabric integration contract
 
-This document defines the supported runtime contract between AX Fabric and AX Serving for the `v1.3` line.
+| Field | Value |
+| --- | --- |
+| Status | Proposed portable-gateway contract |
+| Last updated | 2026-07-12 |
 
-## Purpose
+AX Fabric should integrate with the portable AX Serving gateway over REST/SSE.
+It should not depend on embedded backend traits, local model paths, or gRPC v1
+for a hybrid fleet.
 
-AX Fabric should be able to treat AX Serving as its standard offline model runtime and serving control plane.
+## Stable portable endpoints
 
-This contract defines:
+- `GET /livez`;
+- `GET /readyz`;
+- `GET /health`;
+- `GET /v1/models`;
+- `POST /v1/chat/completions`;
+- `POST /v1/completions`;
+- `POST /v1/embeddings`;
+- `GET /v1/metrics`.
 
-- which endpoints AX Fabric may rely on
-- what health and lifecycle semantics mean
-- which failure classes are expected and stable
+`/v1/responses` is not yet part of this contract. Admin and deployment routes
+use a separate operator credential and should not be called by an ordinary
+inference client.
 
-## Core Assumptions
+## Authentication
 
-- AX Serving is an offline-first runtime.
-- AX Serving may run with bearer auth (`AXS_API_KEY`) or explicit no-auth development mode (`AXS_ALLOW_NO_AUTH=true`).
-- `GET /health` is the runtime health contract.
-- `GET /v1/models` is the authoritative model-availability view.
-- AX Fabric should treat only the endpoints and fields documented here as stable for `v1.3`.
+AX Fabric sends its public inference token as:
 
-## Stable Endpoints For AX Fabric
-
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/models`
-- `DELETE /v1/models/{id}`
-- `POST /v1/models/{id}/reload`
-- `POST /v1/embeddings`
-- `GET /v1/metrics`
-
-Anything outside this list should be treated as implementation detail unless separately documented.
-
-Operators and integration CI can validate the read-side contract with:
-
-```bash
-ax-serving fabric validate --url http://127.0.0.1:18080
+```text
+Authorization: Bearer <AXS_API_KEY value>
 ```
 
-## Health Contract
+It must not receive or reuse `AXS_ADMIN_API_KEY`, worker-control, dispatch,
+runtime, Redis, or affinity secrets.
 
-`GET /health` always returns HTTP `200` when the process is alive enough to answer.
+## Health and readiness
 
-Important fields:
+- `/livez` `200` means the gateway process can answer HTTP.
+- `/readyz` `200` means at least one worker is currently eligible; `503` means
+  the gateway must not receive new inference traffic.
+- `/health` always returns a JSON fleet summary while the process is live.
 
-- `status`: `ok` or `degraded`
-- `ready`: whether the runtime is able to serve
-- `model_available`: whether at least one model is loaded
-- `reason`: present when degraded
-- `loaded_model_count`: number of currently loaded models
+Relevant `/health` fields:
 
-Gateway-mode deployments expose worker readiness instead of single-runtime
-readiness:
+```text
+status
+workers.total
+workers.healthy
+workers.unhealthy
+workers.draining
+workers.eligible
+queue.active
+queue.queued
+queue.rejected_total
+queue.shed_total
+queue.timeout_total
+```
 
-- `workers.eligible`: number of healthy, non-draining workers that can accept
-  requests
-- `workers.healthy`, `workers.unhealthy`, `workers.draining`: fleet health
-  counters
+AX Fabric must use `/readyz` or `workers.eligible > 0`, not merely a live
+process, as serving readiness.
 
-Interpretation:
+## Model inventory
 
-- `status=ok`
-  - runtime is ready
-  - at least one model is available
-- `status=degraded`
-  - process is alive, but runtime is not in the ideal serving state
-  - common reasons:
-    - `no_models_loaded`
-    - `thermal_critical`
-    - `thermal_critical_no_models`
+`GET /v1/models` returns logical model aliases in explicit deployment mode and
+eligible runtime model IDs in legacy compatibility mode. AX Fabric should
+configure logical aliases and avoid selecting runtime pools directly.
 
-AX Fabric integration rule:
+The read API does not imply that every deployment behind an alias is
+equivalent. AX Serving's explicit catalog and equivalence policy enforce that
+internally.
 
-- treat `ready=true` as "the runtime can answer requests"
-- for gateway-mode deployments, treat `workers.eligible > 0` as "the serving
-  endpoint can dispatch requests"
-- treat `model_available=true` as "a model-backed workload can be dispatched now"
-- treat `status=degraded` with `reason=no_models_loaded` as a recoverable startup state, not a process failure
+## Inference
 
-Expected startup sequence for a healthy local deployment:
+AX Fabric may use chat completions, text completions, embeddings, and SSE for
+the fields documented by the release. Unknown request extensions are forwarded
+to the runtime unless a bounded gateway validation rule rejects them.
 
-1. process starts
-2. `GET /health` returns `200` with `status=degraded`, `ready=true`, `model_available=false`
-3. a model is loaded through `POST /v1/models`
-4. `GET /health` returns `200` with `status=ok`, `ready=true`, `model_available=true`
+The gateway does not render templates or tokenize prompts. Runtime token usage
+is authoritative.
 
-## Model Lifecycle Contract
+Gateway-generated errors include:
 
-### Load
+- AX machine code;
+- request ID;
+- retryable flag;
+- phase;
+- safe message/detail.
 
-`POST /v1/models`
+AX Fabric must not retry based on status code alone. AX Serving already performs
+at most one safe pre-commit retry after connect failure or typed non-admission.
+Generic runtime `5xx`, post-admission ambiguity, and committed streams are not
+rerouted.
 
-Success:
-- HTTP `201`
-- returns:
-  - `model_id`
-  - `state=loaded`
-  - `ready`
-  - `model_available`
-  - `loaded_model_count`
-  - `architecture`
-  - `context_length`
-  - `load_time_ms`
+## Metrics
 
-Common failures:
-- HTTP `409` if model already loaded
-- HTTP `422` for invalid model id / invalid file / invalid format
-- HTTP `403` for disallowed path
-- HTTP `503` for capacity exhaustion
+The gateway JSON profile includes:
 
-### Unload
+```text
+mode
+policy
+workers.healthy
+workers.unhealthy
+workers.draining
+total_inflight
+reroute_total
+requests.total
+requests.attempts_total
+requests.completed_total
+requests.failed_total
+requests.cancelled_total
+requests.retried_total
+queue.active
+queue.queued
+queue.permit_total
+queue.rejected_total
+queue.shed_total
+queue.timeout_total
+```
 
-`DELETE /v1/models/{id}`
+AX Fabric may use these for diagnostics but should use request responses as the
+source of truth for individual work. Prometheus monitoring should scrape
+`/metrics` directly.
 
-Success:
-- HTTP `200`
-- returns:
-  - `model_id`
-  - `state=unloaded`
-  - `ready`
-  - `model_available`
-  - `loaded_model_count`
+## Optional request metadata
 
-Common failure:
-- HTTP `404` if model is not loaded
+- `x-ax-project` identifies a configured project/tenant policy;
+- `x-ax-priority` is `low`, `normal`, or `high`;
+- `x-ax-request-timeout-ms` may shorten but not extend the gateway maximum;
+- `x-ax-minimum-context-tokens` declares a hard routing requirement;
+- `x-ax-cache-affinity` is an opaque hint accepted only when the operator has
+  configured a tenant-scoped affinity secret.
 
-### Reload
+AX Fabric must not put prompt text, user PII, credentials, or globally stable
+cross-tenant identifiers in affinity hints.
 
-`POST /v1/models/{id}/reload`
+## Embedded compatibility appendix
 
-Success:
-- HTTP `200`
-- returns:
-  - `model_id`
-  - `state=loaded`
-  - `ready`
-  - `model_available`
-  - `loaded_model_count`
-  - `architecture`
-  - `load_time_ms`
-
-Common failure:
-- HTTP `404` if model is not loaded
-
-AX Fabric should not infer lifecycle success from status code alone. It should read:
-
-- `state`
-- `ready`
-- `model_available`
-- `loaded_model_count`
-
-## Embeddings Contract
-
-`POST /v1/embeddings`
-
-AX Fabric may rely on:
-
-- HTTP `200` on successful embedding generation
-- HTTP `404` when the requested model is not loaded
-- HTTP `422` for invalid request shape/validation failure
-- HTTP `501` when the loaded backend does not support embeddings
-- HTTP `500` when the embedding backend fails after request validation succeeds
-
-Stable response fields on HTTP `200`:
-
-- `object=list`
-- `model`
-- `data[]`
-  - `object=embedding`
-  - `index`
-  - `embedding`
-- `usage.prompt_tokens`
-- `usage.total_tokens`
-
-AX Fabric may use either:
-
-- `encoding_format=float`
-- `encoding_format=base64`
-
-Any other `encoding_format` should be treated as client error.
-
-## Metrics Contract
-
-`GET /v1/metrics`
-
-AX Fabric may receive one of two stable metrics profiles.
-
-Single-runtime endpoint profile:
-
-- `scheduler.queue_depth`
-- `scheduler.inflight_count`
-- `scheduler.cache_follower_waiting`
-- `scheduler.ttft_p50_us`
-- `scheduler.ttft_p95_us`
-- `scheduler.ttft_p99_us`
-- `scheduler.prefill_tokens_active`
-- `scheduler.decode_sequences_active`
-- `scheduler.split_scheduler_enabled`
-- `loaded_models`
-- `thermal`
-
-Gateway endpoint profile:
-
-- `mode`
-- `policy`
-- `workers.healthy`
-- `workers.unhealthy`
-- `workers.draining`
-- `total_inflight`
-- `reroute_total`
-- `queue.active`
-- `queue.queued`
-- `queue.rejected_total`
-- `queue.shed_total`
-- `queue.timeout_total`
-- `worker_detail`
-
-These metrics are intended for readiness decisions, integration diagnostics, and local operator visibility. They are not a replacement for request-level success criteria.
-
-## Failure Semantics AX Fabric Should Handle
-
-- `404` from `POST /v1/embeddings`, `POST /v1/chat/completions`, or `POST /v1/completions`
-  - requested model is not loaded
-- `422` from lifecycle or inference endpoints
-  - validation failure or invalid model path/configuration
-- `429`
-  - admission queue full
-- `500`
-  - backend execution failure after admission
-- `501`
-  - requested backend capability is not implemented
-- `503`
-  - throttling, capacity exhaustion, timeout, or service-side overload
-
-## Operational Guidance
-
-- For offline enterprise deployments, prefer `config/serving.offline-enterprise.yaml`.
-- Keep bind addresses on loopback unless a controlled network boundary is intentional.
-- Use `AXS_MODEL_ALLOWED_DIRS` to restrict runtime model loading to approved local directories.
-
-## Non-Contract Items
-
-The following are not treated as a stable AX Fabric integration contract in `v1.4`:
-
-- internal orchestrator endpoints
-- dashboard HTML structure
-- benchmark report file formats
-- scheduler metrics other than:
-  - `scheduler.queue_depth`
-  - `scheduler.inflight_count`
-  - `scheduler.cache_follower_waiting`
-  - `scheduler.ttft_p50_us`
-  - `scheduler.ttft_p95_us`
-  - `scheduler.ttft_p99_us`
-  - `scheduler.prefill_tokens_active`
-  - `scheduler.decode_sequences_active`
-  - `scheduler.split_scheduler_enabled`
-- gateway metrics other than the gateway endpoint profile listed above
+The macOS `ax-serving` binary may expose synchronous `POST /v1/models`, model
+delete/reload, thermal/scheduler metrics, and gRPC v1. Those are local embedded
+contracts, not portable fleet contracts. AX Fabric integrations that still use
+them need an explicit migration plan to runtime-managed model lifecycle and
+the portable gateway.

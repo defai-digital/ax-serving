@@ -6,16 +6,20 @@ build-backend = "hatchling.build"
 name = "ax-serving"
 version = "2.2.0"
 requires-python = ">=3.10"
-description = "Python SDK for ax-serving: gRPC + OpenAI-compatible inference client"
+description = "AX Serving portable REST/SSE client with embedded gRPC compatibility"
 dependencies = [
-    "grpcio>=1.60",
-    "grpcio-tools>=1.60",
-    "protobuf>=4.25",
     "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+grpc = ["grpcio>=1.78.0", "protobuf>=6.31.1"]
+dev = [
+    "grpcio>=1.78.0",
+    "grpcio-tools>=1.78.0",
+    "protobuf>=6.31.1",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["ax_serving"]

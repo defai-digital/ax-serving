@@ -23,6 +23,10 @@ pub struct LlamaTokenDataArray {
     pub sorted: bool,
 }
 
+fn clamp_keep(requested: usize, min_keep: libc::size_t, size: libc::size_t) -> libc::size_t {
+    requested.max(min_keep).min(size)
+}
+
 /// Apply temperature scaling to logits (in-place).
 ///
 /// `temp = 0` → greedy (collapses to argmax).
@@ -92,7 +96,7 @@ pub unsafe extern "C" fn llama_sample_top_k(
     _ctx: *mut crate::types::LlamaContext,
     candidates: *mut LlamaTokenDataArray,
     k: i32,
-    _min_keep: libc::size_t,
+    min_keep: libc::size_t,
 ) {
     if candidates.is_null() {
         return;
@@ -116,7 +120,7 @@ pub unsafe extern "C" fn llama_sample_top_k(
     });
     arr.sorted = true;
     // Truncate to k.
-    let new_size = (k as usize).min(arr.size);
+    let new_size = clamp_keep(k as usize, min_keep, arr.size);
     arr.size = new_size;
 }
 
@@ -129,7 +133,7 @@ pub unsafe extern "C" fn llama_sample_top_p(
     _ctx: *mut crate::types::LlamaContext,
     candidates: *mut LlamaTokenDataArray,
     p: f32,
-    _min_keep: libc::size_t,
+    min_keep: libc::size_t,
 ) {
     // p >= 1.0 means "keep all" — no-op to avoid float accumulation truncation.
     if candidates.is_null() || p >= 1.0 {
@@ -173,7 +177,7 @@ pub unsafe extern "C" fn llama_sample_top_p(
             break;
         }
     }
-    arr.size = cutoff;
+    arr.size = clamp_keep(cutoff, min_keep, arr.size);
 }
 
 /// Apply repetition penalty.
@@ -216,5 +220,90 @@ pub unsafe extern "C" fn llama_sample_repetition_penalties(
                 entry.logit *= penalty_repeat;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidates(data: &mut [LlamaTokenData]) -> LlamaTokenDataArray {
+        LlamaTokenDataArray {
+            data: data.as_mut_ptr(),
+            size: data.len(),
+            selected: -1,
+            sorted: false,
+        }
+    }
+
+    #[test]
+    fn top_k_respects_min_keep_when_k_is_smaller() {
+        let mut data = [
+            LlamaTokenData {
+                id: 1,
+                logit: 1.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 2,
+                logit: 4.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 3,
+                logit: 3.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 4,
+                logit: 2.0,
+                p: 0.0,
+            },
+        ];
+        let mut arr = candidates(&mut data);
+
+        unsafe {
+            llama_sample_top_k(std::ptr::null_mut(), &mut arr, 1, 3);
+        }
+
+        assert_eq!(arr.size, 3);
+        assert_eq!(data[0].id, 2);
+        assert_eq!(data[1].id, 3);
+        assert_eq!(data[2].id, 4);
+    }
+
+    #[test]
+    fn top_p_respects_min_keep_when_probability_cutoff_is_tighter() {
+        let mut data = [
+            LlamaTokenData {
+                id: 1,
+                logit: 10.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 2,
+                logit: 0.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 3,
+                logit: -1.0,
+                p: 0.0,
+            },
+            LlamaTokenData {
+                id: 4,
+                logit: -2.0,
+                p: 0.0,
+            },
+        ];
+        let mut arr = candidates(&mut data);
+
+        unsafe {
+            llama_sample_top_p(std::ptr::null_mut(), &mut arr, 0.01, 2);
+        }
+
+        assert_eq!(arr.size, 2);
+        assert_eq!(data[0].id, 1);
+        assert_eq!(data[1].id, 2);
     }
 }

@@ -52,16 +52,25 @@ pub unsafe extern "C" fn llama_model_load_from_file(
         backend_type,
         llama_cpp_n_gpu_layers: Some(params.n_gpu_layers),
         mmproj_path: None,
-        backend_hint: None,
+        backend_hint: Some("llama_cpp".to_string()),
         enable_embeddings: None,
         pooling_type: None,
     };
 
     // Share a single RouterBackend across all model loads (BUG-074).
-    static BACKEND: std::sync::OnceLock<Arc<dyn InferenceBackend>> = std::sync::OnceLock::new();
-    let backend = BACKEND
-        .get_or_init(|| Arc::new(RouterBackend::from_env()))
-        .clone();
+    static BACKEND: std::sync::OnceLock<Result<Arc<dyn InferenceBackend>, String>> =
+        std::sync::OnceLock::new();
+    let backend = match BACKEND.get_or_init(|| {
+        RouterBackend::try_from_env()
+            .map(|backend| Arc::new(backend) as Arc<dyn InferenceBackend>)
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(backend) => Arc::clone(backend),
+        Err(e) => {
+            tracing::error!("llama_model_load_from_file: {e}");
+            return std::ptr::null_mut();
+        }
+    };
 
     match backend.load_model(&path, config) {
         Ok((handle, meta)) => {
@@ -81,11 +90,11 @@ pub unsafe extern "C" fn llama_model_load_from_file(
                 .and_then(|v| v.first().copied())
                 .map(|t| t as i32)
                 .unwrap_or(-1);
-            let model = Box::new(LlamaModel {
+            let model = Box::new(LlamaModel::new(
                 handle,
                 backend,
-                vocab_size: (meta.vocab_size).min(i32::MAX as u32) as i32,
-                n_ctx: if meta.context_length > 0 {
+                (meta.vocab_size).min(i32::MAX as u32) as i32,
+                if meta.context_length > 0 {
                     (meta.context_length).min(i32::MAX as u32) as i32
                 } else {
                     4096
@@ -93,7 +102,7 @@ pub unsafe extern "C" fn llama_model_load_from_file(
                 bos_token,
                 eos_token,
                 nl_token,
-            });
+            ));
             Box::into_raw(model)
         }
         Err(e) => {
@@ -109,7 +118,8 @@ pub extern "C" fn llama_token_bos(model: *const LlamaModel) -> i32 {
     if model.is_null() {
         return -1;
     }
-    unsafe { (*model).bos_token }
+    let model = unsafe { &*model };
+    model.inner.bos_token
 }
 
 /// Return the end-of-sequence token ID, or −1 if not available.
@@ -118,7 +128,8 @@ pub extern "C" fn llama_token_eos(model: *const LlamaModel) -> i32 {
     if model.is_null() {
         return -1;
     }
-    unsafe { (*model).eos_token }
+    let model = unsafe { &*model };
+    model.inner.eos_token
 }
 
 /// Return the newline token ID, or −1 if not available.
@@ -127,7 +138,8 @@ pub extern "C" fn llama_token_nl(model: *const LlamaModel) -> i32 {
     if model.is_null() {
         return -1;
     }
-    unsafe { (*model).nl_token }
+    let model = unsafe { &*model };
+    model.inner.nl_token
 }
 
 /// Return the padding token ID. Returns −1 (no dedicated padding token).
@@ -145,7 +157,8 @@ pub extern "C" fn llama_model_n_ctx_train(model: *const LlamaModel) -> i32 {
     if model.is_null() {
         return 0;
     }
-    unsafe { (*model).n_ctx }
+    let model = unsafe { &*model };
+    model.inner.n_ctx
 }
 
 /// Free a loaded model.
@@ -157,11 +170,7 @@ pub unsafe extern "C" fn llama_free_model(model: *mut LlamaModel) {
     if model.is_null() {
         return;
     }
-    let m = unsafe { Box::from_raw(model) };
-    if let Err(e) = m.backend.unload_model(m.handle) {
-        tracing::warn!("llama_free_model: backend unload failed: {e}");
-    }
-    // Box dropped here → frees LlamaModel
+    drop(unsafe { Box::from_raw(model) });
 }
 
 /// Return the vocabulary size.
@@ -170,5 +179,6 @@ pub extern "C" fn llama_n_vocab(model: *const LlamaModel) -> i32 {
     if model.is_null() {
         return 0;
     }
-    unsafe { (*model).vocab_size }
+    let model = unsafe { &*model };
+    model.inner.vocab_size
 }

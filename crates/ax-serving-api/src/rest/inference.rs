@@ -29,13 +29,15 @@ use uuid::Uuid;
 
 use super::schema::*;
 use super::validation::{
-    build_generation_params, cache_ttl_err, effective_max_tokens, map_stop_reason, resolve_grammar,
-    resolve_logprobs, validate_max_tokens, validate_model_identifier,
-    validate_multimodal_backend_support, validate_response_format, validate_sampling_params,
+    build_generation_params, cache_ttl_err, chat_request_uses_tools, effective_max_tokens,
+    map_stop_reason, resolve_grammar, resolve_logprobs, validate_max_tokens,
+    validate_model_identifier, validate_multimodal_backend_support, validate_response_format,
+    validate_sampling_params, validate_tool_backend_support,
 };
 use crate::ServingLayer;
 use crate::cache::{CacheInflightEnter, CacheInflightLeaderGuard, CachePreference};
 use crate::project_policy;
+use crate::registry::LoadedModel;
 use crate::scheduler::SchedulerPermit;
 use crate::utils::request_meta::{
     estimate_chat_prompt_tokens_u64, estimate_text_prompt_tokens_u64,
@@ -195,13 +197,38 @@ fn record_generation_stats(
     metrics.record_generation_stats(stats);
 }
 
+fn usage_from_generation_stats(stats: &ax_serving_engine::GenerationStats) -> Usage {
+    let prompt_tokens = usize_to_u32_saturating(stats.prompt_tokens);
+    let completion_tokens = usize_to_u32_saturating(stats.completion_tokens);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
+fn stream_usage_from_generation_stats(stats: &ax_serving_engine::GenerationStats) -> StreamUsage {
+    StreamUsage {
+        prompt_tokens: stats.prompt_tokens,
+        completion_tokens: stats.completion_tokens,
+        total_tokens: stats.prompt_tokens.saturating_add(stats.completion_tokens),
+    }
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 /// Normalized form of a single chat message used exclusively for cache-key
 /// construction.  Role is lowercased and content is whitespace-trimmed so
 /// that minor client-side formatting differences never cause a false miss.
 #[derive(Serialize)]
 pub(crate) struct NormalizedMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
+    name: Option<String>,
+    tool_calls: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
 }
 
 fn model_cache_fingerprint(path: &Path) -> String {
@@ -219,12 +246,13 @@ fn model_cache_fingerprint(path: &Path) -> String {
 
 /// Cache key payload.
 ///
-/// # Normalization rules
+/// # Keying rules
 /// - `requested_model_id` is dropped: the resolved path already identifies the
 ///   loaded model, so model-alias changes no longer bust the cache.
 /// - `model_fingerprint` includes file metadata so cache entries invalidate
 ///   when weights are replaced in place at the same path.
-/// - `messages`: role lowercased, content trimmed (leading/trailing whitespace).
+/// - `messages`: role and text content are preserved exactly as sent to the
+///   backend. Whitespace and role casing can affect tokenization/templates.
 /// - Floating-point params serialized with 4-decimal precision to absorb f32
 ///   representation noise (`0.6999999` and `0.7` both become `"0.7000"`).
 #[derive(Serialize)]
@@ -271,13 +299,16 @@ pub(crate) fn build_cache_key(
         .messages
         .iter()
         .map(|m| NormalizedMessage {
-            role: m.role.to_lowercase(),
-            content: m.content.as_text().trim().to_string(),
+            role: m.role.clone(),
+            content: message_content_value(m.content.as_ref()),
+            name: m.name.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
         })
         .collect();
 
     let payload = CacheKeyPayload {
-        version: "v4",
+        version: "v6",
         resolved_model_path,
         model_fingerprint,
         resolved_model_arch,
@@ -289,11 +320,7 @@ pub(crate) fn build_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
-        stop: req.stop.as_ref().map(|s| {
-            let mut v = s.clone().into_vec();
-            v.sort();
-            v
-        }),
+        stop: req.stop.as_ref().map(|s| s.clone().into_vec()),
         frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
         presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
         grammar: req.grammar.as_deref(),
@@ -309,9 +336,36 @@ pub(crate) fn build_cache_key(
     serde_json::to_vec(&payload).map_err(anyhow::Error::from)
 }
 
+fn message_content_value(content: Option<&MessageContent>) -> serde_json::Value {
+    match content {
+        Some(content) => serde_json::to_value(content).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn validate_chat_message_content(msg: &InputMessage) -> Option<Response> {
+    if msg.content.is_some() {
+        return None;
+    }
+
+    if msg.role.eq_ignore_ascii_case("assistant") && msg.tool_calls.is_some() {
+        return None;
+    }
+
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "message content is required unless assistant tool_calls are present"
+            })),
+        )
+            .into_response(),
+    )
+}
+
 /// Cache key payload for text completions (`POST /v1/completions`).
 ///
-/// Normalisation mirrors `CacheKeyPayload`: prompt is trimmed, floats at 4dp.
+/// Keying mirrors `CacheKeyPayload`: prompt is preserved exactly, floats at 4dp.
 #[derive(Serialize)]
 pub(crate) struct TextCacheKeyPayload<'a> {
     version: &'static str,
@@ -348,12 +402,12 @@ pub(crate) fn build_text_cache_key(
 ) -> anyhow::Result<Vec<u8>> {
     let model_fingerprint = model_cache_fingerprint(Path::new(resolved_model_path));
     let payload = TextCacheKeyPayload {
-        version: "v3",
+        version: "v4",
         kind: "text_completion",
         resolved_model_path,
         model_fingerprint,
         resolved_model_arch,
-        prompt: req.prompt.trim(),
+        prompt: &req.prompt,
         temperature: format!("{:.4}", req.temperature),
         top_p: format!("{:.4}", req.top_p),
         min_p: req.min_p.map(|v| format!("{v:.4}")),
@@ -361,11 +415,7 @@ pub(crate) fn build_text_cache_key(
         max_tokens: effective_max_tokens,
         seed: req.seed,
         repeat_penalty: format!("{:.4}", req.repeat_penalty),
-        stop: req.stop.as_ref().map(|s| {
-            let mut v = s.clone().into_vec();
-            v.sort();
-            v
-        }),
+        stop: req.stop.as_ref().map(|s| s.clone().into_vec()),
         frequency_penalty: req.frequency_penalty.map(|v| format!("{v:.4}")),
         presence_penalty: req.presence_penalty.map(|v| format!("{v:.4}")),
         grammar: req.grammar.as_deref(),
@@ -406,7 +456,14 @@ pub async fn chat_completions(
             .into_response();
     }
     for msg in &req.messages {
-        if msg.content.byte_len() > MAX_CONTENT_BYTES {
+        if let Some(response) = validate_chat_message_content(msg) {
+            return response;
+        }
+        if msg
+            .content
+            .as_ref()
+            .is_some_and(|content| content.byte_len() > MAX_CONTENT_BYTES)
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "message content exceeds 32 KB limit"})),
@@ -459,11 +516,15 @@ pub async fn chat_completions(
         }
     };
 
-    let has_image_input = req.messages.iter().any(|msg| msg.content.has_images());
-    if let Some(resp) = validate_multimodal_backend_support(
-        has_image_input,
-        layer.backend.backend_name_for_handle(entry.handle),
-    ) {
+    let has_image_input = req
+        .messages
+        .iter()
+        .any(|msg| msg.content.as_ref().is_some_and(MessageContent::has_images));
+    let backend_name = layer.backend.backend_name_for_handle(entry.handle);
+    if let Some(resp) = validate_multimodal_backend_support(has_image_input, backend_name) {
+        return resp;
+    }
+    if let Some(resp) = validate_tool_backend_support(chat_request_uses_tools(&req), backend_name) {
         return resp;
     }
 
@@ -657,7 +718,10 @@ pub async fn chat_completions(
         .iter()
         .map(|m| ChatMessage {
             role: m.role.clone(),
-            content: serde_json::to_value(&m.content).unwrap_or_default(),
+            content: message_content_value(m.content.as_ref()),
+            name: m.name.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
         })
         .collect();
 
@@ -715,6 +779,7 @@ pub async fn chat_completions(
             model_name,
             req_logprobs,
             Arc::clone(&layer.metrics),
+            entry,
             permit,
             pm_permit,
         )
@@ -729,6 +794,7 @@ pub async fn chat_completions(
             layer.cache_metrics.as_ref(),
             layer.metrics.as_ref(),
             cache_leader_guard,
+            entry,
             permit,
             pm_permit,
             queue_wait_us,
@@ -749,13 +815,15 @@ fn stream_response(
     model: String,
     logprobs: bool,
     metrics: Arc<crate::metrics::MetricsStore>,
+    model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let created = unix_now();
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
 
-    // State: (rx, id, model, created, phase, first_token, permit, pm_permit, logprobs, pending)
+    // State includes the stream receiver, response metadata, model entry,
+    // scheduler permits, logprobs flag, and any pending terminal event.
     //
     // phase 0 — normal streaming (recv from channel)
     // phase 1 — stop chunk emitted; send `data: [DONE]` sentinel next
@@ -771,6 +839,9 @@ fn stream_response(
             created,
             0u8,
             true,
+            0u32,
+            false,
+            Some(model_entry),
             Some(permit),
             Some(pm_permit),
             logprobs,
@@ -784,6 +855,9 @@ fn stream_response(
             created,
             phase,
             first_token,
+            next_tool_call_index,
+            saw_tool_call,
+            model_entry,
             permit,
             pm,
             logprobs,
@@ -798,7 +872,20 @@ fn stream_response(
                     Some((
                         Ok(ev),
                         (
-                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                            rx,
+                            id,
+                            model,
+                            created,
+                            2,
+                            false,
+                            next_tool_call_index,
+                            saw_tool_call,
+                            None,
+                            None,
+                            None,
+                            logprobs,
+                            None,
+                            metrics,
                         ),
                     ))
                 }
@@ -811,7 +898,12 @@ fn stream_response(
                         loop {
                             match rx.recv().await {
                                 Some(GenerateEvent::TokenLogprob { .. }) => continue,
-                                ev => break ev.unwrap_or(GenerateEvent::Done(Default::default())),
+                                Some(ev) => break ev,
+                                None => {
+                                    break GenerateEvent::Error(
+                                        "generation ended unexpectedly".to_string(),
+                                    );
+                                }
                             }
                         }
                     };
@@ -866,6 +958,9 @@ fn stream_response(
                                     created,
                                     0,
                                     false,
+                                    next_tool_call_index,
+                                    saw_tool_call,
+                                    model_entry,
                                     permit,
                                     pm,
                                     logprobs,
@@ -879,6 +974,8 @@ fn stream_response(
                             name,
                             arguments,
                         } => {
+                            let tool_call_index = next_tool_call_index;
+                            let next_tool_call_index = next_tool_call_index.saturating_add(1);
                             // Per the OpenAI streaming protocol, the tool call delta
                             // must carry finish_reason: null. A separate empty-delta
                             // chunk with finish_reason: "tool_calls" follows via the
@@ -892,10 +989,10 @@ fn stream_response(
                                 choices: vec![StreamChatChoice {
                                     index: 0,
                                     delta: StreamChatDelta {
-                                        role: Some("assistant"),
+                                        role: if first_token { Some("assistant") } else { None },
                                         content: None,
                                         tool_calls: Some(vec![StreamChatToolCall {
-                                            index: 0,
+                                            index: tool_call_index,
                                             id: &call_id,
                                             tool_type: "function",
                                             function: StreamChatToolFunction {
@@ -913,13 +1010,30 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 0, false, permit, pm, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    0,
+                                    false,
+                                    next_tool_call_index,
+                                    true,
+                                    model_entry,
+                                    permit,
+                                    pm,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
                         }
                         GenerateEvent::Done(stats) => {
                             record_generation_stats(metrics.as_ref(), &stats);
+                            let finish_reason = if saw_tool_call {
+                                "tool_calls"
+                            } else {
+                                map_stop_reason(&stats.stop_reason)
+                            };
                             let chunk = StreamChatChunk {
                                 id: &id,
                                 object: "chat.completion.chunk",
@@ -932,21 +1046,29 @@ fn stream_response(
                                         content: None,
                                         tool_calls: None,
                                     },
-                                    finish_reason: Some(map_stop_reason(&stats.stop_reason)),
+                                    finish_reason: Some(finish_reason),
                                     logprobs: None,
                                 }],
-                                usage: Some(StreamUsage {
-                                    prompt_tokens: stats.prompt_tokens,
-                                    completion_tokens: stats.completion_tokens,
-                                    total_tokens: stats.prompt_tokens + stats.completion_tokens,
-                                }),
+                                usage: Some(stream_usage_from_generation_stats(&stats)),
                             };
                             let ev = sse_json_event(&chunk);
                             // Drop both permits; next phase emits [DONE] then ends.
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    next_tool_call_index,
+                                    saw_tool_call,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -964,7 +1086,19 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    next_tool_call_index,
+                                    saw_tool_call,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -984,7 +1118,19 @@ fn stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    next_tool_call_index,
+                                    saw_tool_call,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1012,6 +1158,7 @@ async fn blocking_response(
     cache_metrics: &crate::cache::CacheMetrics,
     metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
+    _model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
     queue_wait_us: u64,
@@ -1027,10 +1174,15 @@ async fn blocking_response(
     let mut token_texts: Vec<String> = Vec::new();
     let mut logprob_entries: Vec<(f32, Vec<(String, f32)>)> = Vec::new();
     let mut pending_token: Option<String> = None;
+    let mut first_token = true;
 
     while let Some(event) = rx.recv().await {
         match event {
             GenerateEvent::Token(text) => {
+                if first_token {
+                    permit.record_ttft_now();
+                    first_token = false;
+                }
                 content.push_str(&text);
                 if collect_logprobs {
                     pending_token = Some(text);
@@ -1059,11 +1211,7 @@ async fn blocking_response(
             }
             GenerateEvent::Done(stats) => {
                 record_generation_stats(metrics, &stats);
-                usage = Usage {
-                    prompt_tokens: stats.prompt_tokens as u32,
-                    completion_tokens: stats.completion_tokens as u32,
-                    total_tokens: (stats.prompt_tokens + stats.completion_tokens) as u32,
-                };
+                usage = usage_from_generation_stats(&stats);
                 // Only update if not already set by a ToolCall event.
                 if finish_reason == FinishReason::Stop {
                     finish_reason = match stats.stop_reason.as_str() {
@@ -1469,6 +1617,7 @@ pub async fn text_completions(
             model_name,
             req_logprobs,
             Arc::clone(&layer.metrics),
+            entry,
             permit,
             pm_permit,
         )
@@ -1484,6 +1633,7 @@ pub async fn text_completions(
             layer.cache_metrics.as_ref(),
             layer.metrics.as_ref(),
             cache_leader_guard,
+            entry,
             permit,
             pm_permit,
             queue_wait_us,
@@ -1499,6 +1649,7 @@ fn text_stream_response(
     model: String,
     logprobs: bool,
     metrics: Arc<crate::metrics::MetricsStore>,
+    model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1513,6 +1664,7 @@ fn text_stream_response(
             created,
             0u8,
             true, // first_token
+            Some(model_entry),
             Some(permit),
             Some(pm_permit),
             logprobs,
@@ -1526,6 +1678,7 @@ fn text_stream_response(
             created,
             phase,
             first_token,
+            model_entry,
             permit,
             pm,
             logprobs,
@@ -1539,7 +1692,8 @@ fn text_stream_response(
                     Some((
                         Ok(ev),
                         (
-                            rx, id, model, created, 2, false, None, None, logprobs, None, metrics,
+                            rx, id, model, created, 2, false, None, None, None, logprobs, None,
+                            metrics,
                         ),
                     ))
                 }
@@ -1552,7 +1706,12 @@ fn text_stream_response(
                         loop {
                             match rx.recv().await {
                                 Some(GenerateEvent::TokenLogprob { .. }) => continue,
-                                ev => break ev.unwrap_or(GenerateEvent::Done(Default::default())),
+                                Some(ev) => break ev,
+                                None => {
+                                    break GenerateEvent::Error(
+                                        "generation ended unexpectedly".to_string(),
+                                    );
+                                }
                             }
                         }
                     };
@@ -1601,6 +1760,7 @@ fn text_stream_response(
                                     created,
                                     0,
                                     false, // first_token: no longer first
+                                    model_entry,
                                     permit,
                                     pm,
                                     logprobs,
@@ -1622,17 +1782,23 @@ fn text_stream_response(
                                     finish_reason: Some(map_stop_reason(&stats.stop_reason)),
                                     logprobs: None,
                                 }],
-                                usage: Some(StreamUsage {
-                                    prompt_tokens: stats.prompt_tokens,
-                                    completion_tokens: stats.completion_tokens,
-                                    total_tokens: stats.prompt_tokens + stats.completion_tokens,
-                                }),
+                                usage: Some(stream_usage_from_generation_stats(&stats)),
                             };
                             let ev = sse_json_event(&chunk);
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1650,7 +1816,17 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1665,6 +1841,7 @@ fn text_stream_response(
                                 created,
                                 0,
                                 first_token,
+                                model_entry,
                                 permit,
                                 pm,
                                 logprobs,
@@ -1687,7 +1864,17 @@ fn text_stream_response(
                             Some((
                                 Ok(ev),
                                 (
-                                    rx, id, model, created, 1, false, None, None, logprobs, None,
+                                    rx,
+                                    id,
+                                    model,
+                                    created,
+                                    1,
+                                    false,
+                                    model_entry,
+                                    None,
+                                    None,
+                                    logprobs,
+                                    None,
                                     metrics,
                                 ),
                             ))
@@ -1713,6 +1900,7 @@ async fn text_blocking_response(
     cache_metrics: &crate::cache::CacheMetrics,
     metrics: &crate::metrics::MetricsStore,
     _cache_leader_guard: Option<crate::cache::CacheInflightLeaderGuard>,
+    _model_entry: Arc<LoadedModel>,
     permit: SchedulerPermit,
     pm_permit: OwnedSemaphorePermit,
     queue_wait_us: u64,
@@ -1725,10 +1913,15 @@ async fn text_blocking_response(
     let mut token_texts: Vec<String> = Vec::new();
     let mut logprob_entries: Vec<(f32, Vec<(String, f32)>)> = Vec::new();
     let mut pending_token: Option<String> = None;
+    let mut first_token = true;
 
     while let Some(event) = rx.recv().await {
         match event {
             GenerateEvent::Token(t) => {
+                if first_token {
+                    permit.record_ttft_now();
+                    first_token = false;
+                }
                 text.push_str(&t);
                 if collect_logprobs {
                     pending_token = Some(t);
@@ -1743,11 +1936,7 @@ async fn text_blocking_response(
             GenerateEvent::ToolCall { .. } => {}
             GenerateEvent::Done(stats) => {
                 record_generation_stats(metrics, &stats);
-                usage = Usage {
-                    prompt_tokens: stats.prompt_tokens as u32,
-                    completion_tokens: stats.completion_tokens as u32,
-                    total_tokens: (stats.prompt_tokens + stats.completion_tokens) as u32,
-                };
+                usage = usage_from_generation_stats(&stats);
                 finish_reason = match stats.stop_reason.as_str() {
                     "length" => FinishReason::Length,
                     "content_filter" => FinishReason::ContentFilter,
@@ -1849,6 +2038,9 @@ pub async fn embeddings(
     if let Some(response) = validate_model_identifier(&req.model, "model") {
         return response;
     }
+    if let Some(response) = validate_embeddings_input(&req.input) {
+        return response;
+    }
     match req.encoding_format.as_deref() {
         None | Some("float" | "base64") => {}
         Some(other) => {
@@ -1881,35 +2073,89 @@ pub async fn embeddings(
 
     let handle = entry.handle;
     let model_name = req.model.clone();
+    let model_id = req.model.clone();
     let base64_out = req.encoding_format.as_deref() == Some("base64");
     let config = EmbedConfig {
         normalize: req.normalize.unwrap_or(true),
         truncate: req.truncate.unwrap_or(true),
     };
-
-    // Resolve input into owned containers so they can cross the spawn_blocking boundary.
-    let (strings_owned, tokens_owned) = match req.input {
-        EmbeddingsInput::One(s) => (Some(vec![s]), None),
-        EmbeddingsInput::Many(v) => (Some(v), None),
-        EmbeddingsInput::OneTokens(t) => (None, Some(vec![t])),
-        EmbeddingsInput::ManyTokens(t) => (None, Some(t)),
+    let estimated_prompt_tokens = if layer.scheduler.split_enabled {
+        estimate_embedding_prompt_tokens_u64(&req.input)
+    } else {
+        0
     };
 
-    let result = tokio::task::spawn_blocking(move || match (strings_owned, tokens_owned) {
-        (Some(texts), None) => layer
-            .backend
-            .embed(handle, &EmbedInput::Strings(&texts), &config),
-        (None, Some(seqs)) => layer
-            .backend
-            .embed(handle, &EmbedInput::Tokens(&seqs), &config),
-        _ => Err(anyhow::anyhow!(
-            "embedding request payload had unsupported input state"
-        )),
+    // Resolve input into owned containers so they can cross the spawn_blocking boundary.
+    let (expected_embeddings, strings_owned, tokens_owned) = match req.input {
+        EmbeddingsInput::One(s) => (1, Some(vec![s]), None),
+        EmbeddingsInput::Many(v) => (v.len(), Some(v), None),
+        EmbeddingsInput::OneTokens(t) => (1, None, Some(vec![t])),
+        EmbeddingsInput::ManyTokens(t) => (t.len(), None, Some(t)),
+    };
+
+    let pm_permit = match layer
+        .per_model_scheduler
+        .acquire(&model_id, layer.scheduler.config().max_wait_ms)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let permit = match layer
+        .scheduler
+        .acquire_with_tokens(estimated_prompt_tokens)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                scheduler_error_status(&e),
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let queue_wait_us = permit.queue_wait_us();
+    let model_entry = entry;
+    let backend = Arc::clone(&layer.backend);
+    let result = tokio::task::spawn_blocking(move || {
+        let _model_entry = model_entry;
+        match (strings_owned, tokens_owned) {
+            (Some(texts), None) => backend.embed(handle, &EmbedInput::Strings(&texts), &config),
+            (None, Some(seqs)) => backend.embed(handle, &EmbedInput::Tokens(&seqs), &config),
+            _ => Err(anyhow::anyhow!(
+                "embedding request payload had unsupported input state"
+            )),
+        }
     })
     .await;
+    drop(pm_permit);
+    drop(permit);
 
     match result {
         Ok(Ok(embed_result)) => {
+            if embed_result.embeddings.len() != expected_embeddings {
+                return with_timing(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "embedding backend returned {} vectors for {expected_embeddings} inputs",
+                                embed_result.embeddings.len()
+                            )
+                        })),
+                    )
+                        .into_response(),
+                    queue_wait_us,
+                );
+            }
             let data: Vec<EmbeddingObject> = embed_result
                 .embeddings
                 .into_iter()
@@ -1929,7 +2175,7 @@ pub async fn embeddings(
                 })
                 .collect();
             let pt = embed_result.prompt_tokens;
-            Json(EmbeddingsResponse {
+            let response = Json(EmbeddingsResponse {
                 object: "list",
                 model: model_name,
                 data,
@@ -1938,7 +2184,8 @@ pub async fn embeddings(
                     total_tokens: pt,
                 },
             })
-            .into_response()
+            .into_response();
+            with_timing(response, queue_wait_us)
         }
         Ok(Err(e)) => {
             // 501 only when the backend explicitly doesn't implement embeddings.
@@ -1948,12 +2195,478 @@ pub async fn embeddings(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+            with_timing(
+                (status, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+                queue_wait_us,
+            )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+        Err(e) => with_timing(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            queue_wait_us,
+        ),
+    }
+}
+
+fn validate_embeddings_input(input: &EmbeddingsInput) -> Option<Response> {
+    match input {
+        EmbeddingsInput::One(text) => validate_embedding_text(text, 0),
+        EmbeddingsInput::Many(texts) => {
+            if texts.is_empty() {
+                return Some(embedding_validation_error("input must not be empty"));
+            }
+            if texts.len() > MAX_EMBEDDING_INPUTS {
+                return Some(embedding_validation_error(format!(
+                    "too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"
+                )));
+            }
+            let mut total_bytes = 0usize;
+            for (idx, text) in texts.iter().enumerate() {
+                if let Some(resp) = validate_embedding_text(text, idx) {
+                    return Some(resp);
+                }
+                total_bytes = total_bytes.saturating_add(text.len());
+            }
+            if total_bytes > MAX_EMBEDDING_TOTAL_BYTES {
+                return Some(embedding_validation_error(format!(
+                    "embedding input text exceeds total limit of {MAX_EMBEDDING_TOTAL_BYTES} bytes"
+                )));
+            }
+            None
+        }
+        EmbeddingsInput::OneTokens(tokens) => validate_embedding_tokens(tokens, 0),
+        EmbeddingsInput::ManyTokens(seqs) => {
+            if seqs.is_empty() {
+                return Some(embedding_validation_error("input must not be empty"));
+            }
+            if seqs.len() > MAX_EMBEDDING_INPUTS {
+                return Some(embedding_validation_error(format!(
+                    "too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"
+                )));
+            }
+            let mut total_tokens = 0usize;
+            for (idx, tokens) in seqs.iter().enumerate() {
+                if let Some(resp) = validate_embedding_tokens(tokens, idx) {
+                    return Some(resp);
+                }
+                total_tokens = total_tokens.saturating_add(tokens.len());
+            }
+            if total_tokens > MAX_EMBEDDING_TOTAL_TOKENS {
+                return Some(embedding_validation_error(format!(
+                    "embedding token input exceeds total limit of {MAX_EMBEDDING_TOTAL_TOKENS}"
+                )));
+            }
+            None
+        }
+    }
+}
+
+fn validate_embedding_text(text: &str, index: usize) -> Option<Response> {
+    if text.is_empty() {
+        return Some(embedding_validation_error(format!(
+            "embedding input at index {index} must not be empty"
+        )));
+    }
+    if text.len() > MAX_CONTENT_BYTES {
+        return Some(embedding_validation_error(format!(
+            "embedding input at index {index} exceeds {MAX_CONTENT_BYTES} bytes"
+        )));
+    }
+    None
+}
+
+fn validate_embedding_tokens(tokens: &[u32], index: usize) -> Option<Response> {
+    if tokens.is_empty() {
+        return Some(embedding_validation_error(format!(
+            "embedding token input at index {index} must not be empty"
+        )));
+    }
+    if tokens.len() > MAX_EMBEDDING_TOTAL_TOKENS {
+        return Some(embedding_validation_error(format!(
+            "embedding token input at index {index} exceeds {MAX_EMBEDDING_TOTAL_TOKENS} tokens"
+        )));
+    }
+    None
+}
+
+fn embedding_validation_error(msg: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": msg.to_string()})),
+    )
+        .into_response()
+}
+
+fn estimate_embedding_prompt_tokens_u64(input: &EmbeddingsInput) -> u64 {
+    match input {
+        EmbeddingsInput::One(text) => estimate_text_prompt_tokens_u64(text),
+        EmbeddingsInput::Many(texts) => texts
+            .iter()
+            .map(|text| estimate_text_prompt_tokens_u64(text))
+            .fold(0u64, u64::saturating_add),
+        EmbeddingsInput::OneTokens(tokens) => tokens.len() as u64,
+        EmbeddingsInput::ManyTokens(seqs) => seqs
+            .iter()
+            .map(|tokens| tokens.len() as u64)
+            .fold(0u64, u64::saturating_add),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use ax_serving_engine::{
+        BackendType, GenerateEvent, GenerationStats, ModelHandle, ModelMetadata, ThermalMonitor,
+    };
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::cache::CacheMetrics;
+    use crate::metrics::MetricsStore;
+    use crate::scheduler::{OverloadPolicy, PerModelScheduler, Scheduler, SchedulerConfig};
+
+    fn split_scheduler() -> Arc<Scheduler> {
+        let mut scheduler = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 100,
+                overload_policy: OverloadPolicy::Queue,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+        scheduler.split_enabled = true;
+        Arc::new(scheduler)
+    }
+
+    fn done_stats() -> GenerationStats {
+        GenerationStats {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            stop_reason: "stop".into(),
+            ..GenerationStats::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_response_assigns_distinct_tool_call_indexes() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(GenerateEvent::ToolCall {
+            id: "call_a".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(GenerateEvent::ToolCall {
+            id: "call_b".into(),
+            name: "search".into(),
+            arguments: "{\"q\":\"rust\"}".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(GenerateEvent::Done(GenerationStats {
+            stop_reason: "stop".into(),
+            ..GenerationStats::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
         )
-            .into_response(),
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let chunks = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .collect::<Vec<_>>();
+
+        let tool_indexes = chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .pointer("/choices/0/delta/tool_calls/0/index")
+                    .and_then(|value| value.as_u64())
+            })
+            .collect::<Vec<_>>();
+        let finish_reason = chunks
+            .iter()
+            .find_map(|chunk| {
+                chunk
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap();
+
+        assert_eq!(tool_indexes, vec![0, 1]);
+        assert_eq!(finish_reason, "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_response_reports_unexpected_channel_close() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let response = stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"generation ended unexpectedly\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[tokio::test]
+    async fn stream_text_response_reports_unexpected_channel_close() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire().await.unwrap();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let response = text_stream_response(
+            rx,
+            "model".into(),
+            false,
+            Arc::new(MetricsStore::new()),
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"generation ended unexpectedly\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn usage_from_generation_stats_saturates_u32_fields() {
+        let stats = GenerationStats {
+            prompt_tokens: u32::MAX as usize + 1,
+            completion_tokens: u32::MAX as usize + 1,
+            ..GenerationStats::default()
+        };
+
+        let usage = usage_from_generation_stats(&stats);
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn stream_usage_from_generation_stats_saturates_total() {
+        let stats = GenerationStats {
+            prompt_tokens: usize::MAX,
+            completion_tokens: 1,
+            ..GenerationStats::default()
+        };
+
+        let usage = stream_usage_from_generation_stats(&stats);
+
+        assert_eq!(usage.prompt_tokens, usize::MAX);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, usize::MAX);
+    }
+
+    fn dummy_model_entry() -> Arc<LoadedModel> {
+        Arc::new(LoadedModel {
+            id: "model".into(),
+            path: std::path::PathBuf::from("model.gguf"),
+            handle: ModelHandle(1),
+            metadata: ModelMetadata {
+                architecture: "test".into(),
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                embedding_dim: 0,
+                vocab_size: 0,
+                context_length: 2048,
+                load_time_ms: 1,
+                peak_rss_bytes: 0,
+                resolved_backend: BackendType::Auto,
+            },
+            load_config: Default::default(),
+            loaded_at: std::time::Instant::now(),
+            last_accessed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    #[tokio::test]
+    async fn blocking_chat_response_records_first_token_for_split_scheduler() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire_with_tokens(32).await.unwrap();
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            32
+        );
+        let queue_wait_us = permit.queue_wait_us();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tx.send(GenerateEvent::Token("hello".into())).await.unwrap();
+        tx.send(GenerateEvent::Done(done_stats())).await.unwrap();
+        drop(tx);
+
+        let cache_metrics = CacheMetrics::default();
+        let metrics = MetricsStore::new();
+        let response = blocking_response(
+            rx,
+            "model".into(),
+            None,
+            None,
+            None,
+            &cache_metrics,
+            &metrics,
+            None,
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+            queue_wait_us,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            scheduler.metrics.ttft_p50_us() > 0,
+            "non-streaming first token must be recorded for split scheduling"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .decode_sequences_active
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_text_response_records_first_token_for_split_scheduler() {
+        let scheduler = split_scheduler();
+        let permit = scheduler.acquire_with_tokens(24).await.unwrap();
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            24
+        );
+        let queue_wait_us = permit.queue_wait_us();
+        let pm_permit = PerModelScheduler::new(1)
+            .acquire("model", 100)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tx.send(GenerateEvent::Token("hello".into())).await.unwrap();
+        tx.send(GenerateEvent::Done(done_stats())).await.unwrap();
+        drop(tx);
+
+        let cache_metrics = CacheMetrics::default();
+        let metrics = MetricsStore::new();
+        let response = text_blocking_response(
+            rx,
+            "model".into(),
+            false,
+            None,
+            None,
+            None,
+            &cache_metrics,
+            &metrics,
+            None,
+            dummy_model_entry(),
+            permit,
+            pm_permit,
+            queue_wait_us,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            scheduler.metrics.ttft_p50_us() > 0,
+            "non-streaming first token must be recorded for split scheduling"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .prefill_tokens_active
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .decode_sequences_active
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

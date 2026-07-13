@@ -9,11 +9,12 @@ use ax_thor_agent::proxy;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Default)]
@@ -28,6 +29,7 @@ struct ControlPlaneState {
 #[derive(Default)]
 struct SgLangState {
     chats: Mutex<Vec<Value>>,
+    authorization_headers: Mutex<Vec<Option<String>>>,
 }
 
 #[tokio::test]
@@ -43,7 +45,13 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         control_plane_url: control_base.clone(),
         worker_token: Some("secret".into()),
         runtime_url: sglang_base.clone(),
+        runtime_api_key: None,
+        dispatch_token: Some("gateway-dispatch-secret".into()),
+        tls_profile: "loopback_dev".into(),
         runtime: "sglang".into(),
+        runtime_version: "test".into(),
+        worker_id: "worker-test".into(),
+        trust_domain: "test".into(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         advertised_addr: "127.0.0.1:18081".parse().unwrap(),
         max_inflight: 8,
@@ -56,6 +64,7 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         max_context: None,
         embedding: None,
         vision: None,
+        model_identity: Default::default(),
     };
 
     let client = reqwest::Client::builder()
@@ -64,7 +73,7 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         .context("failed to build reqwest client")?;
 
     let runtime = SharedRuntime::new();
-    let registration = agent::register(&client, &config).await?;
+    let registration = agent::register(&client, &client, &config, runtime.instance_id).await?;
     {
         *runtime.models.write().await = registration.models;
         *runtime.session.write().await = Some(registration.session);
@@ -72,33 +81,34 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
 
     let registrations = control_state.registrations.lock().await;
     assert_eq!(registrations.len(), 1);
-    assert_eq!(registrations[0]["backend"], "sglang");
-    assert_eq!(registrations[0]["runtime"], "sglang");
-    assert_eq!(registrations[0]["runtime_mode"], "adapter");
-    assert_eq!(registrations[0]["hardware_class"], "thor");
-    assert_eq!(registrations[0]["addr"], "127.0.0.1:18081");
+    assert_eq!(registrations[0]["protocol"]["version"]["major"], 1);
+    assert_eq!(registrations[0]["worker"]["id"], "worker-test");
+    assert_eq!(registrations[0]["runtime"]["kind"], "sglang");
+    assert_eq!(registrations[0]["hardware"]["hardware_class"], "thor");
     assert_eq!(
-        registrations[0]["capabilities"]["models"],
-        json!(["qwen2-72b"])
+        registrations[0]["worker"]["advertise_url"],
+        "http://127.0.0.1:18081"
     );
     assert_eq!(
-        registrations[0]["model_inventory"][0]["id"],
+        registrations[0]["observation"]["models"][0]["runtime_model_id"],
         json!("qwen2-72b")
     );
     assert_eq!(
-        registrations[0]["model_inventory"][0]["quantization"],
+        registrations[0]["observation"]["models"][0]["identity"]["quantization"],
         json!("awq")
     );
     assert_eq!(
-        registrations[0]["model_inventory"][0]["artifact_format"],
-        json!("safetensors")
+        registrations[0]["observation"]["models"][0]["operations"],
+        json!(["chat_completions", "text_completions"])
     );
-    // BUG-114: verify capabilities are not blindly hardcoded.
-    assert_eq!(registrations[0]["capabilities"]["embedding"], json!(false));
-    assert_eq!(registrations[0]["capabilities"]["vision"], json!(false));
+    assert_eq!(
+        registrations[0]["observation"]["models"][0]["capabilities"],
+        json!(["inference.vision"])
+    );
     drop(registrations);
 
     let heartbeat_task = tokio::spawn(agent::heartbeat_loop(
+        client.clone(),
         client.clone(),
         config.clone(),
         runtime.clone(),
@@ -117,33 +127,36 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
 
     let heartbeats = control_state.heartbeats.lock().await;
     assert!(!heartbeats.is_empty());
-    assert_eq!(heartbeats[0].0, "worker-1");
-    assert_eq!(heartbeats[0].1["model_ids"], json!(["qwen2-72b"]));
+    assert_eq!(heartbeats[0].0, "worker-test");
     assert_eq!(
-        heartbeats[0].1["model_inventory"][0]["id"],
+        heartbeats[0].1["models"][0]["runtime_model_id"],
         json!("qwen2-72b")
     );
+    assert_eq!(heartbeats[0].1["capacity"]["active_requests"], json!(4));
+    assert_eq!(heartbeats[0].1["capacity"]["waiting_requests"], json!(3));
     assert_eq!(
-        heartbeats[0].1["model_inventory"][0]["supported_operations"],
-        json!(["llm", "vision"])
+        heartbeats[0].1["capacity"]["generated_tokens_per_second"],
+        json!(42.5)
     );
-    assert_eq!(heartbeats[0].1["active_sequences"], json!(4));
-    assert_eq!(heartbeats[0].1["queue_depth"], json!(3));
-    assert_eq!(heartbeats[0].1["decode_tok_per_sec"], json!(42.5));
-    assert_eq!(heartbeats[0].1["ttft_p95_ms"], json!(118));
-    assert_eq!(heartbeats[0].1["kv_pages_used"], json!(12));
-    assert_eq!(heartbeats[0].1["kv_pages_total"], json!(128));
+    assert_eq!(heartbeats[0].1["capacity"]["ttft_ewma_ms"], json!(118.0));
+    assert_eq!(heartbeats[0].1["runtime"]["ready"], json!(true));
+    assert_eq!(heartbeats[0].1["runtime"]["state"], json!("ready"));
     drop(heartbeats);
 
     let (proxy_base, _proxy_task) = spawn_server(proxy::router(
         &config,
         client.clone(),
         runtime.inflight.clone(),
+        runtime.draining.clone(),
     ))
     .await?;
 
     let response: Value = client
         .post(format!("{proxy_base}/v1/chat/completions"))
+        .header(header::AUTHORIZATION, "Bearer public-client-secret")
+        .header("x-ax-dispatch-token", "gateway-dispatch-secret")
+        .header("x-ax-request-id", uuid::Uuid::new_v4().to_string())
+        .header("x-ax-attempt-id", uuid::Uuid::new_v4().to_string())
         .json(&json!({
             "model": "qwen2-72b",
             "messages": [{"role": "user", "content": "hello"}],
@@ -167,17 +180,165 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0]["model"], "qwen2-72b");
     drop(chats);
+    assert_eq!(
+        sglang_state.authorization_headers.lock().await.as_slice(),
+        [None],
+        "public client credentials must terminate before the runtime trust zone"
+    );
+
+    let health: Value = client
+        .get(format!("{proxy_base}/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health["agent_live"], json!(true));
+    assert_eq!(health["runtime_ready"], json!(true));
 
     agent::drain(&client, &config, &runtime).await?;
     agent::drain_complete(&client, &config, &runtime).await?;
 
     let drains = control_state.drains.lock().await;
-    assert_eq!(drains.as_slice(), ["worker-1"]);
+    assert_eq!(drains.as_slice(), ["worker-test"]);
     drop(drains);
     let drain_completes = control_state.drain_completes.lock().await;
-    assert_eq!(drain_completes.as_slice(), ["worker-1"]);
+    assert_eq!(drain_completes.as_slice(), ["worker-test"]);
 
     heartbeat_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn thor_proxy_rejects_oversized_runtime_content_length_without_buffering() -> Result<()> {
+    let (runtime_base, _runtime_task) = spawn_raw_oversized_runtime_response().await?;
+
+    let config = ThorConfig {
+        control_plane_url: "http://127.0.0.1:1".into(),
+        worker_token: None,
+        runtime_url: runtime_base,
+        runtime_api_key: None,
+        dispatch_token: None,
+        tls_profile: "loopback_dev".into(),
+        runtime: "sglang".into(),
+        runtime_version: "test".into(),
+        worker_id: "worker-test".into(),
+        trust_domain: "test".into(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+        max_inflight: 8,
+        worker_pool: None,
+        node_class: "thor".into(),
+        hardware_class: "thor".into(),
+        friendly_name: None,
+        chip_model: None,
+        shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
+        model_identity: Default::default(),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build reqwest client")?;
+    let runtime = SharedRuntime::new();
+    let (proxy_base, _proxy_task) = spawn_server(proxy::router(
+        &config,
+        client.clone(),
+        runtime.inflight.clone(),
+        runtime.draining.clone(),
+    ))
+    .await?;
+
+    let response = client
+        .post(format!("{proxy_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "qwen2-72b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .context("failed to call thor proxy")?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response
+        .text()
+        .await
+        .context("failed to read proxy error response")?;
+    assert!(body.contains("exceeded 64 MiB limit"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thor_proxy_accepts_valid_body_above_axum_default_limit() -> Result<()> {
+    let sglang_state = Arc::new(SgLangState::default());
+    let (sglang_base, _sglang_task) = spawn_server(sglang_router(sglang_state.clone())).await?;
+
+    let config = ThorConfig {
+        control_plane_url: "http://127.0.0.1:1".into(),
+        worker_token: None,
+        runtime_url: sglang_base,
+        runtime_api_key: None,
+        dispatch_token: None,
+        tls_profile: "loopback_dev".into(),
+        runtime: "sglang".into(),
+        runtime_version: "test".into(),
+        worker_id: "worker-test".into(),
+        trust_domain: "test".into(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+        max_inflight: 8,
+        worker_pool: None,
+        node_class: "thor".into(),
+        hardware_class: "thor".into(),
+        friendly_name: None,
+        chip_model: None,
+        shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
+        model_identity: Default::default(),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build reqwest client")?;
+    let runtime = SharedRuntime::new();
+    let (proxy_base, _proxy_task) = spawn_server(proxy::router(
+        &config,
+        client.clone(),
+        runtime.inflight.clone(),
+        runtime.draining.clone(),
+    ))
+    .await?;
+
+    let large_content = "a".repeat(2 * 1024 * 1024 + 4096);
+    let body = serde_json::to_vec(&json!({
+        "model": "qwen2-72b",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": false
+    }))
+    .context("failed to serialize large request")?;
+
+    let response = client
+        .post(format!("{proxy_base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .context("failed to call thor proxy")?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chats = sglang_state.chats.lock().await;
+    assert_eq!(chats.len(), 1);
+    assert_eq!(
+        chats[0]["messages"][0]["content"].as_str().unwrap().len(),
+        2 * 1024 * 1024 + 4096
+    );
+
     Ok(())
 }
 
@@ -215,6 +376,7 @@ fn sglang_router(state: Arc<SgLangState>) -> Router {
         )
         .route("/metrics", get(runtime_metrics))
         .route("/v1/chat/completions", post(handle_chat))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -234,12 +396,17 @@ async fn handle_register(
     State(state): State<Arc<ControlPlaneState>>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let protocol = body["protocol"].clone();
     state.registrations.lock().await.push(body);
     (
         StatusCode::OK,
         Json(json!({
-            "worker_id": "worker-1",
-            "heartbeat_interval_ms": 25
+            "registration_id": "9fe2f234-591f-43df-a900-cfd68e5600bd",
+            "lease_token": "0123456789abcdef-test-lease",
+            "protocol": protocol,
+            "heartbeat_interval_ms": 1000,
+            "lease_ttl_ms": 15000,
+            "inventory_resync": false
         })),
     )
 }
@@ -272,10 +439,17 @@ async fn handle_drain_complete(
 
 async fn handle_chat(
     State(state): State<Arc<SgLangState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let parsed: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     state.chats.lock().await.push(parsed);
+    state.authorization_headers.lock().await.push(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+    );
     Ok((
         StatusCode::OK,
         Json(json!({
@@ -300,6 +474,28 @@ async fn spawn_server(app: Router) -> Result<(String, tokio::task::JoinHandle<()
         axum::serve(listener, app)
             .await
             .expect("test server failed");
+    });
+    Ok((format!("http://{}", display_addr(addr)), handle))
+}
+
+async fn spawn_raw_oversized_runtime_response() -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind raw runtime listener")?;
+    let addr = listener.local_addr().context("missing listener addr")?;
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept raw runtime request");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.expect("read proxy request");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            64 * 1024 * 1024 + 1
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write oversized response headers");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     });
     Ok((format!("http://{}", display_addr(addr)), handle))
 }

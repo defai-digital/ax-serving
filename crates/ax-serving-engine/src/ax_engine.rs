@@ -120,7 +120,11 @@ fn resolve_model_dir(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
         anyhow::bail!(
             "native ax-engine v4.10.0 requires an AX MLX model artifact directory, not a .gguf file: {}",
             path.display()
@@ -135,7 +139,7 @@ fn resolve_model_dir(path: &Path) -> Result<PathBuf> {
     })
 }
 
-pub(crate) fn is_ax_engine_model_artifacts(path: &Path) -> bool {
+pub fn is_ax_engine_model_artifacts(path: &Path) -> bool {
     let model_dir = if path.is_dir() {
         path
     } else if let Some(parent) = path.parent() {
@@ -145,6 +149,36 @@ pub(crate) fn is_ax_engine_model_artifacts(path: &Path) -> bool {
     };
 
     model_dir.join(MODEL_MANIFEST_FILE).is_file() && model_dir.join(TOKENIZER_FILE).is_file()
+}
+
+/// Best-effort sum of the on-disk size of a model artifact directory.
+///
+/// Walks the directory recursively and sums regular-file sizes. Used to give
+/// `check_memory_budget` a real figure for the native backend instead of `0`
+/// (which makes the OOM safety net a no-op — BUG-201). Returns 0 if the
+/// directory cannot be read, so a stat failure degrades to the old behavior
+/// rather than blocking a load.
+fn model_dir_size_bytes(model_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![model_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 fn ensure_model_artifacts(model_dir: &Path) -> Result<()> {
@@ -511,6 +545,19 @@ fn render_inst_format_chat_messages(messages: &[(ChatRole, String)]) -> String {
         }
     }
 
+    // A system message that is never followed by a user message (e.g. a
+    // conversation ending in a system or assistant turn) would otherwise be
+    // dropped silently (BUG-203). Emit it in its own [INST] block so the model
+    // still receives the instructions.
+    if let Some(system) = pending_system.take() {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str("[INST] <<SYS>>\n");
+        rendered.push_str(system);
+        rendered.push_str("\n<</SYS>>\n\n [/INST]");
+    }
+
     rendered
 }
 
@@ -814,24 +861,29 @@ fn run_generate(
                     let piece = decode_tokens(&loaded.tokenizer, &[token])?;
                     let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
                     if emit_logprobs {
-                        if !action.emit.is_empty()
-                            && tx.blocking_send(GenerateEvent::Token(action.emit)).is_err()
-                        {
-                            return Ok(());
-                        }
-                        let logprob = step
-                            .delta_token_logprobs
-                            .get(idx)
-                            .and_then(|value| *value)
-                            .unwrap_or(0.0);
-                        if tx
-                            .blocking_send(GenerateEvent::TokenLogprob {
-                                logprob,
-                                top: Vec::with_capacity(top_logprobs as usize),
-                            })
-                            .is_err()
-                        {
-                            return Ok(());
+                        // Keep Token and TokenLogprob events 1:1. When the
+                        // stop-sequence buffer holds back this piece,
+                        // `action.emit` is empty — suppress both events so the
+                        // consumer never sees a logprob without a matching
+                        // Token (BUG-202).
+                        if !action.emit.is_empty() {
+                            if tx.blocking_send(GenerateEvent::Token(action.emit)).is_err() {
+                                return Ok(());
+                            }
+                            let logprob = step
+                                .delta_token_logprobs
+                                .get(idx)
+                                .and_then(|value| *value)
+                                .unwrap_or(0.0);
+                            if tx
+                                .blocking_send(GenerateEvent::TokenLogprob {
+                                    logprob,
+                                    top: Vec::with_capacity(top_logprobs as usize),
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
                         }
                     } else if !push_stream_token_piece(
                         &tx,
@@ -937,7 +989,7 @@ impl InferenceBackend for AxEngineBackend {
         let started = Instant::now();
         let model_dir = resolve_model_dir(path)?;
         ensure_model_artifacts(&model_dir)?;
-        crate::memory::check_memory_budget(0)?;
+        crate::memory::check_memory_budget(model_dir_size_bytes(&model_dir))?;
 
         let tokenizer = Tokenizer::from_file(model_dir.join(TOKENIZER_FILE))
             .map_err(|err| anyhow::anyhow!("ax-engine failed to load tokenizer.json: {err}"))?;
@@ -1068,7 +1120,7 @@ impl InferenceBackend for AxEngineBackend {
                 tokens.truncate(loaded.metadata.context_length as usize);
             }
         }
-        let prompt_tokens = batch.iter().map(Vec::len).sum::<usize>() as u32;
+        let prompt_tokens = saturating_token_count(batch.iter().map(Vec::len));
         let session = loaded.session.lock().unwrap_or_else(|err| {
             warn!("ax-engine session mutex poisoned during embed; recovering");
             err.into_inner()
@@ -1109,18 +1161,39 @@ impl InferenceBackend for AxEngineBackend {
     }
 }
 
+fn saturating_token_count(lengths: impl IntoIterator<Item = usize>) -> u32 {
+    lengths
+        .into_iter()
+        .map(|len| len.min(u32::MAX as usize) as u32)
+        .fold(0u32, u32::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BackendType, ChatMessage, ChatRole, GenerationParams, LoadConfig, StopPieceAction,
         consume_stop_piece, ensure_supported_generation_params, infer_render_architecture,
-        normalize_chat_messages, parse_chat_role, render_chat_messages, session_config_for_model,
+        normalize_chat_messages, parse_chat_role, render_chat_messages, saturating_token_count,
+        session_config_for_model,
     };
 
     #[test]
     fn gguf_native_loads_are_rejected_for_v4_sdk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
+        std::fs::write(&path, "").unwrap();
+
+        let err = super::resolve_model_dir(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an AX MLX model artifact directory")
+        );
+    }
+
+    #[test]
+    fn uppercase_gguf_native_loads_are_rejected_for_v4_sdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.GGUF");
         std::fs::write(&path, "").unwrap();
 
         let err = super::resolve_model_dir(&path).unwrap_err();
@@ -1220,12 +1293,22 @@ mod tests {
                 {"type": "text", "text": "hello "},
                 {"type": "text", "text": "world"}
             ]),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let normalized = normalize_chat_messages(&messages).unwrap();
         assert_eq!(normalized.len(), 1);
         assert!(matches!(normalized[0].0, ChatRole::User));
         assert_eq!(normalized[0].1, "hello world");
+    }
+
+    #[test]
+    fn embedding_prompt_token_count_saturates() {
+        let count = saturating_token_count([u32::MAX as usize, 10]);
+
+        assert_eq!(count, u32::MAX);
     }
 
     #[test]
@@ -1249,5 +1332,56 @@ mod tests {
         let rendered = render_chat_messages(&[(ChatRole::User, "hello".to_string())], "qwen");
         assert!(rendered.contains("<|im_start|>user\nhello<|im_end|>"));
         assert!(rendered.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn inst_renderer_inlines_system_before_following_user() {
+        let rendered = render_chat_messages(
+            &[
+                (ChatRole::System, "be terse".to_string()),
+                (ChatRole::User, "hi".to_string()),
+            ],
+            "mistral",
+        );
+        assert!(rendered.contains("<<SYS>>\nbe terse\n<</SYS>>"));
+        assert!(rendered.contains("hi [/INST]"));
+    }
+
+    #[test]
+    fn inst_renderer_does_not_drop_trailing_system_prompt() {
+        // Regression test for BUG-203: a system message with no following user
+        // message must still be rendered rather than silently dropped.
+        let rendered = render_chat_messages(
+            &[
+                (ChatRole::User, "hi".to_string()),
+                (ChatRole::Assistant, "hello".to_string()),
+                (ChatRole::System, "now be terse".to_string()),
+            ],
+            "mistral",
+        );
+        assert!(
+            rendered.contains("now be terse"),
+            "trailing system prompt was dropped: {rendered}"
+        );
+        assert!(rendered.contains("<<SYS>>"));
+    }
+
+    #[test]
+    fn model_dir_size_sums_files_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 100]).unwrap();
+        let sub = dir.path().join("shards");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("part-00001.safetensors"), vec![0u8; 50]).unwrap();
+
+        assert_eq!(super::model_dir_size_bytes(dir.path()), 150);
+    }
+
+    #[test]
+    fn model_dir_size_of_missing_dir_is_zero() {
+        assert_eq!(
+            super::model_dir_size_bytes(std::path::Path::new("/nonexistent/ax/model/dir")),
+            0
+        );
     }
 }

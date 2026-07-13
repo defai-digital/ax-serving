@@ -13,13 +13,18 @@ name = "ax-runtime-agent"
 path = "src/runtime_main.rs"
 
 [dependencies]
+ax-serving-protocol = { path = "../ax-serving-protocol" }
+ax-serving-observability = { path = "../ax-serving-observability" }
 tokio = { workspace = true, features = ["full"] }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+time = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 futures = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }

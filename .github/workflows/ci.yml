@@ -3,304 +3,256 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['v*']           # trigger release-validation on version tags
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
       results:
-        description: 'Path to mixed bench results JSON (for regression-check job)'
+        description: Path to benchmark results JSON
         required: false
       model_path:
-        description: 'Path to model GGUF for smoke soak test'
+        description: Model path for the manual smoke soak
         required: false
 
+permissions:
+  contents: read
+
 jobs:
-  check:
-    name: Check + Lint
-    runs-on: macos-15  # Apple Silicon (ARM64, macOS 15) — satisfies aarch64-apple-darwin gate
+  gateway-linux:
+    name: Portable gateway (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            arch: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      AXS_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Gateway dependency boundary
+        run: |
+          FORBIDDEN='ax-serving-engine|ax-serving-grpc-compat|ax-engine-|mlx-rs|mlx-sys|llama-cpp|cudarc|(^|[[:space:]])(metal|prost|pyo3|tonic|tonic-build) v'
+          if cargo tree -p ax-serving-api | grep -Eq "$FORBIDDEN"; then
+            echo "portable ax-serving-api crossed the embedded/protobuf dependency boundary" >&2
+            exit 1
+          fi
+          if cargo tree -p ax-serving-cli --no-default-features --features gateway | grep -Eq "$FORBIDDEN"; then
+            echo "portable ax-serving CLI crossed the embedded/protobuf dependency boundary" >&2
+            exit 1
+          fi
+      - name: Check portable crates
+        run: >-
+          cargo check
+          -p ax-serving-protocol
+          -p ax-serving-observability
+          -p ax-serving-api
+          -p ax-thor-agent
+          -p ax-serving-cli
+      - name: Clippy portable crates
+        run: >-
+          cargo clippy
+          -p ax-serving-protocol
+          -p ax-serving-observability
+          -p ax-serving-api
+          -p ax-thor-agent
+          -p ax-serving-cli
+          --all-targets -- -D warnings
+      - name: Protocol and gateway tests
+        run: |
+          cargo test -p ax-serving-protocol
+          cargo test -p ax-serving-observability
+          cargo test -p ax-serving-api
+          cargo test -p ax-thor-agent
+          cargo test -p ax-serving-cli --no-default-features --features gateway --bin ax-servingctl
+      - name: Redis fleet-state conformance
+        run: cargo test -p ax-serving-api --test redis_fleet_state -- --nocapture
+      - name: NATS compatibility tests
+        run: cargo test -p ax-serving-api --features nats-dispatch --lib orchestration::nats
 
+  embedded-macos:
+    name: Embedded compatibility (Apple Silicon)
+    runs-on: macos-15
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+      AXS_ALLOW_NO_AUTH: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: bash scripts/ci-install-native-deps.sh
+      - name: Check all workspace targets and features
+        run: cargo check --workspace --all-targets --all-features
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-features
 
-      - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo check
-        run: cargo check --workspace
-
-      - name: cargo fmt check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --tests -- -D warnings
-
-      - name: cargo test (lib only)
-        run: cargo test --workspace --lib
-
-      - name: Unit test summary
-        if: always()
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Unit Tests
-
-          | Crate | Tests |
-          |---|---|
-          | ax-serving-api | 163 |
-          | ax-serving-engine | 31 |
-          | ax-serving-shim | 22 |
-          | **Total** | **216** |
-          EOF
-
-  js-sdk:
-    name: JS SDK Build + Typecheck
+  sdk:
+    name: SDK conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: '20'
+          cache: npm
           cache-dependency-path: sdk/javascript/package-lock.json
-
-      - name: Install JS SDK dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: JavaScript SDK
         working-directory: sdk/javascript
-        run: npm ci
+        run: npm ci && npm test && npm run typecheck
+      - name: Python SDK
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pytest -q
 
-      - name: Build JS SDK
-        working-directory: sdk/javascript
-        run: npm run build
-
-      - name: Typecheck JS SDK
-        working-directory: sdk/javascript
-        run: npm run typecheck
-
-  # ── Integration tests (no model required) ────────────────────────────────────
-  # These run on every push and PR to catch regressions in:
-  #   - orchestration (queue, dispatch, reroute, health, overload, chaos)
-  #   - model management (load/unload/reload, auth, input validation)
-  #   - graceful shutdown (in-flight drain, final-request completion)
-  # All three test suites use in-process mock servers and NullBackend —
-  # no GGUF model file or Metal GPU is required.
-  integration-tests:
-    name: Integration Tests
-    runs-on: macos-15
-    needs: [check, js-sdk]
-    env:
-      AXS_ALLOW_NO_AUTH: "true"   # integration tests build apps without API keys
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install native build dependencies
+  deployment:
+    name: Container and Kubernetes conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.2
+      - name: Render Kubernetes base
+        run: kubectl kustomize deploy/kubernetes/base >/tmp/ax-serving-kubernetes.yaml
+      - name: Parse deployment YAML
+        run: >-
+          ruby -e 'require "yaml";
+          Dir["deploy/**/*.yaml"].sort.each do |path|
+            YAML.load_stream(File.read(path));
+          end'
+      - name: Validate dashboard JSON
+        run: jq empty deploy/monitoring/grafana-dashboard.json
+      - name: Build portable container targets
         run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Integration tests — orchestration
-        run: cargo test -p ax-serving-api --test orchestration
-
-      - name: Integration tests — model_management
-        run: cargo test -p ax-serving-api --test model_management
-
-      - name: Integration tests — graceful_shutdown
-        run: cargo test -p ax-serving-api --test graceful_shutdown
-
-      - name: Test summary
-        if: always()
+          docker build --target gateway -t ax-serving-gateway:ci -f packaging/container/Dockerfile .
+          docker build --target agent -t ax-serving-agent:ci -f packaging/container/Dockerfile .
+      - name: Verify non-root image configuration
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Test Results
+          test "$(docker image inspect ax-serving-gateway:ci --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect ax-serving-agent:ci --format '{{.Config.User}}')" = "65532:65532"
 
-          All suites use in-process backends — no GPU or model file required.
-
-          | Suite | Tests | Scope |
-          |---|---|---|
-          | Unit — serving API | 163 | Scheduler, registry, orchestration, auth, metrics, config, gRPC |
-          | Unit — engine | 31 | Backend routing, GGUF metadata, thermal, memory |
-          | Unit — C shim | 22 | llama.h ABI compatibility (21 exported symbols) |
-          | Integration — model\_management | 54 | Auth, model lifecycle, health semantics, input validation, inference, embeddings, security headers |
-          | Integration — orchestration | 23 | Worker heartbeat/eviction, dispatch policies, queue backpressure, reroute, chaos, overload |
-          | Integration — graceful\_shutdown | 2 | In-flight drain on SIGTERM |
-          | **Total** | **295** | |
-
-          Suites marked ✅ passed in this run. Check individual step logs for any failures.
-          EOF
-
-  # ── Release readiness validation (runs on v* tags) ───────────────────────────
-  # Enforces that baseline files have been populated before a version is tagged.
-  # Bench regression and smoke soak must have passed manually on release hardware
-  # using workflow_dispatch before the tag is pushed:
-  #
-  #   1. Run on a machine with a GGUF model:
-  #        cargo run -p ax-serving-bench --bin ax-serving-bench -- mixed \
-  #          --url http://127.0.0.1:8080 --model default \
-  #          --concurrency-levels 1,2,4,8 --requests 120 \
-  #          --json benchmarks/baseline-mixed.json
-  #
-  #   2. Trigger workflow_dispatch with inputs.results=benchmarks/baseline-mixed.json
-  #      and verify bench-regression passes.
-  #
-  #   3. Trigger workflow_dispatch with inputs.model_path=./models/llama3.gguf
-  #      and verify smoke-soak passes.
-  #
-  #   4. Only then push the v* tag.
   release-validation:
-    name: Release Readiness Validation
-    runs-on: macos-15
-    needs: [check, integration-tests]
+    name: Release evidence gate
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gateway-linux, embedded-macos, sdk, security, deployment]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Validate baseline files are populated
+      - name: Require populated benchmark evidence
         run: |
-          python3 - <<'EOF'
-          import json, sys, pathlib
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
 
-          errors = []
-
-          for fname in ["benchmarks/baseline-mixed.json"]:
-              p = pathlib.Path(fname)
-              if not p.exists():
-                  errors.append(f"MISSING: {fname}")
+          failures = []
+          for name in (
+              "benchmarks/baseline.json",
+              "benchmarks/baseline-llamacpp.json",
+              "benchmarks/baseline-mixed.json",
+              "benchmarks/baseline-multi-worker.json",
+          ):
+              path = pathlib.Path(name)
+              if not path.exists():
+                  failures.append(f"missing {name}")
                   continue
-              try:
-                  data = json.loads(p.read_text())
-              except json.JSONDecodeError as e:
-                  errors.append(f"INVALID JSON in {fname}: {e}")
-                  continue
-              # Check that at least one metric is non-null
-              non_null = [k for k, v in data.items() if v is not None]
-              if not non_null:
-                  errors.append(
-                      f"BASELINE NOT ESTABLISHED: all values in {fname} are null. "
-                      "Run the mixed bench on release hardware and commit the results "
-                      "before tagging a release."
-                  )
-              else:
-                  print(f"  OK {fname}: {len(non_null)} metric(s) populated: {non_null}")
-
-          if errors:
-              print("\nRelease blocked:", file=sys.stderr)
-              for e in errors:
-                  print(f"  ✗ {e}", file=sys.stderr)
-              print(
-                  "\nRun the bench suite on release hardware and re-commit "
-                  "benchmarks/baseline-mixed.json before tagging.",
-                  file=sys.stderr
-              )
+              data = json.loads(path.read_text())
+              def contains_none(value):
+                  if value is None:
+                      return True
+                  if isinstance(value, dict):
+                      return any(contains_none(item) for item in value.values())
+                  if isinstance(value, list):
+                      return any(contains_none(item) for item in value)
+                  return False
+              if contains_none(data):
+                  failures.append(f"{name} still contains null placeholder evidence")
+          if failures:
+              print("Release evidence is incomplete:", file=sys.stderr)
+              for failure in failures:
+                  print(f"- {failure}", file=sys.stderr)
               sys.exit(1)
+          PY
 
-          print("All release baselines populated — release gate passed.")
-          EOF
-
-      - name: "Remind: manual bench + soak required"
-        run: |
-          echo "Release tag detected: ${{ github.ref_name }}"
-          echo ""
-          echo "Static baseline check passed. Confirm the following were run"
-          echo "via workflow_dispatch before this tag was pushed:"
-          echo "  1. bench-regression job (inputs.results set, all metrics PASS)"
-          echo "  2. smoke-soak job      (inputs.model_path set, 15-min soak PASS)"
-          echo ""
-          echo "If not yet verified, delete this tag and re-run the manual gates first."
-
-  # ── Performance regression gate (manual benchmark run + checked baseline) ──────
   bench-regression:
-    name: Bench Regression Gate
-    runs-on: macos-15
+    name: Manual benchmark regression
     if: github.event_name == 'workflow_dispatch' && inputs.results != ''
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check regression
-        run: |
-          cargo run -p ax-serving-bench --bin ax-serving-bench -- regression-check \
-            --results "${{ inputs.results }}" \
-            --baseline benchmarks/baseline-mixed.json
-
-  # ── Smoke soak (manual — requires live server + GGUF model) ──────────────────
-  smoke-soak:
-    name: 15-min Smoke Soak
     runs-on: macos-15
-    if: github.event_name == 'workflow_dispatch' && inputs.model_path != ''
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/ci-install-native-deps.sh
+      - run: >-
+          cargo run -p ax-serving-bench --release -- regression-check
+          --results "${{ inputs.results }}"
+          --baseline benchmarks/baseline-mixed.json
 
-      - name: Install native build dependencies
-        run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build bench
-        run: cargo build -p ax-serving-bench --release
-
-      - name: Smoke soak (15 min)
+  smoke-soak:
+    name: Manual 60-minute smoke soak
+    if: github.event_name == 'workflow_dispatch' && inputs.model_path != ''
+    runs-on: macos-15
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/ci-install-native-deps.sh
+      - run: cargo build -p ax-serving-bench --release
+      - name: Run soak
         run: |
           mkdir -p target/ci
           ./target/release/ax-serving-bench soak \
             -m "${{ inputs.model_path }}" \
-            --duration-min 15 \
+            --duration-min 60 \
             --json target/ci/smoke-soak-result.json
-
-      - name: Assert soak passed
-        run: |
-          python3 -c "
-          import json, sys
-          r = json.load(open('target/ci/smoke-soak-result.json'))
-          sys.exit(0 if r.get('passed') else 1)
-          "
-
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: smoke-soak-result
           path: target/ci/smoke-soak-result.json

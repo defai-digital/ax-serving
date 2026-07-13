@@ -1,270 +1,275 @@
-"name": Release
+name: Release
 
-# Triggered by pushing a version tag:
-#   Stable: git tag v1.2.3 && git push origin v1.2.3
-#   Beta:   git tag v2.0.0-beta.1 && git push origin v2.0.0-beta.1
-"on":
+on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: write   # upload release assets
+  contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  build-macos:
-    name: Build macOS (Apple Silicon)
-    runs-on: macos-15   # ARM64 runner — satisfies aarch64-apple-darwin gate
-    outputs:
-      tarball: ${{ steps.package.outputs.tarball }}
-      sha256:  ${{ steps.package.outputs.sha256 }}
-      version: ${{ steps.version.outputs.version }}
-      prerelease: ${{ steps.version.outputs.prerelease }}
-
+  release-gate:
+    name: Verify release source and evidence
+    runs-on: macos-15
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+      AXS_ALLOW_NO_AUTH: 'true'
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install native build dependencies
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: sdk/javascript/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: bash scripts/ci-install-native-deps.sh
+      - name: Validate Rust workspace
         run: |
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf
-          fi
-          if [[ ! -f /opt/homebrew/include/mlx/c/array.h ]]; then
-            brew install mlx-c
-          fi
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --all-features
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+      - name: Validate JavaScript SDK
+        working-directory: sdk/javascript
+        run: npm ci && npm test && npm run typecheck
+      - name: Validate Python SDK
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pytest -q
+      - name: Require populated benchmark evidence
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+          failures = []
+          for name in (
+              "benchmarks/baseline.json",
+              "benchmarks/baseline-llamacpp.json",
+              "benchmarks/baseline-mixed.json",
+              "benchmarks/baseline-multi-worker.json",
+          ):
+              path = pathlib.Path(name)
+              if not path.exists():
+                  failures.append(f"missing {name}")
+                  continue
+              data = json.loads(path.read_text())
 
-      # ── Build release binaries ────────────────────────────────────────────
-      - name: cargo build --release
-        run: cargo build --workspace --release --exclude ax-serving-py
+              def contains_none(value):
+                  if value is None:
+                      return True
+                  if isinstance(value, dict):
+                      return any(contains_none(item) for item in value.values())
+                  if isinstance(value, list):
+                      return any(contains_none(item) for item in value)
+                  return False
 
-      # ── Determine version from tag ────────────────────────────────────────
-      - name: Extract version
+              if contains_none(data):
+                  failures.append(f"{name} still contains null placeholder evidence")
+          if failures:
+              print("Release evidence is incomplete:", file=sys.stderr)
+              for failure in failures:
+                  print(f"- {failure}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  release-security:
+    name: Audit release dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build and sign Apple Silicon release
+    needs: [release-gate, release-security]
+    runs-on: macos-15
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tarball: ${{ steps.package.outputs.tarball }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install native dependencies
+        run: |
+          bash scripts/ci-install-native-deps.sh
+          brew list minisign >/dev/null 2>&1 || brew install minisign
+      - name: Resolve and validate version
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"   # strip leading 'v'
-          if [[ "$VERSION" == *-* ]]; then
-            PRERELEASE=true
-          else
-            PRERELEASE=false
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-
-      - name: Validate workspace version matches tag
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           WORKSPACE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [[ -z "$WORKSPACE_VERSION" ]]; then
-            echo "error: failed to read workspace version from Cargo.toml" >&2
-            exit 1
+          JS_VERSION=$(node -p "require('./sdk/javascript/package.json').version")
+          PY_VERSION=$(python3 - <<'PY'
+          import tomllib
+          print(tomllib.load(open('sdk/python/pyproject.toml', 'rb'))['project']['version'])
+          PY
+          )
+          test "$VERSION" = "$WORKSPACE_VERSION"
+          test "$VERSION" = "$JS_VERSION"
+          test "$VERSION" = "$PY_VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "$WORKSPACE_VERSION" != "$VERSION" ]]; then
-            echo "error: tag version v$VERSION does not match workspace version $WORKSPACE_VERSION" >&2
-            echo "Update Cargo.toml [workspace.package].version before tagging this release." >&2
-            exit 1
-          fi
-
-      # ── Create tarball ────────────────────────────────────────────────────
-      - name: Package tarball
+      - name: Build release binaries
+        run: |
+          cargo build --release -p ax-serving-cli --bin ax-serving-api --bin ax-servingctl
+          cargo build --release -p ax-serving-cli --features embedded-compat --bin ax-serving
+          cargo build --release -p ax-thor-agent --bins
+      - name: Package release archive
         id: package
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TARBALL="ax-serving-v${VERSION}-aarch64-apple-darwin.tar.gz"
-          STAGEDIR="ax-serving-v${VERSION}"
-
-          mkdir -p "$STAGEDIR/bin" "$STAGEDIR/config"
-          cp target/release/ax-serving     "$STAGEDIR/bin/"
-          cp target/release/ax-serving-api "$STAGEDIR/bin/"
-          cp config/backends.yaml          "$STAGEDIR/config/"
-          cp config/serving.yaml           "$STAGEDIR/config/"
-          cp README.md                     "$STAGEDIR/"
-
-          tar -czf "$TARBALL" "$STAGEDIR"
-          SHA256=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
-
-          echo "tarball=$TARBALL"     >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256"       >> "$GITHUB_OUTPUT"
-
-      # ── Build .pkg installer ──────────────────────────────────────────────
-      - name: Build .pkg installer
+          STAGE="ax-serving-v${VERSION}"
+          TARBALL="${STAGE}-aarch64-apple-darwin.tar.gz"
+          mkdir -p "$STAGE/bin" "$STAGE/config"
+          cp target/release/ax-serving "$STAGE/bin/"
+          cp target/release/ax-serving-api "$STAGE/bin/"
+          cp target/release/ax-servingctl "$STAGE/bin/"
+          cp target/release/ax-runtime-agent "$STAGE/bin/"
+          cp target/release/ax-thor-agent "$STAGE/bin/"
+          cp config/backends.yaml config/serving.yaml config/serving.example.yaml config/serving.hybrid.example.yaml "$STAGE/config/"
+          cp README.md QUICKSTART.md LICENSE LICENSING.md LICENSE-COMMERCIAL.md "$STAGE/"
+          tar -czf "$TARBALL" "$STAGE"
+          shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(awk '{print $1}' "${TARBALL}.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Sign archive
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
         run: |
-          PAYLOAD="packaging/payload/usr/local/bin"
-          mkdir -p "$PAYLOAD"
-          cp target/release/ax-serving     "$PAYLOAD/"
-          cp target/release/ax-serving-api "$PAYLOAD/"
-
-          pkgbuild \
-            --root packaging/payload \
-            --identifier com.automatosx.ax-serving \
-            --version "$VERSION" \
-            --install-location / \
-            "ax-serving-v${VERSION}.pkg"
-
-      # ── Upload release assets ─────────────────────────────────────────────
-      - name: Upload to GitHub Release
+          test -n "$MINISIGN_SECRET_KEY"
+          umask 077
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$TARBALL" -x "${TARBALL}.minisig"
+          rm -f "$RUNNER_TEMP/minisign.key"
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ steps.package.outputs.tarball }}
+          format: spdx-json
+          output-file: ${{ steps.package.outputs.tarball }}.spdx.json
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ steps.package.outputs.tarball }}
-            ax-serving-v${{ steps.version.outputs.version }}.pkg
+            ${{ steps.package.outputs.tarball }}.sha256
+            ${{ steps.package.outputs.tarball }}.minisig
+            ${{ steps.package.outputs.tarball }}.spdx.json
           generate_release_notes: true
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
-
-      # ── Persist tarball + sha256 for the tap-update job ──────────────────
-      - name: Save artifact metadata
-        run: |
-          echo "${{ steps.package.outputs.sha256 }}" > sha256.txt
-          echo "${{ steps.package.outputs.tarball }}" > tarball.txt
-
       - uses: actions/upload-artifact@v4
         with:
-          name: release-meta
+          name: release-metadata
           path: |
-            sha256.txt
-            tarball.txt
+            ${{ steps.package.outputs.tarball }}.sha256
 
-  # ── Update Homebrew tap formula ───────────────────────────────────────────
-  update-homebrew-tap:
-    name: Update Homebrew Tap
-    runs-on: ubuntu-latest
+  update-homebrew:
+    name: Update Homebrew tap
+    if: needs.build-macos.outputs.prerelease != 'true'
     needs: build-macos
-    if: ${{ needs.build-macos.outputs.prerelease != 'true' }}
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Check tap token configuration
-        id: tap-token
-        env:
-          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-        run: |
-          if [[ -n "$GH_TOKEN" ]]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download release metadata
-        if: ${{ steps.tap-token.outputs.present == 'true' }}
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: release-meta
-
-      - name: Update formula in homebrew-ax-serving tap
-        if: ${{ steps.tap-token.outputs.present == 'true' }}
+          name: release-metadata
+      - name: Update formula
         env:
-          # Set this secret in your repo: Settings → Secrets → TAP_GITHUB_TOKEN
-          # The token needs push access to the homebrew-ax-serving tap repo.
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-          VERSION:  ${{ needs.build-macos.outputs.version }}
+          VERSION: ${{ needs.build-macos.outputs.version }}
+          TARBALL: ${{ needs.build-macos.outputs.tarball }}
+          SHA256: ${{ needs.build-macos.outputs.sha256 }}
         run: |
-          SHA256=$(cat sha256.txt)
-          TARBALL=$(cat tarball.txt)
-
-          # Clone the tap repo
+          test -n "$GH_TOKEN"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/defai-digital/homebrew-ax-serving.git" tap
           cd tap
-
-          # Rewrite the version, url, and sha256 in the formula
           sed -i "s|version \".*\"|version \"${VERSION}\"|" Formula/ax-serving.rb
-          sed -i "s|url \".*aarch64-apple-darwin.*\"|url \"https://github.com/defai-digital/ax-serving/releases/download/v${VERSION}/${TARBALL}\"|" Formula/ax-serving.rb
+          sed -i "s|url \".*\"|url \"https://github.com/defai-digital/ax-serving/releases/download/v${VERSION}/${TARBALL}\"|" Formula/ax-serving.rb
           sed -i "s|sha256 \".*\"|sha256 \"${SHA256}\"|" Formula/ax-serving.rb
-
-          git config user.email "ci@automatosx.com"
-          git config user.name  "CI Bot"
+          git config user.email "ci@defai.digital"
+          git config user.name "AX Serving Release Bot"
           git add Formula/ax-serving.rb
-          git diff --cached --quiet || \
-            git commit -m "ax-serving ${VERSION}" && git push
+          git diff --cached --quiet || git commit -m "ax-serving ${VERSION}"
+          git push
 
-      - name: Skip tap update
-        if: ${{ steps.tap-token.outputs.present != 'true' }}
-        run: echo "TAP_GITHUB_TOKEN is not configured; skipping Homebrew tap update."
-
-  publish-js-sdk:
-    name: Publish JS SDK to npm
-    runs-on: ubuntu-latest
+  publish-npm:
+    name: Publish JavaScript SDK
     needs: build-macos
-    # npm publish is skipped cleanly when the @defai-digital scope/package is
-    # not available on npmjs.com. Other publish failures should fail the job.
+    runs-on: ubuntu-latest
     steps:
-      - name: Check npm token configuration
-        id: npm-token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [[ -n "$NPM_TOKEN" ]]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
-
       - uses: actions/setup-node@v4
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
         with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-          cache: "npm"
-          cache-dependency-path: sdk/javascript/package-lock.json
-
-      - name: Install JS SDK dependencies
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
-        working-directory: sdk/javascript
-        run: npm ci
-
-      - name: Build JS SDK
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
-        working-directory: sdk/javascript
-        run: npm run build
-
-      - name: Validate JS SDK version matches tag
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
-        working-directory: sdk/javascript
-        env:
-          VERSION: ${{ needs.build-macos.outputs.version }}
-        run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          if [[ "$PACKAGE_VERSION" != "$VERSION" ]]; then
-            echo "error: npm package version $PACKAGE_VERSION does not match release tag v$VERSION" >&2
-            echo "Update sdk/javascript/package.json before tagging this release." >&2
-            exit 1
-          fi
-
-      - name: Publish package
-        if: ${{ steps.npm-token.outputs.present == 'true' }}
+          node-version: '20'
+          registry-url: https://registry.npmjs.org
+      - name: Publish
         working-directory: sdk/javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PRERELEASE: ${{ needs.build-macos.outputs.prerelease }}
         run: |
-          set +e
-          if [[ "$PRERELEASE" == "true" ]]; then
-            npm publish --access public --tag beta 2>&1 | tee npm-publish.log
+          test -n "$NODE_AUTH_TOKEN"
+          npm ci
+          npm test
+          if [[ "${{ needs.build-macos.outputs.prerelease }}" == "true" ]]; then
+            npm publish --access public --provenance --tag beta
           else
-            npm publish --access public 2>&1 | tee npm-publish.log
-          fi
-          status=${PIPESTATUS[0]}
-          set -e
-
-          if [[ "$status" -eq 0 ]]; then
-            exit 0
+            npm publish --access public --provenance
           fi
 
-          if grep -Eq "npm error code E404|Not Found - PUT https://registry\\.npmjs\\.org/@defai-digital%2fax-serving" npm-publish.log; then
-            echo "NPM registry does not have the @defai-digital/ax-serving package/scope available; skipping JS SDK publish."
-            exit 0
-          fi
-
-          exit "$status"
-
-      - name: Skip npm publish
-        if: ${{ steps.npm-token.outputs.present != 'true' }}
-        run: echo "NPM_TOKEN is not configured; skipping JS SDK publish."
+  publish-pypi:
+    name: Publish Python SDK
+    needs: build-macos
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ax-serving/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build and test distribution
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade build pytest pytest-asyncio
+          python -m pytest -q
+          python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist/

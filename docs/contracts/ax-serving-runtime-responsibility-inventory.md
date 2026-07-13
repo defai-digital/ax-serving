@@ -1,7 +1,7 @@
 # AX Serving Runtime Responsibility Inventory
 
 > **Status**: Active
-> **Date**: 2026-05-25
+> **Date**: 2026-07-12
 > **Owner**: AX Serving Team
 
 ---
@@ -22,13 +22,15 @@ toward the PRD target architecture:
 
 | Area | Current role | Target role | Status |
 |---|---|---|---|
-| OpenAI-compatible REST/gRPC API | Serving API | Keep in AX Serving | Gateway |
+| OpenAI-compatible REST/SSE API | Serving API | Keep in portable AX Serving | Gateway |
+| `ax.serving.v1` gRPC | Local path/backend/token-ID API | Keep only behind `embedded-compat` pending deprecation policy | Compatibility |
+| `ax-serving-protocol` | Runtime-neutral wire DTOs | Keep as independently versioned cross-platform contract | Protocol |
 | Worker registry, heartbeat, drain | Fleet control plane | Keep in AX Serving | Gateway |
 | Routing, placement, admission, retry | Fleet policy | Keep in AX Serving | Gateway |
 | Metrics, audit, fleet diagnostics | Operator surface | Keep in AX Serving | Gateway |
 | `ax-runtime-agent` / `ax-thor-agent` proxy | Runtime adapter | Keep as thin OpenAI-compatible runtime adapter | Adapter |
 | `ax-serving serve` local worker | Embedded Mac compatibility worker | Keep only as migration bridge | Compatibility |
-| Native ax-engine backend inside serving crate | Direct runtime execution | Prefer `ax-runtime-agent` in front of ax-engine | Compatibility |
+| Native ax-engine backend inside serving crate | Direct runtime execution | Isolated behind `embedded-compat`; prefer the AX Engine agent | Compatibility |
 | llama.cpp subprocess backend | Direct runtime execution | Deprecate after runtime-node deployments cover migration needs | Compatibility |
 | MLX subprocess backend | Direct runtime execution | Deprecate or adapterize after runtime-node replacement is validated | Compatibility |
 | optional libllama direct backend | Direct runtime execution | Deprecate unless required for shim compatibility | Compatibility |
@@ -43,6 +45,8 @@ toward the PRD target architecture:
   approved integrations.
 - New routing and observability features should use runtime/node metadata rather
   than embedded backend internals.
+- The portable gateway dependency tree must not contain AX Engine, MLX,
+  llama.cpp, Metal, CUDA, `prost`, or `tonic`.
 - Runtime-specific tuning belongs in ax-engine or vLLM documentation and
   tooling, not in AX Serving control-plane requirements.
 - Breaking removal requires a migration note and an equivalent node-adapter path.
@@ -51,7 +55,7 @@ toward the PRD target architecture:
 
 ## Operator Signals
 
-`ax-serving doctor` includes a runtime-boundary check:
+The embedded `ax-serving doctor` command includes a runtime-boundary check:
 
 - `PASS` when worker registration is explicitly configured for `ax_engine` or
   `vllm` runtime-node mode.
@@ -85,6 +89,9 @@ The `deny` mode applies to `ax-serving serve -m ...` and single-shot
 `ax-serving -m ...` inference. It does not block `ax-serving-api` gateway mode
 or runtime-node adapters such as `ax-runtime-agent`.
 
+The portable CLI's default feature is `gateway`; building `ax-serving` itself
+requires `--no-default-features --features embedded-compat` on macOS.
+
 ---
 
 ## Removal Gate
@@ -95,7 +102,7 @@ Before removing or disabling any compatibility backend:
 2. Confirm OpenAI-compatible chat/completions behavior through the gateway.
 3. Confirm worker registration, heartbeat, drain, and fleet status.
 4. Confirm routing by model and runtime class.
-5. Run `ax-serving migration embedded-readiness` against the gateway and resolve
+5. Run `ax-servingctl migration embedded-readiness` against the gateway and resolve
    all blockers before switching production to
    `AXS_EMBEDDED_RUNTIME_POLICY=deny`.
 6. Provide migration notes for existing configuration and CLI usage.

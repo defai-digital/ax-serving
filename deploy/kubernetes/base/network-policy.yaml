@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ax-serving-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ax-serving
+      app.kubernetes.io/component: gateway
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 18080
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ax-serving
+              app.kubernetes.io/component: runtime-agent
+      ports:
+        - protocol: TCP
+          port: 19090
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 18081
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

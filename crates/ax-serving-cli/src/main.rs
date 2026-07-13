@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "ax-serving",
+    version,
     about = "AX Serving — LLM inference and worker node for Apple Silicon",
     long_about = "\
 Run a single inference or start an OpenAI-compatible worker node.\n\
@@ -169,6 +170,9 @@ enum Command {
         /// Bearer token. Defaults to the first AXS_API_KEY token when set.
         #[arg(long)]
         api_key: Option<String>,
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long)]
+        admin_key: Option<String>,
         /// Include authenticated gateway diagnostics and recovery actions.
         #[arg(long)]
         diagnostics: bool,
@@ -184,6 +188,9 @@ enum Command {
         /// Bearer token. Defaults to the first AXS_API_KEY token when set.
         #[arg(long)]
         api_key: Option<String>,
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long)]
+        admin_key: Option<String>,
         /// Optional output path for the redacted JSON bundle.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -252,6 +259,9 @@ enum FabricCommand {
         /// Bearer token. Defaults to the first AXS_API_KEY token when set.
         #[arg(long)]
         api_key: Option<String>,
+        /// Admin bearer token for metrics. Defaults to AXS_ADMIN_API_KEY.
+        #[arg(long)]
+        admin_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
         json: bool,
@@ -265,8 +275,8 @@ enum MigrationCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
@@ -281,8 +291,8 @@ enum WorkersCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
@@ -295,8 +305,8 @@ enum WorkersCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
@@ -309,8 +319,8 @@ enum WorkersCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Wait until inflight reaches zero, then call drain-complete.
         #[arg(long)]
@@ -332,8 +342,8 @@ enum WorkersCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
@@ -346,8 +356,8 @@ enum WorkersCommand {
         /// Base URL of the API gateway.
         #[arg(long, default_value = "http://127.0.0.1:18080")]
         url: String,
-        /// Bearer token. Defaults to the first AXS_API_KEY token when set.
-        #[arg(long)]
+        /// Admin bearer token. Defaults to the first AXS_ADMIN_API_KEY token.
+        #[arg(long = "admin-key", visible_alias = "api-key")]
         api_key: Option<String>,
         /// Emit machine-readable JSON for automation.
         #[arg(long)]
@@ -488,7 +498,7 @@ fn main() -> Result<()> {
             routing_config,
             orchestrator,
         }) => {
-            logging::init_logging(cli.verbose);
+            let _telemetry = logging::init_logging(cli.verbose)?;
             serve::run_serve(
                 model,
                 model_id,
@@ -511,19 +521,24 @@ fn main() -> Result<()> {
         Some(Command::Status {
             url,
             api_key,
+            admin_key,
             diagnostics,
             json,
-        }) => support::run_status(url, api_key, diagnostics, json),
+        }) => support::run_status(url, api_key, admin_key, diagnostics, json),
         Some(Command::SupportBundle {
             url,
             api_key,
+            admin_key,
             output,
             json,
-        }) => support::run_support_bundle(url, api_key, output, json),
+        }) => support::run_support_bundle(url, api_key, admin_key, output, json),
         Some(Command::Fabric { command }) => match command {
-            FabricCommand::Validate { url, api_key, json } => {
-                support::run_fabric_validate(url, api_key, json)
-            }
+            FabricCommand::Validate {
+                url,
+                api_key,
+                admin_key,
+                json,
+            } => support::run_fabric_validate(url, api_key, admin_key, json),
         },
         Some(Command::Migration { command }) => match command {
             MigrationCommand::EmbeddedReadiness { url, api_key, json } => {
@@ -687,7 +702,7 @@ fn main() -> Result<()> {
             })
         }
         None => {
-            logging::init_logging(cli.verbose);
+            let _telemetry = logging::init_logging(cli.verbose)?;
             // Inference mode: the selected backend owns its own execution path.
             // Run everything synchronously to avoid nested-runtime panics.
             let model = cli
@@ -707,7 +722,7 @@ fn run_inference(model_path: PathBuf, prompt: String, cli: &Cli) -> Result<()> {
     serve::ensure_embedded_runtime_allowed("single-shot inference mode")?;
 
     // Inference mode uses RouterBackend (same as serve mode).
-    let backend = RouterBackend::from_env();
+    let backend = RouterBackend::try_from_env()?;
     let config = LoadConfig {
         context_length: cli.ctx_size,
         backend_type: if cli.n_gpu_layers == 0 {
@@ -861,6 +876,9 @@ fn build_inference_input(prompt: String, use_chat_template: bool) -> GenerateInp
         GenerateInput::Chat(vec![ax_serving_engine::ChatMessage {
             role: "user".into(),
             content: serde_json::Value::String(prompt),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }])
     } else {
         GenerateInput::Text(prompt)
@@ -888,6 +906,9 @@ mod tests {
                 let expected = ChatMessage {
                     role: "user".into(),
                     content: json!("hello world"),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 };
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].role, expected.role);

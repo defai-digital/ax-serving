@@ -103,12 +103,14 @@ impl EmbeddingBatchRequest {
         match &self.input {
             EmbeddingBatchRequestInput::Strings(texts) => texts
                 .iter()
-                .map(|text| text.chars().count() as u32)
-                .sum::<u32>()
+                .map(|text| saturating_usize_to_u32(text.chars().count()))
+                .fold(0u32, u32::saturating_add)
                 .max(1),
-            EmbeddingBatchRequestInput::Tokens(seqs) => {
-                seqs.iter().map(|seq| seq.len() as u32).sum::<u32>().max(1)
-            }
+            EmbeddingBatchRequestInput::Tokens(seqs) => seqs
+                .iter()
+                .map(|seq| saturating_usize_to_u32(seq.len()))
+                .fold(0u32, u32::saturating_add)
+                .max(1),
         }
     }
 }
@@ -185,6 +187,18 @@ struct PendingEmbeddingRequest {
     tx: oneshot::Sender<std::result::Result<EmbeddingBatchResult, EmbeddingBatchFailure>>,
 }
 
+fn prune_closed_batch_requests(queue: &mut PendingBatchQueue) {
+    for batch in &mut queue.batches {
+        batch.items.retain(|item| !item.tx.is_closed());
+        batch.total_inputs = batch
+            .items
+            .iter()
+            .map(|item| item.request.input_len())
+            .sum();
+    }
+    queue.batches.retain(|batch| !batch.items.is_empty());
+}
+
 impl EmbeddingBatcher {
     pub fn new(
         backend: Arc<dyn InferenceBackend>,
@@ -231,6 +245,7 @@ impl EmbeddingBatcher {
         {
             let mut inner = self.inner.lock().await;
             let queue = inner.entry(key.clone()).or_default();
+            prune_closed_batch_requests(queue);
 
             let fits_existing = queue
                 .batches
@@ -294,6 +309,7 @@ impl EmbeddingBatcher {
         let model = request.model.clone();
         let handle = request.handle;
         let config = request.config.clone();
+        let expected_embeddings = request.input_len();
 
         let pm_permit = self
             .per_model_scheduler
@@ -318,6 +334,12 @@ impl EmbeddingBatcher {
 
         let result = join_result.context("direct embedding task panicked")?;
         let result = result?;
+        if result.embeddings.len() != expected_embeddings {
+            return Err(anyhow!(
+                "embedding result count mismatch: expected {expected_embeddings}, got {}",
+                result.embeddings.len()
+            ));
+        }
         Ok(EmbeddingBatchResult {
             embeddings: result.embeddings,
             prompt_tokens: result.prompt_tokens,
@@ -350,8 +372,13 @@ impl EmbeddingBatcher {
         let PendingBatch {
             id: _,
             total_inputs: _,
-            items,
+            mut items,
         } = batch;
+        items.retain(|item| !item.tx.is_closed());
+        if items.is_empty() {
+            return;
+        }
+
         let result = self.execute_batch_backend(&items).await;
         match result {
             Ok(output) => {
@@ -490,6 +517,10 @@ struct BatchExecutionOutput {
     per_request_prompt_tokens: Vec<u32>,
 }
 
+fn saturating_usize_to_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 fn split_prompt_tokens(total: u32, weights: &[u32]) -> Vec<u32> {
     if weights.is_empty() {
         return Vec::new();
@@ -498,7 +529,11 @@ fn split_prompt_tokens(total: u32, weights: &[u32]) -> Vec<u32> {
         return vec![total];
     }
 
-    let weight_sum = weights.iter().copied().sum::<u32>().max(1) as f64;
+    let weight_sum = weights
+        .iter()
+        .map(|&weight| weight as f64)
+        .sum::<f64>()
+        .max(1.0);
     let mut allocated = Vec::with_capacity(weights.len());
     let mut used = 0u32;
     let mut remainders = Vec::with_capacity(weights.len());
@@ -533,6 +568,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use ax_serving_engine::{
         EmbedConfig, EmbedInput, EmbedResult, GenerateEvent, GenerateInput, GenerationParams,
@@ -551,6 +587,7 @@ mod tests {
         embed_calls: Arc<AtomicUsize>,
         /// Dimension of each returned embedding vector.
         dim: usize,
+        returned_count_offset: isize,
     }
 
     impl EchoEmbedBackend {
@@ -558,6 +595,15 @@ mod tests {
             Arc::new(Self {
                 embed_calls: Arc::new(AtomicUsize::new(0)),
                 dim,
+                returned_count_offset: 0,
+            })
+        }
+
+        fn new_with_count_offset(dim: usize, returned_count_offset: isize) -> Arc<Self> {
+            Arc::new(Self {
+                embed_calls: Arc::new(AtomicUsize::new(0)),
+                dim,
+                returned_count_offset,
             })
         }
     }
@@ -685,7 +731,12 @@ mod tests {
                 EmbedInput::Strings(texts) => texts.len(),
                 EmbedInput::Tokens(seqs) => seqs.len(),
             };
-            let embeddings = (0..count).map(|_| vec![0.0f32; self.dim]).collect();
+            let returned_count = count
+                .checked_add_signed(self.returned_count_offset)
+                .unwrap_or(0);
+            let embeddings = (0..returned_count)
+                .map(|_| vec![0.0f32; self.dim])
+                .collect();
             Ok(EmbedResult {
                 embeddings,
                 prompt_tokens: count as u32 * 4,
@@ -776,6 +827,21 @@ mod tests {
         assert_eq!(embed_calls.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn disabled_batcher_rejects_mismatched_embedding_count() {
+        let backend = EchoEmbedBackend::new_with_count_offset(4, -1);
+        let sched = make_scheduler();
+        let pm = Arc::new(PerModelScheduler::new(4));
+        let batcher = EmbeddingBatcher::new(backend, sched, pm, 1, 50);
+
+        let result = batcher.submit(make_request(vec!["hello", "world"])).await;
+
+        assert!(
+            result.is_err_and(|err| err.message.contains("embedding result count mismatch")),
+            "direct embed should reject mismatched result count"
+        );
+    }
+
     // ── large request bypasses batching ───────────────────────────────────────
 
     #[tokio::test]
@@ -814,6 +880,35 @@ mod tests {
         // only bumped in execute_batch_backend for the batching path).
         let m = batcher.metrics();
         assert_eq!(m.executed_batches.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_batch_request_is_not_sent_to_backend() {
+        let backend = EchoEmbedBackend::new(2);
+        let sched = make_scheduler();
+        let pm = Arc::new(PerModelScheduler::new(4));
+        let batcher = EmbeddingBatcher::new(backend, sched, pm, 4, 20);
+
+        let canceled_batcher = batcher.clone();
+        let canceled = tokio::spawn(async move {
+            canceled_batcher
+                .submit(make_request(vec!["canceled"]))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        canceled.abort();
+        let _ = canceled.await;
+
+        let result = batcher
+            .submit(make_request(vec!["live-a", "live-b", "live-c"]))
+            .await
+            .unwrap();
+
+        assert_eq!(result.embeddings.len(), 3);
+        let metrics = batcher.metrics();
+        assert_eq!(metrics.executed_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.executed_inputs.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.largest_batch_inputs.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -916,5 +1011,12 @@ mod tests {
         for p in &parts {
             assert!(*p >= 2 && *p <= 4, "uneven split: {parts:?}");
         }
+    }
+
+    #[test]
+    fn split_prompt_tokens_handles_large_weights_without_overflow() {
+        let parts = split_prompt_tokens(7, &[u32::MAX, u32::MAX]);
+        assert_eq!(parts.iter().sum::<u32>(), 7);
+        assert!(parts.iter().all(|&part| part <= 7));
     }
 }

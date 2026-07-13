@@ -89,6 +89,10 @@ pub struct MlxConfig {
     /// Recovery window (ms) — how long the breaker stays Open before HalfOpen
     /// (env: `AXS_CB_RECOVERY_MS`).
     pub circuit_breaker_recovery_ms: u64,
+    /// Worker threads used to bridge blocking mlx_lm.server HTTP calls into async callers
+    /// (env: `AXS_MLX_EXECUTOR_THREADS`).
+    /// `None` = default to available host parallelism.
+    pub executor_threads: Option<usize>,
 }
 
 const DEFAULT_MLX_BIN: &str = "mlx_lm.server";
@@ -122,6 +126,7 @@ impl Default for MlxConfig {
             decode_concurrency: None,
             circuit_breaker_trip_threshold: DEFAULT_CB_TRIP_THRESHOLD,
             circuit_breaker_recovery_ms: DEFAULT_CB_RECOVERY_MS,
+            executor_threads: None,
         }
     }
 }
@@ -129,30 +134,35 @@ impl Default for MlxConfig {
 impl MlxConfig {
     /// Apply `AXS_MLX_*` env var overrides.
     pub fn apply_env_overrides(&mut self) {
+        if let Err(err) = self.try_apply_env_overrides() {
+            tracing::warn!(
+                "invalid env override ignored by infallible MlxConfig::apply_env_overrides: {err}"
+            );
+        }
+    }
+
+    /// Apply `AXS_MLX_*` env var overrides, returning an error for malformed values.
+    pub fn try_apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(v) = std::env::var("AXS_MLX_BIN") {
             self.bin = v;
         }
-        if let Ok(v) = std::env::var("AXS_MLX_TOKEN_BATCH")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Some(n) = env_parse::<usize>("AXS_MLX_TOKEN_BATCH")? {
             self.token_batch_size = n.clamp(1, self.token_batch_max);
         }
-        if let Ok(v) = std::env::var("AXS_MLX_DECODE_CONCURRENCY")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_MLX_DECODE_CONCURRENCY")? {
             self.decode_concurrency = Some(n.max(1));
         }
+        if let Some(n) = env_parse::<usize>("AXS_MLX_EXECUTOR_THREADS")? {
+            self.executor_threads = Some(n.max(1));
+        }
         // Circuit breaker — shared env vars with LlamaCppBackend.
-        if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.circuit_breaker_trip_threshold = n;
+        if let Some(n) = env_parse::<u32>("AXS_CB_TRIP_THRESHOLD")? {
+            self.circuit_breaker_trip_threshold = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
-            self.circuit_breaker_recovery_ms = ms;
+        if let Some(ms) = env_parse::<u64>("AXS_CB_RECOVERY_MS")? {
+            self.circuit_breaker_recovery_ms = ms.max(1);
         }
+        Ok(())
     }
 
     /// Create from env vars only (no YAML), using struct defaults as base.
@@ -162,9 +172,32 @@ impl MlxConfig {
         cfg
     }
 
+    /// Create from env vars only, returning an error for malformed overrides.
+    pub fn try_from_env() -> Result<Self> {
+        let mut cfg = Self::default();
+        cfg.try_apply_env_overrides()?;
+        Ok(cfg)
+    }
+
     pub fn effective_batch_size(&self) -> usize {
         self.token_batch_size.clamp(1, self.token_batch_max)
     }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
 }
 
 // ── Model detection ────────────────────────────────────────────────────────────
@@ -230,16 +263,29 @@ fn read_mlx_model_config(path: &Path) -> MlxModelConfig {
     };
     MlxModelConfig {
         model_type: v["model_type"].as_str().unwrap_or("mlx").to_string(),
-        num_hidden_layers: v["num_hidden_layers"].as_u64().unwrap_or(0) as u32,
-        num_attention_heads: v["num_attention_heads"].as_u64().unwrap_or(0) as u32,
-        num_key_value_heads: v["num_key_value_heads"]
-            .as_u64()
-            .or_else(|| v["num_attention_heads"].as_u64())
-            .unwrap_or(0) as u32,
-        hidden_size: v["hidden_size"].as_u64().unwrap_or(0) as u32,
-        vocab_size: v["vocab_size"].as_u64().unwrap_or(0) as u32,
-        max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(0) as u32,
+        num_hidden_layers: json_u32_clamped(&v, "num_hidden_layers"),
+        num_attention_heads: json_u32_clamped(&v, "num_attention_heads"),
+        num_key_value_heads: json_u32_clamped_with_fallback(
+            &v,
+            "num_key_value_heads",
+            "num_attention_heads",
+        ),
+        hidden_size: json_u32_clamped(&v, "hidden_size"),
+        vocab_size: json_u32_clamped(&v, "vocab_size"),
+        max_position_embeddings: json_u32_clamped(&v, "max_position_embeddings"),
     }
+}
+
+fn json_u32_clamped(value: &serde_json::Value, key: &str) -> u32 {
+    value[key].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32
+}
+
+fn json_u32_clamped_with_fallback(value: &serde_json::Value, key: &str, fallback_key: &str) -> u32 {
+    value[key]
+        .as_u64()
+        .or_else(|| value[fallback_key].as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
 
 // ── Health state ──────────────────────────────────────────────────────────────
@@ -267,6 +313,17 @@ fn unix_ms_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn tool_call_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "call_{:016x}{:08x}{:08x}",
+        unix_ms_now(),
+        std::process::id(),
+        n
+    )
 }
 
 /// Per-model circuit breaker for the mlx_lm.server subprocess.
@@ -450,15 +507,11 @@ impl MlxBackend {
                 reqwest::blocking::Client::new()
             }
         };
-        let executor_threads = std::env::var("AXS_MLX_EXECUTOR_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(4)
-            });
+        let executor_threads = config.executor_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+        });
         Self {
             models: Arc::new(Mutex::new(HashMap::new())),
             thermal: ThermalMonitor::new(),
@@ -1098,7 +1151,22 @@ fn build_mlx_chat_body(
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = msgs
         .iter()
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .map(|m| {
+            let mut message = serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            });
+            if let Some(name) = &m.name {
+                message["name"] = serde_json::Value::String(name.clone());
+            }
+            if let Some(tool_calls) = &m.tool_calls {
+                message["tool_calls"] = tool_calls.clone();
+            }
+            if let Some(tool_call_id) = &m.tool_call_id {
+                message["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+            }
+            message
+        })
         .collect();
     let mut body = serde_json::json!({ "messages": messages });
     apply_mlx_generation_params(&mut body, params);
@@ -1154,6 +1222,21 @@ fn post_mlx(
 #[derive(Deserialize)]
 struct MlxSseDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<MlxToolCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct MlxToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MlxToolCallDelta {
+    index: Option<u64>,
+    id: Option<String>,
+    function: Option<MlxToolCallFunctionDelta>,
 }
 
 #[derive(Deserialize)]
@@ -1190,6 +1273,7 @@ struct MlxSseUsage {
 
 #[derive(Deserialize)]
 struct MlxSseChunk {
+    #[serde(default)]
     choices: Vec<MlxSseChoice>,
     usage: Option<MlxSseUsage>,
 }
@@ -1203,7 +1287,7 @@ fn mlx_stream_chat(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_mlx(http, port, "/v1/chat/completions", body)?;
-    parse_mlx_sse(resp, tx, batch_size, emit_logprobs)
+    parse_mlx_sse_reader(resp, tx, batch_size, emit_logprobs)
 }
 
 fn mlx_stream_completions(
@@ -1215,11 +1299,11 @@ fn mlx_stream_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_mlx(http, port, "/v1/completions", body)?;
-    parse_mlx_sse(resp, tx, batch_size, emit_logprobs)
+    parse_mlx_sse_reader(resp, tx, batch_size, emit_logprobs)
 }
 
-fn parse_mlx_sse(
-    resp: reqwest::blocking::Response,
+fn parse_mlx_sse_reader<R: std::io::Read>(
+    resp: R,
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
     batch_size: usize,
     emit_logprobs: bool,
@@ -1231,6 +1315,7 @@ fn parse_mlx_sse(
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut stop_reason = String::new();
+    let mut tool_call_acc: HashMap<u64, (String, String, String)> = HashMap::new();
     // When emitting logprobs, force batch_size=1 to preserve the 1:1
     // Token → TokenLogprob pairing (same strategy as LlamaCppBackend).
     let effective_batch = if emit_logprobs { 1 } else { batch_size };
@@ -1273,14 +1358,28 @@ fn parse_mlx_sse(
             stop_reason = r.clone();
         }
 
-        let token_text = choice
-            .delta
-            .as_ref()
-            .and_then(|d| d.content.as_deref())
-            .unwrap_or("");
-        if token_text.is_empty() {
-            continue;
+        if let Some(delta) = choice.delta.as_ref() {
+            for (fallback_idx, tc) in delta.tool_calls.iter().enumerate() {
+                let idx = tc.index.unwrap_or(fallback_idx as u64);
+                let entry = tool_call_acc
+                    .entry(idx)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                if let Some(id) = tc.id.as_deref() {
+                    entry.0 = id.to_owned();
+                }
+                if let Some(name) = tc.function.as_ref().and_then(|f| f.name.as_deref()) {
+                    entry.1 = name.to_owned();
+                }
+                if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_deref()) {
+                    entry.2.push_str(args);
+                }
+            }
         }
+
+        let token_text = choice.delta.as_ref().and_then(|d| d.content.as_deref());
+        let Some(token_text) = token_text.filter(|text| !text.is_empty()) else {
+            continue;
+        };
 
         // Extract logprob data for this token if present.
         let lp_data = if emit_logprobs {
@@ -1331,6 +1430,14 @@ fn parse_mlx_sse(
         let _ = tx.blocking_send(GenerateEvent::Token(buf));
     }
 
+    let emitted_tool_call = emit_accumulated_tool_calls(tool_call_acc, tx);
+
+    if stop_reason.is_empty() {
+        stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
+    }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens: prompt_tokens as usize,
         completion_tokens: completion_tokens as usize,
@@ -1382,7 +1489,7 @@ fn emit_non_streaming_response(
 
     let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
     let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
-    let stop_reason = val["choices"][0]["finish_reason"]
+    let mut stop_reason = val["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("")
         .to_string();
@@ -1417,6 +1524,15 @@ fn emit_non_streaming_response(
     } else if !text.is_empty() {
         let _ = tx.blocking_send(GenerateEvent::Token(text));
     }
+
+    let emitted_tool_call = emit_non_stream_tool_calls(val, tx);
+    if stop_reason.is_empty() {
+        stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
+    }
+
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
         completion_tokens,
@@ -1426,11 +1542,95 @@ fn emit_non_streaming_response(
     Ok(())
 }
 
+fn emit_non_stream_tool_calls(
+    val: &serde_json::Value,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+) -> bool {
+    let Some(tool_calls) = val["choices"][0]["message"]["tool_calls"].as_array() else {
+        return false;
+    };
+    let mut emitted = false;
+    for tc in tool_calls {
+        let Some(name) = tc["function"]["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let id = tc["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(tool_call_id);
+        let arguments = tc["function"]["arguments"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let _ = tx.blocking_send(GenerateEvent::ToolCall {
+            id,
+            name: name.to_string(),
+            arguments,
+        });
+        emitted = true;
+    }
+    emitted
+}
+
+fn emit_accumulated_tool_calls(
+    mut tool_calls: HashMap<u64, (String, String, String)>,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+) -> bool {
+    let mut sorted = tool_calls.drain().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut emitted = false;
+    for (_, (id, name, arguments)) in sorted {
+        if name.is_empty() {
+            continue;
+        }
+        let call_id = if id.is_empty() { tool_call_id() } else { id };
+        let _ = tx.blocking_send(GenerateEvent::ToolCall {
+            id: call_id,
+            name,
+            arguments,
+        });
+        emitted = true;
+    }
+    emitted
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_body_preserves_tool_call_message_metadata() {
+        let msgs = vec![
+            crate::ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }])),
+                tool_call_id: None,
+            },
+            crate::ChatMessage {
+                role: "tool".into(),
+                content: serde_json::Value::String("{\"ok\":true}".into()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+        let body = build_mlx_chat_body(&msgs, &GenerationParams::default());
+        assert_eq!(body["messages"][0]["content"], serde_json::Value::Null);
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
+    }
 
     #[test]
     fn is_mlx_model_rejects_gguf_file() {
@@ -1488,6 +1688,25 @@ mod tests {
     }
 
     #[test]
+    fn read_mlx_model_config_clamps_oversized_u32_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"num_hidden_layers": 4294967296, "num_attention_heads": 4294967297, "hidden_size": 4294967298, "vocab_size": 4294967299, "max_position_embeddings": 4294967300}"#,
+        )
+        .unwrap();
+
+        let cfg = read_mlx_model_config(dir.path());
+
+        assert_eq!(cfg.num_hidden_layers, u32::MAX);
+        assert_eq!(cfg.num_attention_heads, u32::MAX);
+        assert_eq!(cfg.num_key_value_heads, u32::MAX);
+        assert_eq!(cfg.hidden_size, u32::MAX);
+        assert_eq!(cfg.vocab_size, u32::MAX);
+        assert_eq!(cfg.max_position_embeddings, u32::MAX);
+    }
+
+    #[test]
     fn read_mlx_model_config_defaults_on_empty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
@@ -1501,5 +1720,153 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = read_mlx_model_config(dir.path());
         assert_eq!(cfg.model_type, "mlx");
+    }
+
+    #[test]
+    fn env_overrides_clamp_zero_circuit_breaker_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CB_TRIP_THRESHOLD", "0") };
+        unsafe { std::env::set_var("AXS_CB_RECOVERY_MS", "0") };
+        unsafe { std::env::set_var("AXS_MLX_EXECUTOR_THREADS", "0") };
+
+        let cfg = MlxConfig::from_env();
+        assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
+        assert_eq!(cfg.circuit_breaker_recovery_ms, 1);
+        assert_eq!(cfg.executor_threads, Some(1));
+
+        unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
+        unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+        unsafe { std::env::remove_var("AXS_MLX_EXECUTOR_THREADS") };
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_MLX_DECODE_CONCURRENCY", "many") };
+
+        let err = MlxConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_MLX_DECODE_CONCURRENCY") };
+        assert!(err.contains("AXS_MLX_DECODE_CONCURRENCY"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_executor_threads() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_MLX_EXECUTOR_THREADS", "many") };
+
+        let err = MlxConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_MLX_EXECUTOR_THREADS") };
+        assert!(err.contains("AXS_MLX_EXECUTOR_THREADS"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_mlx_sse_reads_usage_only_chunk_without_choices() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_mlx_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "hello"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 4);
+                assert_eq!(stats.completion_tokens, 6);
+                assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_mlx_sse_emits_accumulated_tool_calls() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}",
+            "]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}",
+            "]},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_mlx_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("tool call event") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_a");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected tool call event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => assert_eq!(stats.stop_reason, "tool_calls"),
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn emit_mlx_non_streaming_response_emits_tool_calls() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{\"q\":\"rust\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        emit_non_streaming_response(&value, &tx, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("tool call event") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected tool call event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 2);
+                assert_eq!(stats.completion_tokens, 3);
+                assert_eq!(stats.stop_reason, "tool_calls");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
     }
 }

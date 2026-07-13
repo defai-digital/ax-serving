@@ -1,0 +1,93 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Eligible runtime endpoints",
+      "type": "stat",
+      "targets": [
+        {"expr": "sum(axs_gateway_workers{state=\"eligible\"})", "legendFormat": "eligible"}
+      ],
+      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Gateway request outcomes",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "sum(rate(axs_gateway_requests_completed_total[5m]))", "legendFormat": "completed/s"},
+        {"expr": "sum(rate(axs_gateway_requests_failed_total[5m]))", "legendFormat": "failed/s"},
+        {"expr": "sum(rate(axs_gateway_requests_cancelled_total[5m]))", "legendFormat": "cancelled/s"}
+      ],
+      "gridPos": {"h": 7, "w": 9, "x": 6, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Admission pressure",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "sum(axs_gateway_queue_requests{state=\"active\"})", "legendFormat": "active"},
+        {"expr": "sum(axs_gateway_queue_requests{state=\"queued\"})", "legendFormat": "queued"},
+        {"expr": "sum(rate(axs_gateway_rejected_total[5m]))", "legendFormat": "rejected/s"}
+      ],
+      "gridPos": {"h": 7, "w": 9, "x": 15, "y": 0}
+    },
+    {
+      "id": 4,
+      "title": "Endpoint selection latency",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(axs_gateway_endpoint_selection_duration_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(axs_gateway_endpoint_selection_duration_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(axs_gateway_endpoint_selection_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7}
+    },
+    {
+      "id": 5,
+      "title": "Dispatch and retry rate",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "sum(rate(axs_gateway_dispatch_attempts_total[5m]))", "legendFormat": "attempts/s"},
+        {"expr": "sum(rate(axs_gateway_retries_total[5m]))", "legendFormat": "safe retries/s"},
+        {"expr": "sum(axs_gateway_worker_inflight)", "legendFormat": "worker inflight"}
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7}
+    },
+    {
+      "id": 6,
+      "title": "Streaming first-byte latency",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(axs_gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(axs_gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(axs_gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15}
+    },
+    {
+      "id": 7,
+      "title": "Stream duration",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(axs_gateway_stream_duration_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(axs_gateway_stream_duration_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(axs_gateway_stream_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["ax-serving", "inference"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "AX Serving Gateway",
+  "uid": "ax-serving-gateway",
+  "version": 1
+}

@@ -30,6 +30,25 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueuePriority {
+    Low,
+    Normal,
+    High,
+}
+
+impl QueuePriority {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+const PRIORITY_AGING_MS: u128 = 5_000;
+
 // ── OverloadPolicy ────────────────────────────────────────────────────────────
 
 /// What to do when both the concurrency limit and queue depth are exceeded.
@@ -234,6 +253,15 @@ impl GlobalQueue {
     /// `max_queue_depth`) and waits up to `wait_ms`.  Applies the overload
     /// policy when the queue is also full.
     pub async fn acquire(&self, client_key: String) -> AcquireResult {
+        self.acquire_with_priority(client_key, QueuePriority::Normal)
+            .await
+    }
+
+    pub async fn acquire_with_priority(
+        &self,
+        client_key: String,
+        priority: QueuePriority,
+    ) -> AcquireResult {
         // ── Fast path: lock-free CAS loop ────────────────────────────────────
         let max = self.config.max_concurrent;
         let mut current = self.active.load(Ordering::Acquire);
@@ -297,8 +325,24 @@ impl GlobalQueue {
                         return AcquireResult::Rejected;
                     }
                     OverloadPolicy::ShedOldest => {
-                        // Evict oldest waiter to make room; active stays the same.
-                        if let Some(oldest) = waiters.pop_front() {
+                        // Shed the oldest waiter in the lowest effective
+                        // priority class. A lower-priority arrival cannot evict
+                        // a higher-priority queued request.
+                        let now = std::time::Instant::now();
+                        let lowest = waiters
+                            .iter()
+                            .map(|entry| effective_priority(entry, now))
+                            .min();
+                        if lowest.is_some_and(|lowest| priority.rank() < lowest) {
+                            self.metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
+                            return AcquireResult::Rejected;
+                        }
+                        let shed_index = lowest.and_then(|lowest| {
+                            waiters
+                                .iter()
+                                .position(|entry| effective_priority(entry, now) == lowest)
+                        });
+                        if let Some(oldest) = shed_index.and_then(|index| waiters.remove(index)) {
                             let _ = oldest.tx.send(false); // false = "you are shed"
                             self.metrics.shed_total.fetch_add(1, Ordering::Relaxed);
                             // Fall through: enqueue current request.
@@ -317,6 +361,8 @@ impl GlobalQueue {
             // handoff); the original moves into the permit when we wake up.
             waiters.push_back(WaiterEntry {
                 client_key: client_key.clone(),
+                priority,
+                enqueued_at: std::time::Instant::now(),
                 tx,
             });
             rx
@@ -351,35 +397,105 @@ impl GlobalQueue {
 
     /// Current number of requests waiting in queue.
     pub fn queued(&self) -> usize {
-        self.waiters_lock().len()
+        let mut waiters = self.waiters_lock();
+        waiters.retain(|entry| !entry.tx.is_closed());
+        waiters.len()
     }
 }
 
 #[derive(Debug)]
 struct WaiterEntry {
     client_key: String,
+    priority: QueuePriority,
+    enqueued_at: std::time::Instant,
     tx: oneshot::Sender<bool>,
+}
+
+fn effective_priority(entry: &WaiterEntry, now: std::time::Instant) -> u8 {
+    let waited_ms = now.saturating_duration_since(entry.enqueued_at).as_millis();
+    let aging = (waited_ms / PRIORITY_AGING_MS).min(2) as u8;
+    entry.priority.rank().saturating_add(aging).min(2)
 }
 
 fn select_next_waiter(
     waiters: &mut VecDeque<WaiterEntry>,
     last_served_client: Option<&str>,
 ) -> Option<WaiterEntry> {
-    let preferred_idx = last_served_client.and_then(|last| {
-        waiters
-            .iter()
-            .position(|entry| !entry.tx.is_closed() && entry.client_key != last)
+    waiters.retain(|entry| !entry.tx.is_closed());
+    let now = std::time::Instant::now();
+    let highest = waiters
+        .iter()
+        .map(|entry| effective_priority(entry, now))
+        .max()?;
+    let preferred_idx = waiters.iter().position(|entry| {
+        effective_priority(entry, now) == highest
+            && last_served_client.is_some_and(|last| entry.client_key != last)
     });
 
     if let Some(idx) = preferred_idx {
         waiters.remove(idx)
     } else {
-        while let Some(entry) = waiters.pop_front() {
-            if !entry.tx.is_closed() {
-                return Some(entry);
+        let idx = waiters
+            .iter()
+            .position(|entry| effective_priority(entry, now) == highest)?;
+        waiters.remove(idx)
+    }
+}
+
+#[derive(Default)]
+pub struct TenantLimiter {
+    active: dashmap::DashMap<String, Arc<AtomicUsize>>,
+}
+
+impl TenantLimiter {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn try_acquire(self: &Arc<Self>, tenant: &str, maximum: usize) -> Option<TenantPermit> {
+        let counter = self
+            .active
+            .entry(tenant.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= maximum.max(1) {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(TenantPermit {
+                        limiter: Arc::clone(self),
+                        tenant: tenant.to_string(),
+                        counter,
+                    });
+                }
+                Err(actual) => current = actual,
             }
         }
-        None
+    }
+}
+
+pub struct TenantPermit {
+    limiter: Arc<TenantLimiter>,
+    tenant: String,
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for TenantPermit {
+    fn drop(&mut self) {
+        let previous = self.counter.fetch_sub(1, Ordering::AcqRel);
+        if previous <= 1 {
+            self.limiter.active.remove_if(&self.tenant, |_, current| {
+                Arc::ptr_eq(current, &self.counter) && current.load(Ordering::Acquire) == 0
+            });
+        }
     }
 }
 
@@ -461,6 +577,19 @@ mod tests {
         let result = handle.await.unwrap();
         assert!(matches!(result, AcquireResult::Timeout));
         assert_eq!(q.metrics.timeout_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_prunes_timed_out_waiters() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 20, OverloadPolicy::Reject)));
+        let _permit = q.acquire(key("a")).await;
+
+        let q2 = Arc::clone(&q);
+        let waiter = tokio::spawn(async move { q2.acquire(key("b")).await });
+
+        let result = waiter.await.unwrap();
+        assert!(matches!(result, AcquireResult::Timeout));
+        assert_eq!(q.queued(), 0);
     }
 
     #[tokio::test]
@@ -614,5 +743,93 @@ mod tests {
 
         let permit_a2 = waiter_a2.await.unwrap();
         assert!(matches!(permit_a2, AcquireResult::Permit(_)));
+    }
+
+    #[tokio::test]
+    async fn queued_handoff_prefers_high_priority_then_serves_low_priority() {
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 1_000, OverloadPolicy::Reject)));
+        let permit = q.acquire(key("active")).await;
+
+        let low_queue = Arc::clone(&q);
+        let low = tokio::spawn(async move {
+            low_queue
+                .acquire_with_priority(key("low"), QueuePriority::Low)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let high_queue = Arc::clone(&q);
+        let high = tokio::spawn(async move {
+            high_queue
+                .acquire_with_priority(key("high"), QueuePriority::High)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(permit);
+        let high_permit = high.await.unwrap();
+        let AcquireResult::Permit(high_permit) = high_permit else {
+            panic!("high-priority waiter did not receive the first handoff")
+        };
+        drop(high_permit);
+        assert!(matches!(low.await.unwrap(), AcquireResult::Permit(_)));
+    }
+
+    #[tokio::test]
+    async fn low_priority_arrival_cannot_shed_high_priority_waiter() {
+        let q = Arc::new(GlobalQueue::new(cfg(
+            1,
+            1,
+            1_000,
+            OverloadPolicy::ShedOldest,
+        )));
+        let active = q.acquire(key("active")).await;
+        let high_queue = Arc::clone(&q);
+        let high = tokio::spawn(async move {
+            high_queue
+                .acquire_with_priority(key("high"), QueuePriority::High)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let low = q
+            .acquire_with_priority(key("low"), QueuePriority::Low)
+            .await;
+        assert!(matches!(low, AcquireResult::Rejected));
+        drop(active);
+        assert!(matches!(high.await.unwrap(), AcquireResult::Permit(_)));
+    }
+
+    #[test]
+    fn tenant_limiter_enforces_and_releases_per_tenant_capacity() {
+        let limiter = TenantLimiter::shared();
+        let first = limiter.try_acquire("tenant-a", 1).unwrap();
+        assert!(limiter.try_acquire("tenant-a", 1).is_none());
+        assert!(limiter.try_acquire("tenant-b", 1).is_some());
+        drop(first);
+        assert!(limiter.try_acquire("tenant-a", 1).is_some());
+    }
+
+    #[test]
+    fn priority_aging_prevents_low_priority_starvation() {
+        let (low_tx, _low_rx) = oneshot::channel();
+        let (high_tx, _high_rx) = oneshot::channel();
+        let mut waiters = VecDeque::from([
+            WaiterEntry {
+                client_key: "low".into(),
+                priority: QueuePriority::Low,
+                enqueued_at: std::time::Instant::now()
+                    - std::time::Duration::from_millis(PRIORITY_AGING_MS as u64 * 2),
+                tx: low_tx,
+            },
+            WaiterEntry {
+                client_key: "high".into(),
+                priority: QueuePriority::High,
+                enqueued_at: std::time::Instant::now(),
+                tx: high_tx,
+            },
+        ]);
+
+        let selected = select_next_waiter(&mut waiters, None).unwrap();
+        assert_eq!(selected.client_key, "low");
     }
 }

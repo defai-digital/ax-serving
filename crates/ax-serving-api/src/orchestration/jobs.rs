@@ -13,18 +13,26 @@ const DEFAULT_COMPLETED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_COMPLETED_JOBS: usize = 1_000;
 
 fn completed_job_ttl_ms() -> u64 {
-    std::env::var("AXS_JOB_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    let raw = std::env::var("AXS_JOB_TTL_SECS").ok();
+    parse_completed_job_ttl_ms(raw.as_deref())
+}
+
+fn parse_completed_job_ttl_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_COMPLETED_JOB_TTL_SECS)
+        .max(1)
         .saturating_mul(1_000)
 }
 
 fn max_completed_jobs() -> usize {
-    std::env::var("AXS_JOB_MAX_COMPLETED")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let raw = std::env::var("AXS_JOB_MAX_COMPLETED").ok();
+    parse_max_completed_jobs(raw.as_deref())
+}
+
+fn parse_max_completed_jobs(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_COMPLETED_JOBS)
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -452,16 +460,35 @@ impl JobStore {
     fn restore_state(&self, state: PersistedJobStoreState) {
         let restored_at_ms = now_ms();
         self.entries.clear();
+        let mut max_job_id = state.next_id;
+        let mut max_batch_id = state.next_batch_id;
         for mut record in state.entries {
             normalize_restored_job_record(&mut record, restored_at_ms);
+            if let Some(id) = parse_counter_suffix(&record.id, "job_") {
+                max_job_id = max_job_id.max(id);
+            }
+            if let Some(batch_id) = record
+                .batch_id
+                .as_deref()
+                .and_then(|id| parse_counter_suffix(id, "batch_"))
+            {
+                max_batch_id = max_batch_id.max(batch_id);
+            }
             self.entries.insert(record.id.clone(), record);
         }
-        self.next_id.store(state.next_id, Ordering::Relaxed);
-        self.next_batch_id
-            .store(state.next_batch_id, Ordering::Relaxed);
+        self.next_id.store(max_job_id, Ordering::Relaxed);
+        self.next_batch_id.store(max_batch_id, Ordering::Relaxed);
         self.pruned_total
             .store(state.pruned_total, Ordering::Relaxed);
     }
+}
+
+fn parse_counter_suffix(value: &str, prefix: &str) -> Option<u64> {
+    let suffix = value.strip_prefix(prefix)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(suffix, 16).ok()
 }
 
 fn now_ms() -> u128 {
@@ -490,7 +517,9 @@ fn normalize_restored_job_record(record: &mut JobRecord, restored_at_ms: u128) {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobRecord, JobStatus, JobStore, PersistedJobStoreState, RESTART_INTERRUPTED_ERROR,
+        DEFAULT_COMPLETED_JOB_TTL_SECS, DEFAULT_MAX_COMPLETED_JOBS, JobRecord, JobStatus, JobStore,
+        PersistedJobStoreState, RESTART_INTERRUPTED_ERROR, parse_completed_job_ttl_ms,
+        parse_counter_suffix, parse_max_completed_jobs,
     };
 
     // ── basic CRUD ────────────────────────────────────────────────────────────
@@ -669,7 +698,14 @@ mod tests {
         let j1 = store.create("chat", None, Some(bid.clone()));
         let j2 = store.create("chat", None, Some(bid.clone()));
         store.mark_finished(&j1.id, JobStatus::Succeeded, 200, None, None, None);
-        store.mark_finished(&j2.id, JobStatus::Failed, 500, None, None, Some("err".into()));
+        store.mark_finished(
+            &j2.id,
+            JobStatus::Failed,
+            500,
+            None,
+            None,
+            Some("err".into()),
+        );
         let batch = store.get_batch(&bid).unwrap();
         assert_eq!(batch.status, JobStatus::Failed);
         assert_eq!(batch.failed_jobs, 1);
@@ -812,25 +848,36 @@ mod tests {
 
     #[test]
     fn mark_finished_auto_prunes_completed_jobs() {
-        let _guard = crate::test_env::lock();
-        unsafe { std::env::set_var("AXS_JOB_TTL_SECS", "3600") };
-        unsafe { std::env::set_var("AXS_JOB_MAX_COMPLETED", "2") };
-
         let store = JobStore::default();
-        let oldest = store.create("completions", Some("m1".into()), None);
-        store.mark_finished(&oldest.id, JobStatus::Succeeded, 200, None, None, None);
-        let middle = store.create("completions", Some("m2".into()), None);
-        store.mark_finished(&middle.id, JobStatus::Succeeded, 200, None, None, None);
-        let newest = store.create("completions", Some("m3".into()), None);
-        store.mark_finished(&newest.id, JobStatus::Succeeded, 200, None, None, None);
+        let mut ids = Vec::with_capacity(DEFAULT_MAX_COMPLETED_JOBS + 1);
+        for idx in 0..=DEFAULT_MAX_COMPLETED_JOBS {
+            let job = store.create("completions", Some(format!("m{idx}")), None);
+            store.mark_finished(&job.id, JobStatus::Succeeded, 200, None, None, None);
+            ids.push(job.id);
+        }
 
-        assert!(store.get(&oldest.id).is_none());
-        assert!(store.get(&middle.id).is_some());
-        assert!(store.get(&newest.id).is_some());
+        assert!(store.get(&ids[0]).is_none());
+        assert!(store.get(ids.last().unwrap()).is_some());
+        assert_eq!(store.summary().total_jobs, DEFAULT_MAX_COMPLETED_JOBS);
         assert_eq!(store.summary().pruned_total, 1);
+    }
 
-        unsafe { std::env::remove_var("AXS_JOB_TTL_SECS") };
-        unsafe { std::env::remove_var("AXS_JOB_MAX_COMPLETED") };
+    #[test]
+    fn job_retention_env_clamps_zero_to_minimum() {
+        assert_eq!(parse_completed_job_ttl_ms(Some("0")), 1_000);
+        assert_eq!(parse_max_completed_jobs(Some("0")), 1);
+    }
+
+    #[test]
+    fn job_retention_env_defaults_invalid_values() {
+        assert_eq!(
+            parse_completed_job_ttl_ms(Some("not-a-number")),
+            DEFAULT_COMPLETED_JOB_TTL_SECS * 1_000
+        );
+        assert_eq!(
+            parse_max_completed_jobs(Some("not-a-number")),
+            DEFAULT_MAX_COMPLETED_JOBS
+        );
     }
 
     #[test]
@@ -916,6 +963,73 @@ mod tests {
         assert_eq!(store.summary().failed_jobs, 1);
     }
 
+    #[test]
+    fn restore_state_advances_job_counter_from_entries_when_snapshot_counter_is_stale() {
+        let store = JobStore::default();
+        store.restore_state(PersistedJobStoreState {
+            entries: vec![JobRecord {
+                id: "job_000000000000000a".into(),
+                kind: "completions".into(),
+                batch_id: None,
+                model_id: Some("model-b".into()),
+                status: JobStatus::Succeeded,
+                created_at_ms: 200,
+                updated_at_ms: 250,
+                completed_at_ms: Some(300),
+                response_status: Some(200),
+                content_type: Some("application/json".into()),
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+            }],
+            next_id: 1,
+            next_batch_id: 0,
+            pruned_total: 0,
+        });
+
+        let created = store.create("completions", Some("model-b".into()), None);
+
+        assert_eq!(created.id, "job_000000000000000b");
+        assert!(store.get("job_000000000000000a").is_some());
+        assert!(store.get("job_000000000000000b").is_some());
+    }
+
+    #[test]
+    fn restore_state_advances_batch_counter_from_entries_when_snapshot_counter_is_stale() {
+        let store = JobStore::default();
+        store.restore_state(PersistedJobStoreState {
+            entries: vec![JobRecord {
+                id: "job_0000000000000001".into(),
+                kind: "completions".into(),
+                batch_id: Some("batch_000000000000000a".into()),
+                model_id: Some("model-b".into()),
+                status: JobStatus::Succeeded,
+                created_at_ms: 200,
+                updated_at_ms: 250,
+                completed_at_ms: Some(300),
+                response_status: Some(200),
+                content_type: Some("application/json".into()),
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+            }],
+            next_id: 1,
+            next_batch_id: 1,
+            pruned_total: 0,
+        });
+
+        assert_eq!(store.new_batch_id(), "batch_000000000000000b");
+    }
+
+    #[test]
+    fn parse_counter_suffix_accepts_hex_prefixed_ids_only() {
+        assert_eq!(
+            parse_counter_suffix("job_000000000000000a", "job_"),
+            Some(10)
+        );
+        assert_eq!(parse_counter_suffix("batch_10", "job_"), None);
+        assert_eq!(parse_counter_suffix("job_not_hex", "job_"), None);
+        assert_eq!(parse_counter_suffix("job_", "job_"), None);
+    }
+
     // ── list_batches_recent ───────────────────────────────────────────────────
 
     #[test]
@@ -929,7 +1043,8 @@ mod tests {
 
         let batches = store.list_batches_recent(10);
         assert_eq!(batches.len(), 2);
-        let ids: std::collections::HashSet<_> = batches.iter().map(|b| b.batch_id.clone()).collect();
+        let ids: std::collections::HashSet<_> =
+            batches.iter().map(|b| b.batch_id.clone()).collect();
         assert!(ids.contains(&batch_a));
         assert!(ids.contains(&batch_b));
     }

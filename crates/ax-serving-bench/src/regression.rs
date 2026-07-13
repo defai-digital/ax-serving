@@ -30,7 +30,12 @@ struct Metrics {
 /// exceeds `baseline * (1 + tolerance_pct / 100)`.
 ///
 /// Null baseline values → skip (no baseline established yet).
-pub fn check(results: PathBuf, baseline: PathBuf, tolerance_pct: f64) -> Result<()> {
+pub fn check(
+    results: PathBuf,
+    baseline: PathBuf,
+    tolerance_pct: f64,
+    require_baseline: bool,
+) -> Result<()> {
     let results_str = std::fs::read_to_string(&results)
         .with_context(|| format!("failed to read results file: {}", results.display()))?;
     let baseline_str = std::fs::read_to_string(&baseline)
@@ -61,6 +66,7 @@ pub fn check(results: PathBuf, baseline: PathBuf, tolerance_pct: f64) -> Result<
     println!("{}", "-".repeat(62));
 
     let mut any_failed = false;
+    let mut established_baselines = 0usize;
 
     for (name, result_val, baseline_val) in checks {
         match (result_val, baseline_val) {
@@ -74,8 +80,10 @@ pub fn check(results: PathBuf, baseline: PathBuf, tolerance_pct: f64) -> Result<
                 );
             }
             (None, Some(bv)) => {
+                established_baselines += 1;
+                any_failed = true;
                 println!(
-                    "{:<14}  {:>12}  {:>12}  {:>10}  no results",
+                    "{:<14}  {:>12}  {:>12}  {:>10}  FAIL ← no results",
                     name,
                     "N/A",
                     format!("{bv:.0}"),
@@ -83,6 +91,7 @@ pub fn check(results: PathBuf, baseline: PathBuf, tolerance_pct: f64) -> Result<
                 );
             }
             (Some(rv), Some(bv)) => {
+                established_baselines += 1;
                 let threshold = bv * multiplier;
                 let pass = *rv <= threshold;
                 if !pass {
@@ -102,12 +111,91 @@ pub fn check(results: PathBuf, baseline: PathBuf, tolerance_pct: f64) -> Result<
 
     println!();
 
+    if require_baseline && established_baselines == 0 {
+        anyhow::bail!(
+            "regression check failed: no baseline metrics are established; populate the baseline \
+             before running a release gate"
+        );
+    }
+
     if any_failed {
         anyhow::bail!(
-            "regression check failed: one or more metrics exceeded baseline + {tolerance_pct:.1}%"
+            "regression check failed: one or more metrics exceeded baseline + {tolerance_pct:.1}% \
+             or were missing from results"
         );
     }
 
     println!("All checks passed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    fn write_temp_json(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ax-serving-bench-{name}-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, body).expect("write temp json");
+        path
+    }
+
+    #[test]
+    fn missing_result_for_established_baseline_fails() {
+        let results = write_temp_json(
+            "missing-result",
+            r#"{"short_p99": null, "medium_p99": null, "long_p99": null, "overall_p99": null}"#,
+        );
+        let baseline = write_temp_json(
+            "established-baseline",
+            r#"{"short_p99": 100.0, "medium_p99": null, "long_p99": null, "overall_p99": null}"#,
+        );
+
+        let err = super::check(results.clone(), baseline.clone(), 10.0, false).unwrap_err();
+        assert!(err.to_string().contains("missing from results"));
+
+        let _ = std::fs::remove_file(results);
+        let _ = std::fs::remove_file(baseline);
+    }
+
+    #[test]
+    fn require_baseline_rejects_all_null_baseline() {
+        let results = write_temp_json(
+            "results",
+            r#"{"short_p99": 100.0, "medium_p99": 200.0, "long_p99": 300.0, "overall_p99": 400.0}"#,
+        );
+        let baseline = write_temp_json(
+            "null-baseline",
+            r#"{"short_p99": null, "medium_p99": null, "long_p99": null, "overall_p99": null}"#,
+        );
+
+        let err = super::check(results.clone(), baseline.clone(), 10.0, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no baseline metrics are established")
+        );
+
+        let _ = std::fs::remove_file(results);
+        let _ = std::fs::remove_file(baseline);
+    }
+
+    #[test]
+    fn all_null_baseline_without_release_requirement_still_passes() {
+        let results = write_temp_json(
+            "incremental-results",
+            r#"{"short_p99": 100.0, "medium_p99": 200.0, "long_p99": 300.0, "overall_p99": 400.0}"#,
+        );
+        let baseline = write_temp_json(
+            "incremental-baseline",
+            r#"{"short_p99": null, "medium_p99": null, "long_p99": null, "overall_p99": null}"#,
+        );
+
+        super::check(results.clone(), baseline.clone(), 10.0, false).unwrap();
+
+        let _ = std::fs::remove_file(results);
+        let _ = std::fs::remove_file(baseline);
+    }
 }

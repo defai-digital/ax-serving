@@ -1,0 +1,71 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ax-serving-gateway
+  labels:
+    app.kubernetes.io/name: ax-serving
+    app.kubernetes.io/component: gateway
+spec:
+  groups:
+    - name: ax-serving.availability
+      rules:
+        - alert: AxServingGatewayTargetDown
+          expr: up{job=~".*ax-serving.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: AX Serving gateway metrics target is unavailable
+            runbook_url: docs/runbooks/multi-worker.md#14-incident-response
+        - alert: AxServingNoEligibleWorkers
+          expr: axs_gateway_workers{state="eligible"} < 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: AX Serving gateway has no eligible runtime endpoint
+            runbook_url: docs/runbooks/multi-worker.md#14-incident-response
+        - alert: AxServingGatewayRequestFailureRate
+          expr: >-
+            rate(axs_gateway_requests_failed_total[5m])
+            /
+            clamp_min(rate(axs_gateway_requests_total[5m]), 0.001)
+            > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: AX Serving request failure ratio exceeds the provisional 5 percent threshold
+            runbook_url: docs/runbooks/multi-worker.md#14-incident-response
+    - name: ax-serving.saturation
+      rules:
+        - alert: AxServingGatewayRejectingRequests
+          expr: rate(axs_gateway_rejected_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: AX Serving admission is rejecting or timing out requests
+            runbook_url: docs/runbooks/multi-worker.md#8-admission-and-tenant-controls
+        - alert: AxServingGatewayRetryIncrease
+          expr: rate(axs_gateway_retries_total[10m]) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: AX Serving safe retries exceed the provisional baseline
+            runbook_url: docs/runbooks/multi-worker.md#7-request-and-retry-contract
+        - alert: AxServingEndpointSelectionP99
+          expr: >-
+            histogram_quantile(
+              0.99,
+              sum by (le, instance) (
+                rate(axs_gateway_endpoint_selection_duration_seconds_bucket[5m])
+              )
+            ) > 0.002
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: AX Serving endpoint-selection p99 exceeds the 2 ms release gate
+            runbook_url: docs/perf/service-tuning.md#6-production-release-gates

@@ -5,6 +5,7 @@
 #
 # Auto-loaded from (first match):
 #   $AXS_CONFIG  >  config/serving.yaml  >  serving.yaml  >  ~/.config/ax-serving/serving.yaml
+# If $AXS_CONFIG is set, the path must exist; startup fails closed otherwise.
 #
 # All values below show the built-in defaults.
 
@@ -16,7 +17,7 @@ grpc_port: null                # env: AXS_GRPC_PORT  (set to enable TCP gRPC alo
 
 # ── Admission scheduler ───────────────────────────────────────────────────────
 sched_max_inflight: 16         # env: AXS_SCHED_MAX_INFLIGHT
-sched_max_queue: 128           # env: AXS_SCHED_MAX_QUEUE
+sched_max_queue: 128           # env: AXS_SCHED_MAX_QUEUE (0 = fail fast, no waiting queue)
 sched_max_wait_ms: 120000      # env: AXS_SCHED_MAX_WAIT_MS
                                # (2 minutes — embedding requests can take 2-15s on local models)
 sched_overload_policy: "queue" # env: AXS_OVERLOAD_POLICY  ("queue" | "reject" | "shed_oldest")
@@ -80,6 +81,8 @@ llamacpp:
   health_poller_max_restarts: 3
   cache_prompt: true           # env: AXS_LLAMACPP_CACHE_PROMPT
                                # (pass cache_prompt=true in llama-server requests)
+  # executor_threads: 8        # env: AXS_LLAMACPP_EXECUTOR_THREADS
+                               # (blocking HTTP bridge threads; defaults to host parallelism)
   # n_batch: 4096              # env: AXS_LLAMACPP_N_BATCH  (logical batch size)
   # n_ubatch: 4096             # env: AXS_LLAMACPP_N_UBATCH  (physical/micro batch size)
                                # IMPORTANT: set n_ubatch >= n_batch for embedding models.
@@ -97,12 +100,24 @@ orchestrator:
                                # (expected heartbeat interval from workers, ms)
   worker_ttl_ms: 15000         # env: AXS_WORKER_TTL_MS
                                # (age at which a silent worker is evicted, ms)
-  dispatch_policy: "least_inflight"  # env: AXS_DISPATCH_POLICY
-                               # ("least_inflight" | "weighted_round_robin" | "model_affinity")
+  dispatch_policy: "inference_aware"  # env: AXS_DISPATCH_POLICY
+                               # production: inference_aware; compatibility policies remain available
+  deployment_mode: "legacy_compat" # env: AXS_DEPLOYMENT_MODE
+                               # use explicit for certified logical-model routing across MLX/CUDA pools
+  telemetry_stale_ms: 10000    # env: AXS_TELEMETRY_STALE_MS
+  max_dispatch_attempts: 2     # env: AXS_MAX_DISPATCH_ATTEMPTS (hard maximum: 2)
+  tls_profile: "loopback_dev" # env: AXS_TLS_PROFILE (remote: trusted_mesh)
+  # dispatch_token is intentionally supplied via AXS_DISPATCH_TOKEN, not YAML.
+  fleet_store: "memory"       # env: AXS_FLEET_STORE (HA: redis)
+  fleet_key_prefix: "axs:fleet:v1" # env: AXS_FLEET_KEY_PREFIX
+  gateway_id: "gateway-local" # env: AXS_GATEWAY_ID; unique per active replica
+  # Supply AXS_REDIS_URL only through the secret environment when fleet_store=redis.
   retry_after_secs: 5          # env: AXS_RETRY_AFTER_SECS  (Retry-After on 429)
   pool_max_idle_per_host: 8    # env: AXS_DISPATCHER_POOL_MAX_IDLE
   request_timeout_secs: 300    # env: AXS_DISPATCHER_TIMEOUT_SECS
                                # (timeout for orchestrator -> worker proxy requests)
+  first_byte_timeout_ms: 120000 # env: AXS_FIRST_BYTE_TIMEOUT_MS
+  stream_idle_timeout_ms: 30000 # env: AXS_STREAM_IDLE_TIMEOUT_MS
 
   # Global admission queue (controls what the orchestrator proxy accepts)
   global_queue_max: 128        # env: AXS_GLOBAL_QUEUE_MAX
@@ -113,6 +128,8 @@ orchestrator:
                                # (max ms a queued request waits before timing out)
   global_queue_policy: "queue"  # env: AXS_GLOBAL_QUEUE_POLICY
                                # ("queue"/"reject" → HTTP 429 | "shed_oldest" → HTTP 503)
+  tenant_max_concurrent: 0      # env: AXS_TENANT_MAX_CONCURRENT (0 disables)
+  # Set AXS_CACHE_AFFINITY_SECRET (32+ random bytes); never store it in YAML.
 
 # ── License reminder & dashboard ─────────────────────────────────────────────
 # Trust-based; no enforcement or feature gating.
@@ -123,5 +140,7 @@ license:
                                # (directory under ~/.config/ for the license key file)
   key_file: "license.key"     # env: AXS_LICENSE_KEY_FILE
                                # (key filename within config_dir)
+  persist: true               # env: AXS_LICENSE_PERSIST
+                               # (disable for ephemeral/test processes)
   dashboard_poll_ms: 2000     # env: AXS_DASHBOARD_POLL_MS
                                # (dashboard polling interval in ms; min 500)

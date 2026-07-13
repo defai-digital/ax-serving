@@ -129,7 +129,7 @@ impl SchedulerConfig {
             max_inflight: max_inflight.max(1),
             max_queue,
             max_wait_ms,
-            overload_policy: match overload_policy.to_lowercase().as_str() {
+            overload_policy: match overload_policy.trim().to_lowercase().as_str() {
                 "shed_oldest" | "shed-oldest" => OverloadPolicy::ShedOldest,
                 "reject" => OverloadPolicy::Reject,
                 _ => OverloadPolicy::Queue,
@@ -442,21 +442,47 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig, thermal: Arc<ThermalMonitor>) -> Self {
-        let adaptive = std::env::var("AXS_TARGET_P99_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(|target_ms| {
-                let probe_interval = std::env::var("AXS_ADAPTIVE_PROBE_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(50);
-                Arc::new(AdaptiveController::new(
-                    config.max_inflight,
-                    target_ms,
-                    probe_interval,
-                ))
-            });
+        let split_enabled = split_scheduler_from_env();
+        Self::new_with_split_enabled(config, thermal, split_enabled)
+    }
+
+    fn new_with_split_enabled(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+    ) -> Self {
+        let adaptive = match adaptive_from_env(&config) {
+            Ok(adaptive) => adaptive,
+            Err(err) => {
+                tracing::warn!(
+                    "invalid adaptive scheduler env ignored by infallible Scheduler::new: {err}"
+                );
+                None
+            }
+        };
+        Self::new_with_split_and_adaptive(config, thermal, split_enabled, adaptive)
+    }
+
+    fn try_new_with_split_enabled(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+    ) -> Result<Self> {
+        let adaptive = adaptive_from_env(&config)?;
+        Ok(Self::new_with_split_and_adaptive(
+            config,
+            thermal,
+            split_enabled,
+            adaptive,
+        ))
+    }
+
+    fn new_with_split_and_adaptive(
+        config: SchedulerConfig,
+        thermal: Arc<ThermalMonitor>,
+        split_enabled: bool,
+        adaptive: Option<Arc<AdaptiveController>>,
+    ) -> Self {
         if let Some(ref a) = adaptive {
             tracing::info!(
                 target_p99_ms = a.target_p99_ms(),
@@ -470,9 +496,6 @@ impl Scheduler {
                  the oldest waiting request will be evicted (503) to make room for the new one."
             );
         }
-        let split_enabled = std::env::var("AXS_SPLIT_SCHEDULER")
-            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
         let semaphore = Arc::new(Semaphore::new(config.max_inflight));
         Self {
             config,
@@ -490,9 +513,10 @@ impl Scheduler {
         max_queue: usize,
         max_wait_ms: u64,
         overload_policy: &str,
+        split_enabled: bool,
         thermal: Arc<ThermalMonitor>,
     ) -> Self {
-        Self::new(
+        Self::new_with_split_enabled(
             SchedulerConfig::from_serve_config(
                 max_inflight,
                 max_queue,
@@ -500,6 +524,27 @@ impl Scheduler {
                 overload_policy,
             ),
             thermal,
+            split_enabled,
+        )
+    }
+
+    pub fn try_from_serve_config(
+        max_inflight: usize,
+        max_queue: usize,
+        max_wait_ms: u64,
+        overload_policy: &str,
+        split_enabled: bool,
+        thermal: Arc<ThermalMonitor>,
+    ) -> Result<Self> {
+        Self::try_new_with_split_enabled(
+            SchedulerConfig::from_serve_config(
+                max_inflight,
+                max_queue,
+                max_wait_ms,
+                overload_policy,
+            ),
+            thermal,
+            split_enabled,
         )
     }
 
@@ -570,25 +615,32 @@ impl Scheduler {
         // atomically under the shed_waiters lock to prevent TOCTOU races where a
         // request claims a queue slot but isn't yet visible to shed_oldest eviction.
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let queue_len = {
+        {
             let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
+            waiters.retain(|tx| !tx.is_closed());
             // Register *before* checking capacity so this request is visible to
             // concurrent shed_oldest callers from the moment it claims a slot.
             waiters.push_back(cancel_tx);
-            let queue_len = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
-            if queue_len >= self.config.max_queue as i64 {
+            let _queue_depth_before = self.metrics.queue_depth.fetch_add(1, Ordering::SeqCst);
+            let live_waiters = waiters.len();
+            if live_waiters > self.config.max_queue {
                 if self.config.overload_policy == OverloadPolicy::ShedOldest {
                     // Evict the oldest waiter to make room for the incoming request.
                     // We need len > 1 so pop_front returns someone *other* than us
                     // (we just pushed to the back).
-                    if waiters.len() > 1 {
+                    let mut shed_live_waiter = false;
+                    while waiters.len() > 1 {
                         if let Some(tx) = waiters.pop_front() {
                             // Signal the victim — its select! branch will fire and return Shed.
-                            let _ = tx.send(());
-                            self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
-                            // queue_depth stays the same: oldest leaves, new request enters.
+                            if tx.send(()).is_ok() {
+                                self.metrics.shed_requests.fetch_add(1, Ordering::Relaxed);
+                                // queue_depth stays the same: oldest leaves, new request enters.
+                                shed_live_waiter = true;
+                                break;
+                            }
                         }
-                    } else {
+                    }
+                    if !shed_live_waiter {
                         // We are the only waiter (max_queue=0 or all others already
                         // drained) — cannot shed ourselves; reject instead.
                         waiters.pop_back(); // remove ourselves
@@ -597,7 +649,7 @@ impl Scheduler {
                             .rejected_requests
                             .fetch_add(1, Ordering::Relaxed);
                         return Err(SchedulerError::QueueFull {
-                            waiting: queue_len,
+                            waiting: live_waiters.saturating_sub(1) as i64,
                             max: self.config.max_queue,
                         }
                         .into());
@@ -610,15 +662,14 @@ impl Scheduler {
                         .rejected_requests
                         .fetch_add(1, Ordering::Relaxed);
                     return Err(SchedulerError::QueueFull {
-                        waiting: queue_len,
+                        waiting: live_waiters.saturating_sub(1) as i64,
                         max: self.config.max_queue,
                     }
                     .into());
                 }
             }
-            queue_len
-        };
-        let _ = queue_len;
+        }
+        let _queue_depth_guard = QueueDepthGuard::new(Arc::clone(&self.metrics));
 
         // Count requests that actually enter the wait queue (used as denominator
         // for avg_queue_wait_us — fast-path requests must not pollute this count).
@@ -637,8 +688,6 @@ impl Scheduler {
             }
         })
         .await;
-
-        self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
 
         let permit = match result {
             Ok(Ok(p)) => {
@@ -772,6 +821,60 @@ impl Scheduler {
     fn cleanup_shed_waiters(&self) {
         let mut waiters = self.shed_waiters.lock().unwrap_or_else(|e| e.into_inner());
         waiters.retain(|tx| !tx.is_closed());
+    }
+}
+
+fn split_scheduler_from_env() -> bool {
+    std::env::var("AXS_SPLIT_SCHEDULER")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+fn adaptive_from_env(config: &SchedulerConfig) -> Result<Option<Arc<AdaptiveController>>> {
+    let Some(target_ms) = env_u64("AXS_TARGET_P99_MS")? else {
+        return Ok(None);
+    };
+    if target_ms == 0 {
+        return Ok(None);
+    }
+
+    let probe_interval = env_u64("AXS_ADAPTIVE_PROBE_INTERVAL")?.unwrap_or(50).max(1);
+    Ok(Some(Arc::new(AdaptiveController::new(
+        config.max_inflight,
+        target_ms,
+        probe_interval,
+    ))))
+}
+
+fn env_u64(name: &str) -> Result<Option<u64>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
+}
+
+struct QueueDepthGuard {
+    metrics: Arc<SchedulerMetrics>,
+}
+
+impl QueueDepthGuard {
+    fn new(metrics: Arc<SchedulerMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        self.metrics.queue_depth.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -983,7 +1086,24 @@ impl LatencyWindow {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{MutexGuard, OnceLock};
+
     use super::*;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn test_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_inflight: 4,
+            max_queue: 4,
+            max_wait_ms: 100,
+            overload_policy: OverloadPolicy::Queue,
+        }
+    }
 
     #[tokio::test]
     async fn permit_raii_decrements_inflight() {
@@ -1003,6 +1123,66 @@ mod tests {
         assert_eq!(s.metrics.inflight_count.load(Ordering::Relaxed), 1);
         drop(p2);
         assert_eq!(s.metrics.inflight_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn try_from_serve_config_rejects_malformed_adaptive_target_env() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "soon") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+
+        let err = match Scheduler::try_from_serve_config(
+            4,
+            4,
+            100,
+            "queue",
+            false,
+            Arc::new(ThermalMonitor::new()),
+        ) {
+            Ok(_) => panic!("malformed adaptive target should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        assert!(err.contains("AXS_TARGET_P99_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_from_serve_config_rejects_malformed_adaptive_probe_env() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "250") };
+        unsafe { std::env::set_var("AXS_ADAPTIVE_PROBE_INTERVAL", "often") };
+
+        let err = match Scheduler::try_new_with_split_enabled(
+            test_config(),
+            Arc::new(ThermalMonitor::new()),
+            false,
+        ) {
+            Ok(_) => panic!("malformed adaptive probe interval should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+        assert!(err.contains("AXS_ADAPTIVE_PROBE_INTERVAL"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_probe_interval_env_clamps_zero_to_one() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("AXS_TARGET_P99_MS", "250") };
+        unsafe { std::env::set_var("AXS_ADAPTIVE_PROBE_INTERVAL", "0") };
+
+        let scheduler = Scheduler::try_new_with_split_enabled(
+            test_config(),
+            Arc::new(ThermalMonitor::new()),
+            false,
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("AXS_TARGET_P99_MS") };
+        unsafe { std::env::remove_var("AXS_ADAPTIVE_PROBE_INTERVAL") };
+        assert_eq!(scheduler.adaptive.unwrap().probe_interval, 1);
     }
 
     #[tokio::test]
@@ -1135,6 +1315,8 @@ mod tests {
         assert_eq!(shed.overload_policy, OverloadPolicy::ShedOldest);
         let shed2 = SchedulerConfig::from_serve_config(4, 32, 200, "shed-oldest");
         assert_eq!(shed2.overload_policy, OverloadPolicy::ShedOldest);
+        let shed3 = SchedulerConfig::from_serve_config(4, 32, 200, " Shed-Oldest ");
+        assert_eq!(shed3.overload_policy, OverloadPolicy::ShedOldest);
         let rej = SchedulerConfig::from_serve_config(4, 32, 200, "reject");
         assert_eq!(rej.overload_policy, OverloadPolicy::Reject);
         let queue = SchedulerConfig::from_serve_config(4, 32, 200, "queue");
@@ -1148,6 +1330,35 @@ mod tests {
     fn scheduler_config_enforces_min_inflight() {
         let cfg = SchedulerConfig::from_serve_config(0, 32, 200, "queue");
         assert_eq!(cfg.max_inflight, 1, "min inflight should be 1");
+    }
+
+    #[test]
+    fn scheduler_from_serve_config_uses_loaded_split_scheduler_setting() {
+        let enabled = Scheduler::from_serve_config(
+            4,
+            32,
+            200,
+            "queue",
+            true,
+            Arc::new(ThermalMonitor::new()),
+        );
+        assert!(
+            enabled.split_enabled,
+            "config-file split_scheduler=true should enable split tracking"
+        );
+
+        let disabled = Scheduler::from_serve_config(
+            4,
+            32,
+            200,
+            "queue",
+            false,
+            Arc::new(ThermalMonitor::new()),
+        );
+        assert!(
+            !disabled.split_enabled,
+            "config-file split_scheduler=false should disable split tracking"
+        );
     }
 
     #[test]
@@ -1315,6 +1526,129 @@ mod tests {
             "error message should mention timeout: {msg}"
         );
         assert_eq!(s.metrics.rejected_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_acquire_releases_queue_depth() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5_000,
+                overload_policy: OverloadPolicy::Reject,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        let p1 = s.acquire().await.unwrap();
+        let s2 = Arc::clone(&s);
+        let waiter = tokio::spawn(async move { s2.acquire().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        waiter.abort();
+        match waiter.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("queued acquire should have been cancelled"),
+        }
+        assert_eq!(
+            s.metrics.queue_depth.load(Ordering::SeqCst),
+            0,
+            "dropping a queued acquire future must release queue_depth"
+        );
+
+        let s3 = Arc::clone(&s);
+        let next_waiter = tokio::spawn(async move { s3.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        drop(p1);
+        let p2 = next_waiter
+            .await
+            .expect("next waiter task panicked")
+            .expect("next waiter should not be rejected by leaked queue depth");
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
+        drop(p2);
+    }
+
+    #[tokio::test]
+    async fn stale_queue_depth_metric_does_not_reject_live_capacity() {
+        let s = Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5,
+                overload_policy: OverloadPolicy::Queue,
+            },
+            Arc::new(ThermalMonitor::new()),
+        );
+
+        let _held = Arc::clone(&s.semaphore).try_acquire_owned().unwrap();
+        s.metrics.queue_depth.store(1, Ordering::SeqCst);
+
+        let err = match s.acquire().await {
+            Ok(_) => {
+                panic!("stale queue_depth metric must not grant a permit while semaphore is held")
+            }
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("timed out"),
+            "request should queue against the live waiter set instead of rejecting on stale metric: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shed_oldest_skips_cancelled_waiters() {
+        let s = Arc::new(Scheduler::new(
+            SchedulerConfig {
+                max_inflight: 1,
+                max_queue: 1,
+                max_wait_ms: 5_000,
+                overload_policy: OverloadPolicy::ShedOldest,
+            },
+            Arc::new(ThermalMonitor::new()),
+        ));
+
+        let p1 = s.acquire().await.unwrap();
+
+        let stale_scheduler = Arc::clone(&s);
+        let stale_waiter = tokio::spawn(async move { stale_scheduler.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+        stale_waiter.abort();
+        match stale_waiter.await {
+            Err(err) => assert!(err.is_cancelled(), "first waiter should be cancelled"),
+            Ok(_) => panic!("first waiter should not complete before cancellation"),
+        }
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 0);
+
+        let older_scheduler = Arc::clone(&s);
+        let older_waiter = tokio::spawn(async move { older_scheduler.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.metrics.queue_depth.load(Ordering::SeqCst), 1);
+
+        let newer_scheduler = Arc::clone(&s);
+        let newer_waiter = tokio::spawn(async move { newer_scheduler.acquire().await });
+
+        let older_result = tokio::time::timeout(Duration::from_millis(500), older_waiter)
+            .await
+            .expect("oldest live waiter should be shed promptly")
+            .expect("oldest live waiter task panicked");
+        assert!(
+            older_result.is_err_and(|err| err.to_string().contains("shed")),
+            "oldest live waiter should be shed, not a stale cancelled waiter"
+        );
+        assert_eq!(s.metrics.shed_requests.load(Ordering::Relaxed), 1);
+
+        drop(p1);
+        let newer_permit = newer_waiter
+            .await
+            .expect("newer waiter task panicked")
+            .expect("newer waiter should acquire after stale waiter is skipped");
+        drop(newer_permit);
     }
 
     // ── split-scheduler drop-without-ttft clears prefill ──────────────────────

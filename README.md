@@ -1,532 +1,268 @@
 # AX Serving
 
-**Category:** Department-Scale Private AI Fleet Control Plane
+[![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-**Product:** The serving and orchestration layer for multi-model private AI fleets operated by SMEs and enterprise departments.
+AX Serving is a runtime-neutral inference gateway and fleet control plane. It
+provides one OpenAI-compatible endpoint over AX Engine deployments on Apple
+Silicon and certified vLLM or SGLang deployments on CUDA.
 
+AX Serving does not generate tokens. The selected runtime owns tokenization,
+chat templates, batching, KV cache, speculative decoding, distributed
+execution, and hardware kernels. AX Serving owns authentication, admission,
+fleet state, model deployment identity, endpoint selection, safe failover,
+streaming transport, and operator workflows.
 
-[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/defai-digital/ax-serving)
-[![rust-1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
-[![Tests: 384 passing](https://img.shields.io/badge/tests-384%20passing-brightgreen)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
-[![license-AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+Project status: the runtime-neutral architecture is implemented in the source
+tree and covered by mock/conformance tests. It is not yet certified as a
+production-ready hybrid release. Live AX Engine plus CUDA certification,
+production-envelope latency/goodput measurements, and the required 60-minute
+soak artifacts must pass before that claim is made. See the
+[canonical PRD](.internal/prd/PRD-AX-SERVING.md) for the release gates.
 
-AX Serving is the serving and orchestration control plane behind
-[AX Fabric](https://github.com/defai-digital/ax-fabric). It is designed for
-department-scale private AI fleets that need OpenAI-compatible APIs, runtime
-and model inventory, scheduling, metrics, audit surfaces, and multi-worker
-routing across heterogeneous runtime nodes.
+## Product boundary
 
-AX Serving is not the token-generation engine. In the target architecture,
-inference execution is delegated to runtime nodes:
+The useful comparisons are at matching layers:
 
-- Mac nodes run `ax-engine`
-- PC CUDA nodes run `vLLM`
-- NVIDIA Thor nodes run `vLLM`
+| Layer | AX stack | Comparable project |
+| --- | --- | --- |
+| Inference runtime | AX Engine on MLX | llama.cpp or another local inference runtime |
+| Serving control plane | AX Serving | a vLLM-compatible gateway/control plane |
+| CUDA execution behind AX Serving | vLLM or SGLang | the same runtime used directly |
 
-The existing embedded local worker path remains available as a compatibility
-bridge. New deployments should prefer runtime-node adapters such as
-`ax-runtime-agent` in front of ax-engine or vLLM endpoints.
+AX Engine versus llama.cpp is an engine benchmark. AX Serving versus vLLM is
+not an engine benchmark: AX Serving complements vLLM by managing it alongside
+MLX runtimes. Serving measurements compare direct runtime traffic with the
+same traffic through AX Serving, then test mixed-fleet failure and overload
+behavior.
 
-AX Fabric is the product-facing layer for retrieval, knowledge, and grounded
-agent workflows. AX Serving is the infrastructure layer that makes that stack
-deployable and operable across Mac-led and mixed-worker environments.
+In this repository, “hybrid” means a fleet containing MLX and CUDA deployment
+pools. One request attempt executes wholly on one compatible endpoint. AX
+Serving does not split a model, prefill/decode phase, or KV cache across MLX
+and CUDA.
 
-Status: production-ready Rust workspace for Apple Silicon
-(`aarch64-apple-darwin`) with OpenAI-compatible REST, gRPC, runtime model
-management, and multi-worker orchestration oriented around department-scale
-private AI serving.
+## Architecture
 
-## Market Focus
-
-AX Serving is built to win in three adjacent niches:
-
-- department-scale private AI fleet control planes
-- Mac-native serving and orchestration for single-node and Mac-grid deployments
-- enterprise mixed-worker orchestration across NVIDIA / Thor-class, Mac Studio-class, and future workers
-- serving infrastructure for governed private AI stacks such as AX Fabric
-
-Who it is for:
-
-- SMEs and enterprise departments with fewer than ~100 users or operators
-- platform and infra teams running private AI fleets
-- operators who need more than a single local runtime process
-- teams that care about model lifecycle, routing, metrics, health, audit, and fleet operations
-- private deployments that need an OpenAI-compatible serving layer without a cloud-first dependency
-
-What it is not:
-
-- not an end-user desktop chat app
-- not a generic CUDA hyperscale serving stack
-- not the low-level token-generation engine itself
-
-Deployment fit:
-
-- `Single Mac`: the default open-source deployment path
-- `Mac grid`: the default open-source multi-worker deployment path
-- `Enterprise heterogeneous fleet`: commercial path for NVIDIA / Thor-class workers, governed mixed-node deployments, and enterprise delivery requirements
-
-For market positioning, competitive analysis, and ICP details, see:
-
-- [docs/market-positioning.md](docs/market-positioning.md)
-- [docs/competitive-landscape.md](docs/competitive-landscape.md)
-- [docs/icp-and-demand.md](docs/icp-and-demand.md)
-- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
-- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
-- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
-- [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
-- [docs/contracts/ax-serving-node-contract.md](docs/contracts/ax-serving-node-contract.md)
-- [docs/contracts/ax-serving-runtime-responsibility-inventory.md](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
-
-* * *
-
-## Licensing And Commercial Use
-
-AX Serving is dual-licensed:
-
-- Open-source use: `AGPL-3.0-or-later`
-- Commercial use: available under separate written license
-
-Commercial licensing is intended for organizations that want to use AX Serving
-as a proprietary serving backend, private inference/control plane, embedded
-runtime, OEM component, managed fleet, or enterprise integration layer without
-AGPL obligations.
-
-Commercial engagements may include:
-
-- commercial runtime licensing
-- private deployment rights
-- OEM / embedded redistribution rights
-- enterprise fleet and mixed-node integration work
-- support, service, and deployment terms
-
-### Open-Source And Enterprise Boundary
-
-The public repository is the open-source core of AX Serving.
-
-The default open-source product scope is:
-
-- single-Mac serving
-- Mac-led local serving
-- Mac worker grids
-- core serving, orchestration, worker, metrics, and admin protocols
-
-Commercial offerings cover one or both of the following:
-
-- non-AGPL licensing rights for the AX Serving core itself
-- separate enterprise modules, deployment bundles, and supported integrations
-
-The intended enterprise expansion path is:
-
-- NVIDIA / Thor-class workers
-- heterogeneous Mac + accelerator fleets
-- enterprise auth, governance, and deployment packaging
-- supported private integrations and fleet operations tooling
-
-The public repository contains the public source distribution, including
-single-node and multi-worker serving/orchestration capabilities. Commercial
-agreements govern usage outside AGPL obligations, private packaging, and
-enterprise delivery terms. The recommended technical boundary is service-level
-integration, not private crates mixed into the public workspace.
-
-See [LICENSING.md](LICENSING.md) and
-[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
-
-Execution artifacts for the open-source / enterprise split:
-
-- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
-- [docs/contracts/enterprise-compatibility-metadata.example.yaml](docs/contracts/enterprise-compatibility-metadata.example.yaml)
-- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
-- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
-
-* * *
-
-## Quick Start
-
-Prerequisites:
-- Apple Silicon macOS
-- Rust toolchain
-- one inference runtime node path:
-  - Mac compatibility worker through `ax-serving serve`
-  - Mac ax-engine node adapter path through `ax-runtime-agent`
-  - PC CUDA or NVIDIA Thor vLLM node path through `ax-runtime-agent`
-
-Validate your environment:
-
-```bash
-cargo check --workspace
-cargo run -p ax-serving-cli --bin ax-serving -- doctor
+```text
+OpenAI client
+     |
+     v
+AX Serving gateway ---- Redis/Valkey fleet state (HA profile)
+     |
+     +---- ax-runtime-agent ---- AX Engine / MLX
+     |
+     +---- ax-runtime-agent ---- vLLM or SGLang / CUDA
 ```
 
-Recommended topology:
+The default `ax-serving-api` binary is portable and has no dependency on AX
+Engine, MLX, llama.cpp, Metal, or CUDA. The macOS-only embedded server and
+gRPC v1 API are isolated behind the `embedded-compat` feature.
 
-- run `ax-serving-api` as the API gateway and control plane
-- register runtime nodes through the worker/node contract
-- route requests by model, runtime class, node pool, health, and capacity
+Key safety properties:
 
-Generic runtime node adapter:
+- versioned worker protocol with runtime-authoritative readiness and inventory;
+- explicit logical models, pools, deployment identities, and equivalence classes;
+- fail-closed routing for stale, incompatible, draining, or overloaded workers;
+- at most one retry, only after a proven connect failure or authenticated typed
+  pre-admission rejection;
+- no retry after response commitment and no arbitrary-`5xx` rerouting;
+- byte-incremental SSE proxying with cancellation and phased deadlines;
+- separate public, admin, worker-control, dispatch, and runtime credentials;
+- Redis/Valkey lease fencing, shared capacity reservations, probe ownership,
+  and active-active gateway reconciliation;
+- asynchronous deployment create, update/roll, drain, delete, and job APIs.
+
+## Quick start: portable gateway and runtime agent
+
+Build the portable binaries:
+
+```bash
+cargo build --release \
+  -p ax-serving-cli --bin ax-serving-api \
+  -p ax-thor-agent --bin ax-runtime-agent
+```
+
+Start a development gateway on loopback:
+
+```bash
+AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
+```
+
+Start an OpenAI-compatible runtime separately, then register it through the
+agent. This example assumes the runtime listens on port 8000 and reports its
+models from `/v1/models`:
 
 ```bash
 AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
 AXS_NODE_RUNTIME=vllm \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
 AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
 AXS_NODE_HARDWARE_CLASS=pc-cuda \
-cargo run -p ax-thor-agent --bin ax-runtime-agent
+AXS_NODE_WORKER_POOL=cuda \
+target/release/ax-runtime-agent
 ```
 
-Use `AXS_NODE_RUNTIME=ax_engine` and `AXS_NODE_HARDWARE_CLASS=mac` for a Mac
-ax-engine node. The legacy `ax-thor-agent` binary remains available as a Thor
-compatibility alias.
-
-Compatibility local worker:
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-AXS_WORKER_RUNTIME=ax_engine \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
-  --model-id default \
-  --host 127.0.0.1 \
-  --port 18080
-```
-
-Send a request:
+Use `AXS_NODE_RUNTIME=ax_engine` and an AX Engine OpenAI-compatible server URL
+for Apple Silicon. The public request model is the runtime model ID in
+`legacy_compat` mode:
 
 ```bash
 curl -sS http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "default",
-    "messages": [{"role": "user", "content": "Give me three short points about Rust."}],
-    "stream": false,
-    "max_tokens": 96
+    "model": "replace-with-runtime-model-id",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 64,
+    "stream": false
   }'
 ```
 
-For fuller setup paths, see [QUICKSTART.md](QUICKSTART.md):
-- gateway + runtime nodes
-- local compatibility worker
-- authenticated offline deployment
-- model management
-- embeddings
+For cross-runtime routing, start from
+[`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml).
+Replace every placeholder identity and certification path. Do not enable an
+equivalence class until both deployment artifacts pass the same conformance
+workload.
 
-TypeScript SDK (Zod-validated):
+See [QUICKSTART.md](QUICKSTART.md) for an authenticated setup and
+[the multi-worker runbook](docs/runbooks/multi-worker.md) for HA, drain,
+rollout, and incident procedures.
 
-```bash
-cd sdk/javascript
-npm install
-npm run build
-```
+## Public and operator APIs
 
----
-
-## Why AX Serving
-
-Most local runtimes focus on single-process inference. AX Serving focuses on the operational layer above inference:
-
-- OpenAI-compatible REST and gRPC serving
-- runtime model load/unload/reload
-- admission queueing and concurrency control
-- metrics, dashboard, diagnostics, and audit surfaces
-- multi-worker orchestration in the public repo
-- benchmark and soak tooling in the same repo
-
-Positioning:
-- AX Fabric is the product layer
-- AX Serving is the serving and orchestration layer underneath it
-- inference runtimes such as `ax-engine`, `vLLM`, and compatibility local
-  backends remain lower-level execution systems
-
-### Runtime Architecture
-
-AX Serving is not itself the token-generation engine. It is the serving layer
-that routes requests into runtime nodes.
-
-- Mac inference should be provided by `ax-engine` runtime nodes.
-- PC CUDA and NVIDIA Thor inference should be provided by `vLLM` runtime nodes.
-- The worker registry records runtime, runtime version, hardware class, runtime
-  endpoint, supported operations, health, queue, and model inventory.
-- Fleet routing can use model, runtime class, worker pool, hardware class,
-  health, load, queue state, and capability constraints.
-
-The legacy embedded backend paths (`llama.cpp`, MLX subprocess, optional
-libllama, and direct native ax-engine integration) are compatibility paths.
-They remain available for migration and local testing, but new product work
-should use the public node contract instead of adding more inference-runtime
-responsibility to AX Serving.
-
-In practice, this means AX Serving owns the APIs, scheduling, orchestration,
-fleet health, metrics, and lifecycle policy, while runtime nodes own inference
-execution.
-
-### Best With AX Fabric
-
-AX Serving is designed to work with AX Fabric as part of one complete system.
-
-- AX Serving: execution control plane, model lifecycle, routing, scheduling, APIs
-- AX Fabric: document ingestion, vector search, BM25/hybrid retrieval, MCP-native data access
-- Together: AX Fabric is the product layer; AX Serving is the execution layer underneath it
-
----
-
-## Core Capabilities
-
-| Capability | AX Serving |
-|---|---|
-| OpenAI-compatible chat/completions/embeddings | ✅ |
-| Streaming SSE + non-streaming responses | ✅ |
-| Runtime model management (`/v1/models`) | ✅ |
-| Multi-worker orchestration (`ax-serving-api`) | ✅ |
-| Dispatch policies (`least_inflight`, `weighted_round_robin`, `model_affinity`, `token_cost`) | ✅ |
-| Scheduler queue/inflight controls | ✅ |
-| Prometheus + JSON metrics | ✅ |
-| Embedded dashboard (`/dashboard`) | ✅ |
-| Built-in benchmarking (`ax-serving-bench`) | ✅ |
-
----
-
-## Run Modes
-
-### 1. Single Inference CLI
-
-```bash
-cargo run -p ax-serving-cli --bin ax-serving -- \
-  -m ./models/<model>.gguf \
-  -p "Hello from AX Serving" \
-  -n 128
-```
-
-### 2. Single Runtime (`ax-serving serve`)
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
-  --model-id default \
-  --port 18080
-```
-
-### 3. Gateway + Workers (`ax-serving-api` + workers)
-
-Gateway:
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving-api -- \
-  --port 18080 \
-  --internal-port 19090 \
-  --policy least_inflight
-```
-
-Worker:
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
-  --model-id default \
-  --port 18081 \
-  --orchestrator http://127.0.0.1:19090
-```
-
-This gateway + worker path is part of the open-source Mac-native deployment
-story. Enterprise fleet products build on the same serving contracts while
-adding supported NVIDIA / Thor-class worker integrations, deployment bundles,
-and governance layers under commercial terms.
-
----
-
-## API Surface
-
-### Serving runtime (`ax-serving serve`)
+Portable gateway inference endpoints:
 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 - `POST /v1/embeddings`
 - `GET /v1/models`
-- `POST /v1/models`
-- `DELETE /v1/models/{id}`
-- `POST /v1/models/{id}/reload`
-- `GET /health`
-- `GET /v1/metrics`
-- `GET /metrics`
-- `GET /dashboard`
-- `GET /v1/license`
-- `POST /v1/license`
-- `GET /v1/admin/status`
-- `GET /v1/admin/startup-report`
-- `GET /v1/admin/diagnostics`
-- `GET /v1/admin/audit`
-- `GET /v1/admin/policy`
 
-### Orchestrator (`ax-serving-api`)
+Health and observability:
 
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/embeddings`
-- `GET /v1/models`
-- `GET /health`
-- `GET /v1/metrics`
-- `GET /v1/license`
-- `POST /v1/license`
-- `GET /v1/admin/status`
-- `GET /v1/admin/startup-report`
-- `GET /v1/admin/diagnostics`
-- `GET /v1/admin/audit`
-- `GET /v1/admin/policy`
-- `GET /v1/admin/fleet`
-- `GET /v1/workers`
-- `GET /v1/workers/{id}`
-- `POST /v1/workers/{id}/drain`
-- `POST /v1/workers/{id}/drain-complete`
-- `DELETE /v1/workers/{id}`
+- `GET /livez` — process liveness;
+- `GET /readyz` — `200` only when at least one worker is routable;
+- `GET /health` — JSON fleet health summary;
+- `GET /v1/metrics` — admin-authenticated JSON operational metrics;
+- `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
+- `GET /dashboard` — compatibility convenience UI, usable only behind an
+  authenticated admin reverse proxy that injects the bearer credential;
+- `GET /v1/admin/status`, `/diagnostics`, `/audit`, `/fleet`.
 
-Runtime health contract:
-- `GET /health` returns current status, loaded `model_ids`, `uptime_secs`, and thermal state.
-- Used for both liveness and readiness by orchestrators and monitoring.
-- See `docs/contracts/ax-fabric-runtime-contract.md` for the formal integration contract.
+Do not put an admin bearer token in a dashboard URL or browser storage. For
+production monitoring, scrape `/metrics` from the monitoring system and use
+the supplied Grafana dashboard instead of exposing `/dashboard` directly.
 
-AX Fabric integration contract:
-- documented in [docs/contracts/ax-fabric-runtime-contract.md](docs/contracts/ax-fabric-runtime-contract.md)
+Asynchronous lifecycle APIs:
 
-Admin/control-plane notes:
-- all authenticated admin responses preserve `X-Request-ID`
-- `GET /v1/admin/status` gives an operational summary
-- `GET /v1/admin/startup-report` and `GET /v1/admin/diagnostics` are for runtime inspection
-- worker inventory and drain APIs are orchestrator-only
+- `GET|POST /admin/v1/deployments`
+- `GET|PATCH|DELETE /admin/v1/deployments/{id}`
+- `GET /admin/v1/jobs`
+- `GET /admin/v1/jobs/{id}`
 
-### v1.4 Runtime Controls
-
-- `AXS_SPLIT_SCHEDULER=true`
-  - enables prefill/decode activity tracking in scheduler metrics
-
-Relevant scheduler metrics:
-- `prefill_tokens_active`
-- `decode_sequences_active`
-- `split_scheduler_enabled`
-
----
-
-## Authentication
-
-- If `AXS_API_KEY` is set, protected endpoints require bearer auth.
-- If `AXS_API_KEY` is unset, startup requires `AXS_ALLOW_NO_AUTH=true`.
-
-Recommended offline enterprise startup:
+The portable operator client is built with the gateway and links no runtime
+SDK:
 
 ```bash
-AXS_CONFIG=config/serving.offline-enterprise.yaml \
-AXS_API_KEY="change-me" \
-AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m /absolute/path/to/models/<model>.gguf \
-  --model-id default
+ax-servingctl status \
+  --url http://127.0.0.1:18080 \
+  --api-key public-key \
+  --admin-key admin-key \
+  --diagnostics --json
 ```
 
+The portable gateway deliberately does not expose gRPC v1 or synchronous
+fleet model load/unload. Those contracts depend on gateway-local paths,
+backend enums, or token-ID streams and remain embedded compatibility only.
+`/v1/responses` is deferred until a runtime adapter passes its protocol
+conformance gate.
+
+## Security profiles
+
+Development may bind only to loopback with `AXS_TLS_PROFILE=loopback_dev` and
+must explicitly set `AXS_ALLOW_NO_AUTH=true` when public auth is absent.
+
+Remote deployments use `AXS_TLS_PROFILE=trusted_mesh`. This profile asserts
+that a trusted ingress/service mesh supplies TLS or mTLS; AX Serving does not
+create certificates itself.
+
+| Credential | Purpose |
+| --- | --- |
+| `AXS_API_KEY` | Public inference clients |
+| `AXS_ADMIN_API_KEY` | Admin and worker-management routes |
+| `AXS_INTERNAL_API_TOKEN` | Gateway worker-control API credential |
+| `AXS_WORKER_TOKEN` | Agent copy of the worker-control credential |
+| `AXS_DISPATCH_TOKEN` | Gateway-to-agent inference dispatch |
+| `AXS_RUNTIME_API_KEY` | Agent-to-runtime authentication |
+| `AXS_REDIS_URL` | Shared HA state; treat as a secret |
+| `AXS_CACHE_AFFINITY_SECRET` | Tenant-scoped opaque affinity digest, 32+ bytes |
+
+Public `Authorization`, cookies, proxy credentials, and hop-by-hop headers are
+not forwarded to runtimes. Raw affinity hints are keyed with the operator
+secret and tenant ID, then discarded.
+
+## Build and validation
+
+Portable checks, suitable for Linux and macOS:
+
 ```bash
-AXS_API_KEY="token1,token2" cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/<model>.gguf
+cargo check -p ax-serving-protocol
+cargo check -p ax-serving-api --no-default-features --features gateway
+cargo check -p ax-serving-cli --no-default-features --features gateway \
+  --bin ax-serving-api
+cargo check -p ax-thor-agent
 ```
 
-Client header:
+Full workspace validation on supported macOS hosts:
 
 ```bash
-Authorization: Bearer token1
-```
-
----
-
-## Build, Lint, Test
-
-```bash
-cargo check --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --tests -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+AXS_ALLOW_NO_AUTH=true cargo test --workspace --all-features
 ```
 
-Integration tests (no model required — uses in-process mock servers):
+Python 3.14 may require PyO3's forward-compatibility switch while PyO3 catches
+up:
 
 ```bash
-AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test orchestration
-AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test model_management
-AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test graceful_shutdown
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo check --workspace
 ```
 
-Release build:
+The release workflow rejects tags while benchmark evidence contains null
+baselines. Benchmark and soak commands must use release builds and retain raw,
+schema-versioned artifacts; incomplete files are not publishable evidence.
 
-```bash
-cargo build --workspace --release
-```
+## Deployment
 
-### Test Coverage
+- Single gateway development: in-memory fleet state and loopback agents.
+- Active-active gateway: Redis/Valkey shared state, unique `AXS_GATEWAY_ID`,
+  authenticated control/dispatch channels, and trusted transport.
+- Kubernetes baseline: [deploy/kubernetes](deploy/kubernetes/README.md).
+- Container targets: `gateway` and `agent` in
+  [packaging/container/Dockerfile](packaging/container/Dockerfile).
 
-All tests run automatically in CI on every push and pull request against `main`. No model file or GPU is required — tests use in-process backends (`NullBackend`, `EchoBackend`, `FailingUnloadBackend`) that exercise the full request path without hardware.
+## Repository layout
 
-Exact test counts change over time. Use the linked CI badge and workflow runs as the source of truth.
+- `crates/ax-serving-protocol` — portable worker/deployment wire contract;
+- `crates/ax-serving-api` — gateway, routing, HA state, lifecycle, REST/SSE;
+- `crates/ax-thor-agent` — generic AX Engine/vLLM/SGLang runtime agent;
+- `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
+- `crates/ax-serving-engine` — embedded compatibility backend abstraction;
+- `crates/ax-serving-bench` — benchmark, regression, and soak runners;
+- `crates/ax-serving-shim` and `crates/ax-serving-py` — compatibility bindings;
+- `.internal` — canonical PRD, ADR, and technical specification;
+- `docs` — public contracts, operations, and performance guidance.
 
-| Suite | What It Covers |
-|---|---|
-| **Unit — serving API** | Scheduler (permits, AIMD, TTFT histogram, split prefill/decode), model registry (lifecycle, idle eviction, capacity), orchestration (queue, dispatch policies, worker registry, DashMap), REST helpers (cache key normalisation, cache hit ratio), config (env layering, validation), gRPC status mapping, auth, metrics |
-| **Unit — engine** | Backend routing, GGUF metadata parsing, thermal state, memory budget |
-| **Unit — C shim** | Null-safe llama.h ABI compatibility |
-| **Integration — model\_management** | Auth (Bearer, whitespace tolerance, 401+WWW-Authenticate), model load/unload/reload (201/200/409/404/503), health semantics (ok/degraded/critical-thermal/no-models), input validation (400/422 on every field), full inference path (chat + completions via EchoBackend), embeddings, security response headers, metrics JSON keys, dashboard HTML, license GET/SET |
-| **Integration — orchestration** | Worker register/heartbeat/eviction, dispatch (least-inflight, weighted round-robin, model-affinity, token-cost), queue admission and backpressure, reroute on 5xx, chaos (all workers fail → 503), overload (queue full → 429) |
-| **Integration — graceful\_shutdown** | In-flight request drains to completion before server exits |
+## Canonical design documents
 
-Every CI run posts a test summary to the GitHub Actions job summary page — see the [Actions tab](https://github.com/defai-digital/ax-serving/actions) for per-run results.
-
----
-
-## Benchmarking
-
-```bash
-cargo run -p ax-serving-bench --release -- bench -m ./models/<model>.gguf
-```
-
-Other benchmark modes:
-
-- `profile`
-- `mixed`
-- `cache-bench`
-- `soak`
-- `compare`
-- `regression-check`
-- `multi-worker`
-
----
-
-## Repository Layout
-
-- `crates/ax-serving-engine`: backend abstraction, routing, model internals
-- `crates/ax-serving-api`: REST/gRPC serving, scheduler, orchestration
-- `crates/ax-serving-cli`: `ax-serving` and `ax-serving-api` binaries
-- `crates/ax-serving-bench`: benchmark and soak runners
-- `crates/ax-serving-shim`: C-compatible shim
-- `crates/ax-serving-py`: Python bindings
-- `config/`: serving and routing configuration
-- `docs/`: runbooks and architecture notes
-
----
-
-## Documentation
-
-- [QUICKSTART.md](QUICKSTART.md)
-- [docs/market-positioning.md](docs/market-positioning.md)
-- [docs/competitive-landscape.md](docs/competitive-landscape.md)
-- [docs/icp-and-demand.md](docs/icp-and-demand.md)
-- [docs/ax-code-integration.md](docs/ax-code-integration.md)
-- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
-- [docs/maintainability-refactor-plan.md](docs/maintainability-refactor-plan.md)
-- `docs/contracts/ax-fabric-runtime-contract.md`
-- `sdk/javascript/README.md` (TypeScript SDK with Zod validation)
-- `sdk/python/` (Python SDK)
-- `docs/runbooks/multi-worker.md`
-- `docs/perf/service-tuning.md`
-
----
+- [Product requirements](.internal/prd/PRD-AX-SERVING.md)
+- [ADR-013: runtime-neutral hybrid inference control plane](.internal/adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md)
+- [Technical specification](.internal/specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
+- [Node protocol contract](docs/contracts/ax-serving-node-contract.md)
+- [Multi-worker operations](docs/runbooks/multi-worker.md)
+- [Service tuning and evidence](docs/perf/service-tuning.md)
 
 ## Licensing
 
-- Open-source terms: [AGPL v3 text](LICENSE) and [licensing guide](LICENSING.md)
-- Commercial terms: [commercial licensing summary](LICENSE-COMMERCIAL.md)
-- Issue reporting policy: [CONTRIBUTING.md](CONTRIBUTING.md)
+AX Serving is available under
+[AGPL-3.0-or-later](LICENSE). Separate commercial terms are described in
+[LICENSING.md](LICENSING.md) and [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).

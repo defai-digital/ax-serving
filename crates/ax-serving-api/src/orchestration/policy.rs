@@ -27,6 +27,12 @@ pub struct DispatchContext<'a> {
     pub model_id: &'a str,
     pub stream: bool,
     pub preferred_pool: Option<&'a str>,
+    /// Stable per-request entropy used only for deterministic tie spreading.
+    pub request_hash: u64,
+    /// Tenant-scoped, keyed digest of an opaque client cache-affinity hint.
+    pub cache_affinity_key: Option<u64>,
+    /// Age at which telemetry receives an additional stale penalty.
+    pub telemetry_stale_ms: u64,
 }
 
 /// Pluggable worker selection algorithm.
@@ -55,6 +61,12 @@ pub trait DispatchPolicy: Send + Sync {
     /// Policies that track per-worker statistics (e.g. `ModelAffinityPolicy`)
     /// override this.  Default implementation is a no-op.
     fn record_dispatch(&self, _worker_id: WorkerId, _model_id: &str) {}
+
+    /// Record a dispatch with the full bounded routing context. Policies that
+    /// only need model identity inherit the compatibility implementation.
+    fn record_dispatch_context(&self, worker_id: WorkerId, ctx: &DispatchContext<'_>) {
+        self.record_dispatch(worker_id, ctx.model_id);
+    }
 }
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
@@ -72,8 +84,8 @@ fn least_inflight_from<'a>(
     candidates
         .filter(|w| w.inflight < w.max_inflight)
         .min_by(|a, b| {
-            let la = a.inflight * b.max_inflight;
-            let lb = b.inflight * a.max_inflight;
+            let la = (a.inflight as u128) * (b.max_inflight as u128);
+            let lb = (b.inflight as u128) * (a.max_inflight as u128);
             la.cmp(&lb)
                 .then_with(|| a.id.0.as_bytes().cmp(b.id.0.as_bytes()))
         })
@@ -162,7 +174,7 @@ impl DispatchPolicy for WeightedRoundRobinPolicy {
         for w in workers {
             let cap = w.max_inflight.saturating_sub(w.inflight);
             if cap > 0 {
-                cumulative += cap;
+                cumulative = cumulative.saturating_add(cap);
                 if slot < cumulative {
                     return Some(w);
                 }
@@ -188,7 +200,7 @@ impl DispatchPolicy for WeightedRoundRobinPolicy {
 ///
 /// # Affinity tracking
 ///
-/// The dispatcher calls `record_dispatch(worker_id, model_id)` after each
+/// The dispatcher calls `record_dispatch(worker_id, context)` after each
 /// successful dispatch. Each worker keeps a bounded LRU of recently-served
 /// model IDs, and entries for workers no longer in the eligible set are pruned
 /// lazily on each `select` call.
@@ -382,6 +394,104 @@ impl DispatchPolicy for TokenCostPolicy {
     }
 }
 
+// ── InferenceAwarePolicy ─────────────────────────────────────────────────────
+
+/// Production endpoint score using runtime-native capacity observations.
+///
+/// Hard eligibility is applied by the registry and deployment router before
+/// this policy runs. Missing signals receive a penalty and neutral pressure;
+/// they are never interpreted as zero load.
+pub struct InferenceAwarePolicy;
+
+impl DispatchPolicy for InferenceAwarePolicy {
+    fn select<'a>(
+        &self,
+        workers: &'a [WorkerStatus],
+        ctx: &DispatchContext<'_>,
+    ) -> Option<&'a WorkerStatus> {
+        workers
+            .iter()
+            .filter(|worker| effective_active_sequences(worker) < worker.max_inflight)
+            .min_by(|left, right| {
+                inference_score(left, ctx)
+                    .total_cmp(&inference_score(right, ctx))
+                    .then_with(|| left.id.0.as_bytes().cmp(right.id.0.as_bytes()))
+            })
+    }
+}
+
+fn inference_score(worker: &WorkerStatus, ctx: &DispatchContext<'_>) -> f64 {
+    const UNKNOWN_SIGNAL_PRESSURE: f64 = 0.5;
+    const UNKNOWN_SIGNAL_PENALTY: f64 = 0.025;
+    const QUEUE_SCALE: f64 = 8.0;
+    const TTFT_SLO_MS: f64 = 2_000.0;
+
+    let active = effective_active_sequences(worker) as f64;
+    let active_ratio = (active / worker.max_inflight.max(1) as f64).clamp(0.0, 1.0);
+    let mut missing = 0u32;
+
+    let queue_pressure = worker
+        .queue_depth
+        .map(|depth| depth as f64 / (depth as f64 + QUEUE_SCALE))
+        .unwrap_or_else(|| {
+            missing += 1;
+            UNKNOWN_SIGNAL_PRESSURE
+        });
+    let kv_pressure = worker.kv_utilization.unwrap_or_else(|| {
+        missing += 1;
+        UNKNOWN_SIGNAL_PRESSURE
+    });
+    let batch_pressure = worker
+        .batch_headroom
+        .map(|headroom| 1.0 - headroom)
+        .unwrap_or_else(|| {
+            missing += 1;
+            UNKNOWN_SIGNAL_PRESSURE
+        });
+    let ttft_pressure = if worker.ttft_p95_ms == 0 {
+        missing += 1;
+        UNKNOWN_SIGNAL_PRESSURE
+    } else {
+        (worker.ttft_p95_ms as f64 / TTFT_SLO_MS).clamp(0.0, 1.0)
+    };
+    let error_pressure = worker.error_rate.unwrap_or_else(|| {
+        missing += 1;
+        UNKNOWN_SIGNAL_PRESSURE
+    });
+    let telemetry_penalty = match worker.telemetry_age_ms {
+        Some(age) if age <= ctx.telemetry_stale_ms => 0.0,
+        Some(age) => {
+            let stale_ratio = age.saturating_sub(ctx.telemetry_stale_ms) as f64
+                / ctx.telemetry_stale_ms.max(1) as f64;
+            (0.05 + 0.05 * stale_ratio).min(0.20)
+        }
+        None => {
+            missing += 1;
+            0.05
+        }
+    };
+    let jitter = stable_jitter(ctx.request_hash, worker);
+
+    0.30 * active_ratio
+        + 0.20 * queue_pressure
+        + 0.15 * kv_pressure
+        + 0.10 * batch_pressure
+        + 0.10 * ttft_pressure
+        + 0.10 * error_pressure
+        + f64::from(missing) * UNKNOWN_SIGNAL_PENALTY
+        + telemetry_penalty
+        + jitter
+}
+
+fn stable_jitter(request_hash: u64, worker: &WorkerStatus) -> f64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    request_hash.hash(&mut hasher);
+    worker.id.hash(&mut hasher);
+    (hasher.finish() % 10_000) as f64 / 1_000_000.0
+}
+
 // ── CacheAffinityPolicy ──────────────────────────────────────────────────────
 
 /// Select the worker with the best composite score combining cache locality,
@@ -406,9 +516,9 @@ impl DispatchPolicy for TokenCostPolicy {
 ///
 /// # Prefix tracking
 ///
-/// On `record_dispatch`, a hash of the model_id is stored in a bounded LRU
-/// per worker (max 256 entries). On `select`, workers with a matching prefix
-/// hash receive a bonus.
+/// On `record_dispatch`, the tenant-scoped cache-affinity digest is stored in
+/// a bounded LRU per worker (max 256 entries). Requests without a hint receive
+/// no prefix-locality bonus and fall back to normalized runtime telemetry.
 const CACHE_PREFIX_WEIGHT: f64 = 0.3;
 const CACHE_KV_WEIGHT: f64 = 0.25;
 const CACHE_BATCH_WEIGHT: f64 = 0.15;
@@ -439,20 +549,15 @@ impl CacheAffinityPolicy {
     fn has_prefix(
         cache: &HashMap<WorkerId, VecDeque<u64>>,
         worker_id: &WorkerId,
-        model_id: &str,
+        affinity_key: Option<u64>,
     ) -> bool {
-        let hash = Self::model_prefix_hash(model_id);
+        let Some(hash) = affinity_key else {
+            return false;
+        };
         cache
             .get(worker_id)
             .map(|hashes| hashes.contains(&hash))
             .unwrap_or(false)
-    }
-
-    fn model_prefix_hash(model_id: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        model_id.hash(&mut hasher);
-        hasher.finish()
     }
 }
 
@@ -468,7 +573,10 @@ impl DispatchPolicy for CacheAffinityPolicy {
         workers: &'a [WorkerStatus],
         ctx: &DispatchContext<'_>,
     ) -> Option<&'a WorkerStatus> {
-        if !workers.iter().any(|w| w.inflight < w.max_inflight) {
+        if !workers
+            .iter()
+            .any(|w| effective_active_sequences(w) < w.max_inflight)
+        {
             return None;
         }
 
@@ -476,12 +584,12 @@ impl DispatchPolicy for CacheAffinityPolicy {
 
         workers
             .iter()
-            .filter(|w| w.inflight < w.max_inflight)
+            .filter(|w| effective_active_sequences(w) < w.max_inflight)
             .max_by(|a, b| {
                 let score = |w: &&WorkerStatus| {
                     let seqs = effective_active_sequences(w) as f64;
                     let load_headroom = 1.0 - seqs / w.max_inflight.max(1) as f64;
-                    let prefix_hit = if Self::has_prefix(&cache, &w.id, ctx.model_id) {
+                    let prefix_hit = if Self::has_prefix(&cache, &w.id, ctx.cache_affinity_key) {
                         1.0
                     } else {
                         0.0
@@ -501,8 +609,10 @@ impl DispatchPolicy for CacheAffinityPolicy {
             })
     }
 
-    fn record_dispatch(&self, worker_id: WorkerId, model_id: &str) {
-        let hash = Self::model_prefix_hash(model_id);
+    fn record_dispatch_context(&self, worker_id: WorkerId, ctx: &DispatchContext<'_>) {
+        let Some(hash) = ctx.cache_affinity_key else {
+            return;
+        };
         let mut cache = self.prefix_lock();
         let hashes = cache.entry(worker_id).or_default();
         if let Some(pos) = hashes.iter().position(|&h| h == hash) {
@@ -520,7 +630,8 @@ impl DispatchPolicy for CacheAffinityPolicy {
 /// Construct a [`DispatchPolicy`] from the `AXS_DISPATCH_POLICY` value.
 ///
 /// Supported values:
-/// - `"least_inflight"` (default) — lowest load ratio
+/// - `"inference_aware"` (default) — capacity, queue, cache, TTFT, errors, and freshness
+/// - `"least_inflight"` — lowest load ratio
 /// - `"weighted_round_robin"` — proportional to available capacity
 /// - `"model_affinity"` — prefers cache-warm workers; falls back to least-inflight
 /// - `"token_cost"` — composite TTFT + sequence-load score; degrades to least-inflight
@@ -528,7 +639,8 @@ impl DispatchPolicy for CacheAffinityPolicy {
 ///
 /// Returns an error for unknown policy names.
 pub fn policy_from_str(name: &str) -> anyhow::Result<Box<dyn DispatchPolicy>> {
-    match name {
+    match name.trim().to_lowercase().as_str() {
+        "inference_aware" | "inference-aware" => Ok(Box::new(InferenceAwarePolicy)),
         "least_inflight" => Ok(Box::new(LeastInflightPolicy)),
         "weighted_round_robin" => Ok(Box::new(WeightedRoundRobinPolicy::new())),
         "model_affinity" => Ok(Box::new(ModelAffinityPolicy::new())),
@@ -536,7 +648,7 @@ pub fn policy_from_str(name: &str) -> anyhow::Result<Box<dyn DispatchPolicy>> {
         "cache_affinity" => Ok(Box::new(CacheAffinityPolicy::new())),
         other => anyhow::bail!(
             "unknown dispatch policy: {other:?} \
-             (supported: least_inflight, weighted_round_robin, model_affinity, \
+             (supported: inference_aware, least_inflight, weighted_round_robin, model_affinity, \
              token_cost, cache_affinity)"
         ),
     }
@@ -561,6 +673,10 @@ mod tests {
             ttft_p95_ms: 0,
             kv_utilization: None,
             batch_headroom: None,
+            queue_depth: None,
+            error_rate: None,
+            decode_tok_per_sec: None,
+            telemetry_age_ms: None,
         }
     }
 
@@ -569,6 +685,16 @@ mod tests {
             model_id: "m1",
             stream: false,
             preferred_pool: None,
+            request_hash: 1,
+            cache_affinity_key: None,
+            telemetry_stale_ms: 10_000,
+        }
+    }
+
+    fn ctx_with_affinity(key: u64) -> DispatchContext<'static> {
+        DispatchContext {
+            cache_affinity_key: Some(key),
+            ..ctx()
         }
     }
 
@@ -594,6 +720,17 @@ mod tests {
         ];
         let selected = LeastInflightPolicy.select(&workers, &ctx()).unwrap();
         assert_eq!(selected.inflight, 1);
+    }
+
+    #[test]
+    fn least_inflight_compares_large_ratios_without_overflow() {
+        let nearly_full = make_worker(usize::MAX - 2, usize::MAX - 1);
+        let sparse = make_worker(1, usize::MAX);
+        let workers = vec![nearly_full, sparse.clone()];
+
+        let selected = LeastInflightPolicy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(selected.id, sparse.id);
     }
 
     #[test]
@@ -667,6 +804,21 @@ mod tests {
         assert_eq!(sel.id, avail.id);
     }
 
+    #[test]
+    fn wrr_saturates_cumulative_capacity() {
+        let policy = WeightedRoundRobinPolicy::new();
+        policy
+            .position
+            .store(usize::MAX as u64 - 1, Ordering::Relaxed);
+        let first = make_worker(0, usize::MAX - 1);
+        let second = make_worker(0, 10);
+        let workers = vec![first, second.clone()];
+
+        let sel = policy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(sel.id, second.id);
+    }
+
     // ── ModelAffinityPolicy ───────────────────────────────────────────────────
 
     #[test]
@@ -698,6 +850,9 @@ mod tests {
                     model_id: "m1",
                     stream: false,
                     preferred_pool: None,
+                    request_hash: 1,
+                    cache_affinity_key: None,
+                    telemetry_stale_ms: 10_000,
                 },
             )
             .unwrap();
@@ -719,6 +874,9 @@ mod tests {
                     model_id: "m1",
                     stream: false,
                     preferred_pool: None,
+                    request_hash: 1,
+                    cache_affinity_key: None,
+                    telemetry_stale_ms: 10_000,
                 },
             )
             .unwrap();
@@ -743,6 +901,9 @@ mod tests {
                     model_id: "m1",
                     stream: false,
                     preferred_pool: None,
+                    request_hash: 1,
+                    cache_affinity_key: None,
+                    telemetry_stale_ms: 10_000,
                 },
             )
             .unwrap();
@@ -774,11 +935,18 @@ mod tests {
 
     #[test]
     fn policy_from_str_all_valid() {
+        assert!(policy_from_str("inference_aware").is_ok());
         assert!(policy_from_str("least_inflight").is_ok());
         assert!(policy_from_str("weighted_round_robin").is_ok());
         assert!(policy_from_str("model_affinity").is_ok());
         assert!(policy_from_str("token_cost").is_ok());
         assert!(policy_from_str("cache_affinity").is_ok());
+    }
+
+    #[test]
+    fn policy_from_str_normalizes_operator_input() {
+        assert!(policy_from_str(" TOKEN_COST ").is_ok());
+        assert!(policy_from_str("Cache_Affinity").is_ok());
     }
 
     #[test]
@@ -869,6 +1037,46 @@ mod tests {
     }
 
     #[test]
+    fn inference_aware_penalizes_unknown_telemetry_instead_of_treating_it_as_idle() {
+        let unknown = make_worker(0, 8);
+        let observed = WorkerStatus {
+            active_sequences: 1,
+            queue_depth: Some(0),
+            error_rate: Some(0.0),
+            decode_tok_per_sec: Some(80.0),
+            telemetry_age_ms: Some(100),
+            ttft_p95_ms: 100,
+            kv_utilization: Some(0.1),
+            batch_headroom: Some(0.9),
+            ..make_worker(1, 8)
+        };
+        let workers = vec![unknown, observed.clone()];
+        let selected = InferenceAwarePolicy.select(&workers, &ctx()).unwrap();
+        assert_eq!(selected.id, observed.id);
+    }
+
+    #[test]
+    fn inference_aware_penalizes_stale_observations() {
+        let fresh = WorkerStatus {
+            queue_depth: Some(0),
+            error_rate: Some(0.0),
+            telemetry_age_ms: Some(100),
+            ttft_p95_ms: 100,
+            kv_utilization: Some(0.2),
+            batch_headroom: Some(0.8),
+            ..make_worker(1, 8)
+        };
+        let stale = WorkerStatus {
+            id: WorkerId(Uuid::new_v4()),
+            telemetry_age_ms: Some(60_000),
+            ..fresh.clone()
+        };
+        let workers = vec![stale, fresh.clone()];
+        let selected = InferenceAwarePolicy.select(&workers, &ctx()).unwrap();
+        assert_eq!(selected.id, fresh.id);
+    }
+
+    #[test]
     fn token_cost_legacy_worker_uses_inflight_as_seqs() {
         // Legacy worker: active_sequences == 0 && inflight != 0.
         // The policy must use `inflight` as the sequence count in that case.
@@ -926,16 +1134,31 @@ mod tests {
     }
 
     #[test]
+    fn cache_affinity_excludes_workers_full_by_active_sequences() {
+        let policy = CacheAffinityPolicy::new();
+        let full_by_runtime = WorkerStatus {
+            active_sequences: 4,
+            ..make_worker_with_cache(0, 4, 0.1, 0.9)
+        };
+        let available = make_worker_with_cache(1, 4, 0.5, 0.5);
+        let workers = vec![full_by_runtime, available.clone()];
+
+        let selected = policy.select(&workers, &ctx()).unwrap();
+
+        assert_eq!(selected.id, available.id);
+    }
+
+    #[test]
     fn cache_affinity_prefers_warm_worker() {
         let policy = CacheAffinityPolicy::new();
         let warm = make_worker_with_cache(2, 4, 0.5, 0.5);
         let cold = make_worker_with_cache(1, 4, 0.5, 0.5);
 
-        // Record dispatch to warm worker for model "m1".
-        policy.record_dispatch(warm.id, "m1");
+        let affinity = ctx_with_affinity(42);
+        policy.record_dispatch_context(warm.id, &affinity);
 
         let workers = vec![warm.clone(), cold];
-        let sel = policy.select(&workers, &ctx()).unwrap();
+        let sel = policy.select(&workers, &affinity).unwrap();
         assert_eq!(
             sel.id, warm.id,
             "warm worker should be preferred despite higher load"
@@ -986,30 +1209,28 @@ mod tests {
         let policy = CacheAffinityPolicy::new();
         let worker = make_worker(0, 4);
 
-        // Fill LRU to capacity with distinct model IDs.
+        // Fill LRU to capacity with distinct tenant-scoped affinity keys.
         for i in 0..PREFIX_LRU_CAPACITY {
-            policy.record_dispatch(worker.id, &format!("model-{i}"));
+            policy.record_dispatch_context(worker.id, &ctx_with_affinity(i as u64));
         }
-        // model-0 should still be present.
+        // Key 0 should still be present.
         {
             let cache = policy.prefix_lock();
-            assert!(CacheAffinityPolicy::has_prefix(
-                &cache, &worker.id, "model-0"
-            ));
+            assert!(CacheAffinityPolicy::has_prefix(&cache, &worker.id, Some(0)));
         }
 
-        // One more entry should evict model-0.
-        policy.record_dispatch(worker.id, "model-overflow");
+        // One more entry should evict key 0.
+        policy.record_dispatch_context(worker.id, &ctx_with_affinity(PREFIX_LRU_CAPACITY as u64));
         {
             let cache = policy.prefix_lock();
             assert!(
-                !CacheAffinityPolicy::has_prefix(&cache, &worker.id, "model-0"),
+                !CacheAffinityPolicy::has_prefix(&cache, &worker.id, Some(0)),
                 "oldest entry should be evicted"
             );
             assert!(CacheAffinityPolicy::has_prefix(
                 &cache,
                 &worker.id,
-                "model-overflow"
+                Some(PREFIX_LRU_CAPACITY as u64)
             ));
         }
     }
@@ -1019,9 +1240,9 @@ mod tests {
         let policy = CacheAffinityPolicy::new();
         let worker = make_worker(0, 4);
 
-        policy.record_dispatch(worker.id, "a");
-        policy.record_dispatch(worker.id, "b");
-        policy.record_dispatch(worker.id, "a"); // move "a" to back
+        policy.record_dispatch_context(worker.id, &ctx_with_affinity(1));
+        policy.record_dispatch_context(worker.id, &ctx_with_affinity(2));
+        policy.record_dispatch_context(worker.id, &ctx_with_affinity(1));
 
         let cache = policy.prefix_lock();
         let hashes = cache.get(&worker.id).unwrap();

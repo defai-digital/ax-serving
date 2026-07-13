@@ -11,8 +11,8 @@
 //! 3. Pull messages in a loop, forward to the local HTTP endpoint, publish
 //!    the response to the request's `reply_subject`.
 //! 4. **Ack** the message on success.
-//! 5. **Nack** the message on worker error (HTTP 5xx or network failure) so
-//!    that JetStream redelivers to another worker (up to `max_deliver` times).
+//! 5. Terminate the attempt on worker error. Inference consumers are configured
+//!    with `max_deliver = 1`; ambiguous admitted work is never redelivered.
 //!
 //! # Streaming
 //!
@@ -33,7 +33,105 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::nats::{NatsConfig, NatsRequest, NatsResponse};
+use super::nats::{MAX_NATS_RESPONSE_BODY_BYTES, NatsConfig, NatsRequest, NatsResponse};
+
+/// Maximum decoded request body accepted from JetStream.
+///
+/// This leaves headroom above the public REST schema limits while preventing a
+/// malformed broker message from forcing an unbounded hex decode allocation.
+const MAX_NATS_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATS_REQUEST_MESSAGE_BYTES: usize = MAX_NATS_REQUEST_BODY_BYTES * 2 + 16 * 1024;
+
+fn local_response_exceeds_limit(content_length: Option<u64>) -> bool {
+    content_length.is_some_and(|len| len > MAX_NATS_RESPONSE_BODY_BYTES as u64)
+}
+
+#[derive(Debug)]
+enum LocalResponseBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+#[derive(Debug)]
+enum NatsRequestBodyError {
+    InvalidHex(hex::FromHexError),
+    TooLarge,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NatsRequestPathError {
+    UnsupportedPath,
+}
+
+fn validate_request_path(path: &str) -> Result<(), NatsRequestPathError> {
+    match path {
+        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" => Ok(()),
+        _ => Err(NatsRequestPathError::UnsupportedPath),
+    }
+}
+
+fn decode_request_body_hex_limited(
+    body_hex: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NatsRequestBodyError> {
+    if body_hex.len() > max_bytes.saturating_mul(2) {
+        return Err(NatsRequestBodyError::TooLarge);
+    }
+    let body = hex::decode(body_hex).map_err(NatsRequestBodyError::InvalidHex)?;
+    if body.len() > max_bytes {
+        return Err(NatsRequestBodyError::TooLarge);
+    }
+    Ok(body)
+}
+
+fn append_limited_local_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), LocalResponseBodyError> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(LocalResponseBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn add_limited_local_response_len(
+    current_len: usize,
+    chunk_len: usize,
+    max_bytes: usize,
+) -> Result<usize, LocalResponseBodyError> {
+    let next_len = current_len
+        .checked_add(chunk_len)
+        .ok_or(LocalResponseBodyError::TooLarge)?;
+    if next_len > max_bytes {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+    Ok(next_len)
+}
+
+async fn read_limited_local_response_body(
+    resp: reqwest::Response,
+) -> Result<Vec<u8>, LocalResponseBodyError> {
+    if local_response_exceeds_limit(resp.content_length()) {
+        return Err(LocalResponseBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_limited_local_response_chunk(
+            &mut body,
+            &chunk.map_err(LocalResponseBodyError::Read)?,
+            MAX_NATS_RESPONSE_BODY_BYTES,
+        )?;
+    }
+    Ok(body)
+}
 
 // ── NatsWorker ────────────────────────────────────────────────────────────────
 
@@ -192,7 +290,7 @@ async fn run_model_loop(
     };
 
     // Create or reattach to a durable pull consumer.
-    // max_deliver limits JetStream redelivery attempts before dead-lettering.
+    // Inference safety requires max_deliver=1; see NatsConfig validation.
     let consumer = match stream
         .get_or_create_consumer(
             &consumer_name,
@@ -243,6 +341,19 @@ async fn run_model_loop(
         } {
             match result {
                 Ok(msg) => {
+                    if msg.message.payload.len() > MAX_NATS_REQUEST_MESSAGE_BYTES {
+                        warn!(
+                            %model_id,
+                            payload_len = msg.message.payload.len(),
+                            limit = MAX_NATS_REQUEST_MESSAGE_BYTES,
+                            "NatsWorker: request message exceeded size limit"
+                        );
+                        if let Err(e) = msg.ack().await {
+                            warn!(%model_id, %e, "NatsWorker: ack failed for oversized request");
+                        }
+                        continue;
+                    }
+
                     let req: NatsRequest = match serde_json::from_slice(&msg.message.payload) {
                         Ok(r) => r,
                         Err(e) => {
@@ -273,7 +384,7 @@ async fn run_model_loop(
                         continue;
                     }
 
-                    let succeeded = dispatch_to_local(
+                    let acknowledged = dispatch_to_local(
                         &http_client,
                         &client,
                         local_addr,
@@ -282,12 +393,14 @@ async fn run_model_loop(
                     )
                     .await;
 
-                    if succeeded {
+                    if acknowledged {
                         if let Err(e) = msg.ack().await {
                             warn!(%model_id, %e, "NatsWorker: ack failed");
                         }
                     } else {
-                        // Nack triggers JetStream redelivery.
+                        // Reserved for failures proven to occur before local
+                        // runtime admission. Current adapters conservatively
+                        // acknowledge every attempted local dispatch.
                         if let Err(e) = msg.ack_with(jetstream::AckKind::Nak(None)).await {
                             warn!(%model_id, %e, "NatsWorker: nack failed");
                         }
@@ -306,7 +419,9 @@ async fn run_model_loop(
 /// Forward one NATS request to the local HTTP inference server and publish
 /// the response back to the `reply_subject`.
 ///
-/// Returns `true` on success (ack), `false` on worker error (nack).
+/// Returns `true` when the broker message must be acknowledged. Once local
+/// HTTP dispatch begins, all outcomes are acknowledged because timeout, 5xx,
+/// and response-read failures cannot prove that inference was not admitted.
 async fn dispatch_to_local(
     http_client: &Client,
     nats_client: &async_nats::Client,
@@ -314,17 +429,36 @@ async fn dispatch_to_local(
     req: &NatsRequest,
     request_timeout: Duration,
 ) -> bool {
+    if validate_request_path(&req.path).is_err() {
+        warn!(
+            request_id = %req.request_id,
+            path = %req.path,
+            "NatsWorker: unsupported request path"
+        );
+        publish_error(nats_client, req, "unsupported NATS request path").await;
+        return true; // ack — malformed request from broker, not retryable
+    }
     let url = format!("http://{}{}", local_addr, req.path);
 
-    let body_bytes = match hex::decode(&req.body_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            error!(request_id = %req.request_id, %e, "NatsWorker: bad body hex");
-            // Publish error response so the orchestrator isn't left hanging.
-            publish_error(nats_client, req, "bad body hex encoding").await;
-            return true; // ack — not retryable
-        }
-    };
+    let body_bytes =
+        match decode_request_body_hex_limited(&req.body_hex, MAX_NATS_REQUEST_BODY_BYTES) {
+            Ok(b) => b,
+            Err(NatsRequestBodyError::InvalidHex(e)) => {
+                error!(request_id = %req.request_id, %e, "NatsWorker: bad body hex");
+                // Publish error response so the orchestrator isn't left hanging.
+                publish_error(nats_client, req, "bad body hex encoding").await;
+                return true; // ack — not retryable
+            }
+            Err(NatsRequestBodyError::TooLarge) => {
+                error!(
+                    request_id = %req.request_id,
+                    limit = MAX_NATS_REQUEST_BODY_BYTES,
+                    "NatsWorker: request body exceeded size limit"
+                );
+                publish_error(nats_client, req, "NATS request body exceeded size limit").await;
+                return true; // ack — not retryable
+            }
+        };
 
     if !req.stream {
         dispatch_non_streaming(
@@ -385,18 +519,28 @@ async fn dispatch_non_streaming(
                 "NatsWorker: local HTTP request timed out"
             );
             publish_error(nats_client, req, "local HTTP request timed out").await;
-            return false;
+            return true;
         }
     };
 
     match result {
         Err(e) => {
             warn!(request_id = %req.request_id, %e, "NatsWorker: local HTTP request failed");
-            publish_error(nats_client, req, &e.to_string()).await;
-            false // nack — network error, retry with another worker
+            publish_error(nats_client, req, "local runtime request failed").await;
+            true
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
+            if local_response_exceeds_limit(resp.content_length()) {
+                warn!(
+                    request_id = %req.request_id,
+                    content_length = resp.content_length().unwrap_or_default(),
+                    limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                    "NatsWorker: local HTTP response exceeded size limit"
+                );
+                publish_error(nats_client, req, "local HTTP response exceeded size limit").await;
+                return true;
+            }
             let content_type = resp
                 .headers()
                 .get("content-type")
@@ -404,7 +548,9 @@ async fn dispatch_non_streaming(
                 .unwrap_or("application/json")
                 .to_string();
 
-            match tokio::time::timeout(request_timeout, resp.bytes()).await {
+            match tokio::time::timeout(request_timeout, read_limited_local_response_body(resp))
+                .await
+            {
                 Err(_) => {
                     warn!(
                         request_id = %req.request_id,
@@ -412,13 +558,23 @@ async fn dispatch_non_streaming(
                         "NatsWorker: reading response body timed out"
                     );
                     publish_error(nats_client, req, "reading local response body timed out").await;
-                    false
+                    true
                 }
                 Ok(result) => match result {
-                    Err(e) => {
+                    Err(LocalResponseBodyError::Read(e)) => {
                         warn!(request_id = %req.request_id, %e, "NatsWorker: reading response body failed");
-                        publish_error(nats_client, req, &e.to_string()).await;
-                        false
+                        publish_error(nats_client, req, "reading local response body failed").await;
+                        true
+                    }
+                    Err(LocalResponseBodyError::TooLarge) => {
+                        warn!(
+                            request_id = %req.request_id,
+                            limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                            "NatsWorker: local HTTP response exceeded size limit"
+                        );
+                        publish_error(nats_client, req, "local HTTP response exceeded size limit")
+                            .await;
+                        true
                     }
                     Ok(body) => {
                         let payload = NatsResponse::complete(
@@ -434,7 +590,7 @@ async fn dispatch_non_streaming(
                         {
                             error!(request_id = %req.request_id, %e, "NatsWorker: reply publish failed");
                         }
-                        status < 500 // ack on success; nack on 5xx (allows redelivery)
+                        true
                     }
                 },
             }
@@ -463,13 +619,13 @@ async fn dispatch_streaming(
                 "NatsWorker: streaming local HTTP request timed out"
             );
             publish_error(nats_client, req, "streaming local HTTP request timed out").await;
-            return false;
+            return true;
         }
         Ok(result) => match result {
             Err(e) => {
                 warn!(request_id = %req.request_id, %e, "NatsWorker: streaming local HTTP failed");
-                publish_error(nats_client, req, &e.to_string()).await;
-                return false;
+                publish_error(nats_client, req, "streaming local runtime request failed").await;
+                return true;
             }
             Ok(r) => r,
         },
@@ -484,7 +640,8 @@ async fn dispatch_streaming(
         .to_string();
 
     if status >= 500 {
-        // Publish a 5xx response and nack so JetStream retries.
+        // Publish the runtime failure and acknowledge it. A generic 5xx does
+        // not prove that inference was rejected before admission.
         let payload = NatsResponse::error_response(
             req.request_id.clone(),
             status,
@@ -494,17 +651,45 @@ async fn dispatch_streaming(
         let _ = nats_client
             .publish(req.reply_subject.clone(), payload)
             .await;
-        return false;
+        return true;
     }
 
     if !resp.status().is_success() {
-        match resp.bytes().await {
-            Err(e) => {
-                warn!(request_id = %req.request_id, %e, "NatsWorker: reading error response body failed");
-                publish_error(nats_client, req, &e.to_string()).await;
-                return false;
+        if local_response_exceeds_limit(resp.content_length()) {
+            warn!(
+                request_id = %req.request_id,
+                content_length = resp.content_length().unwrap_or_default(),
+                limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                "NatsWorker: local streaming error response exceeded size limit"
+            );
+            publish_error(nats_client, req, "local HTTP response exceeded size limit").await;
+            return true;
+        }
+        match tokio::time::timeout(request_timeout, read_limited_local_response_body(resp)).await {
+            Err(_) => {
+                warn!(
+                    request_id = %req.request_id,
+                    timeout_ms = request_timeout.as_millis(),
+                    "NatsWorker: reading streaming error response body timed out"
+                );
+                publish_error(nats_client, req, "reading local response body timed out").await;
+                return true;
             }
-            Ok(body) => {
+            Ok(Err(LocalResponseBodyError::Read(e))) => {
+                warn!(request_id = %req.request_id, %e, "NatsWorker: reading error response body failed");
+                publish_error(nats_client, req, "reading local response body failed").await;
+                return true;
+            }
+            Ok(Err(LocalResponseBodyError::TooLarge)) => {
+                warn!(
+                    request_id = %req.request_id,
+                    limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                    "NatsWorker: local streaming error response exceeded size limit"
+                );
+                publish_error(nats_client, req, "local HTTP response exceeded size limit").await;
+                return true;
+            }
+            Ok(Ok(body)) => {
                 let payload =
                     NatsResponse::complete(req.request_id.clone(), status, content_type, &body)
                         .to_payload();
@@ -519,14 +704,14 @@ async fn dispatch_streaming(
         }
     }
 
-    // Stream chunks to the reply subject using a sliding deadline so a slow
-    // generator cannot run forever after the orchestrator has timed out.
+    // Stream chunks to the reply subject using an idle timeout between chunks.
+    // Long generations remain valid while data keeps flowing, but a stalled
+    // local stream is cut off.
     let mut byte_stream = resp.bytes_stream();
     let mut stream_error = None;
-    let deadline = tokio::time::Instant::now() + request_timeout;
+    let mut total_bytes = 0usize;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, byte_stream.next()).await {
+        match tokio::time::timeout(request_timeout, byte_stream.next()).await {
             Err(_) => {
                 warn!(
                     request_id = %req.request_id,
@@ -539,10 +724,29 @@ async fn dispatch_streaming(
             Ok(None) => break,
             Ok(Some(Err(e))) => {
                 warn!(request_id = %req.request_id, %e, "NatsWorker: stream read error");
-                stream_error = Some(format!("local stream read failed: {e}"));
+                stream_error = Some("local stream read failed".to_string());
                 break;
             }
             Ok(Some(Ok(chunk))) => {
+                match add_limited_local_response_len(
+                    total_bytes,
+                    chunk.len(),
+                    MAX_NATS_RESPONSE_BODY_BYTES,
+                ) {
+                    Ok(next_len) => total_bytes = next_len,
+                    Err(LocalResponseBodyError::TooLarge) => {
+                        warn!(
+                            request_id = %req.request_id,
+                            limit = MAX_NATS_RESPONSE_BODY_BYTES,
+                            "NatsWorker: local streaming response exceeded size limit"
+                        );
+                        stream_error = Some("local HTTP response exceeded size limit".to_string());
+                        break;
+                    }
+                    Err(LocalResponseBodyError::Read(_)) => {
+                        unreachable!("length accounting does not read")
+                    }
+                }
                 let payload = NatsResponse::streaming_chunk(req.request_id.clone(), status, &chunk)
                     .to_payload();
                 if let Err(e) = nats_client
@@ -550,7 +754,7 @@ async fn dispatch_streaming(
                     .await
                 {
                     error!(request_id = %req.request_id, %e, "NatsWorker: chunk publish failed");
-                    stream_error = Some(format!("chunk publish failed: {e}"));
+                    stream_error = Some("stream response delivery failed".to_string());
                     break;
                 }
             }
@@ -574,4 +778,114 @@ async fn publish_error(nats_client: &async_nats::Client, req: &NatsRequest, mess
     let _ = nats_client
         .publish(req.reply_subject.clone(), payload)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{
+        MAX_NATS_RESPONSE_BODY_BYTES, NatsRequestBodyError, NatsRequestPathError,
+        add_limited_local_response_len, append_limited_local_response_chunk,
+        decode_request_body_hex_limited, http_post_json, local_response_exceeds_limit,
+        validate_request_path,
+    };
+
+    #[test]
+    fn local_response_exceeds_limit_rejects_declared_oversize() {
+        assert!(local_response_exceeds_limit(Some(
+            MAX_NATS_RESPONSE_BODY_BYTES as u64 + 1
+        )));
+    }
+
+    #[test]
+    fn local_response_exceeds_limit_accepts_missing_or_in_limit_length() {
+        assert!(!local_response_exceeds_limit(None));
+        assert!(!local_response_exceeds_limit(Some(
+            MAX_NATS_RESPONSE_BODY_BYTES as u64
+        )));
+    }
+
+    #[test]
+    fn append_limited_local_response_chunk_rejects_incremental_excess() {
+        let mut body = Vec::new();
+        append_limited_local_response_chunk(&mut body, b"12345", 8).expect("first chunk fits");
+        assert!(append_limited_local_response_chunk(&mut body, b"6789", 8).is_err());
+        assert_eq!(body, b"12345");
+    }
+
+    #[test]
+    fn add_limited_local_response_len_rejects_incremental_excess() {
+        assert_eq!(add_limited_local_response_len(5, 3, 8).unwrap(), 8);
+        assert!(add_limited_local_response_len(5, 4, 8).is_err());
+        assert!(add_limited_local_response_len(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn validate_request_path_accepts_only_inference_routes() {
+        assert_eq!(validate_request_path("/v1/chat/completions"), Ok(()));
+        assert_eq!(validate_request_path("/v1/completions"), Ok(()));
+        assert_eq!(validate_request_path("/v1/embeddings"), Ok(()));
+        assert_eq!(
+            validate_request_path("/v1/models"),
+            Err(NatsRequestPathError::UnsupportedPath)
+        );
+        assert_eq!(
+            validate_request_path("/v1/chat/completions/../../models"),
+            Err(NatsRequestPathError::UnsupportedPath)
+        );
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_rejects_oversize_before_decode() {
+        let err = decode_request_body_hex_limited("000000", 2).unwrap_err();
+        assert!(matches!(err, NatsRequestBodyError::TooLarge));
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_rejects_invalid_hex() {
+        let err = decode_request_body_hex_limited("not-hex", 64).unwrap_err();
+        assert!(matches!(err, NatsRequestBodyError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn decode_request_body_hex_limited_accepts_valid_payload() {
+        assert_eq!(decode_request_body_hex_limited("6869", 64).unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn http_post_json_never_forwards_public_authorization() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_for_task = Arc::clone(&captured);
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            *captured_for_task.lock().unwrap() = String::from_utf8_lossy(&request[..n]).to_string();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = http_post_json(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/v1/chat/completions"),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert!(!captured.to_ascii_lowercase().contains("authorization:"));
+    }
 }

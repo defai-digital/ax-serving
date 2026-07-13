@@ -1,9 +1,14 @@
 # AX Serving Maintainability Refactor Plan
 
-> **Status**: Draft  
+> **Status**: Historical draft; architecture superseded by ADR-013
 > **Date**: 2026-03-29  
 > **Type**: Engineering Refactor Plan  
 > **Scope**: Supports the public runtime-node product boundary without changing product positioning
+
+This file preserves the March 2026 refactor snapshot. It is not a current
+architecture or completion ledger. Use ADR-013, the canonical PRD, technical
+specification, and `.internal/IMPLEMENTATION-STATUS.md` for current decisions
+and status; re-measure every file-size claim before scheduling follow-up work.
 
 ## 1. Purpose
 

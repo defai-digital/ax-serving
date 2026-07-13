@@ -2,7 +2,7 @@
 # packaging/build-pkg.sh — build a signed + notarized macOS .pkg installer
 #
 # Usage (local signing + notarization):
-#   VERSION=0.2.0 \
+#   VERSION=2.2.0 \
 #   DEVELOPER_ID_INSTALLER="Developer ID Installer: ACME Corp (TEAM1234567)" \
 #   APPLE_ID="you@example.com" \
 #   APPLE_TEAM_ID="TEAM1234567" \
@@ -10,26 +10,28 @@
 #   ./packaging/build-pkg.sh
 #
 # Unsigned local build (skip signing + notarization):
-#   VERSION=0.2.0 ./packaging/build-pkg.sh
+#   VERSION=2.2.0 ./packaging/build-pkg.sh
 #
 # Prerequisites: Xcode Command Line Tools, cargo, Developer ID Installer cert
 # in Keychain (for signed builds).
 
 set -euo pipefail
 
-VERSION="${VERSION:-0.1.0}"
-IDENTIFIER="com.automatosx.ax-serving"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERSION="${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)}"
+IDENTIFIER="digital.defai.ax-serving"
 INSTALL_ROOT="/"
 PKG_NAME="ax-serving-v${VERSION}.pkg"
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAGING="${REPO_ROOT}/packaging/payload"
 DIST_XML="${REPO_ROOT}/packaging/distribution.xml"
+RESOURCES="${REPO_ROOT}/target/pkg-resources"
 
 # ── 1. Build release binaries ───────────────────────────────────────────────
 echo "==> Building release binaries…"
 cd "$REPO_ROOT"
-cargo build --workspace --release
+cargo build --release -p ax-serving-cli --features embedded-compat --bins
+cargo build --release -p ax-thor-agent --bins
 
 # ── 2. Stage payload ─────────────────────────────────────────────────────────
 echo "==> Staging payload…"
@@ -37,11 +39,21 @@ rm -rf "$STAGING"
 mkdir -p "$STAGING/usr/local/bin"
 cp target/release/ax-serving     "$STAGING/usr/local/bin/"
 cp target/release/ax-serving-api "$STAGING/usr/local/bin/"
+cp target/release/ax-servingctl  "$STAGING/usr/local/bin/"
+cp target/release/ax-runtime-agent "$STAGING/usr/local/bin/"
+cp target/release/ax-thor-agent "$STAGING/usr/local/bin/"
 
 # Copy default config to /etc/ax-serving (postinstall script can do this too)
 mkdir -p "$STAGING/etc/ax-serving"
 cp config/backends.yaml "$STAGING/etc/ax-serving/"
 cp config/serving.yaml  "$STAGING/etc/ax-serving/"
+
+# Copy release docs and license notices.
+mkdir -p "$STAGING/usr/local/share/doc/ax-serving"
+cp README.md "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSE "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSING.md "$STAGING/usr/local/share/doc/ax-serving/"
+cp LICENSE-COMMERCIAL.md "$STAGING/usr/local/share/doc/ax-serving/"
 
 # ── 3. Build component .pkg ──────────────────────────────────────────────────
 echo "==> Running pkgbuild…"
@@ -52,15 +64,21 @@ pkgbuild \
   --install-location "$INSTALL_ROOT" \
   "packaging/component.pkg"
 
-# ── 4. Build distribution .pkg (adds welcome/readme screens) ────────────────
+# ── 4. Build distribution .pkg (adds installer metadata/license) ────────────
 echo "==> Running productbuild…"
+rm -rf "$RESOURCES"
+mkdir -p "$RESOURCES"
+cp "$REPO_ROOT/LICENSE" "$RESOURCES/LICENSE"
+
 productbuild \
   --distribution "$DIST_XML" \
   --package-path "packaging" \
+  --resources "$RESOURCES" \
   --version "$VERSION" \
   "$PKG_NAME"
 
 rm -f packaging/component.pkg
+rm -rf "$RESOURCES"
 
 # ── 5. Sign (if DEVELOPER_ID_INSTALLER is set) ───────────────────────────────
 if [[ -n "${DEVELOPER_ID_INSTALLER:-}" ]]; then

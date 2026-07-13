@@ -4,23 +4,35 @@ license.workspace = true
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["gateway"]
+gateway = ["ax-serving-api/gateway"]
+embedded-compat = ["dep:ax-serving-engine", "ax-serving-api/embedded-compat"]
+
 [[bin]]
 name = "ax-serving"
 path = "src/main.rs"
+required-features = ["embedded-compat"]
 
 [[bin]]
 name = "ax-serving-api"
 path = "src/api_main.rs"
+required-features = ["gateway"]
+
+[[bin]]
+name = "ax-servingctl"
+path = "src/ctl_main.rs"
+required-features = ["gateway"]
 
 [dependencies]
-ax-serving-engine = { path = "../ax-serving-engine" }
-ax-serving-api = { path = "../ax-serving-api" }
+ax-serving-engine = { path = "../ax-serving-engine", optional = true }
+ax-serving-api = { path = "../ax-serving-api", default-features = false }
+ax-serving-observability = { path = "../ax-serving-observability" }
 
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }

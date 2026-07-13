@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use ax_serving_protocol::{LogicalModelId, Operation, PoolId, ProtocolCapability, TenantId};
 use axum::{
     Json,
     body::{Body, BodyDataStream, Bytes},
@@ -12,20 +13,51 @@ use axum::{
     response::{Html, IntoResponse},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use super::OrchestratorLayer;
-use super::queue::AcquireResult;
-use super::registry::RequestKind;
-use crate::auth::RequestId;
+use super::deployment::DeploymentMode;
+use super::error::ax_error_response;
+use super::queue::{AcquireResult, QueuePriority};
+use super::registry::{BackendKind, RuntimeKind};
+use super::request_profile::{PriorityClass, RequestProfile, validate_unique_routing_fields};
+use crate::auth::{AxRequestId, RequestId};
 use crate::project_policy;
-use crate::rest::schema::InputMessage;
-use crate::utils::request_meta::{
-    audit_actor, default_audit_limit, estimate_chat_prompt_tokens_u32,
-    estimate_text_prompt_tokens_u32,
+use crate::rest::schema::{
+    EmbeddingsInput, InputMessage, MAX_CONTENT_BYTES, MAX_EMBEDDING_INPUTS,
+    MAX_EMBEDDING_TOTAL_BYTES, MAX_EMBEDDING_TOTAL_TOKENS, MAX_MAX_TOKENS, MAX_MESSAGES,
+    MessageContent,
 };
+use crate::utils::request_meta::{audit_actor, default_audit_limit};
 
 // ── Shared inference proxy ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ProxyRequestMeta {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    messages: Vec<InputMessage>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+}
 
 async fn proxy_inference(
     layer: Arc<OrchestratorLayer>,
@@ -33,126 +65,342 @@ async fn proxy_inference(
     req_headers: HeaderMap,
     body: Bytes,
     worker_path: &'static str,
+    request_id: ax_serving_protocol::RequestId,
 ) -> axum::response::Response {
-    #[derive(Deserialize)]
-    struct ProxyRequestMeta {
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        backend: Option<String>,
-        #[serde(default)]
-        runtime: Option<String>,
-        #[serde(default)]
-        stream: bool,
-        #[serde(default)]
-        max_tokens: Option<u32>,
-        #[serde(default)]
-        messages: Vec<InputMessage>,
-        #[serde(default)]
-        prompt: Option<String>,
+    if let Err(error) = validate_unique_routing_fields(&body) {
+        return ax_error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            "AXS_INVALID_REQUEST_JSON",
+            error.to_string(),
+            false,
+            ax_serving_protocol::AdmissionPhase::Admission,
+        );
     }
-
-    let auth_header = req_headers.get(header::AUTHORIZATION);
     let requested_pool = req_headers
         .get("x-ax-worker-pool")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (model_id, backend_hint, stream, max_tokens, min_context) =
-        match serde_json::from_slice::<ProxyRequestMeta>(&body) {
-            Ok(v) => (
-                v.model.unwrap_or_else(|| "default".to_string()),
-                v.runtime.or(v.backend),
-                v.stream,
-                v.max_tokens,
-                if !v.messages.is_empty() {
-                    Some(estimate_chat_prompt_tokens_u32(&v.messages))
-                } else {
-                    v.prompt.as_deref().map(estimate_text_prompt_tokens_u32)
-                },
-            ),
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
-            }
-        };
+    let meta = match serde_json::from_slice::<ProxyRequestMeta>(&body) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return ax_error_response(
+                StatusCode::BAD_REQUEST,
+                request_id,
+                "AXS_INVALID_REQUEST_JSON",
+                "invalid JSON body",
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let model_id = match validate_proxy_model_id(meta.model.clone()) {
+        Ok(model_id) => model_id,
+        Err((status, error)) => {
+            return ax_error_response(
+                status,
+                request_id,
+                "AXS_INVALID_MODEL",
+                error,
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let backend_hint = match validate_dispatch_hint(meta.runtime.clone().or(meta.backend.clone())) {
+        Ok(hint) => hint,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_RUNTIME_HINT",
+                error,
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let stream = meta.stream;
+    let max_tokens = match (meta.max_tokens, meta.max_completion_tokens) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    let _embedding_input = match validate_proxy_request_shape(worker_path, &meta) {
+        Ok(input) => input,
+        Err((status, error)) => {
+            return ax_error_response(
+                status,
+                request_id,
+                "AXS_INVALID_REQUEST_SHAPE",
+                error,
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let min_context = match declared_minimum_context(&req_headers) {
+        Ok(value) => value,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_CONTEXT_REQUIREMENT",
+                error,
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let request_timeout = match declared_request_timeout(
+        &req_headers,
+        std::time::Duration::from_secs(layer.config.request_timeout_secs),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_REQUEST_DEADLINE",
+                error,
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
 
     let resolved_policy =
         match project_policy::enforce(&req_headers, &model_id, max_tokens, &layer.project_policy) {
             Ok(v) => v,
             Err(resp) => return resp.into_response(),
         };
-    let preferred_pool = resolved_policy
+    let policy_pool = resolved_policy
         .as_ref()
-        .and_then(|v| v.worker_pool.as_deref())
-        .or(requested_pool);
-
-    // Admission control: acquire a queue slot before dispatching.
-    let permit = match layer
-        .queue
-        .acquire(fairness_client_key(&req_headers, peer_addr))
-        .await
+        .and_then(|v| v.worker_pool.as_deref());
+    let required_pool = match policy_pool
+        .map(|pool| PoolId::new(pool.to_string()))
+        .transpose()
     {
-        AcquireResult::Permit(p) => p,
-
-        AcquireResult::Rejected => {
-            // 429 with X-Queue-Depth + Retry-After (PRD §FR-3.3)
-            let queued = layer.queue.queued();
-            return axum::response::Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("content-type", "text/plain; charset=utf-8")
-                .header("x-queue-depth", queued.to_string())
-                .header("retry-after", layer.retry_after_secs.to_string())
-                .body(Body::from("request rejected: concurrency limit exceeded"))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-
-        AcquireResult::Shed => {
-            let mut resp = (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request shed: queue overload",
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                HeaderName::from_static("x-reason"),
-                HeaderValue::from_static("request_shed"),
+        Ok(value) => value,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                request_id,
+                "AXS_POLICY_CONFIGURATION",
+                format!("invalid policy pool: {error}"),
+                false,
+                ax_serving_protocol::AdmissionPhase::Authentication,
             );
-            return resp;
         }
-
-        AcquireResult::Timeout => {
-            let mut resp = (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request timed out waiting for a queue slot",
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                HeaderName::from_static("x-reason"),
-                HeaderValue::from_static("queue_timeout"),
+    };
+    let preferred_pool = match requested_pool
+        .map(|pool| PoolId::new(pool.to_string()))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_POOL_CONSTRAINT",
+                format!("invalid worker pool: {error}"),
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
             );
-            return resp;
+        }
+    };
+    let priority = match PriorityClass::parse(
+        req_headers
+            .get("x-ax-priority")
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_PRIORITY",
+                error.to_string(),
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
+    let profile = match build_request_profile(
+        request_id,
+        worker_path,
+        &model_id,
+        &meta,
+        body.len(),
+        max_tokens,
+        min_context,
+        backend_hint.clone(),
+        required_pool.clone(),
+        preferred_pool.clone(),
+        priority,
+        &req_headers,
+        layer
+            .config
+            .cache_affinity_secret
+            .as_ref()
+            .map(|secret| secret.expose()),
+        request_timeout,
+    ) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                request_id,
+                "AXS_INVALID_REQUEST_PROFILE",
+                error.to_string(),
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
         }
     };
 
-    let mut resp = layer
+    let tenant_permit = if layer.config.tenant_max_concurrent > 0 {
+        match layer.tenant_limiter.try_acquire(
+            profile.tenant_id.as_str(),
+            layer.config.tenant_max_concurrent,
+        ) {
+            Some(permit) => Some(permit),
+            None => {
+                return ax_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    request_id,
+                    "AXS_TENANT_QUOTA_EXCEEDED",
+                    "tenant concurrent-request quota exceeded",
+                    true,
+                    ax_serving_protocol::AdmissionPhase::Admission,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let queue_priority = match profile.priority {
+        PriorityClass::Low => QueuePriority::Low,
+        PriorityClass::Normal => QueuePriority::Normal,
+        PriorityClass::High => QueuePriority::High,
+    };
+
+    // Admission control: acquire a queue slot before dispatching.
+    let permit = match tokio::time::timeout_at(
+        profile.deadline,
+        layer
+            .queue
+            .acquire_with_priority(fairness_client_key(&req_headers, peer_addr), queue_priority),
+    )
+    .await
+    {
+        Err(_) => {
+            return ax_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                request_id,
+                "AXS_REQUEST_DEADLINE",
+                "request deadline expired while waiting for gateway admission",
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+        Ok(outcome) => match outcome {
+            AcquireResult::Permit(p) => p,
+
+            AcquireResult::Rejected => {
+                let queued = layer.queue.queued();
+                let mut response = ax_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    request_id,
+                    "AXS_GATEWAY_OVERLOADED",
+                    "gateway concurrency limit exceeded",
+                    true,
+                    ax_serving_protocol::AdmissionPhase::Admission,
+                );
+                if let Ok(value) = HeaderValue::from_str(&queued.to_string()) {
+                    response.headers_mut().insert("x-queue-depth", value);
+                }
+                if let Ok(value) = HeaderValue::from_str(&layer.retry_after_secs.to_string()) {
+                    response.headers_mut().insert("retry-after", value);
+                }
+                return response;
+            }
+
+            AcquireResult::Shed => {
+                let mut resp = ax_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    request_id,
+                    "AXS_REQUEST_SHED",
+                    "request shed by gateway overload policy",
+                    true,
+                    ax_serving_protocol::AdmissionPhase::Admission,
+                );
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-reason"),
+                    HeaderValue::from_static("request_shed"),
+                );
+                return resp;
+            }
+
+            AcquireResult::Timeout => {
+                let mut resp = ax_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    request_id,
+                    "AXS_ADMISSION_DEADLINE",
+                    "request deadline expired while waiting for gateway admission",
+                    true,
+                    ax_serving_protocol::AdmissionPhase::Admission,
+                );
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-reason"),
+                    HeaderValue::from_static("queue_timeout"),
+                );
+                return resp;
+            }
+        },
+    };
+
+    let deployment_catalog = layer.deployment_catalog.snapshot();
+    let mut resp = if deployment_catalog.mode() == DeploymentMode::Explicit {
+        layer
+            .dispatcher
+            .forward_profile(
+                &layer.registry,
+                &deployment_catalog,
+                layer.policy.as_ref(),
+                &profile,
+                worker_path,
+                body,
+                layer.config.telemetry_stale_ms,
+                layer.config.max_dispatch_attempts,
+            )
+            .await
+    } else {
+        layer
+            .dispatcher
+            .forward_kind_until(
+                &layer.registry,
+                layer.policy.as_ref(),
+                &model_id,
+                profile.request_kind(),
+                backend_hint.as_deref(),
+                min_context.map(|value| value.min(u64::from(u32::MAX)) as u32),
+                stream,
+                required_pool
+                    .as_ref()
+                    .or(preferred_pool.as_ref())
+                    .map(|pool| pool.as_str()),
+                required_pool.is_some(),
+                worker_path,
+                body,
+                Some(profile.deadline),
+            )
+            .await
+    };
+    layer
         .dispatcher
-        .forward_kind(
-            &layer.registry,
-            layer.policy.as_ref(),
-            &model_id,
-            match worker_path {
-                "/v1/embeddings" => RequestKind::Embedding,
-                _ => RequestKind::Llm,
-            },
-            backend_hint.as_deref(),
-            min_context,
-            stream,
-            preferred_pool,
-            worker_path,
-            body,
-            auth_header,
-        )
-        .await;
+        .record_request_result(resp.status().is_success());
 
     // Add X-Reason header for dispatcher-level errors (PRD §FR-3.3).
     if !resp.headers().contains_key("x-reason") {
@@ -178,13 +426,13 @@ async fn proxy_inference(
     if stream {
         let (parts, old_body) = resp.into_parts();
         let guarded = futures::stream::unfold(
-            (old_body.into_data_stream(), Some(permit)),
-            |(mut data_stream, permit): (BodyDataStream, Option<_>)| async move {
+            (old_body.into_data_stream(), Some((permit, tenant_permit))),
+            |(mut data_stream, permits): (BodyDataStream, Option<_>)| async move {
                 use futures::StreamExt as _;
                 match data_stream.next().await {
-                    Some(chunk) => Some((chunk, (data_stream, permit))),
+                    Some(chunk) => Some((chunk, (data_stream, permits))),
                     None => {
-                        drop(permit);
+                        drop(permits);
                         None
                     }
                 }
@@ -193,8 +441,420 @@ async fn proxy_inference(
         axum::response::Response::from_parts(parts, Body::from_stream(guarded))
     } else {
         drop(permit);
+        drop(tenant_permit);
         resp
     }
+}
+
+fn request_has_images(messages: &[InputMessage]) -> bool {
+    messages
+        .iter()
+        .any(|msg| msg.content.as_ref().is_some_and(MessageContent::has_images))
+}
+
+fn declared_minimum_context(headers: &HeaderMap) -> Result<Option<u64>, String> {
+    const MAX_DECLARED_CONTEXT_TOKENS: u64 = 16 * 1024 * 1024;
+    let Some(raw) = headers
+        .get("x-ax-minimum-context-tokens")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "x-ax-minimum-context-tokens must be a positive integer".to_string())?;
+    if value == 0 || value > MAX_DECLARED_CONTEXT_TOKENS {
+        return Err(format!(
+            "x-ax-minimum-context-tokens must be between 1 and {MAX_DECLARED_CONTEXT_TOKENS}"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn declared_request_timeout(
+    headers: &HeaderMap,
+    configured_maximum: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    let Some(raw) = headers
+        .get("x-ax-request-timeout-ms")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(configured_maximum);
+    };
+    let milliseconds = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "x-ax-request-timeout-ms must be a positive integer".to_string())?;
+    if milliseconds == 0 {
+        return Err("x-ax-request-timeout-ms must be greater than zero".into());
+    }
+    Ok(std::time::Duration::from_millis(milliseconds).min(configured_maximum))
+}
+
+fn derive_cache_affinity_key(
+    headers: &HeaderMap,
+    tenant: &str,
+    secret: Option<&str>,
+) -> Result<Option<u64>, String> {
+    const MAX_AFFINITY_HINT_BYTES: usize = 256;
+    let Some(raw) = headers.get("x-ax-cache-affinity") else {
+        return Ok(None);
+    };
+    let hint = raw
+        .to_str()
+        .map_err(|_| "x-ax-cache-affinity must be valid visible ASCII".to_string())?
+        .trim();
+    if hint.is_empty() || hint.len() > MAX_AFFINITY_HINT_BYTES {
+        return Err(format!(
+            "x-ax-cache-affinity must contain 1 to {MAX_AFFINITY_HINT_BYTES} bytes"
+        ));
+    }
+    let secret = secret.ok_or_else(|| {
+        "cache affinity is disabled; configure AXS_CACHE_AFFINITY_SECRET".to_string()
+    })?;
+
+    let mut digest = Sha256::new();
+    digest.update(b"ax-serving-cache-affinity-v1\0");
+    digest.update((secret.len() as u64).to_be_bytes());
+    digest.update(secret.as_bytes());
+    digest.update((tenant.len() as u64).to_be_bytes());
+    digest.update(tenant.as_bytes());
+    digest.update((hint.len() as u64).to_be_bytes());
+    digest.update(hint.as_bytes());
+    let digest = digest.finalize();
+    Ok(Some(u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 has at least 8 bytes"),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_profile(
+    request_id: ax_serving_protocol::RequestId,
+    worker_path: &str,
+    model_id: &str,
+    meta: &ProxyRequestMeta,
+    body_bytes: usize,
+    max_output_tokens: Option<u32>,
+    minimum_context_tokens: Option<u64>,
+    runtime_hint: Option<String>,
+    required_pool: Option<PoolId>,
+    preferred_pool: Option<PoolId>,
+    priority: PriorityClass,
+    headers: &HeaderMap,
+    cache_affinity_secret: Option<&str>,
+    request_timeout: std::time::Duration,
+) -> anyhow::Result<RequestProfile> {
+    let operation = match worker_path {
+        "/v1/chat/completions" => Operation::chat_completions(),
+        "/v1/completions" => Operation::text_completions(),
+        "/v1/embeddings" => Operation::embeddings(),
+        _ => anyhow::bail!("unsupported inference operation"),
+    };
+    let logical_model = LogicalModelId::new(model_id.to_string())?;
+    let tenant = headers
+        .get("x-ax-project")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default");
+    let tenant_id = TenantId::new(tenant.to_string())?;
+    let cache_affinity_key = derive_cache_affinity_key(headers, tenant, cache_affinity_secret)
+        .map_err(anyhow::Error::msg)?;
+
+    let mut modalities = BTreeSet::from(["text".to_string()]);
+    let mut required_capabilities = BTreeSet::new();
+    if request_has_images(&meta.messages) {
+        modalities.insert("image".into());
+        required_capabilities.insert(ProtocolCapability::new("inference.vision")?);
+    }
+    if meta.tools.as_ref().is_some_and(|tools| {
+        tools.as_array().is_none_or(|values| !values.is_empty()) && !tools.is_null()
+    }) {
+        required_capabilities.insert(ProtocolCapability::new("inference.tools")?);
+    }
+    if meta.response_format.as_ref().is_some_and(|format| {
+        format
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind != "text")
+    }) {
+        required_capabilities.insert(ProtocolCapability::new("inference.structured-output")?);
+    }
+
+    Ok(RequestProfile {
+        request_id,
+        operation,
+        logical_model,
+        stream: meta.stream,
+        max_output_tokens: max_output_tokens.map(u64::from),
+        body_bytes,
+        message_count: (!meta.messages.is_empty()).then_some(meta.messages.len()),
+        modalities,
+        required_capabilities,
+        minimum_context_tokens,
+        tenant_id,
+        priority,
+        cache_affinity_key,
+        required_pool,
+        preferred_pool,
+        runtime_hint,
+        deadline: tokio::time::Instant::now() + request_timeout,
+    })
+}
+
+fn validate_proxy_request_shape(
+    worker_path: &str,
+    meta: &ProxyRequestMeta,
+) -> Result<Option<EmbeddingsInput>, (StatusCode, String)> {
+    match worker_path {
+        "/v1/chat/completions" => {
+            validate_proxy_max_tokens(meta.max_tokens)?;
+            validate_proxy_chat_messages(&meta.messages)?;
+            Ok(None)
+        }
+        "/v1/completions" => {
+            validate_proxy_max_tokens(meta.max_tokens)?;
+            validate_proxy_prompt(meta.prompt.as_deref())?;
+            Ok(None)
+        }
+        "/v1/embeddings" => {
+            let Some(input) = meta.input.as_ref() else {
+                return Err((StatusCode::BAD_REQUEST, "missing field: input".to_string()));
+            };
+            let input = serde_json::from_value::<EmbeddingsInput>(input.clone()).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid embedding input".to_string(),
+                )
+            })?;
+            validate_proxy_embeddings_input(&input)?;
+            Ok(Some(input))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn validate_proxy_max_tokens(max_tokens: Option<u32>) -> Result<(), (StatusCode, String)> {
+    if matches!(max_tokens, Some(0)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be >= 1".to_string(),
+        ));
+    }
+    if matches!(max_tokens, Some(n) if n > MAX_MAX_TOKENS) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_chat_messages(messages: &[InputMessage]) -> Result<(), (StatusCode, String)> {
+    if messages.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "messages must not be empty".to_string(),
+        ));
+    }
+    if messages.len() > MAX_MESSAGES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many messages (max {MAX_MESSAGES})"),
+        ));
+    }
+    for message in messages {
+        if message.content.is_none()
+            && !(message.role.eq_ignore_ascii_case("assistant") && message.tool_calls.is_some())
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "message content is required unless assistant tool_calls are present".to_string(),
+            ));
+        }
+        if message
+            .content
+            .as_ref()
+            .is_some_and(|content| content.byte_len() > MAX_CONTENT_BYTES)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "message content exceeds 32 KB limit".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_proxy_prompt(prompt: Option<&str>) -> Result<(), (StatusCode, String)> {
+    let Some(prompt) = prompt else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt must not be empty".to_string(),
+        ));
+    };
+    if prompt.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt must not be empty".to_string(),
+        ));
+    }
+    if prompt.len() > MAX_CONTENT_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt exceeds 32 KB limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_embeddings_input(input: &EmbeddingsInput) -> Result<(), (StatusCode, String)> {
+    match input {
+        EmbeddingsInput::One(text) => validate_proxy_embedding_text(text, 0),
+        EmbeddingsInput::Many(texts) => {
+            if texts.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "input must not be empty".to_string(),
+                ));
+            }
+            if texts.len() > MAX_EMBEDDING_INPUTS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"),
+                ));
+            }
+            let mut total_bytes = 0usize;
+            for (idx, text) in texts.iter().enumerate() {
+                validate_proxy_embedding_text(text, idx)?;
+                total_bytes = total_bytes.saturating_add(text.len());
+            }
+            if total_bytes > MAX_EMBEDDING_TOTAL_BYTES {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "embedding input text exceeds total limit of {MAX_EMBEDDING_TOTAL_BYTES} bytes"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        EmbeddingsInput::OneTokens(tokens) => validate_proxy_embedding_tokens(tokens, 0),
+        EmbeddingsInput::ManyTokens(seqs) => {
+            if seqs.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "input must not be empty".to_string(),
+                ));
+            }
+            if seqs.len() > MAX_EMBEDDING_INPUTS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"),
+                ));
+            }
+            let mut total_tokens = 0usize;
+            for (idx, tokens) in seqs.iter().enumerate() {
+                validate_proxy_embedding_tokens(tokens, idx)?;
+                total_tokens = total_tokens.saturating_add(tokens.len());
+            }
+            if total_tokens > MAX_EMBEDDING_TOTAL_TOKENS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "embedding token input exceeds total limit of {MAX_EMBEDDING_TOTAL_TOKENS}"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_proxy_embedding_text(text: &str, index: usize) -> Result<(), (StatusCode, String)> {
+    if text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("embedding input at index {index} must not be empty"),
+        ));
+    }
+    if text.len() > MAX_CONTENT_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("embedding input at index {index} exceeds {MAX_CONTENT_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_embedding_tokens(
+    tokens: &[u32],
+    index: usize,
+) -> Result<(), (StatusCode, String)> {
+    if tokens.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("embedding token input at index {index} must not be empty"),
+        ));
+    }
+    if tokens.len() > MAX_EMBEDDING_TOTAL_TOKENS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "embedding token input at index {index} exceeds {MAX_EMBEDDING_TOTAL_TOKENS} tokens"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode, String)> {
+    let Some(model) = model else {
+        return Err((StatusCode::BAD_REQUEST, "missing field: model".to_string()));
+    };
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "model must not be empty".to_string(),
+        ));
+    }
+    if model != trimmed {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model contains unsupported whitespace".to_string(),
+        ));
+    }
+    LogicalModelId::new(model.clone()).map_err(|error| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid model identifier: {error}"),
+        )
+    })?;
+    Ok(model)
+}
+
+fn validate_dispatch_hint(hint: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = hint else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+
+    if BackendKind::parse(trimmed) != BackendKind::Auto
+        || RuntimeKind::parse(trimmed) != RuntimeKind::Unknown
+    {
+        return Ok(Some(trimmed.to_ascii_lowercase()));
+    }
+
+    Err(format!(
+        "invalid backend/runtime hint; expected native, ax_engine, llama_cpp, sglang, vllm, or auto but got {trimmed}"
+    ))
 }
 
 fn fairness_client_key(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
@@ -235,9 +895,18 @@ pub(super) fn orchestrator_startup_report_value(
             "allowed_node_cidrs": layer.config.allowed_node_cidrs,
             "internal_port": layer.config.internal_port,
             "dispatch_policy": layer.config.dispatch_policy,
+            "deployment_mode": layer.config.deployment_mode,
+            "telemetry_stale_ms": layer.config.telemetry_stale_ms,
+            "max_dispatch_attempts": layer.config.max_dispatch_attempts,
+            "dispatch_auth_configured": layer.config.dispatch_token.is_some(),
+            "tls_profile": layer.config.tls_profile,
+            "gateway_id": layer.config.gateway_id,
+            "fleet_store": layer.fleet_store.kind(),
             "worker_heartbeat_ms": layer.config.worker_heartbeat_ms,
             "worker_ttl_ms": layer.config.worker_ttl_ms,
             "request_timeout_secs": layer.config.request_timeout_secs,
+            "first_byte_timeout_ms": layer.config.first_byte_timeout_ms,
+            "stream_idle_timeout_ms": layer.config.stream_idle_timeout_ms,
             "global_queue_max": layer.config.global_queue_max,
             "global_queue_depth": layer.config.global_queue_depth,
             "global_queue_wait_ms": layer.config.global_queue_wait_ms,
@@ -255,6 +924,7 @@ pub(super) fn orchestrator_startup_report_value(
 pub(super) async fn proxy_chat_completions(
     State(layer): State<Arc<OrchestratorLayer>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    request_id: Option<Extension<AxRequestId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -264,6 +934,9 @@ pub(super) async fn proxy_chat_completions(
         headers,
         body,
         "/v1/chat/completions",
+        request_id
+            .map(|Extension(value)| value.0)
+            .unwrap_or_default(),
     )
     .await
 }
@@ -271,31 +944,61 @@ pub(super) async fn proxy_chat_completions(
 pub(super) async fn proxy_completions(
     State(layer): State<Arc<OrchestratorLayer>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    request_id: Option<Extension<AxRequestId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    proxy_inference(layer, Some(peer_addr), headers, body, "/v1/completions").await
+    proxy_inference(
+        layer,
+        Some(peer_addr),
+        headers,
+        body,
+        "/v1/completions",
+        request_id
+            .map(|Extension(value)| value.0)
+            .unwrap_or_default(),
+    )
+    .await
 }
 
 pub(super) async fn proxy_embeddings(
     State(layer): State<Arc<OrchestratorLayer>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    request_id: Option<Extension<AxRequestId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    proxy_inference(layer, Some(peer_addr), headers, body, "/v1/embeddings").await
+    proxy_inference(
+        layer,
+        Some(peer_addr),
+        headers,
+        body,
+        "/v1/embeddings",
+        request_id
+            .map(|Extension(value)| value.0)
+            .unwrap_or_default(),
+    )
+    .await
 }
 
 pub(super) async fn proxy_models(State(layer): State<Arc<OrchestratorLayer>>) -> impl IntoResponse {
-    let workers = layer.registry.list_all();
-    let mut models: Vec<String> = workers
-        .iter()
-        // Mirror dispatch eligibility: only healthy, non-draining workers.
-        // Unhealthy workers may recover but are not currently routable, so
-        // advertising their models here would produce 503s on inference.
-        .filter(|w| !w.drain && w.health == "healthy")
-        .flat_map(|w| w.capability_descriptor.models.iter().cloned())
-        .collect();
+    let deployment_catalog = layer.deployment_catalog.snapshot();
+    let mut models: Vec<String> = if deployment_catalog.mode() == DeploymentMode::Explicit {
+        deployment_catalog
+            .logical_models()
+            .into_iter()
+            .map(|model| model.id.to_string())
+            .collect()
+    } else {
+        layer
+            .registry
+            .list_all()
+            .iter()
+            // Mirror dispatch eligibility: only healthy, non-draining workers.
+            .filter(|worker| !worker.drain && worker.health == "healthy")
+            .flat_map(|worker| worker.capability_descriptor.models.iter().cloned())
+            .collect()
+    };
     models.sort_unstable();
     models.dedup();
 
@@ -343,6 +1046,28 @@ pub(super) async fn proxy_health(State(layer): State<Arc<OrchestratorLayer>>) ->
     }))
 }
 
+pub(super) async fn proxy_liveness() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+pub(super) async fn proxy_readiness(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    let eligible = layer.registry.eligible_healthy_count();
+    let ready = eligible > 0;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "eligible_workers": eligible,
+        })),
+    )
+}
+
 pub(super) async fn proxy_metrics(
     State(layer): State<Arc<OrchestratorLayer>>,
 ) -> impl IntoResponse {
@@ -350,6 +1075,7 @@ pub(super) async fn proxy_metrics(
     let workers = layer.registry.list_all();
     let total_inflight: usize = workers.iter().map(|w| w.inflight).sum();
     let qm = &layer.queue.metrics;
+    let dispatch = layer.dispatcher.metrics();
 
     Json(serde_json::json!({
         "mode": "direct",
@@ -361,6 +1087,14 @@ pub(super) async fn proxy_metrics(
         },
         "total_inflight": total_inflight,
         "reroute_total": layer.dispatcher.reroutes(),
+        "requests": {
+            "total": dispatch.requests_total,
+            "attempts_total": dispatch.attempts_total,
+            "completed_total": dispatch.completed_total,
+            "failed_total": dispatch.failed_total,
+            "cancelled_total": dispatch.cancelled_total,
+            "retried_total": dispatch.retries_total,
+        },
         "queue": {
             "active": layer.queue.active(),
             "queued": layer.queue.queued(),
@@ -371,6 +1105,191 @@ pub(super) async fn proxy_metrics(
         },
         "worker_detail": workers,
     }))
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn prometheus_metric(buf: &mut String, name: &str, help: &str, kind: &str, value: u64) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(buf, "# HELP {name} {help}");
+    let _ = writeln!(buf, "# TYPE {name} {kind}");
+    let _ = writeln!(buf, "{name} {value}");
+}
+
+fn prometheus_latency_histogram(
+    buf: &mut String,
+    name: &str,
+    help: &str,
+    snapshot: &super::direct::LatencyHistogramSnapshot,
+) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(buf, "# HELP {name} {help}");
+    let _ = writeln!(buf, "# TYPE {name} histogram");
+    for (upper_us, count) in super::direct::GATEWAY_LATENCY_BUCKETS_US
+        .iter()
+        .zip(snapshot.cumulative_buckets.iter())
+    {
+        if *upper_us == u64::MAX {
+            let _ = writeln!(buf, "{name}_bucket{{le=\"+Inf\"}} {count}");
+        } else {
+            let upper_seconds = *upper_us as f64 / 1_000_000.0;
+            let _ = writeln!(buf, "{name}_bucket{{le=\"{upper_seconds:.6}\"}} {count}");
+        }
+    }
+    let _ = writeln!(
+        buf,
+        "{name}_sum {:.6}",
+        snapshot.sum_us as f64 / 1_000_000.0
+    );
+    let _ = writeln!(buf, "{name}_count {}", snapshot.count);
+}
+
+pub(super) async fn proxy_prometheus_metrics(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    use std::fmt::Write as _;
+
+    let (healthy, unhealthy, draining) = layer.registry.counts();
+    let eligible = layer.registry.eligible_healthy_count();
+    let workers = layer.registry.list_all();
+    let total_inflight = workers.iter().map(|worker| worker.inflight).sum::<usize>();
+    let queue = &layer.queue.metrics;
+    let dispatch = layer.dispatcher.metrics();
+    let mut body = String::with_capacity(4096);
+
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_info Static gateway build and configuration identity.\n# TYPE axs_gateway_info gauge\naxs_gateway_info{{gateway_id=\"{}\",fleet_store=\"{}\",policy=\"{}\"}} 1",
+        prometheus_label(&layer.config.gateway_id),
+        prometheus_label(layer.fleet_store.kind()),
+        prometheus_label(&layer.config.dispatch_policy),
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_requests_total",
+        "Inference requests that reached gateway dispatch.",
+        "counter",
+        dispatch.requests_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_dispatch_attempts_total",
+        "Gateway-to-agent dispatch attempts.",
+        "counter",
+        dispatch.attempts_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_requests_completed_total",
+        "Successful responses consumed through completion.",
+        "counter",
+        dispatch.completed_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_requests_failed_total",
+        "Requests ending in an error response or stream failure.",
+        "counter",
+        dispatch.failed_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_requests_cancelled_total",
+        "Successful response streams dropped before completion.",
+        "counter",
+        dispatch.cancelled_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_retries_total",
+        "Safe pre-commit retries after connect failure or typed non-admission.",
+        "counter",
+        dispatch.retries_total,
+    );
+    prometheus_latency_histogram(
+        &mut body,
+        "axs_gateway_endpoint_selection_duration_seconds",
+        "Time spent resolving and selecting an eligible runtime endpoint.",
+        &dispatch.endpoint_selection,
+    );
+    prometheus_latency_histogram(
+        &mut body,
+        "axs_gateway_response_headers_duration_seconds",
+        "Gateway-to-agent dispatch latency through upstream response headers.",
+        &dispatch.response_headers,
+    );
+    prometheus_latency_histogram(
+        &mut body,
+        "axs_gateway_attempt_duration_seconds",
+        "Dispatch-attempt duration through complete blocking body or streaming termination.",
+        &dispatch.attempt_duration,
+    );
+    prometheus_latency_histogram(
+        &mut body,
+        "axs_gateway_time_to_first_byte_seconds",
+        "Dispatch-attempt latency through the first streamed response bytes.",
+        &dispatch.time_to_first_byte,
+    );
+    prometheus_latency_histogram(
+        &mut body,
+        "axs_gateway_stream_duration_seconds",
+        "Streaming dispatch-attempt duration through completion, failure, or cancellation.",
+        &dispatch.stream_duration,
+    );
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_endpoint_selections_total Endpoint selection outcomes with bounded reason labels.\n# TYPE axs_gateway_endpoint_selections_total counter\naxs_gateway_endpoint_selections_total{{outcome=\"selected\"}} {}\naxs_gateway_endpoint_selections_total{{outcome=\"no_candidate\"}} {}\naxs_gateway_endpoint_selections_total{{outcome=\"at_capacity\"}} {}\naxs_gateway_endpoint_selections_total{{outcome=\"error\"}} {}",
+        dispatch.selection_selected_total,
+        dispatch.selection_no_candidate_total,
+        dispatch.selection_at_capacity_total,
+        dispatch.selection_error_total,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_admitted_total",
+        "Requests admitted by the global concurrency queue.",
+        "counter",
+        queue.permit_total.load(Ordering::Relaxed),
+    );
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_rejected_total Requests rejected before dispatch.\n# TYPE axs_gateway_rejected_total counter\naxs_gateway_rejected_total{{reason=\"queue_full\"}} {}\naxs_gateway_rejected_total{{reason=\"shed\"}} {}\naxs_gateway_rejected_total{{reason=\"queue_timeout\"}} {}",
+        queue.rejected_total.load(Ordering::Relaxed),
+        queue.shed_total.load(Ordering::Relaxed),
+        queue.timeout_total.load(Ordering::Relaxed),
+    );
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_queue_requests Current gateway admission state.\n# TYPE axs_gateway_queue_requests gauge\naxs_gateway_queue_requests{{state=\"active\"}} {}\naxs_gateway_queue_requests{{state=\"queued\"}} {}",
+        layer.queue.active(),
+        layer.queue.queued(),
+    );
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_workers Current worker membership by bounded state.\n# TYPE axs_gateway_workers gauge\naxs_gateway_workers{{state=\"healthy\"}} {healthy}\naxs_gateway_workers{{state=\"unhealthy\"}} {unhealthy}\naxs_gateway_workers{{state=\"draining\"}} {draining}\naxs_gateway_workers{{state=\"eligible\"}} {eligible}"
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_worker_inflight",
+        "Aggregate requests currently reserved on workers.",
+        "gauge",
+        total_inflight as u64,
+    );
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 pub(super) async fn proxy_admin_status(
@@ -392,6 +1311,11 @@ pub(super) async fn proxy_admin_status(
         "status": if eligible > 0 { "ok" } else { "degraded" },
         "auth_required": layer.public_auth_required.load(Ordering::Relaxed),
         "dispatch_policy": layer.config.dispatch_policy,
+        "gateway": {
+            "id": layer.config.gateway_id,
+            "fleet_store": layer.fleet_store.kind(),
+            "tls_profile": layer.config.tls_profile,
+        },
         "license": layer.license.to_json(),
         "workers": {
             "total": total_workers,
@@ -526,6 +1450,8 @@ pub(super) async fn proxy_admin_fleet(
     }
 
     Json(serde_json::json!({
+        "gateway_id": layer.config.gateway_id,
+        "fleet_store": layer.fleet_store.kind(),
         "total_workers": workers.len(),
         "eligible_workers": layer.registry.eligible_healthy_count(),
         "pools": pools,
@@ -533,6 +1459,19 @@ pub(super) async fn proxy_admin_fleet(
         "backends": backends,
         "runtimes": runtimes,
         "workers": workers,
+    }))
+}
+
+pub(super) async fn proxy_admin_deployments(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    let catalog = layer.deployment_catalog.snapshot();
+    Json(serde_json::json!({
+        "mode": catalog.mode(),
+        "logical_models": catalog.logical_models(),
+        "pools": catalog.pools().collect::<Vec<_>>(),
+        "deployments": catalog.deployments().collect::<Vec<_>>(),
+        "equivalence_classes": catalog.equivalence_classes().collect::<Vec<_>>(),
     }))
 }
 
@@ -1352,7 +2291,7 @@ pub(super) async fn proxy_set_license(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::fairness_client_key;
+    use super::{derive_cache_affinity_key, fairness_client_key};
 
     #[test]
     fn fairness_client_key_hashes_authorization_header() {
@@ -1375,5 +2314,37 @@ mod tests {
 
         let key = fairness_client_key(&headers, Some("10.0.0.9:1234".parse().unwrap()));
         assert_eq!(key, "ip:10.0.0.9");
+    }
+
+    #[test]
+    fn cache_affinity_is_keyed_and_tenant_scoped() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ax-cache-affinity",
+            HeaderValue::from_static("conversation-42"),
+        );
+
+        let a = derive_cache_affinity_key(&headers, "tenant-a", Some(&"a".repeat(32)))
+            .unwrap()
+            .unwrap();
+        let b = derive_cache_affinity_key(&headers, "tenant-b", Some(&"a".repeat(32)))
+            .unwrap()
+            .unwrap();
+        let different_secret =
+            derive_cache_affinity_key(&headers, "tenant-a", Some(&"b".repeat(32)))
+                .unwrap()
+                .unwrap();
+
+        assert_ne!(a, b);
+        assert_ne!(a, different_secret);
+    }
+
+    #[test]
+    fn cache_affinity_requires_an_operator_secret() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ax-cache-affinity", HeaderValue::from_static("session"));
+
+        let error = derive_cache_affinity_key(&headers, "tenant-a", None).unwrap_err();
+        assert!(error.contains("AXS_CACHE_AFFINITY_SECRET"));
     }
 }

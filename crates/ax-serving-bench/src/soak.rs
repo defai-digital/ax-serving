@@ -7,11 +7,37 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ax_serving_api::metrics::LatencyHistogram;
 use ax_serving_engine::{
-    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, LoadConfig, RouterBackend,
+    GenerateEvent, GenerateInput, GenerationParams, InferenceBackend, RouterBackend,
 };
 use tokio::sync::mpsc;
+
+use crate::load_config;
+
+struct LatencyHistogram {
+    samples: Vec<Duration>,
+}
+
+impl LatencyHistogram {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn record(&mut self, duration: Duration) {
+        self.samples.push(duration);
+    }
+
+    fn p95(&mut self) -> Duration {
+        if self.samples.is_empty() {
+            return Duration::ZERO;
+        }
+        self.samples.sort_unstable();
+        let index = (self.samples.len() * 95 / 100).min(self.samples.len() - 1);
+        self.samples[index]
+    }
+}
 
 pub async fn run(
     model: PathBuf,
@@ -24,8 +50,8 @@ pub async fn run(
     // load_model may touch backend runtimes depending on routing. Since
     // soak::run() is async, run model load on a blocking thread.
     let (backend, handle, meta) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let backend = RouterBackend::from_env();
-        let (handle, meta) = backend.load_model(&model, LoadConfig::default())?;
+        let backend = RouterBackend::try_from_env()?;
+        let (handle, meta) = backend.load_model(&model, load_config::for_model_path(&model))?;
         Ok((backend, handle, meta))
     })
     .await??;
@@ -105,7 +131,7 @@ pub async fn run(
             // so the cold-start latency spike doesn't become the reference point.
             if !baseline_set_after_interval {
                 baseline_p95 = Some(p95);
-                let rss = ax_serving_api::metrics::current_rss_bytes() as f64;
+                let rss = ax_serving_engine::current_rss_bytes() as f64;
                 baseline_rss = Some(if rss > 0.0 { rss } else { 1.0 });
                 baseline_set_after_interval = true;
                 println!(
@@ -116,7 +142,7 @@ pub async fn run(
             }
 
             let elapsed_min = start.elapsed().as_secs() / 60;
-            let rss = ax_serving_api::metrics::current_rss_bytes() as f64;
+            let rss = ax_serving_engine::current_rss_bytes() as f64;
             let baseline_rss = baseline_rss.unwrap_or(if rss > 0.0 { rss } else { 1.0 });
             let rss_drift = (rss - baseline_rss) / baseline_rss;
             // Guard against zero baseline (empty first burst) — NaN comparisons

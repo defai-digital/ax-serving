@@ -34,9 +34,9 @@ The first supported automation contracts are:
 ax-serving doctor --json
 ax-serving tune --dry-run --json
 ax-serving tune --output serving.toml --json
-ax-serving config validate --json
-ax-serving status --url http://127.0.0.1:18080 --json
-ax-serving smoke-test --url http://127.0.0.1:18080 --model default --json
+ax-servingctl config validate --json
+ax-servingctl status --url http://127.0.0.1:18080 --json
+ax-servingctl smoke-test --url http://127.0.0.1:18080 --model default --json
 ```
 
 `doctor --json` returns a redacted diagnostic report with check status, details, and
@@ -50,8 +50,9 @@ rendered TOML, and the written output path when a file is created.
 runtime summary that is safe for setup tools to display.
 
 `status --json` probes `/health`, `/v1/models`, and `/v1/metrics` on a running worker or
-gateway. Use `--api-key` when authentication is enabled; otherwise it uses the first
-token in `AXS_API_KEY` when available.
+gateway. Use `--api-key` for the public model endpoint and `--admin-key` for metrics and
+optional diagnostics; otherwise it uses the first token in `AXS_API_KEY` and
+`AXS_ADMIN_API_KEY`, respectively.
 
 `smoke-test --json` sends a minimal non-streaming `/v1/chat/completions` request and
 returns the HTTP status, latency, and parsed JSON response.
@@ -130,4 +131,4 @@ Do not add OpenTUI, Bun, or TypeScript dependencies to the AX Serving Rust works
 
 Useful follow-up contracts for AX Code automation:
 
-- `ax-serving support-bundle --output <path>`
+- `ax-servingctl support-bundle --output <path>`

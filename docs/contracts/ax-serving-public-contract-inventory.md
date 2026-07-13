@@ -1,245 +1,153 @@
-# AX Serving Public Contract Inventory
+# AX Serving public contract inventory
 
-> **Status**: Ready for execution
-> **Date**: 2026-03-29
-> **Owner**: AX Serving Core Team
-> **Related**:
-> - [AX Serving Node Contract](ax-serving-node-contract.md)
-> - [Runtime Responsibility Inventory](ax-serving-runtime-responsibility-inventory.md)
-> - [AX Fabric Runtime Contract](ax-fabric-runtime-contract.md)
+| Field | Value |
+| --- | --- |
+| Status | Source contract; release stability follows tagged release notes |
+| Last updated | 2026-07-12 |
+| Related | [Runtime-agent protocol](ax-serving-node-contract.md) |
 
-# Purpose
+This inventory identifies supported integration boundaries. Internal Rust
+module paths, helper functions, dashboard DOM, and embedded backend traits are
+not public contracts.
 
-This document defines the public contracts that enterprise repositories may
-depend on when integrating with the open-source core.
+## Portable gateway
 
-It exists to prevent enterprise products from quietly depending on internal
-Rust modules or undocumented response details.
+Released inference family:
 
-# Contract Families
+- `POST /v1/chat/completions`;
+- `POST /v1/completions`;
+- `POST /v1/embeddings`;
+- `GET /v1/models`.
 
-## 1. Northbound Serving APIs
+The gateway preserves unknown JSON fields while classifying only bounded
+routing metadata. Runtime semantics stay with the selected endpoint.
+`/v1/responses` is not released until a runtime adapter passes its conformance
+gate.
 
-These are the primary public contracts exposed to operators and upstream
-products.
+OpenAI compatibility means documented request/response behavior for supported
+fields; it does not imply every extension of every upstream runtime.
 
-Stable contract family:
+## Errors and tracing
 
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/models`
-- `DELETE /v1/models/{id}`
-- `POST /v1/models/{id}/reload`
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/embeddings`
-- `GET /v1/metrics`
-- CLI contract validation through `ax-serving fabric validate`
+Gateway-generated inference errors use the AX envelope with:
 
-Stability rule:
+- stable machine code;
+- safe message/detail;
+- request ID;
+- retryable flag;
+- admission/dispatch phase.
 
-- fields and semantics documented in public docs or release notes are contract
-- undocumented JSON fields may change without compatibility guarantees
+Responses preserve an opaque request ID. Attempt IDs are internal dispatch
+evidence and must not be used as authentication or user identifiers.
 
-Enterprise usage examples:
+## Health and observability
 
-- enterprise control plane health polling
-- management UI model inventory views
-- enterprise routing clients and benchmark agents
+- `GET /livez` — process liveness;
+- `GET /readyz` — routable readiness;
+- `GET /health` — JSON fleet summary;
+- `GET /v1/metrics` — admin-authenticated JSON operational metrics;
+- `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
+- `GET /dashboard` — admin-authenticated compatibility convenience UI; its DOM is not a
+  contract. Browser access requires an authenticated reverse proxy that injects the admin bearer
+  credential; the token must not be placed in a URL or browser storage.
 
-## 2. Worker Lifecycle Contracts
+Prometheus names documented in the operations runbook are contract within a
+protocol major. Metric label sets are intentionally bounded and may add
+backward-compatible labels. Request IDs, worker IDs, prompts, and secrets are
+not metric labels.
 
-These are the public contracts that separate workers use to participate in the
-control plane.
+## Admin and lifecycle
 
-Stable contract family:
+Read/diagnostic family:
 
-- worker register flow
-- worker heartbeat flow
-- worker drain / undrain semantics
-- worker eviction semantics where documented
-- capability advertisement payloads
-- runtime, runtime mode, runtime version, hardware class, runtime endpoint,
-  supported operations, worker pool, backend compatibility hint, health, and queue
-  metadata that are surfaced as protocol data
-- structured `model_inventory` metadata for model id, context limit,
-  quantization, artifact format, modalities, and model-level operations where
-  runtimes report them
+- `/v1/admin/status`;
+- `/v1/admin/startup-report`;
+- `/v1/admin/diagnostics`;
+- `/v1/admin/audit`;
+- `/v1/admin/policy`;
+- `/v1/admin/fleet`;
+- `/v1/admin/deployments`;
+- `/v1/workers` and worker detail.
 
-Stability rule:
+Asynchronous lifecycle family:
 
-- protocol fields already used by public orchestration or documented in tests
-  may be depended on
-- new enterprise-only worker capabilities must be added as protocol extensions,
-  not as private Rust trait hooks
-- runtime-node integrations must use the public node contract instead of
-  depending on AX Serving internal Rust backend traits
+- `GET|POST /admin/v1/deployments`;
+- `GET|PATCH|DELETE /admin/v1/deployments/{id}`;
+- `GET /admin/v1/jobs`;
+- `GET /admin/v1/jobs/{id}`.
 
-Enterprise usage examples:
+Lifecycle mutations require `deployment_mode=explicit` and the admin
+credential. Job records expose desired/observed state, progress, generation,
+and bounded failure detail. They do not promise that AX Serving itself creates
+runtime processes or downloads models.
 
-- Mac ax-engine node adapters
-- PC CUDA vLLM worker implementations
-- NVIDIA / Thor-class vLLM worker implementations
-- heterogeneous fleet placement services
-- enterprise worker health enrichments
+Worker drain/remove routes are admin-only. Public inference keys are not admin
+keys.
 
-## 3. Admin And Diagnostics Surfaces
+## Runtime-agent protocol
 
-These surfaces may be used by enterprise tooling only where their shape is
-documented or release-noted.
+The cross-platform `ax-serving-protocol` crate and JSON fixtures define:
 
-Stable contract family:
+- version/capability negotiation;
+- registration and lease fencing;
+- heartbeat, readiness, inventory, and capacity observations;
+- drain and deployment-job control;
+- deployment/model/equivalence identity;
+- request/attempt/admission/error fields.
 
-- startup / diagnostics payloads where publicly documented
-- admin status and fleet summaries where documented
-- audit listing response shape where documented
-- fleet and admin-status grouping by pool, node class, backend compatibility
-  hint, and runtime class where documented
-- diagnostics `runtime_diagnostics.runtimes` grouping for runtime model
-  inventory, hardware classes, supported operations, runtime endpoints, and
-  operator-facing issue codes
-- diagnostics `runtime_diagnostics.recommended_actions` for operator workflows
-  such as restoring runtime capacity, replacing unhealthy workers, completing
-  drains, fixing runtime endpoint registration, refreshing model inventory, and
-  migrating embedded compatibility paths
-- diagnostics `suggested_commands` entries for actions that can be advanced
-  through documented CLI workflows such as worker inspect, drain, and
-  complete-when-idle
-- diagnostics telemetry issue/action codes for runtime error rate, queue
-  backlog, KV pressure, and batch pressure, derived from worker heartbeat
-  fields, including counter-based and ratio-based runtime telemetry, when
-  adapters report them
-- diagnostics `runtime_diagnostics.runtimes.<runtime>.runtime_guidance` for
-  runtime-specific expectations such as ax-engine on Mac nodes and vLLM on PC
-  CUDA or NVIDIA Thor nodes
-- CLI support bundle schema with command, base URL, status, redaction marker,
-  endpoint results, and recursively redacted endpoint bodies
-- CLI AX Fabric validation schema with command, base URL, status, detected
-  profile, endpoint results, and per-check contract results
-- CLI embedded migration readiness schema with command, base URL, readiness
-  result, recommended policy, runtime totals, runtime summaries, blockers, and
-  warnings
+New runtime integrations depend on this wire contract, not `InferenceBackend`
+or other embedded Rust traits. Legacy registration is a migration contract and
+cannot certify cross-runtime failover.
 
-Stability rule:
+## Configuration
 
-- documented keys are contract
-- undocumented nested keys are not contract by default
+Documented `AXS_*` variables and YAML keys are operator contracts. The most
+important trust-boundary variables are:
 
-Enterprise usage examples:
+- `AXS_API_KEY`;
+- `AXS_ADMIN_API_KEY`;
+- `AXS_WORKER_TOKEN` / `AXS_INTERNAL_API_TOKEN`;
+- `AXS_DISPATCH_TOKEN`;
+- `AXS_RUNTIME_API_KEY`;
+- `AXS_TLS_PROFILE`;
+- `AXS_FLEET_STORE`, `AXS_REDIS_URL`, `AXS_FLEET_KEY_PREFIX`,
+  `AXS_GATEWAY_ID`;
+- `AXS_DEPLOYMENT_MODE` and explicit pool/deployment/equivalence YAML;
+- queue, deadline, tenant, priority, and affinity controls documented in the
+  quick start.
 
-- private management UI
-- governance status aggregation
-- enterprise support tooling
+Secrets should be supplied through the deployment secret store, not checked-in
+YAML. Configuration changes that remove or alter a documented field require a
+migration note.
 
-## 4. Config And Environment Contracts
+## Embedded compatibility
 
-Stable contract family:
+The `embedded-compat` feature includes macOS-only local inference, synchronous
+model mutation, and `ax.serving.v1` gRPC. Those APIs can depend on local paths,
+backend enums, and token-ID streams. They are not portable hybrid-gateway
+contracts and must not be required by a Linux gateway integration.
 
-- documented YAML config keys
-- documented `AXS_*` environment variables
-- documented CLI flags
+## SDKs
 
-Current documented examples include:
+The JavaScript and Python packages are convenience clients. Their released
+surface follows package versioning and tests. Python gRPC access targets the
+embedded compatibility service; portable hybrid clients should use REST/SSE.
 
-- `AXS_LOG`
-- `AXS_LOG_FORMAT`
-- `AXS_MODEL_ALLOWED_DIRS`
-- `AXS_MODEL_WARM_POOL_SIZE`
-- `AXS_API_KEY`
-- `AXS_WORKER_RUNTIME`
-- `AXS_WORKER_RUNTIME_VERSION`
-- `AXS_WORKER_HARDWARE_CLASS`
-- `AXS_WORKER_RUNTIME_ENDPOINT`
-- `AXS_NODE_RUNTIME`
-- `AXS_NODE_RUNTIME_URL`
-- `AXS_NODE_LISTEN_ADDR`
-- `AXS_NODE_ADVERTISED_ADDR`
-- `AXS_NODE_HARDWARE_CLASS`
-- `AXS_NODE_CLASS`
-- `AXS_NODE_WORKER_POOL`
-- `AXS_NODE_MAX_INFLIGHT`
-- `AXS_EMBEDDED_RUNTIME_POLICY`
-- `AXS_THOR_RUNTIME`
-- `AXS_THOR_RUNTIME_URL`
+## Non-contract surfaces
 
-Stability rule:
+- internal Rust modules and workspace membership;
+- embedded `InferenceBackend` implementations;
+- source-only diagnostics not listed here;
+- HTML/dashboard structure;
+- benchmark summaries without schema-versioned raw evidence;
+- placeholder deployment identities or certification files;
+- private/commercial repository implementation details.
 
-- documented config fields require migration notes when behavior changes
-- private repos must not depend on unpublished config branches
+## Change policy
 
-Enterprise usage examples:
-
-- deployment bundles
-- installers and air-gapped setup tooling
-- entitlement-aware operational wrappers
-
-## 5. Metrics And Audit Payloads
-
-Stable contract family:
-
-- documented Prometheus metric names
-- documented JSON metrics keys
-- audit event payload shapes where exported or documented
-
-Stability rule:
-
-- metric names referenced by public docs or enterprise runbooks are contract
-- temporary or debug-only metrics are not contract unless promoted here or in
-  release notes
-- `GET /v1/metrics` may expose either the single-runtime profile or the gateway
-  profile documented by the AX Fabric Runtime Contract
-
-Enterprise usage examples:
-
-- SIEM export
-- compliance dashboards
-- alerting and SLO policies
-
-# Non-Contract Surfaces
-
-Enterprise repositories must not treat these as stable contracts:
-
-- internal Rust module paths
-- private helper functions
-- `InferenceBackend` trait implementations and embedded backend internals
-- undocumented HTML or dashboard DOM structure
-- test-only scaffolding
-- local branch-only response fields
-- unpublished Cargo workspace membership
-
-# Change Policy
-
-Contract changes must follow all of these rules:
-
-1. changes to documented public contracts require release-note coverage
-2. removals or semantic changes require a migration note
-3. enterprise repositories must consume tagged or frozen public-core versions
-4. contract additions should prefer additive fields and explicit defaults
-
-# Required Review Questions
-
-Any change touching a public contract should answer:
-
-1. Which enterprise repository classes could depend on this surface
-2. Is the change additive, behavior-changing, or breaking
-3. Which public docs or runbooks need updating
-4. Does compatibility metadata need a new contract version marker
-
-# Minimum Contract Set For Enterprise Extraction
-
-The following are the minimum public contracts required to keep enterprise code
-private while keeping the public core coherent:
-
-- northbound REST serving APIs
-- worker lifecycle, runtime metadata, and capability protocol
-- documented admin / diagnostics payloads used by enterprise tooling
-- documented config and `AXS_*` environment contracts
-- documented metrics and audit export payloads
-
-# Decision
-
-Enterprise products may depend only on this documented public contract layer
-and separately release-noted additions.
-
-They must not depend on the public repository's source layout as their
-integration boundary.
+1. Prefer additive fields with explicit defaults.
+2. Negotiate optional worker behavior through capabilities.
+3. Change protocol major for incompatible wire semantics.
+4. Document migrations for removed API/config behavior.
+5. Test old registration/heartbeat fixtures within the supported window.
+6. Keep public documentation limited to released and evidenced behavior.

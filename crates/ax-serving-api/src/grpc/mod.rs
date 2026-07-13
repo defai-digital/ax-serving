@@ -10,9 +10,7 @@
 //! The TCP path requires `Authorization: Bearer <key>` when `AXS_API_KEY` is set,
 //! matching the REST layer's auth policy.
 
-pub mod proto {
-    tonic::include_proto!("ax.serving.v1");
-}
+pub use ax_serving_grpc_compat::proto;
 
 pub mod service;
 
@@ -70,7 +68,7 @@ pub async fn serve(
                     .metadata()
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .and_then(crate::auth::bearer_token_from_authorization)
                     .map(|key| crate::auth::has_valid_api_key(key.trim(), &keys))
                     .unwrap_or(false);
                 if authorized {

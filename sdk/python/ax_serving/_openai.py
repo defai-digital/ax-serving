@@ -1,52 +1,90 @@
-"""High-level OpenAI-SDK-compatible interface backed by gRPC or REST."""
+"""OpenAI-style REST subset plus explicit embedded gRPC compatibility."""
 
 from __future__ import annotations
 
+import os
 from collections.abc import Generator, Iterator
 from typing import Any
 
 from .types import ModelInfo
 
+_GRPC_GENERATION_KEYS = {
+    "temperature",
+    "top_k",
+    "top_p",
+    "repeat_penalty",
+    "max_tokens",
+    "seed",
+}
+
 
 class _CompletionChunk:
     """Minimal OpenAI ChatCompletionChunk-compatible object."""
 
-    def __init__(self, text: str, model: str, finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        text: str | None,
+        model: str,
+        finish_reason: str | None = None,
+        tool_calls: Any | None = None,
+    ) -> None:
         self.model = model
-        self.choices = [_ChunkChoice(text, finish_reason)]
+        self.choices = [_ChunkChoice(text, finish_reason, tool_calls)]
 
 
 class _ChunkChoice:
-    def __init__(self, text: str, finish_reason: str | None) -> None:
-        self.delta = _Delta(text)
+    def __init__(
+        self,
+        text: str | None,
+        finish_reason: str | None,
+        tool_calls: Any | None = None,
+    ) -> None:
+        self.delta = _Delta(text, tool_calls)
         self.finish_reason = finish_reason
 
 
 class _Delta:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str | None, tool_calls: Any | None = None) -> None:
         self.content = content
         self.role = "assistant"
+        if tool_calls is not None:
+            self.tool_calls = tool_calls
 
 
 class _ChatCompletionResponse:
     """Minimal OpenAI ChatCompletion-compatible object."""
 
-    def __init__(self, text: str, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+    def __init__(
+        self,
+        text: str | None,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: str = "stop",
+        tool_calls: Any | None = None,
+    ) -> None:
         self.model = model
-        self.choices = [_Choice(text)]
+        self.choices = [_Choice(text, finish_reason, tool_calls)]
         self.usage = _Usage(prompt_tokens, completion_tokens)
 
 
 class _Choice:
-    def __init__(self, content: str) -> None:
-        self.message = _Message(content)
-        self.finish_reason = "stop"
+    def __init__(
+        self,
+        content: str | None,
+        finish_reason: str,
+        tool_calls: Any | None = None,
+    ) -> None:
+        self.message = _Message(content, tool_calls)
+        self.finish_reason = finish_reason
 
 
 class _Message:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str | None, tool_calls: Any | None = None) -> None:
         self.content = content
         self.role = "assistant"
+        if tool_calls is not None:
+            self.tool_calls = tool_calls
 
 
 class _Usage:
@@ -73,7 +111,7 @@ class _Completions:
         top_k: int = 0,
         repeat_penalty: float = 1.1,
         seed: int = 0,
-        **_: Any,
+        **extra: Any,
     ) -> _ChatCompletionResponse | Iterator[_CompletionChunk]:
         """Create a chat completion.
 
@@ -96,6 +134,9 @@ class _Completions:
             max_tokens=max_tokens,
             seed=seed,
         )
+        for key, value in extra.items():
+            if value is not None:
+                kwargs[key] = value
 
         if self._client._grpc is not None:
             return self._create_grpc(model, messages, stream, **kwargs)
@@ -109,18 +150,24 @@ class _Completions:
         **kwargs: Any,
     ) -> _ChatCompletionResponse | Iterator[_CompletionChunk]:
         grpc_client = self._client._grpc
+        grpc_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in _GRPC_GENERATION_KEYS
+        }
 
         if stream:
             def _stream() -> Generator[_CompletionChunk, None, None]:
-                for tok in grpc_client.infer(model, messages=messages, **kwargs):
+                for tok in grpc_client.infer(model, messages=messages, **grpc_kwargs):
                     yield _CompletionChunk(tok, model)
                 yield _CompletionChunk("", model, finish_reason="stop")
             return _stream()
 
-        result = grpc_client.infer_full(model, messages=messages, **kwargs)
+        result = grpc_client.infer_full(model, messages=messages, **grpc_kwargs)
         pt = result.metrics.prefill_tokens if result.metrics else 0
         ct = result.metrics.decode_tokens if result.metrics else 0
-        return _ChatCompletionResponse(result.text, model, pt, ct)
+        finish_reason = getattr(result, "finish_reason", "stop")
+        return _ChatCompletionResponse(result.text, model, pt, ct, finish_reason)
 
     def _create_rest(
         self,
@@ -145,20 +192,33 @@ class _Completions:
             payload["top_k"] = kwargs["top_k"]
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
+        for key, value in kwargs.items():
+            if key in _GRPC_GENERATION_KEYS:
+                continue
+            if key not in payload and value is not None:
+                payload[key] = value
 
         if stream:
             return self._rest_stream(url, payload, model)
 
-        resp = httpx.post(url, json=payload, timeout=120.0)
+        resp = httpx.post(
+            url,
+            json=payload,
+            headers=self._client._headers(),
+            timeout=120.0,
+        )
         resp.raise_for_status()
         data = resp.json()
         choice = data["choices"][0]
+        message = choice.get("message", {})
         usage = data.get("usage", {})
         return _ChatCompletionResponse(
-            choice["message"]["content"],
+            message.get("content"),
             model,
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
+            choice.get("finish_reason") or "stop",
+            message.get("tool_calls"),
         )
 
     def _rest_stream(
@@ -166,7 +226,13 @@ class _Completions:
     ) -> Iterator[_CompletionChunk]:
         import httpx
 
-        with httpx.stream("POST", url, json=payload, timeout=120.0) as resp:
+        with httpx.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=self._client._headers(),
+            timeout=120.0,
+        ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line.startswith("data:"):
@@ -180,9 +246,14 @@ class _Completions:
                 data = json.loads(raw)
                 choice = data["choices"][0]
                 delta = choice.get("delta", {})
-                content = delta.get("content", "")
+                content = delta.get("content")
                 finish = choice.get("finish_reason")
-                yield _CompletionChunk(content, model, finish_reason=finish)
+                yield _CompletionChunk(
+                    content,
+                    model,
+                    finish_reason=finish,
+                    tool_calls=delta.get("tool_calls"),
+                )
 
 
 class _Chat:
@@ -191,10 +262,10 @@ class _Chat:
 
 
 class Client:
-    """OpenAI-SDK-compatible client for ax-serving.
+    """OpenAI-style client for the tested AX Serving API subset.
 
-    Backed by gRPC when *grpc_socket* or *grpc_port* is supplied,
-    otherwise falls back to REST via *base_url*.
+    Uses portable REST/SSE by default. Supplying *grpc_socket* or *grpc_port*
+    selects the macOS embedded-compatibility gRPC v1 service.
 
     Examples::
 
@@ -224,12 +295,19 @@ class Client:
         base_url: str = "http://localhost:18080",
         grpc_socket: str | None = None,
         grpc_port: int | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._api_key = api_key if api_key is not None else os.getenv("AXS_API_KEY")
         self._grpc = None
 
         if grpc_socket is not None or grpc_port is not None:
-            from ._grpc import GrpcClient
+            try:
+                from ._grpc import GrpcClient
+            except ModuleNotFoundError as error:
+                raise ImportError(
+                    "embedded gRPC compatibility requires 'ax-serving[grpc]'"
+                ) from error
             self._grpc = GrpcClient(
                 socket=grpc_socket or "/tmp/ax-serving.sock",
                 host=None if grpc_socket else "localhost",
@@ -238,13 +316,22 @@ class Client:
 
         self.chat = _Chat(self)
 
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
+
     def models_list(self) -> list[ModelInfo]:
         """List loaded models (gRPC or REST)."""
         if self._grpc is not None:
             return self._grpc.list_models()
 
         import httpx
-        resp = httpx.get(f"{self._base_url}/v1/models", timeout=10.0)
+        resp = httpx.get(
+            f"{self._base_url}/v1/models",
+            headers=self._headers(),
+            timeout=10.0,
+        )
         resp.raise_for_status()
         data = resp.json()
         return [ModelInfo(id=m["id"]) for m in data.get("data", [])]

@@ -1,10 +1,17 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use ax_serving_protocol::{
+    AgentDescriptor, CapacityObservation, DeploymentIdentity, HardwareDescriptor,
+    HeartbeatRequest as ProtocolHeartbeatRequest, HeartbeatResponse as ProtocolHeartbeatResponse,
+    LeaseToken, Operation, PoolId, ProtocolCapability, ProtocolDescriptor, RegisterWorkerRequest,
+    RegisterWorkerResponse, RegistrationId, RuntimeDescriptor, RuntimeModelDescriptor,
+    RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId, WorkerDescriptor,
+    WorkerId as ProtocolWorkerId, WorkerInstanceId,
+};
 use tokio::sync::RwLock;
 
 fn current_rss_bytes() -> u64 {
@@ -28,7 +35,20 @@ fn current_rss_bytes() -> u64 {
         }
         0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    let value = line.strip_prefix("VmRSS:")?.trim();
+                    let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
+                    Some(kib.saturating_mul(1024))
+                })
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         0
     }
@@ -36,6 +56,12 @@ fn current_rss_bytes() -> u64 {
 
 use crate::config::ThorConfig;
 use crate::sglang;
+
+const CONTROL_PLANE_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+fn control_plane_request_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
+}
 
 fn with_internal_token(
     req: reqwest::RequestBuilder,
@@ -49,8 +75,12 @@ fn with_internal_token(
 
 #[derive(Debug, Clone)]
 pub struct WorkerSession {
-    pub worker_id: String,
+    pub worker_id: ProtocolWorkerId,
+    pub instance_id: WorkerInstanceId,
+    pub registration_id: RegistrationId,
+    pub lease_token: LeaseToken,
     pub heartbeat_interval_ms: u64,
+    pub sequence: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +94,9 @@ pub struct SharedRuntime {
     pub inflight: Arc<AtomicUsize>,
     pub session: Arc<RwLock<Option<WorkerSession>>>,
     pub models: Arc<RwLock<Vec<String>>>,
+    pub instance_id: WorkerInstanceId,
+    pub inventory_generation: Arc<AtomicU64>,
+    pub draining: Arc<AtomicBool>,
 }
 
 impl SharedRuntime {
@@ -72,6 +105,9 @@ impl SharedRuntime {
             inflight: Arc::new(AtomicUsize::new(0)),
             session: Arc::new(RwLock::new(None)),
             models: Arc::new(RwLock::new(Vec::new())),
+            instance_id: WorkerInstanceId::new(),
+            inventory_generation: Arc::new(AtomicU64::new(1)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -82,70 +118,28 @@ impl Default for SharedRuntime {
     }
 }
 
-pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<RegistrationState> {
-    let model_info = sglang::get_model_info(client, &config.runtime_url).await?;
+pub async fn register(
+    control_client: &reqwest::Client,
+    runtime_client: &reqwest::Client,
+    config: &ThorConfig,
+    instance_id: WorkerInstanceId,
+) -> Result<RegistrationState> {
+    let model_info = sglang::get_model_info(runtime_client, &config.runtime_url).await?;
     let models: Vec<String> = model_info.iter().map(|m| m.id.clone()).collect();
-    let model_inventory = model_info
-        .iter()
-        .map(model_inventory_entry)
-        .collect::<Vec<_>>();
-
-    // BUG-114: derive capabilities from config overrides or runtime metadata
-    // instead of hardcoding them.
-    let max_context: serde_json::Value = config
-        .max_context
-        .or_else(|| {
-            // Use the max context from any loaded model as a best-effort default.
-            model_info.iter().filter_map(|m| m.max_model_len).max()
-        })
-        .map(serde_json::Value::from)
-        .unwrap_or(serde_json::Value::Null);
-
-    let embedding = config.embedding.unwrap_or(false);
-    let vision = config.vision.unwrap_or(false);
-    let mut supported_operations = vec!["llm"];
-    if embedding {
-        supported_operations.push("embedding");
-    }
-    if vision {
-        supported_operations.push("vision");
-    }
-
-    let body = json!({
-        "addr": config.advertised_addr.to_string(),
-        "capabilities": {
-            "llm": true,
-            "embedding": embedding,
-            "vision": vision,
-            "models": models,
-            "max_context": max_context
-        },
-        "model_inventory": model_inventory,
-        "backend": config.runtime.as_str(),
-        "runtime": config.runtime.as_str(),
-        "runtime_mode": "adapter",
-        "hardware_class": config.hardware_class.as_str(),
-        "runtime_endpoint": config.runtime_url.as_str(),
-        "supported_operations": supported_operations,
-        "max_inflight": config.max_inflight,
-        "friendly_name": config.friendly_name,
-        "chip_model": config.chip_model,
-        "worker_pool": config.worker_pool,
-        "node_class": config.node_class,
-    });
+    let body = registration_body(config, &model_info, instance_id)?;
 
     let req = with_internal_token(
-        client
+        control_client
             .post(format!(
                 "{}/internal/workers/register",
                 config.control_plane_url
             ))
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(control_plane_request_timeout())
             .json(&body),
         config.worker_token.as_ref(),
     );
 
-    let response: serde_json::Value = req
+    let response: RegisterWorkerResponse = req
         .send()
         .await
         .context("runtime-node agent registration request failed")?
@@ -155,24 +149,192 @@ pub async fn register(client: &reqwest::Client, config: &ThorConfig) -> Result<R
         .await
         .context("failed to parse runtime-node agent registration response")?;
 
-    let worker_id = response["worker_id"]
-        .as_str()
-        .context("registration response missing worker_id")?
-        .to_string();
-    let heartbeat_interval_ms = response["heartbeat_interval_ms"]
-        .as_u64()
-        .unwrap_or(5_000)
-        .clamp(1_000, 300_000);
+    let heartbeat_interval_ms = response.heartbeat_interval_ms.clamp(1_000, 300_000);
     Ok(RegistrationState {
         session: WorkerSession {
-            worker_id,
+            worker_id: ProtocolWorkerId::new(config.worker_id.clone())?,
+            instance_id,
+            registration_id: response.registration_id,
+            lease_token: response.lease_token,
             heartbeat_interval_ms,
+            sequence: Arc::new(AtomicU64::new(0)),
         },
         models,
     })
 }
 
-pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime: SharedRuntime) {
+fn registration_body(
+    config: &ThorConfig,
+    model_info: &[sglang::ModelInfo],
+    instance_id: WorkerInstanceId,
+) -> Result<RegisterWorkerRequest> {
+    let runtime_models = model_info
+        .iter()
+        .map(|model| protocol_model_descriptor(model, config))
+        .collect::<Result<Vec<_>>>()?;
+    let pool = config
+        .worker_pool
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", config.runtime, config.hardware_class));
+    let pool = PoolId::new(normalize_identifier(&pool))?;
+    let worker_id = ProtocolWorkerId::new(config.worker_id.clone())?;
+    let trust_domain = TrustDomainId::new(config.trust_domain.clone())?;
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("node_class".into(), config.node_class.clone());
+    if let Some(friendly_name) = &config.friendly_name {
+        labels.insert("friendly_name".into(), friendly_name.clone());
+    }
+    if let Some(chip_model) = &config.chip_model {
+        labels.insert("chip_model".into(), chip_model.clone());
+    }
+
+    Ok(RegisterWorkerRequest {
+        protocol: ProtocolDescriptor::current(protocol_capabilities()),
+        agent: AgentDescriptor {
+            name: "ax-runtime-agent".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_sha: option_env!("AXS_BUILD_SHA").map(ToOwned::to_owned),
+        },
+        worker: WorkerDescriptor {
+            id: worker_id,
+            instance_id,
+            advertise_url: format!("http://{}", config.advertised_addr),
+            pool_id: pool,
+            trust_domain,
+            labels,
+        },
+        runtime: RuntimeDescriptor {
+            kind: normalize_runtime_kind(&config.runtime),
+            version: config.runtime_version.clone(),
+            api: "openai-v1".into(),
+        },
+        hardware: HardwareDescriptor {
+            platform: std::env::consts::OS.into(),
+            accelerator: accelerator_name(config),
+            device_count: 1,
+            memory_bytes: None,
+            hardware_class: Some(config.hardware_class.clone()),
+        },
+        observation: RuntimeObservation {
+            observed_at: time::OffsetDateTime::now_utc(),
+            runtime: RuntimeStatus::ready(),
+            inventory_generation: 1,
+            models: runtime_models,
+            capacity: Some(CapacityObservation {
+                active_requests: Some(0),
+                max_concurrent_requests: Some(config.max_inflight as u64),
+                ..Default::default()
+            }),
+        },
+    })
+}
+
+fn protocol_capabilities() -> Vec<ProtocolCapability> {
+    [
+        ProtocolCapability::CONTROL_DRAIN,
+        ProtocolCapability::CONTROL_INVENTORY_DELTA,
+        ProtocolCapability::DISPATCH_CANCEL,
+        ProtocolCapability::DISPATCH_TYPED_ADMISSION,
+        ProtocolCapability::TELEMETRY_CAPACITY,
+        ProtocolCapability::TELEMETRY_KV_CACHE,
+        ProtocolCapability::TELEMETRY_PREFIX_CACHE,
+    ]
+    .into_iter()
+    .map(|capability| ProtocolCapability::new(capability).expect("static protocol capability"))
+    .collect()
+}
+
+fn protocol_model_descriptor(
+    model: &sglang::ModelInfo,
+    config: &ThorConfig,
+) -> Result<RuntimeModelDescriptor> {
+    let supported = model_supported_operations(model, config);
+    let mut operations = std::collections::BTreeSet::new();
+    let mut capabilities = std::collections::BTreeSet::new();
+    if supported.iter().any(|operation| operation == "llm") {
+        operations.insert(Operation::chat_completions());
+        operations.insert(Operation::text_completions());
+    }
+    if supported.iter().any(|operation| operation == "embedding") {
+        operations.insert(Operation::embeddings());
+    }
+    if supported.iter().any(|operation| operation == "vision") {
+        capabilities.insert(ProtocolCapability::new("inference.vision")?);
+    }
+    capabilities.extend(config.model_identity.capabilities.iter().cloned());
+
+    Ok(RuntimeModelDescriptor {
+        runtime_model_id: RuntimeModelId::new(model.id.clone())?,
+        identity: DeploymentIdentity {
+            runtime_kind: normalize_runtime_kind(&config.runtime),
+            runtime_version: Some(config.runtime_version.clone()),
+            revision: config.model_identity.revision.clone(),
+            artifact_digest: config.model_identity.artifact_digest.clone(),
+            tokenizer_digest: config.model_identity.tokenizer_digest.clone(),
+            template_digest: config.model_identity.template_digest.clone(),
+            quantization: config
+                .model_identity
+                .quantization
+                .clone()
+                .or_else(|| model.quantization.clone()),
+        },
+        operations,
+        capabilities,
+        max_context_tokens: config.max_context.or(model.max_model_len).map(u64::from),
+        max_output_tokens: config
+            .model_identity
+            .max_output_tokens
+            .or(model.max_output_tokens.map(u64::from)),
+    })
+}
+
+fn normalize_runtime_kind(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "axengine" | "ax_engine" | "native" => "ax_engine".into(),
+        "v_llm" | "vllm" => "vllm".into(),
+        "sg_lang" | "sglang" => "sglang".into(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_identifier(raw: &str) -> String {
+    let mut normalized = raw
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized.truncate(128);
+    if normalized.is_empty() {
+        "default".into()
+    } else {
+        normalized
+    }
+}
+
+fn accelerator_name(config: &ThorConfig) -> String {
+    if config.runtime.eq_ignore_ascii_case("ax_engine") {
+        "apple-gpu".into()
+    } else if config.hardware_class.to_ascii_lowercase().contains("cuda")
+        || matches!(config.runtime.as_str(), "vllm" | "sglang")
+    {
+        "nvidia-gpu".into()
+    } else {
+        "unknown".into()
+    }
+}
+
+pub async fn heartbeat_loop(
+    control_client: reqwest::Client,
+    runtime_client: reqwest::Client,
+    config: ThorConfig,
+    runtime: SharedRuntime,
+) {
     loop {
         let session = {
             let guard = runtime.session.read().await;
@@ -184,71 +346,172 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
             continue;
         };
 
-        let (models, model_inventory) =
-            match sglang::get_model_info(&client, &config.runtime_url).await {
+        let readiness = sglang::probe_runtime(&runtime_client, &config.runtime_url).await;
+        let (models, runtime_models, runtime_ready, runtime_status_reason) = match readiness {
+            Ok(()) => match sglang::get_model_info(&runtime_client, &config.runtime_url).await {
                 Ok(model_info) => {
                     let models = model_info.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-                    let inventory = model_info
+                    let runtime_models = model_info
                         .iter()
-                        .map(model_inventory_entry)
-                        .collect::<Vec<_>>();
-                    *runtime.models.write().await = models.clone();
-                    (models, inventory)
+                        .map(|model| protocol_model_descriptor(model, &config))
+                        .collect::<Result<Vec<_>>>();
+                    match runtime_models {
+                        Ok(runtime_models) => (models, runtime_models, true, None),
+                        Err(error) => {
+                            tracing::warn!(%error, "runtime inventory violates protocol contract");
+                            (
+                                Vec::new(),
+                                Vec::new(),
+                                false,
+                                Some("runtime_inventory_invalid"),
+                            )
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(%err, "failed to refresh runtime model list for heartbeat");
-                    (runtime.models.read().await.clone(), Vec::new())
+                    runtime.models.write().await.clear();
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        Some("runtime_inventory_failed"),
+                    )
                 }
-            };
-
-        let current_inflight = runtime.inflight.load(Ordering::Relaxed);
-        // BUG-073: use real RSS instead of hardcoded 0.
-        let rss_bytes = current_rss_bytes();
-        let telemetry = match sglang::get_runtime_telemetry(&client, &config.runtime_url).await {
-            Ok(telemetry) => telemetry,
+            },
             Err(err) => {
-                tracing::debug!(%err, "runtime metrics unavailable; using heartbeat defaults");
-                sglang::RuntimeTelemetry::default()
+                tracing::warn!(%err, "runtime readiness probe failed");
+                runtime.models.write().await.clear();
+                (Vec::new(), Vec::new(), false, Some("runtime_health_failed"))
             }
         };
-        let body = json!({
-            "inflight": current_inflight,
-            "thermal_state": "nominal",
-            "model_ids": models,
-            "model_inventory": model_inventory,
-            "rss_bytes": rss_bytes,
-            "active_sequences": telemetry.active_sequences.unwrap_or(current_inflight),
-            "decode_tok_per_sec": telemetry.decode_tok_per_sec.unwrap_or(0.0_f64),
-            "ttft_p95_ms": telemetry.ttft_p95_ms.unwrap_or(0_u64),
-            "queue_depth": telemetry.queue_depth.unwrap_or(0_usize),
-            "error_rate": telemetry.error_rate.unwrap_or(0.0_f64),
-            "kv_pages_used": telemetry.kv_pages_used.unwrap_or(0_u64),
-            "kv_pages_total": telemetry.kv_pages_total.unwrap_or(0_u64),
-            "kv_utilization": telemetry.kv_utilization,
-            "prefix_reusable_tokens": telemetry.prefix_reusable_tokens.unwrap_or(0_u64),
-            "active_batch_size": telemetry.active_batch_size.unwrap_or(0_u32),
-            "max_batch_size": telemetry.max_batch_size.unwrap_or(0_u32),
-            "batch_utilization": telemetry.batch_utilization,
+
+        let inventory_generation = {
+            let mut current_models = runtime.models.write().await;
+            if *current_models != models {
+                *current_models = models;
+                runtime.inventory_generation.fetch_add(1, Ordering::AcqRel) + 1
+            } else {
+                runtime.inventory_generation.load(Ordering::Acquire)
+            }
+        };
+
+        let current_inflight = runtime.inflight.load(Ordering::Relaxed);
+        let rss_bytes = current_rss_bytes();
+        let telemetry = if runtime_ready {
+            match sglang::get_runtime_telemetry(&runtime_client, &config.runtime_url).await {
+                Ok(telemetry) => telemetry,
+                Err(err) => {
+                    tracing::debug!(%err, "runtime metrics unavailable; using heartbeat defaults");
+                    sglang::RuntimeTelemetry::default()
+                }
+            }
+        } else {
+            sglang::RuntimeTelemetry::default()
+        };
+        let kv_cache_used_ratio = telemetry.kv_utilization.or_else(|| {
+            match (telemetry.kv_pages_used, telemetry.kv_pages_total) {
+                (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64),
+                _ => None,
+            }
         });
+        let capacity = CapacityObservation {
+            active_requests: Some(
+                telemetry
+                    .active_sequences
+                    .unwrap_or(current_inflight)
+                    .min(u64::MAX as usize) as u64,
+            ),
+            max_concurrent_requests: Some(config.max_inflight as u64),
+            waiting_requests: Some(telemetry.queue_depth.unwrap_or(0).min(u64::MAX as usize) as u64),
+            process_rss_bytes: Some(rss_bytes),
+            recent_error_rate: telemetry.error_rate,
+            kv_cache_used_ratio,
+            prefix_cache_hit_ratio: None,
+            batch_token_capacity: telemetry.max_batch_size.map(u64::from),
+            batch_tokens_in_use: telemetry.active_batch_size.map(u64::from),
+            ttft_ewma_ms: telemetry.ttft_p95_ms.map(|value| value as f64),
+            inter_token_ewma_ms: None,
+            generated_tokens_per_second: telemetry.decode_tok_per_sec,
+            observation_window_ms: None,
+        };
+        let sequence = session.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let body = ProtocolHeartbeatRequest {
+            registration_id: session.registration_id,
+            instance_id: session.instance_id,
+            sequence,
+            observed_at: time::OffsetDateTime::now_utc(),
+            runtime: if runtime_ready {
+                RuntimeStatus::ready()
+            } else {
+                RuntimeStatus::unavailable(runtime_status_reason.unwrap_or("runtime_unavailable"))
+            },
+            inventory_generation,
+            models: Some(runtime_models),
+            capacity: Some(capacity),
+            deployment_jobs: Vec::new(),
+        };
 
         // BUG-096: use a short per-request timeout for control-plane calls so a
         // slow/unresponsive orchestrator doesn't stall the heartbeat loop for 300s.
         let req = with_internal_token(
-            client
+            control_client
                 .post(format!(
                     "{}/internal/workers/{}/heartbeat",
                     config.control_plane_url, session.worker_id
                 ))
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(control_plane_request_timeout())
+                .header("x-ax-lease-token", session.lease_token.expose())
                 .json(&body),
             config.worker_token.as_ref(),
         );
 
         match req.send().await {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) if matches!(resp.status().as_u16(), 404 | 410) => {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<ProtocolHeartbeatResponse>().await {
+                    Ok(directive) if directive.reregister => {
+                        tracing::warn!("control plane requested runtime-node re-registration");
+                        *runtime.session.write().await = None;
+                    }
+                    Ok(directive)
+                        if directive.drain == ax_serving_protocol::DrainDirective::Begin =>
+                    {
+                        runtime.draining.store(true, Ordering::Release);
+                        tracing::info!("control plane requested runtime-node drain");
+                        if runtime.inflight.load(Ordering::Acquire) == 0 {
+                            match drain_complete(&control_client, &config, &runtime).await {
+                                Ok(()) => {
+                                    *runtime.session.write().await = None;
+                                    tracing::info!("runtime-node drain completed");
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "runtime-node drain completion failed");
+                                }
+                            }
+                        }
+                    }
+                    Ok(directive)
+                        if directive.drain == ax_serving_protocol::DrainDirective::Complete =>
+                    {
+                        runtime.draining.store(true, Ordering::Release);
+                        *runtime.session.write().await = None;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid control-plane heartbeat response");
+                    }
+                }
+            }
+            Ok(resp) if matches!(resp.status().as_u16(), 404 | 409 | 410) => {
                 tracing::warn!(status = %resp.status(), "runtime-node agent evicted, re-registering");
-                match register(&client, &config).await {
+                match register(
+                    &control_client,
+                    &runtime_client,
+                    &config,
+                    runtime.instance_id,
+                )
+                .await
+                {
                     Ok(registration) => {
                         *runtime.models.write().await = registration.models;
                         *runtime.session.write().await = Some(registration.session);
@@ -270,15 +533,45 @@ pub async fn heartbeat_loop(client: reqwest::Client, config: ThorConfig, runtime
     }
 }
 
-fn model_inventory_entry(model: &sglang::ModelInfo) -> serde_json::Value {
-    serde_json::json!({
-        "id": model.id.as_str(),
-        "max_context": model.max_model_len,
-        "quantization": model.quantization.as_deref(),
-        "artifact_format": model.artifact_format.as_deref(),
-        "modalities": &model.modalities,
-        "supported_operations": &model.supported_operations,
-    })
+fn model_supported_operations(model: &sglang::ModelInfo, config: &ThorConfig) -> Vec<String> {
+    let mut operations = model
+        .supported_operations
+        .iter()
+        .filter_map(|operation| normalize_operation(operation))
+        .collect::<Vec<_>>();
+    apply_operation_override(&mut operations, "embedding", config.embedding);
+    apply_operation_override(&mut operations, "vision", config.vision);
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+fn apply_operation_override(
+    operations: &mut Vec<String>,
+    operation: &'static str,
+    override_value: Option<bool>,
+) {
+    match override_value {
+        Some(true) => operations.push(operation.to_string()),
+        Some(false) => operations.retain(|op| !operation_matches(op, operation)),
+        None => {}
+    }
+}
+
+fn operation_matches(raw: &str, operation: &str) -> bool {
+    normalize_operation(raw).as_deref() == Some(operation)
+}
+
+fn normalize_operation(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let operation = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(operation.to_string())
 }
 
 pub async fn drain(
@@ -293,10 +586,13 @@ pub async fn drain(
         .clone()
         .context("runtime-node agent has no active worker session")?;
     with_internal_token(
-        client.post(format!(
-            "{}/internal/workers/{}/drain",
-            config.control_plane_url, session.worker_id
-        )),
+        client
+            .post(format!(
+                "{}/internal/workers/{}/drain",
+                config.control_plane_url, session.worker_id
+            ))
+            .header("x-ax-lease-token", session.lease_token.expose())
+            .timeout(control_plane_request_timeout()),
         config.worker_token.as_ref(),
     )
     .send()
@@ -319,10 +615,13 @@ pub async fn drain_complete(
         .clone()
         .context("runtime-node agent has no active worker session")?;
     with_internal_token(
-        client.post(format!(
-            "{}/internal/workers/{}/drain-complete",
-            config.control_plane_url, session.worker_id
-        )),
+        client
+            .post(format!(
+                "{}/internal/workers/{}/drain-complete",
+                config.control_plane_url, session.worker_id
+            ))
+            .header("x-ax-lease-token", session.lease_token.expose())
+            .timeout(control_plane_request_timeout()),
         config.worker_token.as_ref(),
     )
     .send()
@@ -335,11 +634,152 @@ pub async fn drain_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::SharedRuntime;
+    use super::{
+        CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout,
+        registration_body,
+    };
+    use crate::config::ThorConfig;
+    use crate::sglang::ModelInfo;
+    use ax_serving_protocol::{Operation, WorkerInstanceId};
+
+    fn test_config() -> ThorConfig {
+        ThorConfig {
+            control_plane_url: "http://127.0.0.1:18080".into(),
+            worker_token: None,
+            runtime_url: "http://127.0.0.1:8000".into(),
+            runtime_api_key: None,
+            dispatch_token: None,
+            tls_profile: "loopback_dev".into(),
+            runtime: "vllm".into(),
+            runtime_version: "test".into(),
+            worker_id: "worker-test".into(),
+            trust_domain: "test".into(),
+            listen_addr: "127.0.0.1:18081".parse().unwrap(),
+            advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+            max_inflight: 8,
+            worker_pool: None,
+            node_class: "thor".into(),
+            hardware_class: "thor".into(),
+            friendly_name: None,
+            chip_model: None,
+            shutdown_timeout_secs: None,
+            max_context: None,
+            embedding: None,
+            vision: None,
+            model_identity: Default::default(),
+        }
+    }
 
     #[tokio::test]
     async fn shared_runtime_starts_with_empty_model_cache() {
         let runtime = SharedRuntime::new();
         assert!(runtime.models.read().await.is_empty());
+    }
+
+    #[test]
+    fn control_plane_request_timeout_is_short_enough_for_shutdown_paths() {
+        assert_eq!(
+            control_plane_request_timeout(),
+            std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
+        );
+        assert!(control_plane_request_timeout() <= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn registration_body_derives_embedding_capability_from_runtime_metadata() {
+        let config = test_config();
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                max_output_tokens: Some(2048),
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["embedding".into()],
+            }],
+            WorkerInstanceId::new(),
+        )
+        .unwrap();
+
+        let model = &body.observation.models[0];
+        assert_eq!(model.runtime_model_id.as_str(), "embed-main");
+        assert!(model.operations.contains(&Operation::embeddings()));
+        assert!(!model.operations.contains(&Operation::chat_completions()));
+        assert_eq!(model.max_output_tokens, Some(2048));
+    }
+
+    #[test]
+    fn registration_body_env_override_can_disable_metadata_embedding() {
+        let mut config = test_config();
+        config.embedding = Some(false);
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                max_output_tokens: None,
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["embedding".into()],
+            }],
+            WorkerInstanceId::new(),
+        )
+        .unwrap();
+
+        assert!(body.observation.models[0].operations.is_empty());
+    }
+
+    #[test]
+    fn registration_body_env_override_updates_model_inventory_operations() {
+        let mut config = test_config();
+        config.embedding = Some(true);
+        config.vision = Some(false);
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "mixed-main".into(),
+                max_model_len: Some(8192),
+                max_output_tokens: None,
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["Completion".into(), "Image".into()],
+            }],
+            WorkerInstanceId::new(),
+        )
+        .unwrap();
+
+        let model = &body.observation.models[0];
+        assert!(model.operations.contains(&Operation::embeddings()));
+        assert!(model.operations.contains(&Operation::chat_completions()));
+        assert!(model.capabilities.is_empty());
+    }
+
+    #[test]
+    fn registration_body_normalizes_runtime_operation_aliases() {
+        let config = test_config();
+        let body = registration_body(
+            &config,
+            &[ModelInfo {
+                id: "embed-main".into(),
+                max_model_len: Some(8192),
+                max_output_tokens: None,
+                quantization: None,
+                artifact_format: None,
+                modalities: Vec::new(),
+                supported_operations: vec!["Embeddings".into()],
+            }],
+            WorkerInstanceId::new(),
+        )
+        .unwrap();
+
+        assert!(
+            body.observation.models[0]
+                .operations
+                .contains(&Operation::embeddings())
+        );
     }
 }

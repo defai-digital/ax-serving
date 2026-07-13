@@ -15,16 +15,28 @@
 //! must heartbeat at least once every 5 s or it transitions through
 //! Unhealthy within 10 s and is evicted at 15 s.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
-
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tracing::warn;
 use uuid::Uuid;
+
+use ax_serving_protocol::{
+    AgentDescriptor, HeartbeatRequest as ProtocolHeartbeatRequest,
+    HeartbeatResponse as ProtocolHeartbeatResponse, LeaseToken, NegotiatedProtocol,
+    ProtocolDescriptor, ProtocolVersion, RegisterWorkerRequest as ProtocolRegisterRequest,
+    RegisterWorkerResponse as ProtocolRegisterResponse, RegistrationId, RuntimeModelDescriptor,
+    WorkerId as ProtocolWorkerId, WorkerInstanceId,
+};
+
+use super::fleet_state::{SharedWorkerRecord, unix_time_millis};
 
 const MAX_WORKER_INFLIGHT: usize = 1_000_000;
 
@@ -69,7 +81,7 @@ pub enum BackendKind {
 
 impl BackendKind {
     pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
             "vllm" | "v_llm" | "v-llm" => Self::Vllm,
@@ -125,7 +137,7 @@ pub enum RuntimeKind {
 
 impl RuntimeKind {
     pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "ax_engine" | "ax-engine" | "axengine" | "native" => Self::AxEngine,
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
@@ -218,6 +230,7 @@ enum CapabilitySource {
 pub enum RequestKind {
     Llm,
     Embedding,
+    Vision,
 }
 
 // ── WorkerHealth ──────────────────────────────────────────────────────────────
@@ -259,13 +272,28 @@ pub struct WorkerEntry {
     pub hardware_class: Option<String>,
     /// Runtime-compatible endpoint or proxy target reported by the worker.
     pub runtime_endpoint: Option<String>,
+    pub protocol_worker_id: Option<String>,
+    pub worker_instance_id: Option<String>,
+    pub registration_id: Option<String>,
+    pub trust_domain: Option<String>,
+    pub agent_name: Option<String>,
     /// Operations the worker supports, e.g. `llm`, `embedding`, `vision`.
     pub supported_operations: Vec<String>,
+    supported_operations_explicit: bool,
     pub max_inflight: usize,
-    /// Atomically updated by the dispatcher without taking the registry lock.
+    /// Dispatcher-owned in-flight count, updated without taking the registry lock.
     pub inflight: Arc<AtomicUsize>,
+    /// Last in-flight count reported by the worker heartbeat.
+    pub reported_inflight: usize,
     pub health: WorkerHealth,
     pub last_heartbeat: Instant,
+    /// Authoritative upstream runtime readiness when reported by a v1-capable agent.
+    pub runtime_ready: Option<bool>,
+    pub runtime_state: Option<String>,
+    pub runtime_status_reason: Option<String>,
+    pub observed_at_unix_ms: Option<u64>,
+    pub protocol_version: Option<ProtocolVersion>,
+    pub agent_version: Option<String>,
     pub drain: bool,
     /// Thermal state string from the last heartbeat (e.g. "nominal", "serious").
     pub thermal_state: String,
@@ -320,6 +348,56 @@ pub struct ModelInventoryEntry {
     pub modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_operations: Vec<String>,
+    /// Runtime-neutral per-model protocol capabilities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ProtocolSession {
+    internal_id: WorkerId,
+    instance_id: WorkerInstanceId,
+    registration_id: RegistrationId,
+    lease_token_digest: [u8; 32],
+    negotiated: ProtocolDescriptor,
+    agent: AgentDescriptor,
+    last_sequence: u64,
+    inventory_generation: u64,
+    heartbeat_interval_ms: u64,
+    lease_ttl_ms: u64,
+    registration: ProtocolRegisterRequest,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProtocolRegistryError {
+    #[error("protocol worker is not registered")]
+    NotRegistered,
+    #[error("worker instance does not match the active registration")]
+    InstanceMismatch,
+    #[error("registration id does not match the active lease")]
+    RegistrationMismatch,
+    #[error("missing or invalid worker lease token")]
+    InvalidLeaseToken,
+    #[error("heartbeat sequence {received} is older than accepted sequence {accepted}")]
+    ReplayedHeartbeat { received: u64, accepted: u64 },
+    #[error("runtime observation is invalid: {0}")]
+    InvalidObservation(String),
+    #[error("internal worker registration failed")]
+    InternalRegistration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,7 +431,8 @@ pub struct RegisterRequest {
     /// Runtime-compatible endpoint or proxy target, if different from `addr`.
     #[serde(default)]
     pub runtime_endpoint: Option<String>,
-    /// Explicit supported operations. If absent, AX Serving derives them from capabilities.
+    /// Explicit supported operations. If absent, AX Serving derives them from structured
+    /// capabilities while legacy model-id registrations keep compatibility routing.
     #[serde(default)]
     pub supported_operations: Vec<String>,
     pub max_inflight: usize,
@@ -464,6 +543,19 @@ pub struct HeartbeatRequest {
     /// instead of batch counters.
     #[serde(default)]
     pub batch_utilization: Option<f64>,
+    /// Authoritative readiness of the upstream runtime, not merely the agent process.
+    #[serde(default)]
+    pub runtime_ready: Option<bool>,
+    #[serde(default)]
+    pub runtime_state: Option<String>,
+    #[serde(default)]
+    pub runtime_status_reason: Option<String>,
+    #[serde(default)]
+    pub observed_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub protocol_version: Option<ProtocolVersion>,
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
 // ── Read-only snapshot for dispatch policies ──────────────────────────────────
@@ -489,6 +581,30 @@ pub struct WorkerStatus {
     pub kv_utilization: Option<f64>,
     /// Batch headroom ratio (0.0-1.0). `None` = worker does not report batch telemetry.
     pub batch_headroom: Option<f64>,
+    /// Runtime-reported pending request count. `None` means the signal is unavailable.
+    pub queue_depth: Option<usize>,
+    /// Recent runtime error rate. `None` means the signal is unavailable.
+    pub error_rate: Option<f64>,
+    /// Recent runtime decode throughput. `None` means the signal is unavailable.
+    pub decode_tok_per_sec: Option<f64>,
+    /// Age of the authoritative runtime observation, when protocol v1 telemetry is available.
+    pub telemetry_age_ms: Option<u64>,
+}
+
+/// Model-scoped endpoint snapshot used by explicit deployment routing.
+#[derive(Clone)]
+pub struct WorkerModelEndpoint {
+    pub worker: WorkerStatus,
+    pub worker_pool: Option<String>,
+    pub node_class: Option<String>,
+    pub hardware_class: Option<String>,
+    pub runtime_kind: String,
+    pub runtime_version: Option<String>,
+    pub trust_domain: Option<String>,
+    pub protocol_worker_id: Option<String>,
+    pub worker_instance_id: Option<String>,
+    pub registration_id: Option<String>,
+    pub model: ModelInventoryEntry,
 }
 
 // ── JSON snapshot for the listing endpoints ───────────────────────────────────
@@ -510,12 +626,34 @@ pub struct WorkerSnapshot {
     pub hardware_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     pub supported_operations: Vec<String>,
     pub max_inflight: usize,
     pub inflight: usize,
     /// `inflight / max_inflight` — 0.0 when idle, ≥ 1.0 when at or above capacity.
     pub saturation: f64,
     pub health: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_status_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<ProtocolVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
     pub drain: bool,
     pub last_heartbeat_age_ms: u64,
     /// Thermal state reported by the worker's last heartbeat.
@@ -581,12 +719,14 @@ pub struct WorkerSnapshot {
 #[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<DashMap<WorkerId, WorkerEntry>>,
+    protocol_sessions: Arc<DashMap<ProtocolWorkerId, ProtocolSession>>,
 }
 
 impl WorkerRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            protocol_sessions: Arc::new(DashMap::new()),
         }
     }
 
@@ -638,25 +778,80 @@ impl WorkerRegistry {
             .filter(|runtime| *runtime != RuntimeKind::Unknown)
             .unwrap_or_else(|| RuntimeKind::from_backend(&backend));
         let runtime_mode = normalize_runtime_mode(runtime_mode);
-        let (capabilities, capability_source) = capabilities.into_parts();
-        let model_inventory = normalize_model_inventory(&capabilities.models, model_inventory);
-        let supported_operations = if supported_operations.is_empty() {
-            supported_operations_from_capabilities(&capabilities)
+        let runtime_version = normalize_optional_string(runtime_version);
+        let hardware_class = normalize_optional_string(hardware_class);
+        let runtime_endpoint = normalize_optional_string(runtime_endpoint);
+        let friendly_name = normalize_optional_string(friendly_name);
+        let chip_model = normalize_optional_string(chip_model);
+        let worker_pool = normalize_optional_string(worker_pool);
+        let node_class = normalize_optional_string(node_class);
+        let (mut capabilities, capability_source) = capabilities.into_parts();
+        let incoming_model_inventory = model_inventory;
+        let incoming_model_inventory_empty = incoming_model_inventory.is_empty();
+        let model_inventory =
+            normalize_model_inventory(&capabilities.models, incoming_model_inventory);
+        let inventory_supported_operations = if incoming_model_inventory_empty {
+            Vec::new()
         } else {
-            supported_operations
+            let operations = supported_operations_from_model_inventory(&model_inventory);
+            refresh_capabilities_from_inventory_summary(
+                &mut capabilities,
+                &operations,
+                max_context_from_model_inventory(&model_inventory),
+                false,
+            );
+            operations
         };
+        capabilities.models = model_inventory
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
+        let explicit_supported_operations_empty = supported_operations.is_empty();
+        let supported_operations = if explicit_supported_operations_empty {
+            if !inventory_supported_operations.is_empty() {
+                inventory_supported_operations
+            } else {
+                match capability_source {
+                    CapabilitySource::Legacy => Vec::new(),
+                    CapabilitySource::Structured => {
+                        supported_operations_from_capabilities(&capabilities)
+                    }
+                }
+            }
+        } else {
+            normalize_supported_operations(supported_operations)
+        };
+        refresh_capabilities_from_operation_summary(&mut capabilities, &supported_operations);
 
         self.inner
             .entry(id)
             .and_modify(|existing| {
+                let mut updated_capabilities = capabilities.clone();
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr;
-                existing.capabilities = capabilities.clone();
-                // Preserve prior per-model metadata if the new registration omits inventory,
-                // matching the same guard used for runtime_mode below.
-                if !model_inventory.is_empty() {
-                    existing.model_inventory = model_inventory.clone();
-                }
+                existing.model_inventory = if incoming_model_inventory_empty {
+                    retain_model_inventory_for_ids(
+                        &existing.model_inventory,
+                        &updated_capabilities.models,
+                    )
+                } else {
+                    model_inventory.clone()
+                };
+                let retained_inventory_supported_operations =
+                    if incoming_model_inventory_empty && explicit_supported_operations_empty {
+                        let operations =
+                            supported_operations_from_model_inventory(&existing.model_inventory);
+                        refresh_capabilities_from_inventory_summary(
+                            &mut updated_capabilities,
+                            &operations,
+                            max_context_from_model_inventory(&existing.model_inventory),
+                            false,
+                        );
+                        operations
+                    } else {
+                        Vec::new()
+                    };
+                existing.capabilities = updated_capabilities;
                 existing.capability_source = capability_source;
                 existing.backend = backend.clone();
                 existing.runtime = runtime.clone();
@@ -666,30 +861,32 @@ impl WorkerRegistry {
                 existing.max_inflight = max_inflight;
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
+                existing.runtime_ready = None;
+                existing.runtime_state = None;
+                existing.runtime_status_reason = None;
+                existing.observed_at_unix_ms = None;
+                existing.protocol_version = None;
+                existing.agent_version = None;
                 existing.drain = false;
-                existing.supported_operations = supported_operations.clone();
-                // Preserve richer identity fields if re-registering with them.
-                if runtime_version.is_some() {
-                    existing.runtime_version = runtime_version.clone();
-                }
-                if hardware_class.is_some() {
-                    existing.hardware_class = hardware_class.clone();
-                }
-                if runtime_endpoint.is_some() {
-                    existing.runtime_endpoint = runtime_endpoint.clone();
-                }
-                if friendly_name.is_some() {
-                    existing.friendly_name = friendly_name.clone();
-                }
-                if chip_model.is_some() {
-                    existing.chip_model = chip_model.clone();
-                }
-                if worker_pool.is_some() {
-                    existing.worker_pool = worker_pool.clone();
-                }
-                if node_class.is_some() {
-                    existing.node_class = node_class.clone();
-                }
+                existing.supported_operations =
+                    if retained_inventory_supported_operations.is_empty() {
+                        supported_operations.clone()
+                    } else {
+                        retained_inventory_supported_operations
+                    };
+                existing.supported_operations_explicit = !explicit_supported_operations_empty;
+                existing.runtime_version = runtime_version.clone();
+                existing.hardware_class = hardware_class.clone();
+                existing.runtime_endpoint = runtime_endpoint.clone();
+                existing.protocol_worker_id = None;
+                existing.worker_instance_id = None;
+                existing.registration_id = None;
+                existing.trust_domain = None;
+                existing.agent_name = None;
+                existing.friendly_name = friendly_name.clone();
+                existing.chip_model = chip_model.clone();
+                existing.worker_pool = worker_pool.clone();
+                existing.node_class = node_class.clone();
             })
             .or_insert_with(|| WorkerEntry {
                 id,
@@ -703,11 +900,24 @@ impl WorkerRegistry {
                 runtime_version,
                 hardware_class,
                 runtime_endpoint,
+                protocol_worker_id: None,
+                worker_instance_id: None,
+                registration_id: None,
+                trust_domain: None,
+                agent_name: None,
                 supported_operations,
+                supported_operations_explicit: !explicit_supported_operations_empty,
                 max_inflight,
                 inflight: Arc::new(AtomicUsize::new(0)),
+                reported_inflight: 0,
                 health: WorkerHealth::Healthy,
                 last_heartbeat: Instant::now(),
+                runtime_ready: None,
+                runtime_state: None,
+                runtime_status_reason: None,
+                observed_at_unix_ms: None,
+                protocol_version: None,
+                agent_version: None,
                 drain: false,
                 thermal_state: String::new(),
                 rss_bytes: 0,
@@ -735,46 +945,510 @@ impl WorkerRegistry {
         }
     }
 
+    /// Register a protocol-v1 runtime agent while retaining the legacy
+    /// registry as the endpoint-picker storage during migration.
+    pub fn register_protocol(
+        &self,
+        request: ProtocolRegisterRequest,
+        addr: SocketAddr,
+        negotiated: NegotiatedProtocol,
+        heartbeat_interval_ms: u64,
+        lease_ttl_ms: u64,
+    ) -> Result<ProtocolRegisterResponse, ProtocolRegistryError> {
+        request
+            .observation
+            .validate()
+            .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+
+        let registration = request.clone();
+        let stable_worker_id = request.worker.id.clone();
+        let existing_internal_id = self
+            .protocol_sessions
+            .get(&stable_worker_id)
+            .map(|session| session.internal_id);
+        let model_inventory = protocol_model_inventory(&request.observation.models);
+        let models = model_inventory
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let operations = protocol_supported_operations(&request.observation.models);
+        let max_context = request
+            .observation
+            .models
+            .iter()
+            .filter_map(|model| model.max_context_tokens)
+            .max()
+            .map(|value| value.min(u64::from(u32::MAX)) as u32);
+        let capabilities = WorkerCapabilities {
+            llm: operations.iter().any(|operation| operation == "llm"),
+            embedding: operations.iter().any(|operation| operation == "embedding"),
+            vision: operations.iter().any(|operation| operation == "vision"),
+            models,
+            max_context,
+        };
+
+        let legacy_request = RegisterRequest {
+            worker_id: existing_internal_id.map(|id| id.to_string()),
+            addr: addr.to_string(),
+            capabilities: RegisterCapabilities::Structured(capabilities),
+            model_inventory,
+            backend: request.runtime.kind.clone(),
+            runtime: Some(request.runtime.kind.clone()),
+            runtime_mode: Some("adapter".into()),
+            runtime_version: Some(request.runtime.version.clone()),
+            hardware_class: request.hardware.hardware_class.clone(),
+            runtime_endpoint: None,
+            supported_operations: operations,
+            max_inflight: request
+                .observation
+                .capacity
+                .as_ref()
+                .and_then(|capacity| capacity.max_concurrent_requests)
+                .unwrap_or(1)
+                .min(MAX_WORKER_INFLIGHT as u64) as usize,
+            friendly_name: request.worker.labels.get("friendly_name").cloned(),
+            chip_model: request.worker.labels.get("chip_model").cloned(),
+            worker_pool: Some(request.worker.pool_id.to_string()),
+            node_class: request.worker.labels.get("node_class").cloned(),
+        };
+        let registered = self.register(legacy_request, heartbeat_interval_ms);
+        let internal_id = WorkerId::parse(&registered.worker_id)
+            .ok_or(ProtocolRegistryError::InternalRegistration)?;
+
+        let heartbeat = legacy_heartbeat_from_observation(
+            &request.observation,
+            negotiated.version,
+            &request.agent.version,
+        );
+        if !self.heartbeat(internal_id, heartbeat) {
+            return Err(ProtocolRegistryError::InternalRegistration);
+        }
+
+        let registration_id = RegistrationId::new();
+        let raw_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let lease_token = LeaseToken::new(raw_token.clone())
+            .map_err(|_| ProtocolRegistryError::InternalRegistration)?;
+        let descriptor: ProtocolDescriptor = negotiated.clone().into();
+        self.protocol_sessions.insert(
+            stable_worker_id.clone(),
+            ProtocolSession {
+                internal_id,
+                instance_id: request.worker.instance_id,
+                registration_id,
+                lease_token_digest: lease_token_digest(&raw_token),
+                negotiated: descriptor.clone(),
+                agent: request.agent.clone(),
+                last_sequence: 0,
+                inventory_generation: request.observation.inventory_generation,
+                heartbeat_interval_ms,
+                lease_ttl_ms,
+                registration,
+            },
+        );
+        if let Some(mut entry) = self.inner.get_mut(&internal_id) {
+            entry.protocol_worker_id = Some(stable_worker_id.to_string());
+            entry.worker_instance_id = Some(request.worker.instance_id.to_string());
+            entry.registration_id = Some(registration_id.to_string());
+            entry.trust_domain = Some(request.worker.trust_domain.to_string());
+            entry.agent_name = Some(request.agent.name);
+        }
+
+        Ok(ProtocolRegisterResponse {
+            registration_id,
+            lease_token,
+            protocol: descriptor,
+            heartbeat_interval_ms,
+            lease_ttl_ms,
+            inventory_resync: false,
+        })
+    }
+
+    pub fn heartbeat_protocol(
+        &self,
+        worker_id: &ProtocolWorkerId,
+        lease_token: &str,
+        request: ProtocolHeartbeatRequest,
+    ) -> Result<ProtocolHeartbeatResponse, ProtocolRegistryError> {
+        if !request.runtime.is_consistent() {
+            return Err(ProtocolRegistryError::InvalidObservation(
+                "runtime ready flag and state are inconsistent".into(),
+            ));
+        }
+        if let Some(capacity) = &request.capacity {
+            capacity
+                .validate()
+                .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+        }
+
+        let mut session = self
+            .protocol_sessions
+            .get_mut(worker_id)
+            .ok_or(ProtocolRegistryError::NotRegistered)?;
+        if session.instance_id != request.instance_id {
+            return Err(ProtocolRegistryError::InstanceMismatch);
+        }
+        if session.registration_id != request.registration_id {
+            return Err(ProtocolRegistryError::RegistrationMismatch);
+        }
+        if !constant_time_digest_eq(
+            &session.lease_token_digest,
+            &lease_token_digest(lease_token),
+        ) {
+            return Err(ProtocolRegistryError::InvalidLeaseToken);
+        }
+        if request.sequence < session.last_sequence {
+            return Err(ProtocolRegistryError::ReplayedHeartbeat {
+                received: request.sequence,
+                accepted: session.last_sequence,
+            });
+        }
+        if request.sequence == session.last_sequence && session.last_sequence != 0 {
+            return Ok(ProtocolHeartbeatResponse::default());
+        }
+
+        let inventory_resync = request.models.is_none()
+            && request.inventory_generation != session.inventory_generation;
+        let model_inventory = match &request.models {
+            Some(models) => protocol_model_inventory(models),
+            None => self
+                .inner
+                .get(&session.internal_id)
+                .map(|entry| entry.model_inventory.clone())
+                .unwrap_or_default(),
+        };
+        let heartbeat = legacy_heartbeat_from_protocol(
+            &request,
+            &model_inventory,
+            session.negotiated.version,
+            &session.agent.version,
+        );
+        if !self.heartbeat(session.internal_id, heartbeat) {
+            return Err(ProtocolRegistryError::NotRegistered);
+        }
+
+        session.last_sequence = request.sequence;
+        session.registration.observation.observed_at = request.observed_at;
+        session.registration.observation.runtime = request.runtime.clone();
+        session.registration.observation.capacity = request.capacity.clone();
+        session.registration.observation.inventory_generation = request.inventory_generation;
+        if request.models.is_some() {
+            session.inventory_generation = request.inventory_generation;
+            session.registration.observation.models = request.models.clone().unwrap_or_default();
+        }
+
+        Ok(ProtocolHeartbeatResponse {
+            drain: if self
+                .inner
+                .get(&session.internal_id)
+                .is_some_and(|entry| entry.drain)
+            {
+                ax_serving_protocol::DrainDirective::Begin
+            } else {
+                ax_serving_protocol::DrainDirective::None
+            },
+            inventory_resync,
+            reregister: false,
+            deployment_commands: Vec::new(),
+        })
+    }
+
+    /// Resolve either the legacy gateway-assigned UUID or a protocol-v1 stable
+    /// worker identifier to the current internal registry identity.
+    pub fn resolve_worker_id(&self, raw: &str) -> Option<WorkerId> {
+        WorkerId::parse(raw).or_else(|| {
+            let stable = raw.parse::<ProtocolWorkerId>().ok()?;
+            self.protocol_sessions
+                .get(&stable)
+                .map(|session| session.internal_id)
+        })
+    }
+
+    pub fn validate_protocol_lease(
+        &self,
+        worker_id: &ProtocolWorkerId,
+        lease_token: &str,
+    ) -> Result<WorkerId, ProtocolRegistryError> {
+        let session = self
+            .protocol_sessions
+            .get(worker_id)
+            .ok_or(ProtocolRegistryError::NotRegistered)?;
+        if !constant_time_digest_eq(
+            &session.lease_token_digest,
+            &lease_token_digest(lease_token),
+        ) {
+            return Err(ProtocolRegistryError::InvalidLeaseToken);
+        }
+        Ok(session.internal_id)
+    }
+
+    pub fn export_protocol_record(
+        &self,
+        worker_id: &ProtocolWorkerId,
+    ) -> Option<SharedWorkerRecord> {
+        let session = self.protocol_sessions.get(worker_id)?;
+        let entry = self.inner.get(&session.internal_id)?;
+        Some(SharedWorkerRecord {
+            worker_id: worker_id.clone(),
+            instance_id: session.instance_id,
+            registration_id: session.registration_id,
+            lease_token_digest: session.lease_token_digest,
+            protocol: session.negotiated.clone(),
+            agent: session.agent.clone(),
+            registration: session.registration.clone(),
+            addr: entry.addr,
+            last_sequence: session.last_sequence,
+            inventory_generation: session.inventory_generation,
+            heartbeat_interval_ms: session.heartbeat_interval_ms,
+            lease_ttl_ms: session.lease_ttl_ms,
+            updated_at_unix_ms: unix_time_millis(),
+            draining: entry.drain,
+        })
+    }
+
+    /// Stable protocol worker ids currently mirrored by this gateway replica.
+    pub fn protocol_worker_ids(&self) -> BTreeSet<ProtocolWorkerId> {
+        self.protocol_sessions
+            .iter()
+            .map(|session| session.key().clone())
+            .collect()
+    }
+
+    /// Return the shared lease identity associated with an internal routing id.
+    pub fn protocol_identity_for_internal(
+        &self,
+        internal_id: WorkerId,
+    ) -> Option<(ProtocolWorkerId, RegistrationId)> {
+        self.protocol_sessions.iter().find_map(|session| {
+            (session.internal_id == internal_id)
+                .then(|| (session.key().clone(), session.registration_id))
+        })
+    }
+
+    /// Drop the local mirror for a stable protocol worker id.
+    pub fn evict_protocol(&self, worker_id: &ProtocolWorkerId) -> bool {
+        let Some((_, session)) = self.protocol_sessions.remove(worker_id) else {
+            return false;
+        };
+        self.inner.remove(&session.internal_id);
+        true
+    }
+
+    /// Restore only when shared state is authoritative and newer than this
+    /// replica's local mirror. This avoids resetting local inflight counters on
+    /// every reconciliation pass.
+    pub fn restore_protocol_record_if_newer(
+        &self,
+        record: SharedWorkerRecord,
+    ) -> Result<bool, ProtocolRegistryError> {
+        let should_restore = match self.protocol_sessions.get(&record.worker_id) {
+            None => true,
+            Some(session)
+                if session.registration_id != record.registration_id
+                    || session.instance_id != record.instance_id =>
+            {
+                true
+            }
+            Some(session) if record.last_sequence > session.last_sequence => true,
+            Some(session) if record.last_sequence == session.last_sequence => self
+                .inner
+                .get(&session.internal_id)
+                .is_none_or(|entry| entry.drain != record.draining),
+            Some(_) => false,
+        };
+        if should_restore {
+            self.restore_protocol_record(record)?;
+        }
+        Ok(should_restore)
+    }
+
+    /// Reconcile a protocol worker record created by another gateway replica.
+    pub fn restore_protocol_record(
+        &self,
+        record: SharedWorkerRecord,
+    ) -> Result<WorkerId, ProtocolRegistryError> {
+        let shared_age = std::time::Duration::from_millis(
+            unix_time_millis().saturating_sub(record.updated_at_unix_ms),
+        );
+        record
+            .registration
+            .observation
+            .validate()
+            .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+        if record.worker_id != record.registration.worker.id
+            || record.instance_id != record.registration.worker.instance_id
+        {
+            return Err(ProtocolRegistryError::InstanceMismatch);
+        }
+
+        let existing_internal_id = self
+            .protocol_sessions
+            .get(&record.worker_id)
+            .map(|session| session.internal_id);
+        let model_inventory = protocol_model_inventory(&record.registration.observation.models);
+        let operations = protocol_supported_operations(&record.registration.observation.models);
+        let capabilities = WorkerCapabilities {
+            llm: operations.iter().any(|operation| operation == "llm"),
+            embedding: operations.iter().any(|operation| operation == "embedding"),
+            vision: operations.iter().any(|operation| operation == "vision"),
+            models: model_inventory
+                .iter()
+                .map(|model| model.id.clone())
+                .collect(),
+            max_context: record
+                .registration
+                .observation
+                .models
+                .iter()
+                .filter_map(|model| model.max_context_tokens)
+                .max()
+                .map(|value| value.min(u64::from(u32::MAX)) as u32),
+        };
+        let request = &record.registration;
+        let registered = self.register(
+            RegisterRequest {
+                worker_id: existing_internal_id.map(|id| id.to_string()),
+                addr: record.addr.to_string(),
+                capabilities: RegisterCapabilities::Structured(capabilities),
+                model_inventory,
+                backend: request.runtime.kind.clone(),
+                runtime: Some(request.runtime.kind.clone()),
+                runtime_mode: Some("adapter".into()),
+                runtime_version: Some(request.runtime.version.clone()),
+                hardware_class: request.hardware.hardware_class.clone(),
+                runtime_endpoint: None,
+                supported_operations: operations,
+                max_inflight: request
+                    .observation
+                    .capacity
+                    .as_ref()
+                    .and_then(|capacity| capacity.max_concurrent_requests)
+                    .unwrap_or(1)
+                    .min(MAX_WORKER_INFLIGHT as u64) as usize,
+                friendly_name: request.worker.labels.get("friendly_name").cloned(),
+                chip_model: request.worker.labels.get("chip_model").cloned(),
+                worker_pool: Some(request.worker.pool_id.to_string()),
+                node_class: request.worker.labels.get("node_class").cloned(),
+            },
+            record.heartbeat_interval_ms,
+        );
+        let internal_id = WorkerId::parse(&registered.worker_id)
+            .ok_or(ProtocolRegistryError::InternalRegistration)?;
+        if !self.heartbeat(
+            internal_id,
+            legacy_heartbeat_from_observation(
+                &request.observation,
+                record.protocol.version,
+                &record.agent.version,
+            ),
+        ) {
+            return Err(ProtocolRegistryError::InternalRegistration);
+        }
+
+        self.protocol_sessions.insert(
+            record.worker_id.clone(),
+            ProtocolSession {
+                internal_id,
+                instance_id: record.instance_id,
+                registration_id: record.registration_id,
+                lease_token_digest: record.lease_token_digest,
+                negotiated: record.protocol.clone(),
+                agent: record.agent.clone(),
+                last_sequence: record.last_sequence,
+                inventory_generation: record.inventory_generation,
+                heartbeat_interval_ms: record.heartbeat_interval_ms,
+                lease_ttl_ms: record.lease_ttl_ms,
+                registration: record.registration.clone(),
+            },
+        );
+        if let Some(mut entry) = self.inner.get_mut(&internal_id) {
+            entry.protocol_worker_id = Some(record.worker_id.to_string());
+            entry.worker_instance_id = Some(record.instance_id.to_string());
+            entry.registration_id = Some(record.registration_id.to_string());
+            entry.trust_domain = Some(request.worker.trust_domain.to_string());
+            entry.agent_name = Some(record.agent.name);
+            entry.drain = record.draining;
+            entry.last_heartbeat = Instant::now()
+                .checked_sub(shared_age)
+                .unwrap_or_else(Instant::now);
+        }
+        Ok(internal_id)
+    }
+
     /// Record a heartbeat.  Returns `false` if the worker is not registered.
     pub fn heartbeat(&self, id: WorkerId, req: HeartbeatRequest) -> bool {
         match self.inner.get_mut(&id) {
             Some(mut e) => {
+                let runtime_ready = req.runtime_ready;
+                let runtime_state = normalize_optional_string(req.runtime_state);
+                let runtime_status_reason = normalize_optional_string(req.runtime_status_reason);
+                let observed_at_unix_ms = req.observed_at_unix_ms;
+                let protocol_version = req.protocol_version;
+                let agent_version = normalize_optional_string(req.agent_version);
                 e.last_heartbeat = Instant::now();
-                e.health = WorkerHealth::Healthy;
-                e.inflight.store(req.inflight, Ordering::Relaxed);
+                e.health = if runtime_ready == Some(false) {
+                    WorkerHealth::Unhealthy { missed: 1 }
+                } else {
+                    WorkerHealth::Healthy
+                };
+                e.runtime_ready = runtime_ready;
+                e.runtime_state = runtime_state;
+                e.runtime_status_reason = runtime_status_reason;
+                e.observed_at_unix_ms = observed_at_unix_ms;
+                e.protocol_version = protocol_version;
+                e.agent_version = agent_version;
+                e.reported_inflight = req.inflight.min(MAX_WORKER_INFLIGHT);
                 e.thermal_state = req.thermal_state;
                 e.rss_bytes = req.rss_bytes;
                 // Authoritative capability snapshot from worker heartbeat.
                 // Empty model_ids means the worker currently has no models.
-                let model_ids = if req.model_inventory.is_empty() {
-                    req.model_ids
-                } else {
-                    req.model_inventory
-                        .iter()
-                        .map(|model| model.id.clone())
-                        .collect()
-                };
+                let mut model_ids = req.model_ids;
+                let heartbeat_has_inventory = !req.model_inventory.is_empty();
+                if !req.model_inventory.is_empty() {
+                    model_ids.extend(req.model_inventory.iter().map(|model| model.id.clone()));
+                }
                 e.model_inventory = if req.model_inventory.is_empty() {
                     retain_model_inventory_for_ids(&e.model_inventory, &model_ids)
                 } else {
                     normalize_model_inventory(&model_ids, req.model_inventory)
                 };
-                e.capabilities.models = model_ids;
+                e.capabilities.models = e
+                    .model_inventory
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect();
+                let retained_inventory_has_operations = e
+                    .model_inventory
+                    .iter()
+                    .any(|model| !model.supported_operations.is_empty());
+                if heartbeat_has_inventory
+                    || (retained_inventory_has_operations && !e.supported_operations_explicit)
+                {
+                    let operations = supported_operations_from_model_inventory(&e.model_inventory);
+                    let max_context = max_context_from_model_inventory(&e.model_inventory);
+                    refresh_capabilities_from_inventory_summary(
+                        &mut e.capabilities,
+                        &operations,
+                        max_context,
+                        true,
+                    );
+                    e.supported_operations = operations;
+                    e.supported_operations_explicit = false;
+                }
                 // Token-cost dispatch telemetry — graceful defaults for legacy workers.
                 // active_sequences == 0 and inflight != 0 means the worker doesn't send
                 // the extended field; TokenCostPolicy falls back to inflight ratio.
-                e.active_sequences = req.active_sequences;
-                e.decode_tok_per_sec = req.decode_tok_per_sec;
+                e.active_sequences = req.active_sequences.min(MAX_WORKER_INFLIGHT);
+                e.decode_tok_per_sec = non_negative_finite(req.decode_tok_per_sec);
                 e.ttft_p95_ms = req.ttft_p95_ms;
-                e.queue_depth = req.queue_depth;
-                e.error_rate = req.error_rate;
+                e.queue_depth = req.queue_depth.min(MAX_WORKER_INFLIGHT);
+                e.error_rate = ratio_or_zero(req.error_rate);
                 e.kv_pages_used = req.kv_pages_used;
                 e.kv_pages_total = req.kv_pages_total;
-                e.kv_utilization = req.kv_utilization.map(|value| value.clamp(0.0, 1.0));
+                e.kv_utilization = req.kv_utilization.map(ratio_or_zero);
                 e.prefix_reusable_tokens = req.prefix_reusable_tokens;
                 e.active_batch_size = req.active_batch_size;
                 e.max_batch_size = req.max_batch_size;
-                e.batch_utilization = req.batch_utilization.map(|value| value.clamp(0.0, 1.0));
+                e.batch_utilization = req.batch_utilization.map(ratio_or_zero);
                 true
             }
             None => false,
@@ -807,6 +1481,28 @@ impl WorkerRegistry {
     /// Remove a worker entirely (drain-complete or explicit eviction).
     pub fn evict(&self, id: WorkerId) {
         self.inner.remove(&id);
+        self.protocol_sessions
+            .retain(|_, session| session.internal_id != id);
+    }
+
+    /// Remove a worker only if it still matches a stale unhealthy probe snapshot.
+    ///
+    /// Active TCP probes are launched from a point-in-time list of unhealthy
+    /// workers. A heartbeat or re-registration can make that snapshot stale
+    /// before the probe result returns, so failed probes must not evict a worker
+    /// that has already recovered or moved to a different address.
+    pub fn evict_if_unhealthy_at_addr(&self, id: WorkerId, addr: SocketAddr) -> bool {
+        let removed = self
+            .inner
+            .remove_if(&id, |_, entry| {
+                entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
+            })
+            .is_some();
+        if removed {
+            self.protocol_sessions
+                .retain(|_, session| session.internal_id != id);
+        }
+        removed
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -853,6 +1549,28 @@ impl WorkerRegistry {
         preferred_pool: Option<&str>,
         excluded_id: Option<WorkerId>,
     ) -> Vec<WorkerStatus> {
+        self.dispatch_workers_filtered_with_pool_mode(
+            model_id,
+            request_kind,
+            backend_hint,
+            min_context,
+            preferred_pool,
+            false,
+            excluded_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_workers_filtered_with_pool_mode(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+        preferred_pool: Option<&str>,
+        require_preferred_pool: bool,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerStatus> {
         let backend_filter = backend_filter_from_hint(backend_hint);
         let runtime_filter = runtime_filter_from_hint(backend_hint);
         let preferred_pool = preferred_pool
@@ -877,7 +1595,6 @@ impl WorkerRegistry {
                 })
                 .collect();
         };
-        let mut preferred_pool_exists = false;
         let mut preferred_workers = Vec::new();
         let mut fallback_workers = Vec::new();
 
@@ -897,9 +1614,6 @@ impl WorkerRegistry {
             if !matches_without_exclusion {
                 continue;
             }
-            if in_preferred_pool {
-                preferred_pool_exists = true;
-            }
             if excluded_id == Some(e.id) {
                 continue;
             }
@@ -912,11 +1626,87 @@ impl WorkerRegistry {
             }
         }
 
-        if preferred_pool_exists {
+        if require_preferred_pool || !preferred_workers.is_empty() {
             preferred_workers
         } else {
             fallback_workers
         }
+    }
+
+    /// Build strict model-scoped endpoint snapshots for explicit deployment routing.
+    ///
+    /// Unlike the legacy compatibility queries, unknown context, output, modality,
+    /// or protocol-capability limits fail closed when the request declares them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eligible_model_endpoints(
+        &self,
+        runtime_model_id: &str,
+        request_kind: RequestKind,
+        runtime_hint: Option<&str>,
+        minimum_context_tokens: Option<u64>,
+        max_output_tokens: Option<u64>,
+        required_modalities: &BTreeSet<String>,
+        required_capabilities: &BTreeSet<ax_serving_protocol::ProtocolCapability>,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerModelEndpoint> {
+        let backend_filter = backend_filter_from_hint(runtime_hint);
+        let runtime_filter = runtime_filter_from_hint(runtime_hint);
+        self.inner
+            .iter()
+            .filter_map(|item| {
+                let entry = item.value();
+                if !dispatch_filter_matches(
+                    entry,
+                    runtime_model_id,
+                    request_kind,
+                    backend_filter.as_ref(),
+                    runtime_filter.as_ref(),
+                    None,
+                    excluded_id,
+                ) || effective_inflight(entry) >= entry.max_inflight
+                {
+                    return None;
+                }
+                let model = entry
+                    .model_inventory
+                    .iter()
+                    .find(|model| model.id == runtime_model_id)?;
+                if minimum_context_tokens.is_some_and(|required| {
+                    model
+                        .max_context
+                        .map(u64::from)
+                        .is_none_or(|limit| limit < required)
+                }) || max_output_tokens.is_some_and(|required| {
+                    model.max_output_tokens.is_none_or(|limit| limit < required)
+                }) || !required_modalities.iter().all(|required| {
+                    model
+                        .modalities
+                        .iter()
+                        .any(|observed| observed.eq_ignore_ascii_case(required))
+                }) || !required_capabilities.iter().all(|required| {
+                    model
+                        .protocol_capabilities
+                        .iter()
+                        .any(|observed| observed == required.as_str())
+                }) {
+                    return None;
+                }
+
+                Some(WorkerModelEndpoint {
+                    worker: worker_status_of(entry),
+                    worker_pool: entry.worker_pool.clone(),
+                    node_class: entry.node_class.clone(),
+                    hardware_class: entry.hardware_class.clone(),
+                    runtime_kind: entry.runtime.as_str().to_string(),
+                    runtime_version: entry.runtime_version.clone(),
+                    trust_domain: entry.trust_domain.clone(),
+                    protocol_worker_id: entry.protocol_worker_id.clone(),
+                    worker_instance_id: entry.worker_instance_id.clone(),
+                    registration_id: entry.registration_id.clone(),
+                    model: model.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Shared inflight counter for a specific worker.
@@ -927,6 +1717,45 @@ impl WorkerRegistry {
         self.inner
             .get(&id)
             .map(|entry| Arc::clone(&entry.value().inflight))
+    }
+
+    /// Conservative compatibility guard for retries in legacy deployment mode.
+    ///
+    /// Compatibility mode has no operator-certified equivalence graph, so a
+    /// retry may stay only inside the same runtime/pool cohort and must not
+    /// cross any observed model-identity difference.
+    pub fn legacy_retry_compatible(
+        &self,
+        source_id: WorkerId,
+        target_id: WorkerId,
+        model_id: &str,
+    ) -> bool {
+        let Some(source) = self.inner.get(&source_id) else {
+            return false;
+        };
+        let Some(target) = self.inner.get(&target_id) else {
+            return false;
+        };
+        if source.runtime != target.runtime
+            || source.worker_pool != target.worker_pool
+            || (source.trust_domain.is_some() || target.trust_domain.is_some())
+                && source.trust_domain != target.trust_domain
+        {
+            return false;
+        }
+        let source_model = source
+            .model_inventory
+            .iter()
+            .find(|model| model.id == model_id);
+        let target_model = target
+            .model_inventory
+            .iter()
+            .find(|model| model.id == model_id);
+        match (source_model, target_model) {
+            (Some(source), Some(target)) => legacy_model_identity_matches(source, target),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// All workers — for the `/internal/workers` listing endpoint.
@@ -976,7 +1805,11 @@ impl WorkerRegistry {
             }
 
             entry.health = if age_ms <= ttl_ms / 3 {
-                WorkerHealth::Healthy
+                if matches!(entry.health, WorkerHealth::Unhealthy { .. }) {
+                    entry.health.clone()
+                } else {
+                    WorkerHealth::Healthy
+                }
             } else if age_ms <= (2 * ttl_ms) / 3 {
                 WorkerHealth::Unhealthy { missed: 1 }
             } else if age_ms <= ttl_ms {
@@ -999,6 +1832,11 @@ impl WorkerRegistry {
                     age_ms > ttl_ms && matches!(entry.health, WorkerHealth::Dead)
                 }
             });
+        }
+
+        if !evicted.is_empty() {
+            self.protocol_sessions
+                .retain(|_, session| !evicted.contains(&session.internal_id));
         }
 
         evicted
@@ -1056,8 +1894,187 @@ impl Default for WorkerRegistry {
     }
 }
 
+fn protocol_model_inventory(models: &[RuntimeModelDescriptor]) -> Vec<ModelInventoryEntry> {
+    models
+        .iter()
+        .map(|model| ModelInventoryEntry {
+            id: model.runtime_model_id.to_string(),
+            max_context: model
+                .max_context_tokens
+                .map(|value| value.min(u64::from(u32::MAX)) as u32),
+            quantization: model.identity.quantization.clone(),
+            artifact_format: None,
+            modalities: protocol_model_modalities(model),
+            supported_operations: model
+                .operations
+                .iter()
+                .filter_map(protocol_operation_to_legacy)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            protocol_capabilities: model.capabilities.iter().map(ToString::to_string).collect(),
+            revision: model.identity.revision.clone(),
+            artifact_digest: model
+                .identity
+                .artifact_digest
+                .as_ref()
+                .map(ToString::to_string),
+            tokenizer_digest: model
+                .identity
+                .tokenizer_digest
+                .as_ref()
+                .map(ToString::to_string),
+            template_digest: model
+                .identity
+                .template_digest
+                .as_ref()
+                .map(ToString::to_string),
+            runtime_kind: Some(model.identity.runtime_kind.clone()),
+            runtime_version: model.identity.runtime_version.clone(),
+            max_output_tokens: model.max_output_tokens,
+        })
+        .collect()
+}
+
+fn protocol_model_modalities(model: &RuntimeModelDescriptor) -> Vec<String> {
+    let mut modalities = BTreeSet::from(["text".to_string()]);
+    if model
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == "inference.vision")
+    {
+        modalities.insert("image".into());
+    }
+    modalities.into_iter().collect()
+}
+
+fn protocol_operation_to_legacy(operation: &ax_serving_protocol::Operation) -> Option<String> {
+    match operation.as_str() {
+        ax_serving_protocol::Operation::CHAT_COMPLETIONS
+        | ax_serving_protocol::Operation::TEXT_COMPLETIONS => Some("llm".into()),
+        ax_serving_protocol::Operation::EMBEDDINGS => Some("embedding".into()),
+        _ => None,
+    }
+}
+
+fn protocol_supported_operations(models: &[RuntimeModelDescriptor]) -> Vec<String> {
+    let mut operations = models
+        .iter()
+        .flat_map(|model| model.operations.iter())
+        .filter_map(protocol_operation_to_legacy)
+        .collect::<BTreeSet<_>>();
+    if models.iter().any(|model| {
+        model
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "inference.vision")
+    }) {
+        operations.insert("vision".into());
+    }
+    operations.into_iter().collect()
+}
+
+fn legacy_heartbeat_from_observation(
+    observation: &ax_serving_protocol::RuntimeObservation,
+    protocol_version: ProtocolVersion,
+    agent_version: &str,
+) -> HeartbeatRequest {
+    let model_inventory = protocol_model_inventory(&observation.models);
+    HeartbeatRequest {
+        model_ids: model_inventory
+            .iter()
+            .map(|model| model.id.clone())
+            .collect(),
+        model_inventory,
+        runtime_ready: Some(observation.runtime.ready),
+        runtime_state: Some(format!("{:?}", observation.runtime.state).to_ascii_lowercase()),
+        runtime_status_reason: observation.runtime.reason_code.clone(),
+        observed_at_unix_ms: offset_datetime_millis(observation.observed_at),
+        protocol_version: Some(protocol_version),
+        agent_version: Some(agent_version.to_string()),
+        ..legacy_capacity_heartbeat(observation.capacity.as_ref())
+    }
+}
+
+fn legacy_heartbeat_from_protocol(
+    request: &ProtocolHeartbeatRequest,
+    model_inventory: &[ModelInventoryEntry],
+    protocol_version: ProtocolVersion,
+    agent_version: &str,
+) -> HeartbeatRequest {
+    HeartbeatRequest {
+        model_ids: model_inventory
+            .iter()
+            .map(|model| model.id.clone())
+            .collect(),
+        model_inventory: model_inventory.to_vec(),
+        runtime_ready: Some(request.runtime.ready),
+        runtime_state: Some(format!("{:?}", request.runtime.state).to_ascii_lowercase()),
+        runtime_status_reason: request.runtime.reason_code.clone(),
+        observed_at_unix_ms: offset_datetime_millis(request.observed_at),
+        protocol_version: Some(protocol_version),
+        agent_version: Some(agent_version.to_string()),
+        ..legacy_capacity_heartbeat(request.capacity.as_ref())
+    }
+}
+
+fn legacy_capacity_heartbeat(
+    capacity: Option<&ax_serving_protocol::CapacityObservation>,
+) -> HeartbeatRequest {
+    let Some(capacity) = capacity else {
+        return HeartbeatRequest::default();
+    };
+    HeartbeatRequest {
+        inflight: capacity
+            .active_requests
+            .unwrap_or(0)
+            .min(MAX_WORKER_INFLIGHT as u64) as usize,
+        active_sequences: capacity
+            .active_requests
+            .unwrap_or(0)
+            .min(MAX_WORKER_INFLIGHT as u64) as usize,
+        decode_tok_per_sec: capacity.generated_tokens_per_second.unwrap_or(0.0),
+        ttft_p95_ms: capacity
+            .ttft_ewma_ms
+            .unwrap_or(0.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64,
+        queue_depth: capacity
+            .waiting_requests
+            .unwrap_or(0)
+            .min(MAX_WORKER_INFLIGHT as u64) as usize,
+        rss_bytes: capacity.process_rss_bytes.unwrap_or(0),
+        error_rate: capacity.recent_error_rate.unwrap_or(0.0),
+        kv_utilization: capacity.kv_cache_used_ratio,
+        batch_utilization: match (capacity.batch_tokens_in_use, capacity.batch_token_capacity) {
+            (Some(in_use), Some(total)) if total > 0 => Some(in_use as f64 / total as f64),
+            _ => None,
+        },
+        ..Default::default()
+    }
+}
+
+fn offset_datetime_millis(value: time::OffsetDateTime) -> Option<u64> {
+    let nanos = value.unix_timestamp_nanos();
+    if nanos < 0 {
+        return None;
+    }
+    Some((nanos / 1_000_000).min(i128::from(u64::MAX)) as u64)
+}
+
+fn lease_token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
 fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
-    let inflight = e.inflight.load(Ordering::Relaxed);
+    let inflight = effective_inflight(e);
     let kv_utilization = worker_kv_utilization(e);
     let batch_utilization = worker_batch_utilization(e);
     WorkerSnapshot {
@@ -1072,11 +2089,22 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         runtime_version: e.runtime_version.clone(),
         hardware_class: e.hardware_class.clone(),
         runtime_endpoint: e.runtime_endpoint.clone(),
+        protocol_worker_id: e.protocol_worker_id.clone(),
+        worker_instance_id: e.worker_instance_id.clone(),
+        registration_id: e.registration_id.clone(),
+        trust_domain: e.trust_domain.clone(),
+        agent_name: e.agent_name.clone(),
         supported_operations: e.supported_operations.clone(),
         max_inflight: e.max_inflight,
         inflight,
         saturation: inflight as f64 / e.max_inflight.max(1) as f64,
         health: e.health.as_str().to_string(),
+        runtime_ready: e.runtime_ready,
+        runtime_state: e.runtime_state.clone(),
+        runtime_status_reason: e.runtime_status_reason.clone(),
+        observed_at_unix_ms: e.observed_at_unix_ms,
+        protocol_version: e.protocol_version,
+        agent_version: e.agent_version.clone(),
         drain: e.drain,
         last_heartbeat_age_ms: e.last_heartbeat.elapsed().as_millis() as u64,
         thermal_state: e.thermal_state.clone(),
@@ -1114,6 +2142,72 @@ fn supported_operations_from_capabilities(capabilities: &WorkerCapabilities) -> 
     operations
 }
 
+fn supported_operations_from_model_inventory(inventory: &[ModelInventoryEntry]) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    let mut operations = Vec::new();
+    for operation in inventory
+        .iter()
+        .flat_map(|model| model.supported_operations.iter())
+    {
+        if seen.insert(operation.clone()) {
+            operations.push(operation.clone());
+        }
+    }
+    operations
+}
+
+fn max_context_from_model_inventory(inventory: &[ModelInventoryEntry]) -> Option<u32> {
+    inventory.iter().filter_map(|model| model.max_context).max()
+}
+
+fn refresh_capabilities_from_inventory_summary(
+    capabilities: &mut WorkerCapabilities,
+    operations: &[String],
+    max_context: Option<u32>,
+    clear_missing_max_context: bool,
+) {
+    if !operations.is_empty() {
+        capabilities.llm = operations.iter().any(|op| op == "llm");
+        capabilities.embedding = operations.iter().any(|op| op == "embedding");
+        capabilities.vision = operations.iter().any(|op| op == "vision");
+    }
+    if max_context.is_some() || clear_missing_max_context {
+        capabilities.max_context = max_context;
+    }
+}
+
+fn refresh_capabilities_from_operation_summary(
+    capabilities: &mut WorkerCapabilities,
+    operations: &[String],
+) {
+    if !operations.is_empty() {
+        capabilities.llm = operations.iter().any(|op| op == "llm");
+        capabilities.embedding = operations.iter().any(|op| op == "embedding");
+        capabilities.vision = operations.iter().any(|op| op == "vision");
+    }
+}
+
+fn normalize_supported_operations(operations: Vec<String>) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    operations
+        .into_iter()
+        .filter_map(|op| normalize_supported_operation(&op))
+        .filter(|op| seen.insert(op.clone()))
+        .collect()
+}
+
+fn normalize_supported_operation(operation: &str) -> Option<String> {
+    let normalized = operation.trim().to_ascii_lowercase().replace('-', "_");
+    let canonical = match normalized.as_str() {
+        "" => return None,
+        "embedding" | "embeddings" => "embedding",
+        "vision" | "image" | "multimodal" => "vision",
+        "llm" | "text" | "chat" | "completion" | "completions" => "llm",
+        _ => normalized.as_str(),
+    };
+    Some(canonical.to_string())
+}
+
 fn normalize_model_inventory(
     model_ids: &[String],
     inventory: Vec<ModelInventoryEntry>,
@@ -1126,16 +2220,16 @@ fn normalize_model_inventory(
         }
         item.modalities.sort();
         item.modalities.dedup();
-        item.supported_operations.sort();
-        item.supported_operations.dedup();
+        item.supported_operations = normalize_supported_operations(item.supported_operations);
         by_id.insert(item.id.clone(), item);
     }
     for id in model_ids {
-        if !id.trim().is_empty() {
+        let id = id.trim();
+        if !id.is_empty() {
             by_id
-                .entry(id.clone())
+                .entry(id.to_string())
                 .or_insert_with(|| ModelInventoryEntry {
-                    id: id.clone(),
+                    id: id.to_string(),
                     ..Default::default()
                 });
         }
@@ -1149,7 +2243,7 @@ fn retain_model_inventory_for_ids(
 ) -> Vec<ModelInventoryEntry> {
     let retained = previous
         .iter()
-        .filter(|entry| model_ids.iter().any(|id| id == &entry.id))
+        .filter(|entry| model_ids.iter().any(|id| id.trim() == entry.id))
         .cloned()
         .collect();
     normalize_model_inventory(model_ids, retained)
@@ -1166,19 +2260,68 @@ fn normalize_runtime_mode(mode: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn ratio_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn non_negative_finite(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
     let kv_utilization = worker_kv_utilization(e);
     let batch_headroom = worker_batch_utilization(e).map(|value| 1.0 - value);
     WorkerStatus {
         id: e.id,
         addr: e.addr,
-        inflight: e.inflight.load(Ordering::Relaxed),
+        inflight: effective_inflight(e),
         max_inflight: e.max_inflight,
         active_sequences: e.active_sequences,
         ttft_p95_ms: e.ttft_p95_ms,
         kv_utilization,
         batch_headroom,
+        queue_depth: e.protocol_version.map(|_| e.queue_depth),
+        error_rate: e.protocol_version.map(|_| e.error_rate),
+        decode_tok_per_sec: e
+            .protocol_version
+            .and((e.decode_tok_per_sec > 0.0).then_some(e.decode_tok_per_sec)),
+        telemetry_age_ms: e
+            .protocol_version
+            .and(e.observed_at_unix_ms)
+            .map(observation_age_ms),
     }
+}
+
+fn observation_age_ms(observed_at_unix_ms: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    now.saturating_sub(observed_at_unix_ms)
+}
+
+fn effective_inflight(e: &WorkerEntry) -> usize {
+    e.inflight.load(Ordering::Relaxed).max(e.reported_inflight)
 }
 
 fn worker_kv_utilization(e: &WorkerEntry) -> Option<f64> {
@@ -1211,24 +2354,105 @@ fn dispatch_filter_matches(
         && matches!(entry.health, WorkerHealth::Healthy)
         && entry.capabilities.models.iter().any(|c| c == model_id)
         && supports_request_kind(entry, request_kind)
+        && model_inventory_supports_request_kind(entry, model_id, request_kind)
         && backend_filter.is_none_or(|kind| &entry.backend == kind)
         && runtime_filter.is_none_or(|kind| &entry.runtime == kind)
-        && min_context.is_none_or(|required| {
-            entry
-                .capabilities
-                .max_context
-                .is_none_or(|worker_max| worker_max >= required)
+        && model_context_supports_request(entry, model_id, min_context)
+}
+
+fn model_context_supports_request(
+    entry: &WorkerEntry,
+    model_id: &str,
+    min_context: Option<u32>,
+) -> bool {
+    let Some(required) = min_context else {
+        return true;
+    };
+
+    let worker_context_ok = entry
+        .capabilities
+        .max_context
+        .is_none_or(|worker_max| worker_max >= required);
+    if !worker_context_ok {
+        return false;
+    }
+
+    entry
+        .model_inventory
+        .iter()
+        .find(|model| model.id == model_id)
+        .and_then(|model| model.max_context)
+        .is_none_or(|model_max| model_max >= required)
+}
+
+fn model_inventory_supports_request_kind(
+    entry: &WorkerEntry,
+    model_id: &str,
+    request_kind: RequestKind,
+) -> bool {
+    entry
+        .model_inventory
+        .iter()
+        .find(|model| model.id == model_id)
+        .is_none_or(|model| {
+            model.supported_operations.is_empty()
+                || model
+                    .supported_operations
+                    .iter()
+                    .any(|operation| operation == request_kind.as_operation())
         })
 }
 
+fn legacy_model_identity_matches(
+    source: &ModelInventoryEntry,
+    target: &ModelInventoryEntry,
+) -> bool {
+    let fields_present = source.revision.is_some()
+        || target.revision.is_some()
+        || source.artifact_digest.is_some()
+        || target.artifact_digest.is_some()
+        || source.tokenizer_digest.is_some()
+        || target.tokenizer_digest.is_some()
+        || source.template_digest.is_some()
+        || target.template_digest.is_some()
+        || source.quantization.is_some()
+        || target.quantization.is_some();
+    !fields_present
+        || (source.revision == target.revision
+            && source.artifact_digest == target.artifact_digest
+            && source.tokenizer_digest == target.tokenizer_digest
+            && source.template_digest == target.template_digest
+            && source.quantization == target.quantization)
+}
+
 fn supports_request_kind(entry: &WorkerEntry, request_kind: RequestKind) -> bool {
+    if !entry.supported_operations.is_empty()
+        && !entry
+            .supported_operations
+            .iter()
+            .any(|operation| operation == request_kind.as_operation())
+    {
+        return false;
+    }
+
     match entry.capability_source {
         // Compatibility path: legacy workers historically routed by model-id only.
         CapabilitySource::Legacy => true,
         CapabilitySource::Structured => match request_kind {
             RequestKind::Llm => entry.capabilities.llm,
             RequestKind::Embedding => entry.capabilities.embedding,
+            RequestKind::Vision => entry.capabilities.vision,
         },
+    }
+}
+
+impl RequestKind {
+    fn as_operation(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Embedding => "embedding",
+            Self::Vision => "vision",
+        }
     }
 }
 
@@ -1338,7 +2562,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_workers_apply_exclusion_after_pool_preference() {
+    fn dispatch_workers_fall_back_when_soft_preferred_pool_is_excluded() {
         let r = WorkerRegistry::new();
         let blue = r.register(
             RegisterRequest {
@@ -1347,7 +2571,7 @@ mod tests {
             },
             5000,
         );
-        r.register(
+        let green = r.register(
             RegisterRequest {
                 worker_pool: Some("green".into()),
                 ..reg_req("127.0.0.1:8082", &["m1"], 4)
@@ -1364,10 +2588,8 @@ mod tests {
             Some(WorkerId::parse(&blue.worker_id).unwrap()),
         );
 
-        assert!(
-            workers.is_empty(),
-            "preferred-pool filtering must still win before exclusion"
-        );
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, WorkerId::parse(&green.worker_id).unwrap());
     }
 
     #[test]
@@ -1388,6 +2610,24 @@ mod tests {
             RuntimeKind::from_backend(&BackendKind::Vllm),
             RuntimeKind::Vllm
         );
+    }
+
+    #[test]
+    fn register_trims_backend_and_runtime_names() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                backend: " SGLANG ".into(),
+                runtime: Some(" VLLM ".into()),
+                ..reg_req("127.0.0.1:8081", &["m1"], 4)
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snap = r.get_snapshot(id).unwrap();
+
+        assert_eq!(snap.backend, BackendKind::SgLang.as_str());
+        assert_eq!(snap.runtime, RuntimeKind::Vllm.as_str());
     }
 
     #[test]
@@ -1455,6 +2695,404 @@ mod tests {
         assert!(r.eligible_workers("embed-1").is_empty());
         assert_eq!(
             r.eligible_workers_for("embed-1", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_inventory_operations_constrain_mixed_runtime_models() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["chat-model".into(), "embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![
+                    ModelInventoryEntry {
+                        id: "chat-model".into(),
+                        supported_operations: vec!["llm".into()],
+                        ..Default::default()
+                    },
+                    ModelInventoryEntry {
+                        id: "embed-model".into(),
+                        supported_operations: vec!["embedding".into()],
+                        ..Default::default()
+                    },
+                ],
+                supported_operations: vec!["llm".into(), "embedding".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("chat-model").len(), 1);
+        assert!(
+            r.eligible_workers_for("chat-model", RequestKind::Embedding)
+                .is_empty(),
+            "chat-only model inventory must reject embedding requests"
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "embedding-only model inventory must reject llm requests"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn vision_requests_require_vision_operation() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["vision-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["llm".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8082".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: true,
+                    models: vec!["vision-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["llm".into(), "vision".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_for("vision-model", RequestKind::Llm)
+                .len(),
+            2
+        );
+        let vision_workers = r.eligible_workers_for("vision-model", RequestKind::Vision);
+        assert_eq!(vision_workers.len(), 1);
+        assert_eq!(vision_workers[0].addr.to_string(), "127.0.0.1:8082");
+    }
+
+    #[test]
+    fn registration_routes_models_from_inventory_when_capability_models_absent() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "inventory-model".into(),
+                    max_context: Some(32768),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["inventory-model".to_string()]);
+        assert_eq!(snapshot.model_inventory[0].id, "inventory-model");
+        assert_eq!(r.eligible_workers("inventory-model").len(), 1);
+    }
+
+    #[test]
+    fn registration_refreshes_structured_operations_from_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["embed-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "inventory-only embedding registration must not be llm eligible"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn registration_preserves_explicit_max_context_when_inventory_omits_it() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: Some(4096),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "chat-model".into(),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(4096));
+        assert_eq!(
+            r.eligible_workers_filtered("chat-model", RequestKind::Llm, None, Some(4096))
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers_filtered("chat-model", RequestKind::Llm, None, Some(4097))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn registration_treats_model_inventory_as_additive() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["capability-model".into()],
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "inventory-model".into(),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("capability-model").len(), 1);
+        assert_eq!(r.eligible_workers("inventory-model").len(), 1);
+    }
+
+    #[test]
+    fn legacy_worker_explicit_llm_only_operations_are_not_embedding_eligible() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                supported_operations: vec!["llm".into()],
+                ..reg_req("127.0.0.1:8081", &["shared-model"], 4)
+            },
+            5000,
+        );
+
+        assert_eq!(r.eligible_workers("shared-model").len(), 1);
+        assert!(
+            r.eligible_workers_for("shared-model", RequestKind::Embedding)
+                .is_empty(),
+            "explicit supported_operations must constrain legacy worker routing"
+        );
+    }
+
+    #[test]
+    fn legacy_worker_without_explicit_operations_keeps_model_id_compatibility() {
+        let r = WorkerRegistry::new();
+        r.register(reg_req("127.0.0.1:8081", &["shared-model"], 4), 5000);
+
+        assert_eq!(
+            r.eligible_workers_for("shared-model", RequestKind::Embedding)
+                .len(),
+            1,
+            "legacy model-id-only registrations remain backward compatible"
+        );
+    }
+
+    #[test]
+    fn explicit_operations_are_normalized_and_deduplicated() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["shared-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec![
+                    " LLM ".into(),
+                    "Embeddings".into(),
+                    "llm".into(),
+                    "completion".into(),
+                    "text-generation".into(),
+                    "text_generation".into(),
+                ],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snapshot.supported_operations,
+            vec![
+                "llm".to_string(),
+                "embedding".to_string(),
+                "text_generation".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_operations_refresh_structured_capability_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                supported_operations: vec!["Embeddings".into()],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "explicit embedding-only operations must not leave stale llm routing enabled"
+        );
+    }
+
+    #[test]
+    fn inventory_operations_are_normalized_to_routing_operations() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: Vec::new(),
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["Embeddings".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
                 .len(),
             1
         );
@@ -1598,6 +3236,7 @@ mod tests {
                     artifact_format: Some("safetensors".into()),
                     modalities: vec!["text".into()],
                     supported_operations: vec!["llm".into(), "vision".into()],
+                    ..Default::default()
                 }],
                 backend: "vllm".into(),
                 runtime_mode: Some("adapter".into()),
@@ -1705,6 +3344,157 @@ mod tests {
     }
 
     #[test]
+    fn min_context_respects_model_inventory_context_limit() {
+        let r = WorkerRegistry::new();
+        r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["short-model".into()],
+                    max_context: Some(32768),
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "short-model".into(),
+                    max_context: Some(4096),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        assert_eq!(
+            r.eligible_workers_filtered("short-model", RequestKind::Llm, None, Some(4096))
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers_filtered("short-model", RequestKind::Llm, None, Some(8000))
+                .is_empty(),
+            "per-model context limit must override broader worker context"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_filters_fail_closed_on_unknown_declared_limits() {
+        let registry = WorkerRegistry::new();
+        registry.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["repo/model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "repo/model".into(),
+                    modalities: vec!["text".into()],
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                backend: "vllm".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5_000,
+        );
+
+        assert_eq!(
+            registry
+                .eligible_model_endpoints(
+                    "repo/model",
+                    RequestKind::Llm,
+                    None,
+                    None,
+                    None,
+                    &BTreeSet::from(["text".to_string()]),
+                    &BTreeSet::new(),
+                    None,
+                )
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .eligible_model_endpoints(
+                    "repo/model",
+                    RequestKind::Llm,
+                    None,
+                    Some(8_192),
+                    None,
+                    &BTreeSet::from(["text".to_string()]),
+                    &BTreeSet::new(),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            registry
+                .eligible_model_endpoints(
+                    "repo/model",
+                    RequestKind::Llm,
+                    None,
+                    None,
+                    Some(1_024),
+                    &BTreeSet::from(["text".to_string()]),
+                    &BTreeSet::new(),
+                    None,
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_retry_guard_never_crosses_runtime_pool_or_identity() {
+        let registry = WorkerRegistry::new();
+        let register = |addr: &str, runtime: &str, pool: &str, revision: &str| RegisterRequest {
+            addr: addr.into(),
+            capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                llm: true,
+                embedding: false,
+                vision: false,
+                models: vec!["shared-model".into()],
+                max_context: Some(8_192),
+            }),
+            model_inventory: vec![ModelInventoryEntry {
+                id: "shared-model".into(),
+                revision: Some(revision.into()),
+                modalities: vec!["text".into()],
+                supported_operations: vec!["llm".into()],
+                ..Default::default()
+            }],
+            backend: runtime.into(),
+            runtime: Some(runtime.into()),
+            worker_pool: Some(pool.into()),
+            max_inflight: 4,
+            ..Default::default()
+        };
+        let source = registry.register(register("127.0.0.1:8081", "vllm", "cuda", "rev-1"), 5_000);
+        let same = registry.register(register("127.0.0.1:8082", "vllm", "cuda", "rev-1"), 5_000);
+        let other_runtime =
+            registry.register(register("127.0.0.1:8083", "native", "mac", "rev-1"), 5_000);
+        let other_identity =
+            registry.register(register("127.0.0.1:8084", "vllm", "cuda", "rev-2"), 5_000);
+        let source = WorkerId::parse(&source.worker_id).unwrap();
+        let same = WorkerId::parse(&same.worker_id).unwrap();
+        let other_runtime = WorkerId::parse(&other_runtime.worker_id).unwrap();
+        let other_identity = WorkerId::parse(&other_identity.worker_id).unwrap();
+
+        assert!(registry.legacy_retry_compatible(source, same, "shared-model"));
+        assert!(!registry.legacy_retry_compatible(source, other_runtime, "shared-model"));
+        assert!(!registry.legacy_retry_compatible(source, other_identity, "shared-model"));
+    }
+
+    #[test]
     fn reregister_is_idempotent() {
         let r = WorkerRegistry::new();
         let resp1 = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
@@ -1718,6 +3508,199 @@ mod tests {
         assert_eq!(resp2.worker_id, id1);
         assert_eq!(r.eligible_workers("m2").len(), 1);
         assert_eq!(r.list_all().len(), 1); // still one entry
+    }
+
+    #[test]
+    fn reregister_without_inventory_preserves_matching_model_metadata() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    models: vec!["m1".into()],
+                    ..Default::default()
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("Q4_K_M".into()),
+                    artifact_format: Some("gguf".into()),
+                    ..Default::default()
+                }],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let mut req2 = reg_req("127.0.0.1:8081", &["m1"], 8);
+        req2.worker_id = Some(resp.worker_id);
+        r.register(req2, 5000);
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.model_inventory.len(), 1);
+        assert_eq!(snapshot.model_inventory[0].id, "m1");
+        assert_eq!(
+            snapshot.model_inventory[0].quantization.as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            snapshot.model_inventory[0].artifact_format.as_deref(),
+            Some("gguf")
+        );
+    }
+
+    #[test]
+    fn reregister_without_inventory_preserves_retained_operation_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.register(
+            RegisterRequest {
+                worker_id: Some(resp.worker_id),
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                backend: "sglang".into(),
+                max_inflight: 8,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "retained embedding-only inventory must continue to reject llm routing"
+        );
+    }
+
+    #[test]
+    fn reregister_without_inventory_prefers_retained_operations_over_derived_capabilities() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: false,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.register(
+            RegisterRequest {
+                worker_id: Some(resp.worker_id),
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["embed-model".into()],
+                    max_context: None,
+                }),
+                backend: "sglang".into(),
+                max_inflight: 8,
+                ..Default::default()
+            },
+            5000,
+        );
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert!(snapshot.capability_descriptor.embedding);
+        assert!(!snapshot.capability_descriptor.llm);
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "retained embedding-only inventory must override derived llm capabilities"
+        );
+    }
+
+    #[test]
+    fn reregister_without_models_clears_stale_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    models: vec!["m1".into()],
+                    ..Default::default()
+                }),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("Q4_K_M".into()),
+                    ..Default::default()
+                }],
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let mut req2 = reg_req("127.0.0.1:8081", &[], 8);
+        req2.worker_id = Some(resp.worker_id);
+        r.register(req2, 5000);
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert!(snapshot.model_inventory.is_empty());
+        assert!(snapshot.capability_descriptor.models.is_empty());
+        assert!(r.eligible_workers("m1").is_empty());
     }
 
     #[test]
@@ -1789,6 +3772,47 @@ mod tests {
     }
 
     #[test]
+    fn tick_preserves_recent_unhealthy_until_heartbeat() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        r.mark_unhealthy(id);
+        r.tick(9_000);
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Unhealthy { missed: 1 },
+            "tick must not erase a dispatch failure before a heartbeat restores health"
+        );
+        assert!(r.eligible_workers("m1").is_empty());
+        assert!(
+            r.list_unhealthy_addrs()
+                .iter()
+                .any(|(candidate_id, _)| *candidate_id == id),
+            "health ticker must still see the failed worker as a probe candidate"
+        );
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Healthy,
+            "heartbeat is the signal that restores a dispatch-failed worker"
+        );
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+    }
+
+    #[test]
     fn evict_removes_entry() {
         let r = WorkerRegistry::new();
         let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
@@ -1856,6 +3880,204 @@ mod tests {
     }
 
     #[test]
+    fn model_ids_are_trimmed_for_registration_and_heartbeat_routing() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &[" m1 "], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+        assert_eq!(
+            r.get_snapshot(id).unwrap().model_inventory[0].id.as_str(),
+            "m1"
+        );
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec![" m2 ".to_string()],
+                rss_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            }
+        ));
+
+        assert!(r.eligible_workers("m1").is_empty());
+        assert_eq!(r.eligible_workers("m2").len(), 1);
+        assert_eq!(
+            r.get_snapshot(id).unwrap().model_inventory[0].id.as_str(),
+            "m2"
+        );
+    }
+
+    #[test]
+    fn heartbeat_retains_inventory_when_model_ids_need_trimming() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                ..reg_req("127.0.0.1:8081", &[], 4)
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec![" m1 ".to_string()],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.model_inventory[0].id, "m1");
+        assert_eq!(snapshot.model_inventory[0].max_context, Some(8192));
+    }
+
+    #[test]
+    fn heartbeat_treats_model_inventory_as_additive() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1", "m2"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["m1".into(), "m2".into()],
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "m1".into(),
+                    quantization: Some("q4".into()),
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snapshot.capabilities,
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert_eq!(snapshot.model_inventory.len(), 2);
+        assert_eq!(r.eligible_workers("m1").len(), 1);
+        assert_eq!(r.eligible_workers("m2").len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_refreshes_structured_operations_from_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: false,
+                    vision: false,
+                    models: vec!["chat-model".into()],
+                    max_context: Some(2048),
+                }),
+                supported_operations: vec!["llm".into()],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["embed-model".into()],
+                model_inventory: vec![ModelInventoryEntry {
+                    id: "embed-model".into(),
+                    max_context: Some(8192),
+                    supported_operations: vec!["embedding".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["embed-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["embedding".to_string()]);
+        assert_eq!(snapshot.capability_descriptor.max_context, Some(8192));
+        assert!(
+            r.eligible_workers("embed-model").is_empty(),
+            "heartbeat inventory must remove stale llm eligibility"
+        );
+        assert_eq!(
+            r.eligible_workers_for("embed-model", RequestKind::Embedding)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn heartbeat_model_ids_refresh_operations_from_retained_inventory() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:8081".into(),
+                capabilities: RegisterCapabilities::Structured(WorkerCapabilities {
+                    llm: true,
+                    embedding: true,
+                    vision: false,
+                    models: vec!["chat-model".into(), "embed-model".into()],
+                    max_context: None,
+                }),
+                model_inventory: vec![
+                    ModelInventoryEntry {
+                        id: "chat-model".into(),
+                        supported_operations: vec!["llm".into()],
+                        ..Default::default()
+                    },
+                    ModelInventoryEntry {
+                        id: "embed-model".into(),
+                        supported_operations: vec!["embedding".into()],
+                        ..Default::default()
+                    },
+                ],
+                backend: "sglang".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                model_ids: vec!["chat-model".into()],
+                ..Default::default()
+            }
+        ));
+
+        let snapshot = r.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.capabilities, vec!["chat-model".to_string()]);
+        assert_eq!(snapshot.supported_operations, vec!["llm".to_string()]);
+        assert!(snapshot.capability_descriptor.llm);
+        assert!(!snapshot.capability_descriptor.embedding);
+    }
+
+    #[test]
     fn heartbeat_stores_thermal_and_rss() {
         let r = WorkerRegistry::new();
         let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
@@ -1876,6 +4098,93 @@ mod tests {
         assert_eq!(snap.thermal_state, "serious");
         assert_eq!(snap.rss_bytes, 1_073_741_824);
         assert_eq!(snap.inflight, 3);
+    }
+
+    #[test]
+    fn heartbeat_does_not_overwrite_dispatcher_inflight_counter() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        let counter = r.inflight_counter(id).expect("registered worker counter");
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 0,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(
+            snap.inflight, 1,
+            "heartbeat must not erase dispatcher-owned in-flight accounting"
+        );
+        assert_eq!(r.eligible_workers("m1")[0].inflight, 1);
+
+        counter.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(r.get_snapshot(id).unwrap().inflight, 0);
+    }
+
+    #[test]
+    fn heartbeat_reported_inflight_is_used_when_dispatch_counter_is_lower() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: 2,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                rss_bytes: 0,
+                ..Default::default()
+            }
+        ));
+
+        assert_eq!(r.get_snapshot(id).unwrap().inflight, 2);
+        assert_eq!(r.eligible_workers("m1")[0].inflight, 2);
+    }
+
+    #[test]
+    fn heartbeat_clamps_runtime_load_telemetry() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                inflight: usize::MAX,
+                thermal_state: "nominal".into(),
+                model_ids: vec!["m1".to_string()],
+                active_sequences: usize::MAX,
+                decode_tok_per_sec: f64::INFINITY,
+                queue_depth: usize::MAX,
+                error_rate: 2.5,
+                kv_utilization: Some(f64::NAN),
+                batch_utilization: Some(f64::INFINITY),
+                ..Default::default()
+            }
+        ));
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.inflight, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.active_sequences, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.decode_tok_per_sec, 0.0);
+        assert_eq!(snap.queue_depth, MAX_WORKER_INFLIGHT);
+        assert_eq!(snap.error_rate, 1.0);
+        assert_eq!(snap.kv_utilization, Some(0.0));
+        assert_eq!(snap.batch_utilization, Some(0.0));
+
+        let worker = r.eligible_workers("m1").remove(0);
+        assert_eq!(worker.active_sequences, MAX_WORKER_INFLIGHT);
+        assert_eq!(worker.kv_utilization, Some(0.0));
     }
 
     #[test]
@@ -1901,6 +4210,112 @@ mod tests {
         assert_eq!(snap.chip_model.as_deref(), Some("Apple M3 Pro"));
         assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
         assert_eq!(snap.node_class.as_deref(), Some("m3-pro"));
+    }
+
+    #[test]
+    fn register_normalizes_optional_metadata_fields() {
+        let r = WorkerRegistry::new();
+        let req = RegisterRequest {
+            worker_id: None,
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "auto".into(),
+            runtime_mode: Some(" Adapter ".into()),
+            runtime_version: Some(" 0.13.0 ".into()),
+            hardware_class: Some(" pc-cuda ".into()),
+            runtime_endpoint: Some(" http://127.0.0.1:8000 ".into()),
+            max_inflight: 4,
+            friendly_name: Some(" node-a ".into()),
+            chip_model: Some(" NVIDIA L40S ".into()),
+            worker_pool: Some(" blue ".into()),
+            node_class: Some(" pc-cuda ".into()),
+            ..Default::default()
+        };
+        let resp = r.register(req, 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.runtime_mode.as_deref(), Some("adapter"));
+        assert_eq!(snap.runtime_version.as_deref(), Some("0.13.0"));
+        assert_eq!(snap.hardware_class.as_deref(), Some("pc-cuda"));
+        assert_eq!(
+            snap.runtime_endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(snap.friendly_name.as_deref(), Some("node-a"));
+        assert_eq!(snap.chip_model.as_deref(), Some("NVIDIA L40S"));
+        assert_eq!(snap.worker_pool.as_deref(), Some("blue"));
+        assert_eq!(snap.node_class.as_deref(), Some("pc-cuda"));
+        assert_eq!(
+            r.dispatch_workers_filtered_with_pool_mode(
+                "m1",
+                RequestKind::Llm,
+                None,
+                None,
+                Some("blue"),
+                true,
+                None,
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reregister_clears_stale_identity_and_routing_fields() {
+        let r = WorkerRegistry::new();
+        let req = RegisterRequest {
+            worker_id: None,
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "vllm".into(),
+            runtime: Some("vllm".into()),
+            runtime_mode: Some("adapter".into()),
+            runtime_version: Some("0.13.0".into()),
+            hardware_class: Some("pc-cuda".into()),
+            runtime_endpoint: Some("http://127.0.0.1:8000".into()),
+            max_inflight: 4,
+            friendly_name: Some("node-a".to_string()),
+            chip_model: Some("NVIDIA L40S".to_string()),
+            worker_pool: Some("blue".to_string()),
+            node_class: Some("pc-cuda".to_string()),
+            ..Default::default()
+        };
+        let resp = r.register(req, 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let req = RegisterRequest {
+            worker_id: Some(resp.worker_id),
+            addr: "127.0.0.1:8081".into(),
+            capabilities: RegisterCapabilities::Legacy(vec!["m1".into()]),
+            backend: "vllm".into(),
+            runtime: Some("vllm".into()),
+            runtime_mode: Some("adapter".into()),
+            max_inflight: 4,
+            ..Default::default()
+        };
+        r.register(req, 5000);
+
+        let snap = r.get_snapshot(id).unwrap();
+        assert_eq!(snap.runtime_version, None);
+        assert_eq!(snap.hardware_class, None);
+        assert_eq!(snap.runtime_endpoint, None);
+        assert_eq!(snap.friendly_name, None);
+        assert_eq!(snap.chip_model, None);
+        assert_eq!(snap.worker_pool, None);
+        assert_eq!(snap.node_class, None);
+        assert!(
+            r.dispatch_workers_filtered_with_pool_mode(
+                "m1",
+                RequestKind::Llm,
+                None,
+                None,
+                Some("blue"),
+                true,
+                None,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1960,6 +4375,7 @@ mod tests {
         assert_eq!(BackendKind::parse("llamacpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("llama-cpp"), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("LLAMA_CPP"), BackendKind::LlamaCpp);
+        assert_eq!(BackendKind::parse(" llama-cpp "), BackendKind::LlamaCpp);
         assert_eq!(BackendKind::parse("sglang"), BackendKind::SgLang);
         assert_eq!(BackendKind::parse("sg_lang"), BackendKind::SgLang);
         assert_eq!(BackendKind::parse("sg-lang"), BackendKind::SgLang);
@@ -1971,6 +4387,14 @@ mod tests {
         assert_eq!(BackendKind::parse("auto"), BackendKind::Auto);
         assert_eq!(BackendKind::parse("unknown"), BackendKind::Auto);
         assert_eq!(BackendKind::parse(""), BackendKind::Auto);
+    }
+
+    #[test]
+    fn runtime_kind_parse_trims_operator_values() {
+        assert_eq!(RuntimeKind::parse(" ax-engine "), RuntimeKind::AxEngine);
+        assert_eq!(RuntimeKind::parse(" LLAMA_CPP "), RuntimeKind::LlamaCpp);
+        assert_eq!(RuntimeKind::parse(" sglang "), RuntimeKind::SgLang);
+        assert_eq!(RuntimeKind::parse(" V-LLM "), RuntimeKind::Vllm);
     }
 
     #[test]
@@ -2344,5 +4768,43 @@ mod tests {
         let eligible = reg.eligible_workers("m1");
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].kv_utilization, Some(1.0));
+    }
+
+    #[test]
+    fn authoritative_runtime_readiness_controls_eligibility() {
+        let registry = WorkerRegistry::new();
+        let response = registry.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5_000);
+        let id = WorkerId::parse(&response.worker_id).unwrap();
+
+        assert!(registry.heartbeat(
+            id,
+            HeartbeatRequest {
+                model_ids: vec!["m1".into()],
+                runtime_ready: Some(false),
+                runtime_state: Some("unavailable".into()),
+                runtime_status_reason: Some("runtime_health_failed".into()),
+                protocol_version: Some(ProtocolVersion { major: 1, minor: 0 }),
+                agent_version: Some("3.0.0".into()),
+                ..Default::default()
+            },
+        ));
+        assert!(registry.eligible_workers("m1").is_empty());
+        let unavailable = registry.get_snapshot(id).unwrap();
+        assert_eq!(unavailable.runtime_ready, Some(false));
+        assert_eq!(unavailable.health, "unhealthy");
+
+        assert!(registry.heartbeat(
+            id,
+            HeartbeatRequest {
+                model_ids: vec!["m1".into()],
+                runtime_ready: Some(true),
+                runtime_state: Some("ready".into()),
+                protocol_version: Some(ProtocolVersion { major: 1, minor: 0 }),
+                agent_version: Some("3.0.0".into()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(registry.eligible_workers("m1").len(), 1);
+        assert_eq!(registry.get_snapshot(id).unwrap().runtime_ready, Some(true));
     }
 }

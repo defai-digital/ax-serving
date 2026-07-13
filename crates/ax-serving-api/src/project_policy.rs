@@ -60,10 +60,13 @@ pub fn enforce(
     let project_name = headers
         .get(PROJECT_HEADER)
         .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .or_else(|| config.default_project.clone())
+        .and_then(normalize_nonempty_string)
+        .or_else(|| {
+            config
+                .default_project
+                .as_deref()
+                .and_then(normalize_nonempty_string)
+        })
         .ok_or_else(|| ProjectPolicyError {
             status: StatusCode::BAD_REQUEST,
             message: format!("missing required header '{}'", PROJECT_HEADER),
@@ -72,7 +75,7 @@ pub fn enforce(
     let rule = config
         .rules
         .iter()
-        .find(|rule| rule.project == project_name)
+        .find(|rule| rule.project.trim() == project_name)
         .ok_or_else(|| ProjectPolicyError {
             status: StatusCode::FORBIDDEN,
             message: format!(
@@ -106,14 +109,26 @@ pub fn enforce(
 
     Ok(Some(ResolvedProjectPolicy {
         project: project_name,
-        worker_pool: rule.worker_pool.clone(),
+        worker_pool: rule
+            .worker_pool
+            .as_deref()
+            .and_then(normalize_nonempty_string),
     }))
+}
+
+fn normalize_nonempty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn model_allowed(allowed_models: &[String], model: &str) -> bool {
     allowed_models
         .iter()
-        .any(|pattern| model_matches(pattern, model))
+        .any(|pattern| model_matches(pattern.trim(), model))
 }
 
 fn model_matches(pattern: &str, model: &str) -> bool {
@@ -207,6 +222,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resolved.project, "fabric");
+    }
+
+    #[test]
+    fn enforce_trims_default_project_rule_and_worker_pool() {
+        let cfg = ProjectPolicyConfig {
+            enabled: true,
+            default_project: Some(" fabric ".into()),
+            rules: vec![ProjectRuleConfig {
+                project: " fabric ".into(),
+                allowed_models: vec![" chat-* ".into()],
+                max_tokens_limit: None,
+                worker_pool: Some(" blue ".into()),
+            }],
+        };
+
+        let resolved = enforce(&HeaderMap::new(), "chat-main", Some(64), &cfg)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.project, "fabric");
+        assert_eq!(resolved.worker_pool.as_deref(), Some("blue"));
     }
 
     #[test]

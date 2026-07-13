@@ -36,6 +36,9 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 
 # Hashing
@@ -55,6 +58,7 @@ rstest = "0.24"
 futures = "0.3"
 uuid = { version = "1", features = ["serde", "v4"] }
 ipnet = "2"
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 
 # HTTP client (llama.cpp backend subprocess proxy)
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }

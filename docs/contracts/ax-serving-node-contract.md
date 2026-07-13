@@ -1,318 +1,280 @@
-# AX Serving Node Contract
+# AX Serving runtime-agent protocol contract
 
-> **Status**: Active
-> **Date**: 2026-05-25
-> **Owner**: AX Serving Team
-> **Related**: [Runtime Responsibility Inventory](ax-serving-runtime-responsibility-inventory.md)
+| Field | Value |
+| --- | --- |
+| Status | Protocol v1 source contract |
+| Wire types | `crates/ax-serving-protocol` |
+| Current version | `1.0` |
+| Last updated | 2026-07-12 |
 
----
+This contract defines how a runtime agent joins the portable AX Serving fleet.
+The Rust protocol crate and its JSON fixtures are authoritative when this
+document and code differ.
 
-## Purpose
+## 1. Runtime ownership
 
-The node contract defines how inference runtimes join an AX Serving fleet.
+The runtime owns model loading, tokenization, templates, batching, cache,
+generation, distributed execution, and hardware kernels. The agent owns
+runtime discovery, readiness normalization, credential isolation,
+cancellation, and byte-preserving HTTP/SSE proxying. The gateway owns fleet
+leases, admission, endpoint selection, equivalence, retry, and operations.
 
-AX Serving is the serving control plane. Runtime nodes own model loading,
-token generation, batching internals, KV cache internals, kernels, and
-runtime-specific tuning.
+An agent must not parse model files or invent model identity from a filename.
+Unknown runtime facts remain unknown.
 
-Target runtime nodes:
+## 2. Transport and trust
 
-- Mac nodes running `ax-engine`
-- PC CUDA nodes running `vllm`
-- NVIDIA Thor nodes running `vllm`
-
----
-
-## Registration
-
-Nodes register with:
+Control-plane endpoints:
 
 ```text
 POST /internal/workers/register
+POST /internal/workers/{worker_id}/heartbeat
+POST /internal/workers/{worker_id}/drain
+POST /internal/workers/{worker_id}/drain-complete
 ```
 
-Required fields:
+Inference dispatch uses the agent's advertised OpenAI-compatible HTTP endpoint.
+Streaming uses incremental SSE bytes over direct HTTP. A durable broker is not
+the primary token-stream transport.
 
-| Field | Type | Meaning |
-|---|---:|---|
-| `addr` | string | Address AX Serving uses to reach the worker proxy. |
-| `capabilities` | object or string array | Model and modality inventory. |
-| `max_inflight` | number | Maximum requests AX Serving should route concurrently. |
+Credential boundaries:
 
-Runtime-neutral fields:
+- worker control: `X-Internal-Token` from `AXS_WORKER_TOKEN` or
+  `AXS_INTERNAL_API_TOKEN`;
+- worker lease: registration-issued `X-Ax-Lease-Token`;
+- inference dispatch: `X-Ax-Dispatch-Token`;
+- runtime authentication: agent-owned `Authorization` derived from
+  `AXS_RUNTIME_API_KEY`.
 
-| Field | Type | Meaning |
-|---|---:|---|
-| `backend` | string | Legacy routing hint: `native`, `llama_cpp`, `sglang`, `vllm`, or `auto`. |
-| `runtime` | string | Runtime owner: `ax_engine`, `vllm`, `sglang`, `llama_cpp`, or `unknown`. |
-| `runtime_mode` | string | Integration mode: `adapter` for external runtime adapters, `embedded` for AX Serving compatibility workers. |
-| `runtime_version` | string | Runtime version reported by the adapter, when known. |
-| `hardware_class` | string | Placement class such as `mac`, `pc-cuda`, or `thor`. |
-| `runtime_endpoint` | string | Runtime-compatible endpoint or proxy target, when different from `addr`. |
-| `supported_operations` | string array | Operations such as `llm`, `embedding`, and `vision`. |
-| `node_class` | string | Operator-defined node class, e.g. `m3-max-128g` or `thor`. |
-| `worker_pool` | string | Operator-defined placement or maintenance pool. |
+The client's `Authorization`, cookies, proxy authorization, hop-by-hop
+headers, and AX internal headers must not reach the runtime. Non-loopback
+control and dispatch require authenticated channels and the `trusted_mesh`
+transport profile.
 
-Compatibility rules:
+## 3. Protocol negotiation
 
-- `runtime` is optional for legacy workers. If absent, AX Serving derives it
-  from `backend` where possible.
-- `runtime_mode` is optional for legacy workers. New runtime-node adapters should
-  send `adapter`; `ax-serving serve` sends `embedded` so diagnostics can
-  quarantine compatibility workers explicitly instead of relying only on backend
-  heuristics.
-- `supported_operations` is optional. If absent, AX Serving derives it from the
-  structured capability descriptor.
-- Unknown fields should be ignored by the control plane.
-- Runtime-specific fields must not be required for basic routing.
-
-Example vLLM node registration:
+Registration carries:
 
 ```json
 {
-  "addr": "10.0.10.21:18081",
-  "backend": "vllm",
-  "runtime": "vllm",
-  "runtime_mode": "adapter",
-  "runtime_version": "0.13.0",
-  "hardware_class": "pc-cuda",
-  "runtime_endpoint": "http://10.0.10.21:8000",
-  "capabilities": {
-    "llm": true,
-    "embedding": false,
-    "vision": true,
-    "models": ["qwen3-32b"],
-    "max_context": 32768
-  },
-  "model_inventory": [
-    {
-      "id": "qwen3-32b",
-      "max_context": 32768,
-      "quantization": "awq",
-      "artifact_format": "safetensors",
-      "modalities": ["text", "vision"],
-      "supported_operations": ["llm", "vision"]
-    }
-  ],
-  "supported_operations": ["llm", "vision"],
-  "max_inflight": 16,
-  "worker_pool": "cuda",
-  "node_class": "pc-cuda"
+  "protocol": {
+    "version": {"major": 1, "minor": 0},
+    "capabilities": ["control.drain", "dispatch.typed-admission"]
+  }
 }
 ```
 
----
+Rules:
 
-## Heartbeat
+- different major versions are incompatible;
+- the negotiated minor is the lower supported minor, subject to minimums;
+- optional capabilities are an intersection, not runtime-name checks;
+- unknown future capabilities and fields must survive tolerant decoding where
+  the protocol type permits it;
+- a missing required capability makes the endpoint ineligible for that
+  operation, not optimistically compatible.
 
-Nodes heartbeat with:
+Known protocol capabilities include:
 
 ```text
-POST /internal/workers/{worker_id}/heartbeat
+control.drain
+control.deployment-jobs
+control.inventory-delta
+dispatch.cancel
+dispatch.typed-admission
+telemetry.capacity
+telemetry.kv-cache
+telemetry.prefix-cache
 ```
 
-Required fields:
+## 4. Registration
 
-| Field | Type | Meaning |
-|---|---:|---|
-| `inflight` | number | Current routed request count. |
+`RegisterWorkerRequest` contains six descriptors:
 
-Optional fields:
+| Object | Required content |
+| --- | --- |
+| `protocol` | Version and optional capabilities |
+| `agent` | Agent name, version, optional build SHA |
+| `worker` | Stable worker ID, process instance ID, advertised URL, pool, trust domain, bounded labels |
+| `runtime` | Runtime kind, version, and API family |
+| `hardware` | Platform, accelerator, device count, optional memory and hardware class |
+| `observation` | Runtime-authoritative status, inventory generation, model descriptors, optional capacity |
 
-| Field | Type | Meaning |
-|---|---:|---|
-| `model_ids` | string array | Current loaded model inventory. |
-| `model_inventory` | object array | Optional structured per-model metadata. |
-| `thermal_state` | string | Runtime or host thermal state. |
-| `rss_bytes` | number | Worker process RSS. |
-| `active_sequences` | number | Active decode sequences. |
-| `decode_tok_per_sec` | number | Recent decode throughput. |
-| `ttft_p95_ms` | number | Runtime-reported P95 TTFT. |
-| `queue_depth` | number | Pending queue depth at the worker. |
-| `error_rate` | number | Recent worker-side error fraction. |
-| `kv_pages_used` | number | KV cache pages used, if reported. |
-| `kv_pages_total` | number | KV cache page budget, if reported. |
-| `kv_utilization` | number | KV/cache utilization ratio from 0.0 to 1.0, used when page counters are unavailable. |
-| `prefix_reusable_tokens` | number | Prefix-cache reusable token count. |
-| `active_batch_size` | number | Runtime internal batch occupancy. |
-| `max_batch_size` | number | Runtime batch capacity. |
-| `batch_utilization` | number | Batch utilization ratio from 0.0 to 1.0, used when batch counters are unavailable. |
+Worker identity has two levels:
 
-Heartbeat telemetry is best effort. AX Serving must continue routing safely when
-optional telemetry is absent.
+- stable `worker.id`, chosen by the operator;
+- unique `worker.instance_id`, regenerated for each agent process.
 
-`model_inventory` entries are additive. Known fields are:
+Re-registering a stable worker ID creates a new registration and fences the old
+instance. The advertised URL must use HTTP or HTTPS, contain an IP address and
+port, contain no credentials/path/query/fragment, and avoid wildcard,
+multicast, or link-local destinations.
 
-| Field | Type | Meaning |
-|---|---:|---|
-| `id` | string | Stable model id used for routing. |
-| `max_context` | number | Model context limit, when reported by the runtime. |
-| `quantization` | string | Quantization or compression format, when known. |
-| `artifact_format` | string | Artifact/container format such as `gguf` or `safetensors`, when known. |
-| `modalities` | string array | Runtime-reported modalities such as `text` or `vision`. |
-| `supported_operations` | string array | Model-level operations such as `llm`, `embedding`, or `vision`. |
+The response returns:
 
-If `model_inventory` is absent, AX Serving derives id-only entries from
-`capabilities.models` during registration and preserves known metadata across
-heartbeats while `model_ids` still contain the same model id.
+- registration ID;
+- opaque lease token, redacted by `Debug`;
+- negotiated protocol;
+- heartbeat interval and lease TTL;
+- optional inventory-resync directive.
 
-Runtime-node adapters may translate runtime `/metrics` output into these
-heartbeat fields. The generic `ax-runtime-agent` recognizes these common
-Prometheus gauge names when present:
+## 5. Runtime observation
 
-| Metric | Heartbeat field |
-|---|---|
-| `ax_runtime_active_sequences` | `active_sequences` |
-| `ax_runtime_decode_tok_per_sec` | `decode_tok_per_sec` |
-| `ax_runtime_ttft_p95_ms` | `ttft_p95_ms` |
-| `ax_runtime_queue_depth` | `queue_depth` |
-| `ax_runtime_error_rate` | `error_rate` |
-| `ax_runtime_kv_pages_used` | `kv_pages_used` |
-| `ax_runtime_kv_pages_total` | `kv_pages_total` |
-| `ax_runtime_kv_utilization` | `kv_utilization` |
-| `ax_runtime_prefix_reusable_tokens` | `prefix_reusable_tokens` |
-| `ax_runtime_active_batch_size` | `active_batch_size` |
-| `ax_runtime_max_batch_size` | `max_batch_size` |
-| `ax_runtime_batch_utilization` | `batch_utilization` |
+Runtime status includes:
 
-The adapter also accepts runtime-specific aliases where stable enough to treat
-as best-effort hints:
+| Field | Meaning |
+| --- | --- |
+| `ready` | Runtime can accept an operation now |
+| `state` | `starting`, `ready`, `degraded`, `draining`, `unavailable`, or `unknown` |
+| `reason_code` | Bounded machine-readable reason |
+| `message` | Safe diagnostic text without secrets or model paths |
+| `probe_latency_ms` | Optional observation latency |
 
-- AX Serving / ax-engine style `axs_*` Prometheus metrics such as
-  `axs_scheduler_queue_depth`, `axs_scheduler_inflight_count`,
-  `axs_scheduler_decode_sequences_active`, and `axs_ttft_p95_us`
-- AX Serving / ax-engine style `/v1/metrics` JSON fields such as
-  `scheduler.queue_depth`, `scheduler.inflight_count`,
-  `scheduler.ttft_p95_us`, `kv_cache.utilization`, and `batch.utilization`
-- vLLM gauges such as `vllm:num_requests_running`,
-  `vllm:num_requests_waiting`, `vllm:avg_generation_throughput_toks_per_s`,
-  and `vllm:gpu_cache_usage_perc`
-- vLLM `time_to_first_token_seconds_bucket` histogram buckets, translated to
-  `ttft_p95_ms`
+`ready` must agree with state. Startup, unknown, unavailable, and draining
+observations are not eligible. Observation timestamps outside the configured
+clock-skew envelope are rejected.
 
-Missing metrics are not registration failures; the adapter sends safe defaults
-and AX Serving keeps routing by health, capacity, and model inventory.
+Each model descriptor contains:
 
-### Per-runtime telemetry support
+- runtime model ID;
+- runtime kind/version, revision/artifact digest, tokenizer digest, template
+  digest, and quantization where known;
+- supported operations and capabilities;
+- optional context and output limits.
 
-The table below documents which optional heartbeat fields each known runtime
-actually exposes. Blank cells mean the field is not available from that runtime
-without additional instrumentation; adapters emit the safe default (`0` or
-`0.0`) for those entries.
+Supported operation names are currently `chat_completions`,
+`text_completions`, and `embeddings`. `responses` exists as a future protocol
+operation but is not a released public endpoint until adapter certification.
 
-| Heartbeat field | ax-engine (AXS) | vLLM | SGLang |
-|---|---|---|---|
-| `active_sequences` | `axs_scheduler_inflight_count` gauge | `vllm:num_requests_running` gauge | `num_running_reqs` gauge |
-| `queue_depth` | `axs_scheduler_queue_depth` gauge | `vllm:num_requests_waiting` gauge | `num_waiting_reqs` gauge |
-| `decode_tok_per_sec` | `axs_decode_tok_per_sec` gauge | `vllm:avg_generation_throughput_toks_per_s` gauge | `avg_generation_throughput_toks_per_s` gauge |
-| `ttft_p95_ms` | `axs_ttft_p95_us` gauge (÷ 1000) | `time_to_first_token_seconds_bucket` histogram P95 | `time_to_first_token_seconds_bucket` histogram P95 |
-| `kv_pages_used` | `axs_kv_pages_used` gauge | `vllm:gpu_cache_usage_perc × total_pages` (estimated) | _(not available)_ |
-| `kv_pages_total` | `axs_kv_pages_total` gauge | `vllm:num_gpu_blocks` gauge | _(not available)_ |
-| `kv_utilization` | `kv_cache.utilization` JSON field | `vllm:gpu_cache_usage_perc` gauge | _(not available)_ |
-| `batch_utilization` | `batch.utilization` JSON field | _(not available)_ | _(not available)_ |
-| `error_rate` | `axs_error_rate` gauge | _(not available — use counters)_ | _(not available)_ |
-| `active_batch_size` | `axs_scheduler_inflight_count` gauge | _(not available)_ | _(not available)_ |
+Digests use lowercase `sha256:<64 hex>` or `blake3:<64 hex>`. Missing identity
+is not synthesized. It can support a pinned single-pool deployment when policy
+allows, but cannot authorize cross-runtime equivalence.
 
-**Note on `error_rate`**: vLLM exposes error counts as counters
-(`vllm:num_preemptions_total`), not a fraction gauge. Computing a rate requires
-delta tracking across heartbeats; adapters currently send `0.0` as the safe
-default. The orchestrator's error-rate diagnostic threshold is therefore not
-effective for vLLM or SGLang workers.
+## 6. Capacity observation
 
----
+All capacity fields are optional. Available fields include:
 
-## Runtime Responsibilities
+- active and maximum concurrent requests;
+- waiting requests and process RSS;
+- recent error rate;
+- KV-cache used ratio and prefix-cache hit ratio;
+- batch token capacity and use;
+- TTFT and inter-token EWMA;
+- generated tokens per second and observation window.
 
-Runtime nodes own:
+Ratios must be finite in `[0,1]`; latency/throughput values must be finite and
+non-negative; active/batch use cannot exceed an advertised maximum. Unknown
+signals remain absent. The gateway penalizes absent or stale telemetry instead
+of treating it as idle.
 
-- model loading and unloading inside the runtime
-- tokenizer and prompt formatting behavior
-- inference execution
-- runtime scheduler and batching internals
-- KV cache internals
-- hardware kernels and tuning
-- runtime-native metrics collection
+The generic agent can translate selected stable AX/vLLM/SGLang Prometheus and
+JSON aliases. Those translations are best-effort adapter behavior, not a
+guarantee that every runtime version exports every signal. Pin and test each
+certified runtime image.
 
-AX Serving owns:
+## 7. Heartbeat and fencing
 
-- northbound API compatibility
-- worker and model inventory
-- placement and routing policy
-- admission, retries, overload, and drain behavior
-- normalized metrics and diagnostics
-- operator-facing control workflows
+Each heartbeat contains:
 
-The fleet admin surface groups workers by pool, node class, backend, and
-runtime. Runtime groups are the preferred operational view for mixed ax-engine
-and vLLM fleets.
+- registration ID and instance ID;
+- strictly increasing sequence;
+- runtime observation time/status;
+- inventory generation;
+- optional full model inventory and capacity;
+- optional deployment-job observations.
 
----
+It carries `X-Ax-Lease-Token`. The gateway rejects:
 
-## Adapter Guidance
+- missing or expired leases;
+- a different registration or process instance;
+- replayed or decreasing sequence numbers;
+- malformed/inconsistent observations.
 
-Adapters should be thin protocol bridges.
+Workers become ineligible when fresh authoritative observations stop and are
+removed after lease TTL. In HA mode, registration and heartbeat are written to
+shared state atomically, old registrations are fenced, and only one gateway
+owns an active probe lease for a worker at a time.
 
-The public workspace provides `ax-runtime-agent` as the generic runtime-node
-adapter binary. It is currently implemented from the same code path as the
-legacy `ax-thor-agent` binary, so existing Thor deployments remain compatible.
-New deployments should prefer the generic `AXS_NODE_*` environment variables:
+Heartbeat responses may request:
 
-| Variable | Meaning |
-|---|---|
-| `AXS_CONTROL_PLANE_URL` | AX Serving internal control-plane URL. |
-| `AXS_WORKER_TOKEN` | Optional internal worker registration token. |
-| `AXS_NODE_RUNTIME_URL` | OpenAI-compatible runtime endpoint to proxy to. |
-| `AXS_NODE_RUNTIME` | Runtime owner, e.g. `ax_engine` or `vllm`. |
-| `AXS_NODE_LISTEN_ADDR` | Local adapter listen address. |
-| `AXS_NODE_ADVERTISED_ADDR` | Routable adapter address registered with AX Serving. |
-| `AXS_NODE_HARDWARE_CLASS` | Placement class, e.g. `mac`, `pc-cuda`, or `thor`. |
-| `AXS_NODE_CLASS` | Operator-defined node class. |
-| `AXS_NODE_WORKER_POOL` | Operator-defined routing or maintenance pool. |
-| `AXS_NODE_MAX_INFLIGHT` | Advertised concurrent request capacity. |
+- begin drain;
+- drain complete;
+- inventory resync;
+- re-registration;
+- negotiated deployment commands when supported.
 
-An ax-engine runtime node should report `runtime = "ax_engine"`. When ax-engine
-exposes an OpenAI-compatible endpoint, the generic `ax-runtime-agent` can
-register and proxy it through this contract. Runtime-specific inventory,
-health, and metrics mappings can be added behind the same adapter boundary
-without moving ax-engine internals into AX Serving.
+The agent must apply a begin-drain directive immediately: stop new admission,
+allow current streams to finish, then report completion at zero inflight or the
+operator deadline.
 
-A vLLM adapter should report `runtime = "vllm"` and use vLLM's
-OpenAI-compatible serving endpoint as the runtime endpoint. PC CUDA and NVIDIA
-Thor nodes should differ by `hardware_class`, `node_class`, and operator pool,
-not by a separate AX Serving inference implementation.
+## 8. Dispatch contract
 
----
+Gateway requests include opaque request and attempt IDs and, on remote
+profiles, a dispatch credential. The agent:
 
-## Compatibility Paths
+1. authenticates dispatch before reading an unbounded body;
+2. rejects while draining or locally saturated with a typed pre-admission
+   response;
+3. forwards only approved headers and the runtime credential;
+4. preserves unknown JSON request fields and SSE byte order;
+5. propagates body drop/client cancellation to the runtime connection;
+6. sanitizes runtime transport errors.
 
-The existing `ax-serving serve` command can still register as a worker for
-local Mac compatibility. When runtime metadata is not provided, it registers as:
+Typed non-admission uses `X-Ax-Admission-State: not-admitted` and a stable AX
+error code. The gateway trusts that marker only on the authenticated agent
+channel. A generic runtime `5xx` is not a safe retry signal.
 
-- `runtime = "ax_engine"`
-- `runtime_mode = "embedded"`
-- `hardware_class = "mac"`
-- `runtime_endpoint = "http://<worker-addr>"`
+## 9. Deployment identity and failover
 
-This path is a compatibility bridge for local development and migration. New
-Mac inference integration should prefer `ax-runtime-agent` in front of an
-OpenAI-compatible ax-engine endpoint, or another thin adapter that implements
-this contract without moving ax-engine runtime internals into AX Serving.
+The gateway resolves a logical model to explicit deployments and pools. It
+checks runtime readiness, lease freshness, drain, pool/trust policy, operation,
+capabilities, context/output limits, identity, equivalence, and shared capacity
+before scoring.
 
----
+Cross-pool retry additionally requires:
 
-## Versioning And Compatibility
+- source and target in the same operator-certified equivalence class;
+- both deployment IDs listed in the certification artifact;
+- every required identity field present and matching.
 
-This contract is additive by default.
+The protocol does not promise bit-identical output. Equivalence is an explicit
+operator policy backed by a retained workload artifact.
 
-- New optional fields may be added without breaking older workers.
-- Required fields require a public contract update and migration note.
-- Workers should ignore unknown fields returned by AX Serving.
-- AX Serving should derive safe defaults for missing runtime metadata when
-  legacy workers register with only `backend`, `addr`, `capabilities`, and
-  `max_inflight`.
-- Runtime-specific lifecycle operations must be capability-gated. A worker that
-  cannot load, unload, or reload models through the control plane should still
-  be routable when it advertises a compatible model inventory.
+## 10. Lifecycle jobs
 
-Breaking changes to this contract must update the PRD traceability table,
-contract inventory, and relevant runbooks in the same change set.
+Agents may advertise `control.deployment-jobs` and report job observations.
+AX Serving's admin jobs always represent desired and observed control-plane
+state. Runtime process creation, image rollout, model download, and GPU
+allocation remain external unless a certified lifecycle adapter explicitly
+implements them.
+
+## 11. Conformance requirements
+
+A runtime adapter is not certified until tests cover:
+
+1. protocol negotiation and future-field tolerance;
+2. startup unavailable and later ready;
+3. runtime failure after registration;
+4. inventory add/remove/resync;
+5. every claimed operation and modality;
+6. blocking and streaming byte preservation;
+7. client cancellation;
+8. drain with inflight work;
+9. public credential non-forwarding;
+10. typed local non-admission;
+11. generic runtime `5xx` remaining non-retryable;
+12. exact runtime image/model identity and retained result metadata.
+
+Mock adapter tests validate protocol logic but do not certify a live runtime
+version or model artifact.
+
+## 12. Legacy compatibility
+
+The same internal paths still decode the pre-v1 registration and heartbeat
+shape for migration. Legacy workers lack registration fencing, complete
+deployment identity, and negotiated capabilities. They are accepted only in
+`legacy_compat` routing and cannot participate in certified cross-runtime
+failover.
+
+New integrations must use the protocol crate rather than adding runtime-name
+conditionals or more fields to the legacy DTOs.

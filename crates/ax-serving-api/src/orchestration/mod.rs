@@ -21,9 +21,14 @@
 //!   └── HealthTicker (tokio task)
 //! ```
 
+pub mod deployment;
+pub mod deployment_lifecycle;
 pub mod direct;
+pub mod error;
+pub mod fleet_state;
 pub mod health_ticker;
 pub mod internal_routes;
+pub mod jobs;
 #[cfg(feature = "nats-dispatch")]
 pub mod nats;
 #[cfg(feature = "nats-dispatch")]
@@ -32,33 +37,40 @@ pub mod policy;
 mod proxy_handlers;
 pub mod queue;
 pub mod registry;
+pub mod request_profile;
 
 use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, DefaultBodyLimit, Request},
     middleware,
     response::Response,
     routing::{get, post},
 };
+use opentelemetry::propagation::Extractor;
 use tokio::sync::watch;
+use tracing::Instrument as _;
 use tracing::{info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
+use self::deployment::{DeploymentCatalog, DeploymentCatalogStore};
 use self::direct::DirectDispatcher;
+use self::fleet_state::{FleetStateStore, store_from_config, unix_time_millis};
 use self::health_ticker::HealthTicker;
 use self::internal_routes::{
     InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
     router as internal_router,
 };
 use self::policy::DispatchPolicy;
-use self::queue::{GlobalQueue, GlobalQueueConfig, OverloadPolicy};
+use self::queue::{GlobalQueue, GlobalQueueConfig, OverloadPolicy, TenantLimiter};
 use self::registry::WorkerRegistry;
 use crate::audit::AuditLog;
 use crate::license::LicenseState;
+use crate::rest::schema::MAX_HTTP_REQUEST_BODY_BYTES;
 
 pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
 
@@ -70,6 +82,18 @@ fn is_loopback_bind_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn parse_global_queue_policy(raw: &str) -> Result<OverloadPolicy> {
+    match raw.trim().to_lowercase().as_str() {
+        "queue" => Ok(OverloadPolicy::Queue),
+        "reject" => Ok(OverloadPolicy::Reject),
+        "shed_oldest" | "shed-oldest" | "shedoldest" => Ok(OverloadPolicy::ShedOldest),
+        other => anyhow::bail!(
+            "unknown global_queue_policy '{}'; valid: queue, reject, shed_oldest, shed-oldest",
+            other
+        ),
+    }
+}
+
 // ── OrchestratorLayer ─────────────────────────────────────────────────────────
 
 /// Shared state for the orchestrator's public router.
@@ -77,8 +101,13 @@ pub struct OrchestratorLayer {
     pub registry: WorkerRegistry,
     pub policy: Arc<dyn DispatchPolicy>,
     pub dispatcher: DirectDispatcher,
+    /// Validated desired-state catalog for logical models and runtime pools.
+    pub deployment_catalog: Arc<DeploymentCatalogStore>,
+    /// Lease-scoped fleet state shared across gateway replicas in HA mode.
+    pub fleet_store: Arc<dyn FleetStateStore>,
     pub config: Arc<OrchestratorConfig>,
     pub queue: GlobalQueue,
+    pub tenant_limiter: Arc<TenantLimiter>,
     /// Value emitted in `Retry-After` header on 429 responses (from config).
     pub retry_after_secs: u64,
     /// Soft license reminder state.
@@ -97,15 +126,24 @@ impl OrchestratorLayer {
         license_config: LicenseConfig,
         project_policy: ProjectPolicyConfig,
     ) -> Result<Self> {
+        let fleet_store = store_from_config(&config)?;
+        Self::new_with_fleet_store(config, license_config, project_policy, fleet_store)
+    }
+
+    pub fn new_with_fleet_store(
+        config: OrchestratorConfig,
+        license_config: LicenseConfig,
+        project_policy: ProjectPolicyConfig,
+        fleet_store: Arc<dyn FleetStateStore>,
+    ) -> Result<Self> {
         let policy = policy::policy_from_str(&config.dispatch_policy)?;
+        let deployment_catalog = Arc::new(DeploymentCatalogStore::new(
+            DeploymentCatalog::from_config(&config)?,
+        ));
         let retry_after_secs = config.retry_after_secs;
         let pool_max_idle = config.pool_max_idle_per_host;
         let timeout_secs = config.request_timeout_secs;
-        let queue_policy = match config.global_queue_policy.to_lowercase().as_str() {
-            "shed_oldest" | "shedoldest" => OverloadPolicy::ShedOldest,
-            "reject" => OverloadPolicy::Reject,
-            _ => OverloadPolicy::Queue,
-        };
+        let queue_policy = parse_global_queue_policy(&config.global_queue_policy)?;
         let queue_config = GlobalQueueConfig {
             max_concurrent: config.global_queue_max,
             max_queue_depth: config.global_queue_depth,
@@ -115,9 +153,19 @@ impl OrchestratorLayer {
         let layer = Self {
             registry: WorkerRegistry::new(),
             policy: Arc::from(policy),
-            dispatcher: DirectDispatcher::new(pool_max_idle, timeout_secs),
+            dispatcher: DirectDispatcher::try_new_with_timeouts(
+                pool_max_idle,
+                timeout_secs,
+                config.first_byte_timeout_ms,
+                config.stream_idle_timeout_ms,
+                config.dispatch_token.as_ref().map(|token| token.expose()),
+            )?
+            .with_fleet_state(Arc::clone(&fleet_store), config.worker_ttl_ms),
+            deployment_catalog,
+            fleet_store,
             config: Arc::new(config),
             queue: GlobalQueue::new(queue_config),
+            tenant_limiter: TenantLimiter::shared(),
             retry_after_secs,
             license: LicenseState::new(&license_config),
             project_policy: Arc::new(project_policy),
@@ -132,6 +180,8 @@ impl OrchestratorLayer {
             "ok",
             Some(serde_json::json!({
                 "dispatch_policy": layer.config.dispatch_policy,
+                "deployment_mode": layer.config.deployment_mode,
+                "dispatch_auth_configured": layer.config.dispatch_token.is_some(),
                 "public_port": layer.config.port,
                 "internal_bind_addr": layer.config.internal_bind_addr,
                 "allowed_node_cidrs": layer.config.allowed_node_cidrs,
@@ -144,11 +194,80 @@ impl OrchestratorLayer {
     pub fn set_public_auth_required(&self, required: bool) {
         self.public_auth_required.store(required, Ordering::Relaxed);
     }
+
+    pub async fn reconcile_fleet_state(&self) -> Result<usize> {
+        let now = unix_time_millis();
+        let records = self.fleet_store.list().await?;
+        let mut active_worker_ids = std::collections::BTreeSet::new();
+        let mut restored = 0usize;
+        for record in records {
+            if !record.is_fresh(now) {
+                let _ = self
+                    .fleet_store
+                    .remove_if_registration(&record.worker_id, record.registration_id)
+                    .await?;
+                continue;
+            }
+            let worker_id = record.worker_id.clone();
+            let registration_id = record.registration_id;
+            match self.registry.restore_protocol_record_if_newer(record) {
+                Ok(was_restored) => {
+                    active_worker_ids.insert(worker_id);
+                    restored += usize::from(was_restored);
+                }
+                Err(error) => {
+                    warn!(%worker_id, %error, "discarding invalid shared worker record");
+                    let _ = self
+                        .fleet_store
+                        .remove_if_registration(&worker_id, registration_id)
+                        .await?;
+                }
+            }
+        }
+        for worker_id in self.registry.protocol_worker_ids() {
+            if !active_worker_ids.contains(&worker_id) {
+                self.registry.evict_protocol(&worker_id);
+            }
+        }
+        Ok(restored)
+    }
+
+    pub async fn reconcile_deployment_state(&self) -> Result<usize> {
+        use ax_serving_protocol::{DeploymentControlRecord, DeploymentDesiredState};
+
+        let mut records = self.fleet_store.list_deployments().await?;
+        if records.is_empty()
+            && self.deployment_catalog.snapshot().mode() == deployment::DeploymentMode::Explicit
+        {
+            for deployment in &self.config.deployments {
+                let record = DeploymentControlRecord {
+                    deployment: deployment.clone(),
+                    generation: 1,
+                    desired_state: if deployment.enabled {
+                        DeploymentDesiredState::Enabled
+                    } else {
+                        DeploymentDesiredState::Disabled
+                    },
+                    updated_at: time::OffsetDateTime::now_utc(),
+                };
+                let _ = self
+                    .fleet_store
+                    .put_deployment_if_generation(&record, None)
+                    .await?;
+            }
+            records = self.fleet_store.list_deployments().await?;
+        }
+        if self.deployment_catalog.snapshot().mode() == deployment::DeploymentMode::Explicit {
+            self.deployment_catalog.apply_control_records(&records)?;
+        }
+        Ok(records.len())
+    }
 }
 
 // ── Public proxy router ───────────────────────────────────────────────────────
 
 pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
+    use deployment_lifecycle::*;
     use proxy_handlers::*;
 
     Router::new()
@@ -157,13 +276,29 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/models", get(proxy_models))
         .route("/health", get(proxy_health))
+        .route("/livez", get(proxy_liveness))
+        .route("/readyz", get(proxy_readiness))
         .route("/v1/metrics", get(proxy_metrics))
+        .route("/metrics", get(proxy_prometheus_metrics))
         .route("/v1/admin/status", get(proxy_admin_status))
         .route("/v1/admin/startup-report", get(proxy_admin_startup_report))
         .route("/v1/admin/diagnostics", get(proxy_admin_diagnostics))
         .route("/v1/admin/audit", get(proxy_admin_audit))
         .route("/v1/admin/policy", get(proxy_admin_policy))
         .route("/v1/admin/fleet", get(proxy_admin_fleet))
+        .route("/v1/admin/deployments", get(proxy_admin_deployments))
+        .route(
+            "/admin/v1/deployments",
+            get(list_deployments).post(create_deployment),
+        )
+        .route(
+            "/admin/v1/deployments/{id}",
+            get(get_deployment)
+                .patch(patch_deployment)
+                .delete(delete_deployment),
+        )
+        .route("/admin/v1/jobs", get(list_jobs))
+        .route("/admin/v1/jobs/{id}", get(get_job))
         .route("/dashboard", get(proxy_dashboard))
         .route(
             "/v1/license",
@@ -179,8 +314,47 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
             "/v1/workers/{id}/drain-complete",
             post(proxy_drain_complete_worker),
         )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn(trace_request_middleware))
         .layer(middleware::from_fn(ensure_public_connect_info))
         .with_state(layer)
+}
+
+struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(axum::http::HeaderName::as_str).collect()
+    }
+}
+
+async fn trace_request_middleware(request: Request, next: middleware::Next) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let request_id = request
+        .extensions()
+        .get::<crate::auth::AxRequestId>()
+        .map(|value| value.0.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(request.headers()))
+    });
+    let span = tracing::info_span!(
+        "axs.request",
+        otel.kind = "server",
+        http.request.method = %method,
+        url.path = %path,
+        axs.request.id = %request_id,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent);
+    let response = next.run(request).instrument(span.clone()).await;
+    span.record("http.response.status_code", response.status().as_u16());
+    response
 }
 
 async fn ensure_public_connect_info(mut request: Request, next: middleware::Next) -> Response {
@@ -211,6 +385,14 @@ pub async fn start_orchestrator(
         license_config,
         project_policy,
     )?);
+    let restored_workers = layer
+        .reconcile_fleet_state()
+        .await
+        .context("failed to reconcile shared fleet state during startup")?;
+    let desired_deployments = layer
+        .reconcile_deployment_state()
+        .await
+        .context("failed to reconcile shared deployment state during startup")?;
 
     let public_addr = format!("{}:{}", config.host, config.port);
     let internal_addr = format!("{}:{}", config.internal_bind_addr, config.internal_port);
@@ -224,6 +406,10 @@ pub async fn start_orchestrator(
     }
     info!(
         policy = %config.dispatch_policy,
+        gateway_id = %config.gateway_id,
+        fleet_store = layer.fleet_store.kind(),
+        restored_workers,
+        desired_deployments,
         heartbeat_ms = config.worker_heartbeat_ms,
         ttl_ms = config.worker_ttl_ms,
         "orchestrator config"
@@ -237,15 +423,48 @@ pub async fn start_orchestrator(
         layer.registry.clone(),
         config.worker_heartbeat_ms,
         config.worker_ttl_ms,
+    )
+    .with_probe_ownership(
+        Arc::clone(&layer.fleet_store),
+        config.gateway_id.clone(),
+        config.worker_heartbeat_ms.max(1_000),
     );
     let ticker_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         ticker.run(ticker_shutdown).await;
     });
 
+    // Keep protocol worker leases synchronized across active gateway replicas.
+    let fleet_layer = Arc::clone(&layer);
+    let mut fleet_shutdown = shutdown_rx.clone();
+    let fleet_interval_ms = config.worker_heartbeat_ms.max(250);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(fleet_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = fleet_layer.reconcile_fleet_state().await {
+                        warn!(%error, "shared fleet-state reconciliation failed");
+                    }
+                    if let Err(error) = fleet_layer.reconcile_deployment_state().await {
+                        warn!(%error, "shared deployment-state reconciliation failed");
+                    }
+                }
+                changed = fleet_shutdown.changed() => {
+                    if changed.is_err() || *fleet_shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     // Internal router (loopback).
     let internal_state = InternalState {
         registry: layer.registry.clone(),
+        fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
         license: Arc::clone(&layer.license),
     };
@@ -284,14 +503,37 @@ pub async fn start_orchestrator(
             app
         }
     };
+    let public_is_loopback = is_loopback_bind_host(&config.host);
+    let tls_profile = config.tls_profile.trim().to_ascii_lowercase();
+    if !matches!(
+        tls_profile.as_str(),
+        "loopback_dev" | "loopback-dev" | "trusted_mesh" | "trusted-mesh"
+    ) {
+        anyhow::bail!(
+            "unsupported AXS_TLS_PROFILE '{}'; expected loopback_dev or trusted_mesh",
+            config.tls_profile
+        );
+    }
+    if matches!(tls_profile.as_str(), "loopback_dev" | "loopback-dev")
+        && (!public_is_loopback || !internal_is_loopback)
+    {
+        anyhow::bail!(
+            "AXS_TLS_PROFILE=loopback_dev cannot expose AX Serving on a non-loopback address; use a trusted mTLS service-mesh profile"
+        );
+    }
+    if !internal_is_loopback && config.dispatch_token.is_none() {
+        anyhow::bail!(
+            "AXS_DISPATCH_TOKEN is required when the worker control plane accepts remote agents"
+        );
+    }
     let internal_listener = tokio::net::TcpListener::bind(&internal_addr).await?;
 
     let public_listener = tokio::net::TcpListener::bind(&public_addr).await?;
 
-    // Auth: load API keys and apply to the public proxy.
-    // The internal router (loopback-only) is not authenticated — it is
-    // network-isolated and intended for worker-to-orchestrator communication.
+    // Load independent public and admin keys. The internal router above uses
+    // its own worker-control token whenever it is remotely reachable.
     let api_keys = crate::auth::load_api_keys();
+    let admin_api_keys = crate::auth::load_admin_api_keys();
     if api_keys.is_empty() {
         let allow_no_auth = std::env::var("AXS_ALLOW_NO_AUTH")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -316,13 +558,25 @@ pub async fn start_orchestrator(
             "orchestrator API key authentication enabled ({} key(s))",
             api_keys.len()
         );
+        if admin_api_keys.is_empty() {
+            anyhow::bail!(
+                "AXS_ADMIN_API_KEY is required when AXS_API_KEY is configured; public client credentials are not accepted by admin routes"
+            );
+        }
+        info!(
+            "orchestrator admin authentication enabled ({} key(s))",
+            admin_api_keys.len()
+        );
     }
     layer.set_public_auth_required(!api_keys.is_empty());
 
     let public_app = proxy_router(Arc::clone(&layer))
         .route_layer(middleware::from_fn_with_state(
-            api_keys,
-            crate::auth::auth_middleware,
+            crate::auth::GatewayAuthState {
+                public_keys: api_keys,
+                admin_keys: admin_api_keys,
+            },
+            crate::auth::gateway_auth_middleware,
         ))
         .layer(middleware::from_fn(
             crate::auth::request_id_and_headers_middleware,
@@ -392,4 +646,45 @@ pub async fn start_orchestrator(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orchestrator_layer_rejects_unknown_global_queue_policy() {
+        let config = OrchestratorConfig {
+            global_queue_policy: "drop_newest".into(),
+            ..Default::default()
+        };
+
+        let err = match OrchestratorLayer::new(
+            config,
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        ) {
+            Ok(_) => panic!("invalid global queue policy should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("global_queue_policy"), "got: {err}");
+    }
+
+    #[test]
+    fn orchestrator_layer_accepts_global_queue_policy_aliases() {
+        let config = OrchestratorConfig {
+            global_queue_policy: " Shed-Oldest ".into(),
+            ..Default::default()
+        };
+
+        assert!(
+            OrchestratorLayer::new(
+                config,
+                LicenseConfig::default(),
+                ProjectPolicyConfig::default(),
+            )
+            .is_ok()
+        );
+    }
 }

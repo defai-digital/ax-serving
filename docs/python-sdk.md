@@ -1,170 +1,100 @@
-# AX Serving Python SDK
+# AX Serving Python client
 
-## Overview
+The `sdk/python` package provides a small synchronous REST client for the
+portable gateway and a separate gRPC client for the embedded compatibility
+service.
 
-The official Python SDK (`ax_serving`) provides both a high-level OpenAI-compatible client and a low-level gRPC client for the AX Serving backend.
+It is not a complete replacement for the upstream `openai` package. It exposes
+the subset implemented and tested in this repository; unknown REST generation
+options are forwarded to the gateway.
 
-**Advantages:**
-- **OpenAI compatibility**: Drop-in replacement for `openai` library in most cases
-- **gRPC support**: Ultra-low latency via Unix domain sockets or TCP
-- **Type safety**: Full type hints and dataclasses for responses
-- **Streaming support**: Both sync and async-friendly iterators
-- **Model management**: Load/unload/list models programmatically
-- **Metrics & health**: Easy access to scheduler, cache, and thermal metrics
-
-## Installation
+## Install for development
 
 ```bash
-# From the project root
-cd sdk/python
-pip install -e ".[dev]"
-
-# Or install from PyPI once published:
-# pip install ax-serving
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e 'sdk/python[dev]'
+pytest -q sdk/python/tests
 ```
 
-## Quick Examples
+Do not use a PyPI command as release evidence until the package is present and
+verified in that channel.
 
-### 1. Basic Chat Completion (REST)
+Portable REST users install only the base package:
+
+```bash
+pip install ax-serving
+```
+
+## Portable REST/SSE
 
 ```python
 from ax_serving import Client
 
-client = Client(base_url="http://127.0.0.1:18080")
+client = Client(
+    base_url="http://127.0.0.1:18080",
+    api_key="public-client-key",
+)
 
 response = client.chat.completions.create(
-    model="default",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Explain the advantages of Rust over Python for serving LLMs."}
-    ],
-    max_tokens=200,
-    temperature=0.7,
+    model="logical/model",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=64,
 )
-
 print(response.choices[0].message.content)
-print("Usage:", response.usage)
 ```
 
-### 2. Streaming Response
+Streaming:
 
 ```python
-from ax_serving import Client
-
-client = Client(base_url="http://127.0.0.1:18080")
-
-stream = client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "Write a haiku about AI."}],
+for chunk in client.chat.completions.create(
+    model="logical/model",
+    messages=[{"role": "user", "content": "Count to five"}],
+    max_tokens=32,
     stream=True,
-)
-
-for chunk in stream:
-    content = chunk.choices[0].delta.content
-    if content:
-        print(content, end="", flush=True)
-print()
+):
+    text = chunk.choices[0].delta.content
+    if text:
+        print(text, end="", flush=True)
 ```
 
-### 3. Using gRPC for Maximum Performance
+When `api_key` is omitted, the client reads `AXS_API_KEY`. The public key is
+for inference only; admin APIs require a separate operator client and
+`AXS_ADMIN_API_KEY`.
 
-```python
-from ax_serving import GrpcClient, Client
+## Embedded gRPC compatibility
 
-# Option A: High-level OpenAI interface with gRPC backend
-client = Client(grpc_socket="/tmp/ax-serving.sock")
+`GrpcClient`, `grpc_socket`, and `grpc_port` target `ax.serving.v1`. That
+service is available only when the macOS embedded server is built with
+`embedded-compat`.
 
-# Option B: Low-level gRPC client
-with GrpcClient(socket="/tmp/ax-serving.sock") as grpc:
-    result = grpc.infer_full(
-        model_id="default",
-        messages=[{"role": "user", "content": "Hello"}],
-        max_tokens=100,
-        temperature=0.0,
-    )
-    print("Response:", result.text)
-    if result.metrics:
-        print("Prefill t/s:", result.metrics.prefill_tok_per_sec)
+```bash
+pip install 'ax-serving[grpc]'
 ```
 
-### 4. Model Management
-
 ```python
-from ax_serving import Client
-
-client = Client(base_url="http://127.0.0.1:18080")
-
-# List loaded models
-models = client.models_list()
-print("Loaded models:", [m.id for m in models])
-
-# Load a new model (via REST or gRPC)
-# client.load_model(...) is available on GrpcClient
-```
-
-### 5. Health and Metrics
-
-```python
-from ax_serving import Client
-
-client = Client(base_url="http://127.0.0.1:18080")
-
-# Health and metrics are currently only on GrpcClient
 from ax_serving import GrpcClient
 
-with GrpcClient() as g:
-    health = g.health()
-    print("Status:", health.status)
-    print("Models:", health.model_ids)
-    print("Thermal:", health.thermal_state)
-
-    metrics = g.get_metrics()
-    print("Cache errors:", metrics.system.errors if hasattr(metrics.system, 'errors') else "N/A")
+with GrpcClient(socket="/tmp/ax-serving.sock") as client:
+    result = client.infer_full(
+        model_id="local-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=32,
+    )
 ```
 
-## Advanced Usage
+Do not use gRPC v1 as a hybrid gateway protocol. It carries local model paths,
+backend-specific controls, and token-ID semantics that cannot be mapped
+losslessly across AX Engine and CUDA runtimes.
 
-### Cache Control
+## Errors and timeouts
 
-```python
-response = client.chat.completions.create(
-    model="default",
-    messages=[...],
-    cache="enable",      # or "disable"
-    cache_ttl="30m",     # 30 minutes
-)
-```
+REST calls raise `httpx.HTTPStatusError`; gRPC calls raise gRPC exceptions.
+The current convenience client uses a 120-second HTTP timeout. Applications
+with longer generation requirements should use a directly configured HTTP
+client until timeout configuration is exposed by this SDK.
 
-### Error Handling
-
-The SDK raises standard exceptions (`httpx.HTTPStatusError`, gRPC errors). Use `try/except` around calls.
-
-### Context Manager
-
-```python
-with Client(grpc_socket="/tmp/ax-serving.sock") as client:
-    # safe automatic cleanup of gRPC channel
-    ...
-```
-
-## Advantages vs Raw HTTP/gRPC
-
-- **Developer experience**: Matches OpenAI Python library API
-- **Performance**: gRPC backend avoids HTTP overhead
-- **Type safety**: Full dataclasses (`GenerationResult`, `ModelInfo`, etc.)
-- **Maintenance**: Official support, stays in sync with backend changes
-- **Multi-protocol**: Same client works with REST or gRPC transparently
-
-## Configuration
-
-Environment variables used by the SDK:
-- `AXS_API_KEY` — automatically added as Bearer token
-- Server-side cache, scheduler, and thermal settings affect behavior
-
-See `QUICKSTART.md` for server setup and `sdk/python/pyproject.toml` for dependencies.
-
-## Links
-
-- [QUICKSTART.md](../QUICKSTART.md) — Full server setup
-- [Python source](../sdk/python/ax_serving/)
-- [Test scripts](../scripts/)
+Gateway-generated errors include an AX machine code, request ID, retryability,
+and phase. Applications must not retry solely because a status is `5xx`; follow
+the returned contract and remember that the gateway itself performs at most
+one safe pre-commit retry.

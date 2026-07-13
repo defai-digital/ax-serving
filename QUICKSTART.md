@@ -1,675 +1,330 @@
-# AX Serving Quickstart
+# AX Serving quick start
 
-This guide gets you from checkout to a working AX Serving deployment.
+This guide starts the portable runtime-neutral gateway. The embedded
+Apple-Silicon server is a separate compatibility path described at the end.
 
-AX Serving works best with [AX Fabric](https://github.com/defai-digital/ax-fabric):
-- AX Fabric is the product-facing retrieval and knowledge layer
-- AX Serving is the serving and orchestration layer underneath it
+## 1. Build
 
-Use this guide for:
-- a single local serving runtime
-- an authenticated offline deployment
-- a gateway plus multiple workers
+Requirements:
 
-## Prerequisites
-
-- Apple Silicon macOS 14+
-- Rust toolchain (`cargo`)
-- Python 3.10+ (for the official Python SDK)
-- `llama-server` available on `PATH` for `llama.cpp` fallback, embeddings, and explicit `llama_cpp` loads
-- A GGUF model file at `./models/<model>.gguf`
-
-Validate your environment:
+- Rust 1.88 or newer;
+- macOS arm64 or Linux x86_64/arm64 for the portable gateway and agent;
+- an independently running OpenAI-compatible AX Engine, vLLM, or SGLang
+  endpoint.
 
 ```bash
-cargo check --workspace
-which llama-server
-python3 -c "import sys; print('Python', sys.version); import httpx, grpcio; print('Dependencies OK')"
+cargo build --release \
+  -p ax-serving-cli --bin ax-serving-api \
+  -p ax-thor-agent --bin ax-runtime-agent
 ```
 
-Backend model:
-- `native` = explicit `ax-engine` SDK session over AX MLX artifacts
-- `llama_cpp` = `llama-server` from `llama.cpp`
-- `auto` = AX MLX artifact directories use native; GGUF uses `llama.cpp`
-
----
-
-## Choose A Deployment Path
-
-### Path A: Single Runtime (`ax-serving serve`)
-
-One process handles:
-- model loading
-- OpenAI-compatible serving
-- scheduler/admission control
-- metrics, dashboard, and admin endpoints
-
-By default, AX Serving routes GGUF model loads through `llama.cpp`.
-Use `backend: "native"` in `POST /v1/models` (or equivalent internal controls)
-to force `ax-engine` for a specific AX MLX artifact directory containing
-`model-manifest.json` and `tokenizer.json`.
-
-Best for:
-- OSS usage
-- local evaluation
-- single-node offline deployments
-
-Authenticated startup:
+The gateway build must remain runtime-SDK-free:
 
 ```bash
-AXS_CONFIG=config/serving.offline-enterprise.yaml \
-AXS_API_KEY="change-me" \
-AXS_MODEL_ALLOWED_DIRS="/absolute/path/to/models" \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m /absolute/path/to/models/<model>.gguf \
-  --model-id default \
-  --host 127.0.0.1 \
+cargo tree -p ax-serving-cli --no-default-features --features gateway \
+  | rg 'ax-serving-engine|mlx-rs|llama-cpp'
+```
+
+No output is expected.
+
+## 2. Start a local development gateway
+
+The checked-in default binds both APIs to loopback and uses in-memory fleet
+state:
+
+```bash
+AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
+```
+
+Verify process health. Readiness is intentionally `503` until a runtime is
+registered and ready:
+
+```bash
+curl -i http://127.0.0.1:18080/livez
+curl -i http://127.0.0.1:18080/readyz
+curl -sS http://127.0.0.1:18080/health | jq .
+```
+
+## 3. Attach a runtime
+
+Start the runtime first. It must expose:
+
+- `GET /health` or an adapter-supported readiness endpoint;
+- `GET /v1/models`;
+- the OpenAI-compatible inference operations it advertises.
+
+For a local vLLM endpoint on port 8000:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
+AXS_NODE_RUNTIME=vllm \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
+AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_HARDWARE_CLASS=pc-cuda \
+AXS_NODE_WORKER_POOL=cuda \
+AXS_NODE_MAX_INFLIGHT=16 \
+target/release/ax-runtime-agent
+```
+
+For AX Engine on Apple Silicon, point the same agent at the AX Engine server:
+
+```bash
+AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
+AXS_NODE_RUNTIME=ax_engine \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
+AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
+AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_HARDWARE_CLASS=mac \
+AXS_NODE_WORKER_POOL=mac-mlx \
+AXS_NODE_MAX_INFLIGHT=8 \
+target/release/ax-runtime-agent
+```
+
+The agent does not link the runtime SDK. It discovers readiness, inventory,
+capabilities, and common metrics over HTTP, then proxies request and stream
+bytes. Runtime credentials use `AXS_RUNTIME_API_KEY`; client credentials are
+never reused for that hop.
+
+Check registration:
+
+```bash
+curl -sS http://127.0.0.1:19090/internal/workers | jq .
+curl -i http://127.0.0.1:18080/readyz
+curl -sS http://127.0.0.1:18080/v1/models | jq .
+```
+
+## 4. Send requests
+
+In the default `legacy_compat` deployment mode, use a model ID reported by the
+runtime:
+
+```bash
+export MODEL_ID='replace-with-runtime-model-id'
+
+curl -sS http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"model\": \"${MODEL_ID}\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"Explain hybrid inference briefly.\"}],
+    \"max_tokens\": 96,
+    \"stream\": false
+  }"
+```
+
+Streaming:
+
+```bash
+curl -N http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"model\": \"${MODEL_ID}\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"Count to five.\"}],
+    \"max_tokens\": 32,
+    \"stream\": true
+  }"
+```
+
+Embeddings use the same gateway and require a runtime that advertises the
+embedding operation:
+
+```bash
+curl -sS http://127.0.0.1:18080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODEL_ID}\",\"input\":\"hello\"}"
+```
+
+## 5. Configure safe hybrid routing
+
+`legacy_compat` is for migration and one-pool setups. Certified cross-runtime
+failover requires `deployment_mode: explicit` with:
+
+- homogeneous pools;
+- logical-model-to-runtime deployment mappings;
+- exact runtime/model/tokenizer/template/quantization identity;
+- an operator-approved equivalence class and retained certification artifact.
+
+Copy the example, replace every placeholder, then validate startup:
+
+```bash
+cp config/serving.hybrid.example.yaml /secure/path/serving.yaml
+AXS_CONFIG=/secure/path/serving.yaml \
+AXS_API_KEY='public-client-key' \
+AXS_ADMIN_API_KEY='admin-key' \
+AXS_INTERNAL_API_TOKEN='worker-control-key' \
+AXS_DISPATCH_TOKEN='gateway-agent-key' \
+target/release/ax-serving-api
+```
+
+The example binds remotely, so `trusted_mesh` requires TLS or mTLS from the
+deployment environment. It is not an in-process TLS server switch.
+
+Do not certify different tokenizer or template digests merely because two
+deployments share a public model name. Missing identity is eligible only for
+explicitly pinned single-pool use, not cross-runtime failover.
+
+## 6. Authentication and trust boundaries
+
+Use different random credentials for each boundary:
+
+```text
+client -> gateway             AXS_API_KEY
+operator -> admin API         AXS_ADMIN_API_KEY
+agent -> worker control API   AXS_WORKER_TOKEN / AXS_INTERNAL_API_TOKEN
+gateway -> agent dispatch     AXS_DISPATCH_TOKEN
+agent -> runtime              AXS_RUNTIME_API_KEY
+gateway -> Redis/Valkey       AXS_REDIS_URL
+```
+
+Public inference calls use:
+
+```bash
+curl -sS http://gateway.example/v1/models \
+  -H 'Authorization: Bearer public-client-key'
+```
+
+Admin calls require the admin key, not the public key:
+
+```bash
+curl -sS http://gateway.example/admin/v1/deployments \
+  -H 'Authorization: Bearer admin-key'
+```
+
+The gateway strips public authorization, cookies, proxy credentials,
+hop-by-hop headers, and AX internal headers before dispatch.
+
+## 7. Active-active gateways
+
+Use Redis or Valkey for shared leases, desired deployment state, jobs, probe
+ownership, and worker-capacity reservations:
+
+```bash
+AXS_CONFIG=/secure/path/serving.yaml \
+AXS_FLEET_STORE=redis \
+AXS_REDIS_URL='rediss://user:password@redis.example:6379/0' \
+AXS_GATEWAY_ID='gateway-a' \
+AXS_API_KEY='public-client-key' \
+AXS_ADMIN_API_KEY='admin-key' \
+AXS_INTERNAL_API_TOKEN='worker-control-key' \
+AXS_DISPATCH_TOKEN='gateway-agent-key' \
+target/release/ax-serving-api
+```
+
+Start another replica with a unique `AXS_GATEWAY_ID` and the same Redis key
+prefix. Use a durable Redis topology appropriate to the availability target;
+an ephemeral cache is not fleet-state durability.
+
+The Kubernetes baseline in [deploy/kubernetes](deploy/kubernetes/README.md)
+contains two gateway replicas, probes, security contexts, a disruption budget,
+and a runtime-agent sidecar example.
+
+## 8. Admission, priorities, and affinity
+
+Useful controls:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `AXS_GLOBAL_QUEUE_MAX` | `128` | Active gateway requests |
+| `AXS_GLOBAL_QUEUE_DEPTH` | `256` | Waiting requests |
+| `AXS_GLOBAL_QUEUE_WAIT_MS` | `10000` | Admission deadline |
+| `AXS_TENANT_MAX_CONCURRENT` | `0` | Per-tenant active quota; zero disables |
+| `AXS_DISPATCH_POLICY` | `inference_aware` | Endpoint scoring after hard filters |
+| `AXS_MAX_DISPATCH_ATTEMPTS` | `2` | Hard maximum; safe conditions only |
+
+Clients may send `x-ax-priority: low|normal|high`. Priority aging and
+cross-client fairness prevent indefinite starvation, but runtime token
+scheduling remains inside the runtime.
+
+An opaque `x-ax-cache-affinity` hint is accepted only when
+`AXS_CACHE_AFFINITY_SECRET` contains at least 32 random bytes. The gateway
+derives a tenant-scoped keyed digest and discards the raw value. It never hashes
+or logs prompt text for affinity.
+
+## 9. Lifecycle and drain
+
+In explicit mode, mutations return asynchronous job records:
+
+```bash
+curl -sS -X PATCH \
+  http://127.0.0.1:18080/admin/v1/deployments/DEPLOYMENT_ID \
+  -H 'Authorization: Bearer admin-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"drain"}'
+
+curl -sS http://127.0.0.1:18080/admin/v1/jobs/JOB_ID \
+  -H 'Authorization: Bearer admin-key'
+```
+
+Deployment jobs change and observe control-plane desired state. External
+runtime/orchestrator adapters still own process creation, model download, and
+GPU allocation. A rolling replacement is enabled and proven ready before the
+source is disabled; timeout rolls desired state back.
+
+## 10. Observability
+
+The portable `ax-servingctl` binary can collect the public and operator views
+without installing the embedded macOS runtime:
+
+```bash
+ax-servingctl status --url http://127.0.0.1:18080 \
+  --api-key public-key --admin-key admin-key --diagnostics --json
+```
+
+```bash
+curl -sS http://127.0.0.1:18080/v1/metrics \
+  -H 'Authorization: Bearer admin-key' | jq .
+curl -sS http://127.0.0.1:18080/metrics \
+  -H 'Authorization: Bearer admin-key'
+curl -sS http://127.0.0.1:18080/v1/admin/diagnostics \
+  -H 'Authorization: Bearer admin-key' | jq .
+```
+
+Prometheus metrics use bounded `axs_gateway_*` names and avoid worker IDs,
+request IDs, prompts, model paths, and credentials as labels.
+
+W3C trace context is propagated through gateway, agent, and runtime whether
+or not spans are exported. To export OTLP/HTTP JSON traces, set a collector
+endpoint and optional sensitive headers on both gateway and agents:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
+OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer%20replace-me' \
+target/release/ax-serving-api
+```
+
+Prompt text, generated output, tool arguments, images, model paths, and
+credentials are not captured by the built-in spans.
+
+## 11. Embedded compatibility on macOS
+
+The local inference CLI and server require the non-default feature and link
+the embedded engine stack:
+
+```bash
+cargo build --release -p ax-serving-cli \
+  --no-default-features --features embedded-compat --bin ax-serving
+
+AXS_ALLOW_NO_AUTH=true target/release/ax-serving serve \
+  -m ./models/replace-with-supported-artifact \
+  --model-id local-model \
   --port 18080
 ```
 
-Ad hoc local startup without auth:
+Use this path for migration, local diagnostics, and compatibility. New hybrid
+deployment work belongs in runtime agents and the versioned protocol rather
+than new gateway engine integrations.
+
+## 12. Validation
 
 ```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
-  --model-id default \
-  --host 127.0.0.1 \
-  --port 18080
+cargo fmt --all -- --check
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 \
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 AXS_ALLOW_NO_AUTH=true \
+  cargo test --workspace --all-features
 ```
 
-Verify it is up:
-
-```bash
-curl -sS http://127.0.0.1:18080/health
-curl -sS http://127.0.0.1:18080/v1/models
-```
-
-**Health contract** (`GET /health`):
-- Returns JSON with `status` ("ok", "degraded", or thermal state), `model_ids`, `uptime_secs`, and `thermal` state.
-- `/health` is used for both liveness and readiness.
-- The gateway and workers expose health for orchestration.
-
-See `docs/contracts/ax-fabric-runtime-contract.md` for the formal AX Fabric integration contract.
-See `docs/python-sdk.md` for how to call health/metrics from Python.
-
-`v1.4` runtime tuning knobs:
-- `AXS_SPLIT_SCHEDULER=true`
-  - enables prefill/decode activity tracking in scheduler metrics
-
----
-
-### Path B: Gateway + Multiple Workers
-
-The gateway (`ax-serving-api`) is the public API and orchestration layer. Workers (`ax-serving serve --orchestrator ...`) do the inference and register themselves automatically.
-
-Best for:
-- Business deployments
-- multi-worker Mac Grid
-- fleet-aware routing and admin control
-
-Start the gateway:
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving-api -- \
-  --port 18080 \
-  --internal-port 19090 \
-  --policy least_inflight
-```
-
-Start one or more workers:
-
-```bash
-AXS_ALLOW_NO_AUTH=true \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf \
-  --model-id default \
-  --port 18081 \
-  --orchestrator http://127.0.0.1:19090
-```
-
-Start additional workers on ports `18082`, `18083`, etc. using the same `--orchestrator` flag.
-
-Verify worker registration:
-
-```bash
-curl -sS http://127.0.0.1:19090/internal/workers
-curl -sS http://127.0.0.1:18080/v1/models
-```
-
-Dispatch policies:
-- `least_inflight` — routes to the worker with the fewest in-flight requests (default).
-- `weighted_round_robin` — rotates across workers proportionally to capacity.
-- `model_affinity` — prefers a worker that has already served the model.
-- `token_cost` — prefers workers with lower effective sequence and TTFT cost.
-
----
-
-## Chat completions
-
-Non-streaming:
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [
-      {"role": "user", "content": "Give me three short points about Rust."}
-    ],
-    "stream": false,
-    "max_tokens": 96
-  }'
-```
-
-Streaming SSE:
-
-```bash
-curl -N -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [
-      {"role": "user", "content": "Give me three short points about Rust."}
-    ],
-    "stream": true,
-    "max_tokens": 96
-  }'
-```
-
-### Python SDK
-
-```bash
-# Install editable from project root
-cd sdk/python
-pip install -e ".[dev]"
-```
-
-**Basic usage (OpenAI-compatible interface):**
-
-```python
-from ax_serving import Client
-
-# REST (default)
-client = Client(base_url="http://127.0.0.1:18080")
-
-# or gRPC (UDS or TCP)
-# client = Client(grpc_socket="/tmp/ax-serving.sock")
-# client = Client(grpc_port=50051)
-
-resp = client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "Give me three short points about Rust."}],
-    max_tokens=96,
-    temperature=0.7,
-)
-
-print(resp.choices[0].message.content)
-```
-
-**Streaming:**
-
-```python
-for chunk in client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "Tell me a story."}],
-    stream=True,
-):
-    content = chunk.choices[0].delta.content or ""
-    print(content, end="", flush=True)
-print()
-```
-
-**Raw gRPC client:**
-
-```python
-from ax_serving import GrpcClient
-
-with GrpcClient() as g:
-    result = g.infer_full("default", messages=[{"role": "user", "content": "Hello"}])
-    print(result.text)
-```
-
-### TypeScript SDK (with Zod validation)
-
-Build SDK locally:
-
-```bash
-cd sdk/javascript
-npm install
-npm run build
-```
-
-Example:
-
-```ts
-import { AxServingClient } from "@defai-digital/ax-serving";
-
-const client = new AxServingClient({
-  baseURL: "http://127.0.0.1:18080",
-  apiKey: process.env.AXS_API_KEY,
-});
-
-const result = await client.chatCompletionsCreate({
-  model: "default",
-  messages: [{ role: "user", content: "Give me three short points about Rust." }],
-  max_tokens: 96,
-  repeat_penalty: 1.1,
-});
-
-console.log(result.choices[0]?.message?.content ?? "");
-```
-
-### Logprobs
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [{"role": "user", "content": "Say hello."}],
-    "logprobs": true,
-    "top_logprobs": 3,
-    "max_tokens": 16
-  }'
-```
-
-Each response choice contains `logprobs.content[]` — one entry per token with `token`, `logprob`, `bytes`, and `top_logprobs`. Streaming works identically.
-
-### Sampling parameters
-
-```json
-{
-  "temperature": 0.7,
-  "top_p": 0.9,
-  "top_k": 40,
-  "seed": 42,
-  "repeat_penalty": 1.1,
-  "frequency_penalty": 0.2,
-  "presence_penalty": 0.1,
-  "mirostat": 2,
-  "mirostat_tau": 5.0,
-  "mirostat_eta": 0.1,
-  "stop": ["<|end|>", "\n###"]
-}
-```
-
-### Tool calling
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "description": "Get the current weather for a city",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "city": {"type": "string", "description": "City name"}
-            },
-            "required": ["city"]
-          }
-        }
-      }
-    ],
-    "tool_choice": "auto"
-  }'
-```
-
-`choices[0].message.tool_calls` contains `id`, `type`, and `function.name` + `function.arguments` (JSON string). Streaming works identically.
-
-### Constrained generation (JSON mode and grammar)
-
-Force JSON output:
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [{"role": "user", "content": "Return a JSON object with name and age."}],
-    "response_format": {"type": "json_object"}
-  }'
-```
-
-BNF grammar (llama.cpp extended syntax):
-
-```json
-{ "grammar": "root ::= (\"yes\" | \"no\")" }
-```
-
-### Vision / multimodal
-
-Pass image URLs alongside text (requires a vision-capable model and mmproj file):
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "Describe this image."},
-          {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-        ]
-      }
-    ]
-  }'
-```
-
----
-
-## Embeddings
-
-Load a dedicated embedding model, or start a chat-capable model with embeddings enabled in the backend. In practice, embeddings remain a `llama.cpp`-oriented path today, even when native text generation uses `ax-engine`.
-
-Basic embedding:
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "input": "The quick brown fox"
-  }'
-```
-
-Batch with options:
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "input": ["sentence one", "sentence two"],
-    "normalize": true,
-    "truncate": true,
-    "encoding_format": "float"
-  }'
-```
-
-Base64-encoded output (efficient for large batches):
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "default",
-    "input": "Hello world",
-    "encoding_format": "base64"
-  }'
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `input` | string \| string[] \| int[] \| int[][] | required | Text, token IDs, or batches of either |
-| `normalize` | bool | `true` | L2-normalize each vector |
-| `truncate` | bool | `true` | Truncate inputs exceeding context length |
-| `encoding_format` | string | `"float"` | `"float"` or `"base64"` (little-endian f32 bytes) |
-
-### Important: batch size for embedding workloads
-
-llama-server's default `n_ubatch=512` causes HTTP 500 errors for any input exceeding 512 tokens. Set both values to 4096 or higher:
-
-```yaml
-# config/serving.yaml
-llamacpp:
-  n_batch: 4096
-  n_ubatch: 4096
-```
-
-Or with env vars at startup:
-
-```bash
-AXS_LLAMACPP_N_BATCH=4096 AXS_LLAMACPP_N_UBATCH=4096 \
-cargo run -p ax-serving-cli --bin ax-serving -- serve -m ./models/embed-model.gguf ...
-```
-
-Without this, long document chunks will produce HTTP 500 errors from the `llama.cpp` / `llama-server` subprocess path.
-
----
-
-## Runtime model management
-
-Load a model:
-
-```bash
-curl -sS -X POST http://127.0.0.1:18080/v1/models \
-  -H 'Content-Type: application/json' \
-  -d '{"model_id":"m2","path":"/absolute/path/to/model.gguf"}'
-```
-
-Load with overrides:
-
-```bash
-curl -sS -X POST http://127.0.0.1:18080/v1/models \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model_id": "llava",
-    "path": "/models/llava-v1.6-mistral-7b.gguf",
-    "mmproj_path": "/models/llava-v1.6-mistral-7b-mmproj.gguf",
-    "backend": "llama_cpp",
-    "n_gpu_layers": 32,
-    "context_length": 4096
-  }'
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model_id` | string | Identifier (1–128 chars, alphanumeric + `-_./:`) |
-| `path` | string | Absolute path to the `.gguf` file |
-| `backend` | string? | `"llama_cpp"`, `"lib_llama"`, `"native"` (`ax-engine`), or `"auto"` |
-| `mmproj_path` | string? | Multimodal projector `.gguf` for vision models |
-| `n_gpu_layers` | int? | GPU layer count override (`-1` = all) |
-| `context_length` | int? | Context window override (0 = model default) |
-
-Unload a model:
-
-```bash
-curl -sS -X DELETE http://127.0.0.1:18080/v1/models/m2
-```
-
-Reload (unload then load again from the same path and config):
-
-```bash
-curl -sS -X POST http://127.0.0.1:18080/v1/models/m2/reload
-```
-
----
-
-## Operator dashboard
-
-Open in a browser while the server is running:
-
-```
-http://127.0.0.1:18080/dashboard
-```
-
-The dashboard requires no login and auto-polls `/v1/metrics` every 2 seconds. It shows:
-
-- License status
-- Worker table: health, inflight count, thermal state, chip model
-- Queue depth and admission stats
-- System RSS and request metrics
-
-The **Remove** button on each worker row calls `DELETE /v1/workers/{id}` through the public proxy — no direct internal port access needed.
-
----
-
-## Authentication
-
-Recommended production setup:
-
-```bash
-AXS_API_KEY="token1,token2" \
-cargo run -p ax-serving-cli --bin ax-serving -- serve \
-  -m ./models/<model>.gguf --port 18080
-```
-
-Protected endpoints require:
-
-```
-Authorization: Bearer token1
-```
-
-If `AXS_API_KEY` is not set, you must explicitly opt in:
-
-```bash
-AXS_ALLOW_NO_AUTH=true
-```
-
----
-
-## License key
-
-AX Serving is available under AGPL-3.0-only by default, with separate commercial licensing available. Register a commercial license key to suppress the multi-machine reminder and unlock Business edition features.
-
-```bash
-# One-time env var (both gateway and workers read this)
-export AXS_LICENSE_KEY="your-key-here"
-
-# Or persist via the API (survives restarts without the env var).
-# If API auth is enabled, POST requires Authorization: Bearer <token>.
-curl -sS -X POST http://127.0.0.1:18080/v1/license \
-  -H 'Authorization: Bearer token1' \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"your-key-here"}'
-```
-
-Check current license state:
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/license
-```
-
----
-
-## Single inference CLI (no server)
-
-Run one local inference without starting a server:
-
-```bash
-cargo run -p ax-serving-cli --bin ax-serving -- \
-  -m ./models/<model>.gguf \
-  -p "Hello from AX Serving" \
-  -n 64
-```
-
-Useful flags: `-v` (timing), `--chat` (chat templating), `--temp 0` (greedy), `--n-gpu-layers N`.
-
----
-
-## Benchmarks
-
-Throughput (tokens/sec, prefill + decode):
-
-```bash
-cargo run -p ax-serving-bench --release -- bench -m ./models/<model>.gguf
-```
-
-Per-token latency profile (TTFT + inter-token latency percentiles):
-
-```bash
-cargo run -p ax-serving-bench --release -- profile -m ./models/<model>.gguf
-```
-
-Mixed workload against a running server (short/medium/long prompts, P50/P95/P99):
-
-```bash
-cargo run -p ax-serving-bench --release -- mixed \
-  --url http://127.0.0.1:18080 --model default
-```
-
-Release baselines for `mixed` are checked during release validation, but the
-benchmark run itself is still a manual hardware step. Populate
-`benchmarks/baseline-mixed.json` on the reference machine before tagging.
-
-Exact-response cache effectiveness (cold vs. warm latency):
-
-```bash
-cargo run -p ax-serving-bench --release -- cache-bench \
-  --url http://127.0.0.1:18080 --model default
-```
-
-This measures response-cache reuse for repeated identical requests. It does not
-measure KV prefix-cache reuse across partially overlapping prompts.
-
-24-hour soak test:
-
-```bash
-cargo run -p ax-serving-bench --release -- soak \
-  -m ./models/<model>.gguf --duration_min 1440
-```
-
-Additional modes: `compare`, `regression-check`, `multi-worker`.
-
----
-
-## Key environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `AXS_CONFIG` | Path to config YAML |
-| `AXS_ROUTING_CONFIG` | Path to backends routing config |
-| `AXS_REST_HOST` / `AXS_REST_PORT` | Bind address |
-| `AXS_GRPC_HOST` / `AXS_GRPC_PORT` | TCP gRPC bind address (optional; defaults loopback) |
-| `AXS_API_KEY` | Bearer token(s), comma-separated |
-| `AXS_ALLOW_NO_AUTH` | Required when no `AXS_API_KEY` is set |
-| `AXS_ORCHESTRATOR_HOST` / `AXS_ORCHESTRATOR_PORT` | Gateway bind address (defaults `127.0.0.1`) |
-| `AXS_ORCHESTRATOR_ADDR` | Gateway address for worker registration |
-| `AXS_INTERNAL_API_TOKEN` | Optional shared token for orchestrator internal APIs (`X-Internal-Token`) |
-| `AXS_WORKER_HEARTBEAT_MS` | Worker heartbeat interval (default `5000`) |
-| `AXS_WORKER_TTL_MS` | Worker TTL without heartbeat (default `15000`) |
-| `AXS_DISPATCH_POLICY` | `least_inflight`, `weighted_round_robin`, `model_affinity`, or `token_cost` |
-| `AXS_MODEL_ALLOWED_DIRS` | Optional comma-separated allowlist of model root directories for `POST /v1/models` |
-| `AXS_LICENSE_KEY` | Commercial license key |
-| `AXS_DASHBOARD_POLL_MS` | Dashboard refresh interval (default `2000`) |
-| `AXS_LLAMACPP_N_BATCH` | llama-server logical batch size |
-| `AXS_LLAMACPP_N_UBATCH` | llama-server physical micro-batch size |
-| `AXS_LOG` | Log level: `debug`, `info`, `warn`, `error` |
-| `AXS_LOG_FORMAT` | `pretty` (default) or `json` |
-
-Recommended profiles:
-- `config/serving.offline-enterprise.yaml` — secure starter profile for offline Business deployments
-- `config/serving.example.yaml` — full configuration reference
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `model file not found` | Verify the model path is correct |
-| `failed to spawn llama-server` | Ensure `llama-server` is installed and on `PATH` for `llama_cpp` / fallback routes |
-| `401` / `403` | Check `AXS_API_KEY` matches the `Authorization: Bearer` token |
-| `503` from gateway | Check `GET http://127.0.0.1:19090/internal/workers` — no healthy workers |
-| Model missing from `GET /v1/models` | Worker is unhealthy or draining; check worker logs |
-| Dashboard shows no workers | Start a worker with `--orchestrator http://127.0.0.1:19090` |
-| Embedding fails with HTTP 500 | Set `n_ubatch` ≥ `n_batch` (both to 4096); see embeddings section above |
-| License reminder in logs | Set `AXS_LICENSE_KEY` or POST to `/v1/license` |
-
----
-
-## Next references
-
-- [README.md](README.md)
-- [docs/python-sdk.md](docs/python-sdk.md) — **Python SDK usage, examples, and advantages**
-- [docs/advantages-and-use-cases.md](docs/advantages-and-use-cases.md) — Why AX Serving, target use cases, and comparisons
-- `docs/contracts/ax-fabric-runtime-contract.md` — supported AX Fabric integration contract
-- `config/serving.example.yaml` — full configuration reference
-- `config/backends.yaml` — backend routing rules (`ax-engine` native + `llama.cpp` fallback)
-- `docs/runbooks/multi-worker.md` — multi-worker deployment guide
-- `docs/perf/service-tuning.md` — throughput and latency tuning
-- [LICENSE](LICENSE) — full AGPL-3.0-only text
-- [LICENSING.md](LICENSING.md) — dual-license policy
-- [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — commercial terms
-- [CONTRIBUTING.md](CONTRIBUTING.md) — issue reporting and patch policy
+Live runtime certification and production performance evidence are separate
+release gates. A passing mock suite does not certify a runtime image, model
+identity, latency SLO, goodput target, or 60-minute soak.

@@ -20,6 +20,7 @@ pub struct LicenseState {
     buy_link: String,
     config_dir: String,
     key_file: String,
+    persist: bool,
     pub dashboard_poll_ms: u64,
 }
 
@@ -31,14 +32,19 @@ impl LicenseState {
         let config_dir = config.config_dir.clone();
         let key_file = config.key_file.clone();
         let dashboard_poll_ms = config.dashboard_poll_ms;
-        let key = Self::read_key_from_env()
-            .or_else(|| Self::read_key_from_file_path(&config_dir, &key_file));
+        let key = Self::read_key_from_env().or_else(|| {
+            config
+                .persist
+                .then(|| Self::read_key_from_file_path(&config_dir, &key_file))
+                .flatten()
+        });
         Arc::new(Self {
             key: Mutex::new(key),
             remote_worker_seen: AtomicBool::new(false),
             buy_link,
             config_dir,
             key_file,
+            persist: config.persist,
             dashboard_poll_ms,
         })
     }
@@ -56,7 +62,9 @@ impl LicenseState {
     /// Persist a new license key to `~/.config/<config_dir>/<key_file>`
     /// and update the in-memory state.
     pub fn set_key(&self, key: String) -> anyhow::Result<()> {
-        if let Some(path) = self.license_file_path() {
+        if self.persist
+            && let Some(path) = self.license_file_path()
+        {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -161,6 +169,7 @@ mod tests {
             buy_link: "https://license.automatosx.com".into(),
             config_dir: "ax-serving".into(),
             key_file: "license.key".into(),
+            persist: false,
             dashboard_poll_ms: 2000,
         }
     }
@@ -218,6 +227,7 @@ mod tests {
             buy_link: "https://example.com/buy".into(),
             config_dir: "my-app".into(),
             key_file: "my.key".into(),
+            persist: false,
             dashboard_poll_ms: 5000,
         };
         let ls = LicenseState::new(&config);
@@ -264,6 +274,7 @@ mod tests {
             buy_link: "https://example.com".into(),
             config_dir: "ax-serving".into(),
             key_file: "license.key".into(),
+            persist: false,
             dashboard_poll_ms: 2000,
         };
         // Restore HOME so later tests work.
@@ -292,6 +303,7 @@ mod tests {
             buy_link: "https://example.com".into(),
             config_dir: "ax-serving".into(),
             key_file: "license.key".into(),
+            persist: true,
             dashboard_poll_ms: 2000,
         };
         ls.set_key("prod-key-abc".to_string())
@@ -327,6 +339,7 @@ mod tests {
             buy_link: "https://example.com".into(),
             config_dir: "ax-serving".into(),
             key_file: "license.key".into(),
+            persist: true,
             dashboard_poll_ms: 2000,
         };
         let ls = LicenseState::new(&config);

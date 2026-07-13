@@ -102,6 +102,10 @@ pub struct LlamaCppConfig {
     /// Number of parallel request slots (env: `AXS_LLAMACPP_PARALLEL`, default 1).
     /// Increase to allow KV prefix reuse across concurrent requests.
     pub n_parallel: u32,
+    /// Worker threads used to bridge blocking llama-server HTTP calls into async callers
+    /// (env: `AXS_LLAMACPP_EXECUTOR_THREADS`).
+    /// `None` = default to available host parallelism.
+    pub executor_threads: Option<usize>,
     /// Multimodal projector path for vision models (env: `AXS_LLAMACPP_MMPROJ`).
     /// Passed as `--mmproj` to llama-server.
     pub mmproj_path: Option<String>,
@@ -162,6 +166,7 @@ impl Default for LlamaCppConfig {
             n_batch: None,
             n_ubatch: None,
             n_parallel: DEFAULT_N_PARALLEL,
+            executor_threads: None,
             mmproj_path: None,
         }
     }
@@ -170,53 +175,52 @@ impl Default for LlamaCppConfig {
 impl LlamaCppConfig {
     /// Apply `AXS_*` env var overrides on top of YAML-loaded values.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_TOKEN_BATCH")
-            && let Ok(n) = v.parse::<usize>()
-        {
+        if let Err(err) = self.try_apply_env_overrides() {
+            tracing::warn!(
+                "invalid env override ignored by infallible LlamaCppConfig::apply_env_overrides: {err}"
+            );
+        }
+    }
+
+    /// Apply `AXS_*` env var overrides, returning an error for malformed values.
+    pub fn try_apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(n) = env_parse::<usize>("AXS_LLAMACPP_TOKEN_BATCH")? {
             self.token_batch_size = n.clamp(1, self.token_batch_max);
         }
-        if let Ok(v) = std::env::var("AXS_CB_TRIP_THRESHOLD")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.circuit_breaker_trip_threshold = n;
+        if let Some(n) = env_parse::<u32>("AXS_CB_TRIP_THRESHOLD")? {
+            self.circuit_breaker_trip_threshold = n.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_CB_RECOVERY_MS")
-            && let Ok(ms) = v.parse::<u64>()
-        {
-            self.circuit_breaker_recovery_ms = ms;
+        if let Some(ms) = env_parse::<u64>("AXS_CB_RECOVERY_MS")? {
+            self.circuit_breaker_recovery_ms = ms.max(1);
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_CACHE_PROMPT") {
-            self.cache_prompt = v != "0" && v.to_lowercase() != "false";
+        if let Some(enabled) = env_bool("AXS_LLAMACPP_CACHE_PROMPT")? {
+            self.cache_prompt = enabled;
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_THREADS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.n_threads = Some(n);
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_THREADS")? {
+            self.n_threads = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_FLASH_ATTN") {
-            self.flash_attn = v != "0" && v.to_lowercase() != "false";
+        if let Some(enabled) = env_bool("AXS_LLAMACPP_FLASH_ATTN")? {
+            self.flash_attn = enabled;
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_KV_TYPE") {
             self.kv_cache_type = Some(v);
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_N_BATCH")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.n_batch = Some(n);
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_N_BATCH")? {
+            self.n_batch = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_N_UBATCH")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.n_ubatch = Some(n);
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_N_UBATCH")? {
+            self.n_ubatch = Some(n.max(1));
         }
-        if let Ok(v) = std::env::var("AXS_LLAMACPP_PARALLEL")
-            && let Ok(n) = v.parse::<u32>()
-        {
+        if let Some(n) = env_parse::<u32>("AXS_LLAMACPP_PARALLEL")? {
             self.n_parallel = n.max(1);
+        }
+        if let Some(n) = env_parse::<usize>("AXS_LLAMACPP_EXECUTOR_THREADS")? {
+            self.executor_threads = Some(n.max(1));
         }
         if let Ok(v) = std::env::var("AXS_LLAMACPP_MMPROJ") {
             self.mmproj_path = Some(v);
         }
+        Ok(())
     }
 
     /// Create from env vars only (no YAML), using struct defaults as the base.
@@ -226,9 +230,46 @@ impl LlamaCppConfig {
         cfg
     }
 
+    /// Create from env vars only, returning an error for malformed overrides.
+    pub fn try_from_env() -> Result<Self> {
+        let mut cfg = Self::default();
+        cfg.try_apply_env_overrides()?;
+        Ok(cfg)
+    }
+
     /// Effective batch size, clamped to `[1, token_batch_max]`.
     pub fn effective_batch_size(&self) -> usize {
         self.token_batch_size.clamp(1, self.token_batch_max)
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: {raw:?}"))
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("invalid {name}")),
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(Some(true)),
+        "false" | "0" | "no" => Ok(Some(false)),
+        "" => anyhow::bail!("{name} must not be empty"),
+        _ => anyhow::bail!("invalid {name}: {raw:?}"),
     }
 }
 
@@ -502,15 +543,11 @@ impl LlamaCppBackend {
                 reqwest::blocking::Client::new()
             }
         };
-        let executor_threads = std::env::var("AXS_LLAMACPP_EXECUTOR_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(4)
-            });
+        let executor_threads = config.executor_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+        });
         Self {
             models: Arc::new(Mutex::new(HashMap::new())),
             thermal: ThermalMonitor::new(),
@@ -736,22 +773,8 @@ impl InferenceBackend for LlamaCppBackend {
             .send()
             .ok()
             .and_then(|r| r.json::<serde_json::Value>().ok());
-        let eos_token = props
-            .as_ref()
-            .and_then(|v| {
-                v["default_generation_settings"]["eos_token_id"]
-                    .as_u64()
-                    .or_else(|| v["eos_token_id"].as_u64())
-            })
-            .unwrap_or(2) as u32;
-        let bos_token = props
-            .as_ref()
-            .and_then(|v| {
-                v["default_generation_settings"]["bos_token_id"]
-                    .as_u64()
-                    .or_else(|| v["bos_token_id"].as_u64())
-            })
-            .unwrap_or(1) as u32;
+        let eos_token = props_token_id(props.as_ref(), "eos_token_id", 2)?;
+        let bos_token = props_token_id(props.as_ref(), "bos_token_id", 1)?;
 
         // Wrap child in Arc<Mutex> for shared access with the poller thread.
         let child_arc = Arc::new(Mutex::new(Some(child)));
@@ -997,11 +1020,7 @@ impl InferenceBackend for LlamaCppBackend {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("/tokenize response missing 'tokens' array"))?
             .iter()
-            .map(|v| {
-                v.as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("non-integer token id"))
-                    .map(|n| n as u32)
-            })
+            .map(json_token_id_to_u32)
             .collect::<Result<Vec<u32>>>()?;
         Ok(tokens)
     }
@@ -1067,9 +1086,9 @@ impl InferenceBackend for LlamaCppBackend {
         };
 
         // Build the input value: string array or token array.
-        let input_json = match inputs {
-            EmbedInput::Strings(texts) => serde_json::to_value(texts)?,
-            EmbedInput::Tokens(seqs) => serde_json::to_value(seqs)?,
+        let (input_json, expected_embeddings) = match inputs {
+            EmbedInput::Strings(texts) => (serde_json::to_value(texts)?, texts.len()),
+            EmbedInput::Tokens(seqs) => (serde_json::to_value(seqs)?, seqs.len()),
         };
 
         let body = serde_json::json!({
@@ -1089,38 +1108,7 @@ impl InferenceBackend for LlamaCppBackend {
             .json()
             .context("decoding /v1/embeddings response")?;
 
-        let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-
-        let data = resp["data"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("/v1/embeddings response missing 'data' array"))?;
-
-        // Collect in index order — llama-server may reorder batches.
-        let mut indexed: Vec<(usize, Vec<f32>)> = data
-            .iter()
-            .map(|item| {
-                let index = item["index"].as_u64().unwrap_or(0) as usize;
-                let embedding = item["embedding"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("missing 'embedding' in data[{index}]"))?
-                    .iter()
-                    .map(|v| {
-                        v.as_f64()
-                            .map(|f| f as f32)
-                            .ok_or_else(|| anyhow::anyhow!("non-float in embedding array"))
-                    })
-                    .collect::<Result<Vec<f32>>>()?;
-                Ok((index, embedding))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        indexed.sort_unstable_by_key(|(i, _)| *i);
-        let embeddings = indexed.into_iter().map(|(_, v)| v).collect();
-
-        Ok(EmbedResult {
-            embeddings,
-            prompt_tokens,
-        })
+        parse_embeddings_response(&resp, expected_embeddings)
     }
 
     fn eval_tokens(&self, _handle: ModelHandle, _tokens: &[u32]) -> Result<u32> {
@@ -1157,13 +1145,20 @@ impl InferenceBackend for LlamaCppBackend {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let idle = json.get("slots_idle").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let idle = json
+                .get("slots_idle")
+                .and_then(|v| v.as_u64())
+                .map(u64_to_u32_saturating)
+                .unwrap_or(0);
             let processing = json
                 .get("slots_processing")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            total.active_batch_size += processing;
-            total.max_batch_size += idle + processing;
+                .map(u64_to_u32_saturating)
+                .unwrap_or(0);
+            total.active_batch_size = total.active_batch_size.saturating_add(processing);
+            total.max_batch_size = total
+                .max_batch_size
+                .saturating_add(idle.saturating_add(processing));
         }
         total
     }
@@ -1399,7 +1394,22 @@ fn build_chat_completions_body(
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = msgs
         .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .map(|m| {
+            let mut message = serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            });
+            if let Some(name) = &m.name {
+                message["name"] = serde_json::Value::String(name.clone());
+            }
+            if let Some(tool_calls) = &m.tool_calls {
+                message["tool_calls"] = tool_calls.clone();
+            }
+            if let Some(tool_call_id) = &m.tool_call_id {
+                message["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+            }
+            message
+        })
         .collect();
 
     let mut body = serde_json::json!({
@@ -1765,6 +1775,7 @@ fn complete_chat_completions(
         let _ = tx.blocking_send(GenerateEvent::Token(text.to_string()));
     }
 
+    let mut emitted_tool_call = false;
     if let Some(tool_calls) = val["choices"][0]["message"]["tool_calls"].as_array() {
         for tc in tool_calls {
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
@@ -1786,15 +1797,19 @@ fn complete_chat_completions(
                 name,
                 arguments,
             });
+            emitted_tool_call = true;
         }
     }
 
     let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
     let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
-    let stop_reason = val["choices"][0]["finish_reason"]
+    let mut stop_reason = val["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("stop")
         .to_string();
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
+    }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
         completion_tokens,
@@ -1816,7 +1831,15 @@ fn stream_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_llama(http, port, "/v1/completions", body)?;
+    parse_completion_sse(resp, tx, batch_size, emit_logprobs)
+}
 
+fn parse_completion_sse<R: std::io::Read>(
+    resp: R,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    batch_size: usize,
+    emit_logprobs: bool,
+) -> Result<()> {
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();
     let mut prompt_tokens = 0usize;
@@ -1826,6 +1849,7 @@ fn stream_completions(
     let mut token_buf: Vec<StreamToken> = Vec::new();
     let effective_batch = if emit_logprobs { 1 } else { batch_size };
     let mut stop_reason = String::new();
+    let mut saw_stop = false;
 
     loop {
         line.clear();
@@ -1847,6 +1871,18 @@ fn stream_completions(
             continue;
         };
 
+        // Usage can arrive on a final usage-only chunk after the finish chunk
+        // when stream_options.include_usage is enabled.
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
+            prompt_tokens = u64_to_usize_saturating(n);
+        }
+        if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
+            completion_tokens = u64_to_usize_saturating(n);
+        }
+        if saw_stop {
+            continue;
+        }
+
         let first_choice = val.choices.first();
         let token_text = if !val.content.is_empty() {
             val.content.as_str()
@@ -1860,7 +1896,7 @@ fn stream_completions(
         let chunk_finish_reason = first_choice
             .and_then(|c| c.finish_reason.as_deref())
             .unwrap_or("");
-        let stopped = val.stop.unwrap_or(false) || matches!(chunk_finish_reason, "stop" | "length");
+        let stopped = val.stop.unwrap_or(false) || is_terminal_finish_reason(chunk_finish_reason);
         if stopped && !chunk_finish_reason.is_empty() {
             stop_reason = chunk_finish_reason.to_string();
         }
@@ -1876,18 +1912,6 @@ fn stream_completions(
                 None
             };
             token_buf.push((token_text.to_string(), lp_data));
-        }
-
-        if stopped {
-            // /v1/completions returns usage in OpenAI format under the `usage`
-            // object, not in the native `tokens_evaluated`/`tokens_predicted`
-            // fields (those only appear on the native /completion endpoint).
-            if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
-                prompt_tokens = n as usize;
-            }
-            if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
-                completion_tokens = n as usize;
-            }
         }
 
         // Flush token buffer when batch is full or stream stopped.
@@ -1915,7 +1939,7 @@ fn stream_completions(
                 }
             }
             if stopped {
-                break;
+                saw_stop = true;
             }
         }
     }
@@ -1966,7 +1990,15 @@ fn stream_chat_completions(
     emit_logprobs: bool,
 ) -> Result<()> {
     let resp = post_llama(http, port, "/v1/chat/completions", body)?;
+    parse_chat_sse_reader(resp, tx, batch_size, emit_logprobs)
+}
 
+fn parse_chat_sse_reader<R: std::io::Read>(
+    resp: R,
+    tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
+    batch_size: usize,
+    emit_logprobs: bool,
+) -> Result<()> {
     let mut reader = std::io::BufReader::new(resp);
     let mut line = String::new();
     let mut prompt_tokens = 0usize;
@@ -2001,10 +2033,10 @@ fn stream_chat_completions(
         // Read usage from any chunk that carries it, including the final
         // usage-only chunk emitted with empty choices.
         if let Some(n) = val.usage.as_ref().and_then(|u| u.prompt_tokens) {
-            prompt_tokens = n as usize;
+            prompt_tokens = u64_to_usize_saturating(n);
         }
         if let Some(n) = val.usage.as_ref().and_then(|u| u.completion_tokens) {
-            completion_tokens = n as usize;
+            completion_tokens = u64_to_usize_saturating(n);
         }
 
         let Some(choice) = val.choices.first() else {
@@ -2030,8 +2062,8 @@ fn stream_chat_completions(
 
         // Tool call deltas — accumulate arguments across chunks.
         if let Some(tool_calls) = delta.map(|d| &d.tool_calls) {
-            for tc in tool_calls {
-                let idx = tc.index.unwrap_or(0);
+            for (fallback_idx, tc) in tool_calls.iter().enumerate() {
+                let idx = tc.index.unwrap_or(fallback_idx as u64);
                 let entry = tool_call_acc
                     .entry(idx)
                     .or_insert_with(|| (String::new(), String::new(), String::new()));
@@ -2048,8 +2080,7 @@ fn stream_chat_completions(
         }
 
         let finish_reason = choice.finish_reason.as_deref().unwrap_or("");
-        let stopped =
-            finish_reason == "stop" || finish_reason == "length" || finish_reason == "tool_calls";
+        let stopped = is_terminal_finish_reason(finish_reason);
         if stopped && !finish_reason.is_empty() {
             stop_reason = finish_reason.to_string();
         }
@@ -2096,6 +2127,7 @@ fn stream_chat_completions(
     let mut sorted_calls: Vec<(u64, (String, String, String))> =
         tool_call_acc.into_iter().collect();
     sorted_calls.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut emitted_tool_call = false;
     for (_, (id, name, arguments)) in sorted_calls {
         if !name.is_empty() {
             let call_id = if id.is_empty() {
@@ -2108,11 +2140,15 @@ fn stream_chat_completions(
                 name,
                 arguments,
             });
+            emitted_tool_call = true;
         }
     }
 
     if stop_reason.is_empty() {
         stop_reason = "stop".to_string();
+    }
+    if emitted_tool_call && stop_reason == "stop" {
+        stop_reason = "tool_calls".to_string();
     }
     let _ = tx.blocking_send(GenerateEvent::Done(GenerationStats {
         prompt_tokens,
@@ -2125,11 +2161,117 @@ fn stream_chat_completions(
     Ok(())
 }
 
+fn is_terminal_finish_reason(reason: &str) -> bool {
+    matches!(reason, "stop" | "length" | "tool_calls" | "content_filter")
+}
+
 /// Generate a simple unique ID for tool calls.
 fn uuid_simple() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:032x}{:08x}{:08x}", unix_ns_now(), std::process::id(), n)
+}
+
+fn u64_to_u32(value: u64, field: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{field} exceeds u32::MAX"))
+}
+
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+fn json_token_id_to_u32(value: &serde_json::Value) -> Result<u32> {
+    let id = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("non-integer token id"))?;
+    u64_to_u32(id, "token id")
+}
+
+fn json_u32_at_pointer_or_zero(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<u32> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| u64_to_u32(n, field))
+        .unwrap_or(Ok(0))
+}
+
+fn parse_embeddings_response(
+    resp: &serde_json::Value,
+    expected_embeddings: usize,
+) -> Result<EmbedResult> {
+    let prompt_tokens = json_u32_at_pointer_or_zero(resp, "/usage/prompt_tokens", "prompt_tokens")?;
+
+    let data = resp["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("/v1/embeddings response missing 'data' array"))?;
+    if data.len() != expected_embeddings {
+        anyhow::bail!(
+            "/v1/embeddings response returned {} vectors for {expected_embeddings} inputs",
+            data.len()
+        );
+    }
+
+    let mut embeddings = Vec::with_capacity(expected_embeddings);
+    embeddings.resize_with(expected_embeddings, || None);
+
+    for (position, item) in data.iter().enumerate() {
+        let raw_index = item
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("missing integer 'index' in data[{position}]"))?;
+        let index = usize::try_from(raw_index)
+            .with_context(|| format!("embedding index {raw_index} exceeds usize::MAX"))?;
+        if index >= expected_embeddings {
+            anyhow::bail!("embedding index {index} out of range for {expected_embeddings} inputs");
+        }
+        if embeddings[index].is_some() {
+            anyhow::bail!("duplicate embedding index {index}");
+        }
+
+        let embedding = item["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing 'embedding' in data[{index}]"))?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow::anyhow!("non-float in embedding array"))
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        embeddings[index] = Some(embedding);
+    }
+
+    let embeddings = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            embedding.ok_or_else(|| anyhow::anyhow!("missing embedding index {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(EmbedResult {
+        embeddings,
+        prompt_tokens,
+    })
+}
+
+fn props_token_id(props: Option<&serde_json::Value>, key: &str, default: u32) -> Result<u32> {
+    props
+        .and_then(|value| {
+            value["default_generation_settings"][key]
+                .as_u64()
+                .or_else(|| value[key].as_u64())
+        })
+        .map(|id| u64_to_u32(id, key))
+        .unwrap_or(Ok(default))
 }
 
 /// Build `ModelMetadata` from GGUF header data + the running server's `/props`.
@@ -2154,7 +2296,7 @@ fn fetch_model_meta(
             .ok()
             .and_then(|r| r.json::<serde_json::Value>().ok())
             .and_then(|v| v["n_ctx"].as_u64())
-            .map(|n| n as u32);
+            .and_then(|n| u32::try_from(n).ok());
 
         from_server
             .or_else(|| {
@@ -2235,6 +2377,247 @@ mod tests {
     }
 
     #[test]
+    fn json_token_id_to_u32_rejects_overflow() {
+        let value = serde_json::json!(u32::MAX as u64 + 1);
+        let err = json_token_id_to_u32(&value).unwrap_err();
+
+        assert!(err.to_string().contains("token id exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn json_u32_at_pointer_or_zero_rejects_overflow() {
+        let value = serde_json::json!({
+            "usage": {
+                "prompt_tokens": u32::MAX as u64 + 1
+            }
+        });
+        let err = json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("prompt_tokens exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn json_u32_at_pointer_or_zero_defaults_missing_values() {
+        let value = serde_json::json!({});
+
+        assert_eq!(
+            json_u32_at_pointer_or_zero(&value, "/usage/prompt_tokens", "prompt_tokens").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_embeddings_response_reorders_by_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 1, "embedding": [2.0, 2.5]},
+                {"index": 0, "embedding": [1.0, 1.5]}
+            ],
+            "usage": {"prompt_tokens": 7}
+        });
+
+        let result = parse_embeddings_response(&value, 2).unwrap();
+
+        assert_eq!(result.prompt_tokens, 7);
+        assert_eq!(result.embeddings, vec![vec![1.0, 1.5], vec![2.0, 2.5]]);
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_missing_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"embedding": [1.0]},
+                {"index": 1, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("missing index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("missing integer 'index'"));
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_duplicate_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 0, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("duplicate index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("duplicate embedding index 0"));
+    }
+
+    #[test]
+    fn parse_embeddings_response_rejects_out_of_range_index() {
+        let value = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 2, "embedding": [2.0]}
+            ]
+        });
+
+        let err = match parse_embeddings_response(&value, 2) {
+            Ok(_) => panic!("out-of-range index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn parse_completion_sse_reads_usage_after_finish_chunk() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_completion_sse(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "hello"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 3);
+                assert_eq!(stats.completion_tokens, 5);
+                assert_eq!(stats.stop_reason, "stop");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_completion_sse_preserves_content_filter_finish_reason() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"text\":\"blocked\",\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_completion_sse(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "blocked"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.stop_reason, "content_filter");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_chat_sse_preserves_content_filter_finish_reason() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_chat_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("token event") {
+            GenerateEvent::Token(text) => assert_eq!(text, "blocked"),
+            other => panic!("expected token event, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => {
+                assert_eq!(stats.stop_reason, "content_filter");
+            }
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn parse_chat_sse_uses_delta_position_for_missing_tool_call_indexes() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},",
+            "{\"id\":\"call_b\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}}",
+            "]},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        parse_chat_sse_reader(stream.as_bytes(), &tx, 16, false).unwrap();
+        drop(tx);
+
+        match rx.blocking_recv().expect("first tool call") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_a");
+                assert_eq!(name, "lookup");
+                assert_eq!(arguments, "{}");
+            }
+            other => panic!("expected first tool call, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("second tool call") {
+            GenerateEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_b");
+                assert_eq!(name, "search");
+                assert_eq!(arguments, "{\"q\":\"rust\"}");
+            }
+            other => panic!("expected second tool call, got {other:?}"),
+        }
+        match rx.blocking_recv().expect("done event") {
+            GenerateEvent::Done(stats) => assert_eq!(stats.stop_reason, "tool_calls"),
+            other => panic!("expected done event, got {other:?}"),
+        }
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn u64_to_u32_saturating_clamps_overflow() {
+        assert_eq!(u64_to_u32_saturating(u32::MAX as u64 + 1), u32::MAX);
+    }
+
+    #[test]
+    fn props_token_id_rejects_overflow() {
+        let props = serde_json::json!({
+            "default_generation_settings": {
+                "eos_token_id": u32::MAX as u64 + 1
+            }
+        });
+        let err = props_token_id(Some(&props), "eos_token_id", 2).unwrap_err();
+
+        assert!(err.to_string().contains("eos_token_id exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn props_token_id_uses_default_when_missing() {
+        assert_eq!(props_token_id(None, "eos_token_id", 2).unwrap(), 2);
+    }
+
+    #[test]
     fn effective_n_gpu_layers_defaults_when_unset() {
         let cfg = LoadConfig {
             context_length: 0,
@@ -2264,6 +2647,9 @@ mod tests {
         let msgs = vec![crate::ChatMessage {
             role: "user".into(),
             content: serde_json::Value::String("hi".into()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let params = GenerationParams {
             stream: false,
@@ -2272,6 +2658,34 @@ mod tests {
         let body = build_chat_completions_body(&msgs, &params, true);
         assert_eq!(body["stream"].as_bool(), Some(false));
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn chat_body_preserves_tool_call_message_metadata() {
+        let msgs = vec![
+            crate::ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }])),
+                tool_call_id: None,
+            },
+            crate::ChatMessage {
+                role: "tool".into(),
+                content: serde_json::Value::String("{\"ok\":true}".into()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+        let body = build_chat_completions_body(&msgs, &GenerationParams::default(), true);
+        assert_eq!(body["messages"][0]["content"], serde_json::Value::Null);
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
     }
 
     #[test]
@@ -2284,5 +2698,64 @@ mod tests {
     fn normalize_pooling_type_rejects_invalid() {
         assert_eq!(normalize_pooling_type("average"), None);
         assert_eq!(normalize_pooling_type(""), None);
+    }
+
+    #[test]
+    fn env_overrides_clamp_zero_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_CB_TRIP_THRESHOLD", "0") };
+        unsafe { std::env::set_var("AXS_CB_RECOVERY_MS", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_N_BATCH", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_N_UBATCH", "0") };
+        unsafe { std::env::set_var("AXS_LLAMACPP_EXECUTOR_THREADS", "0") };
+
+        let cfg = LlamaCppConfig::from_env();
+        assert_eq!(cfg.circuit_breaker_trip_threshold, 1);
+        assert_eq!(cfg.circuit_breaker_recovery_ms, 1);
+        assert_eq!(cfg.n_threads, Some(1));
+        assert_eq!(cfg.n_batch, Some(1));
+        assert_eq!(cfg.n_ubatch, Some(1));
+        assert_eq!(cfg.executor_threads, Some(1));
+
+        unsafe { std::env::remove_var("AXS_CB_TRIP_THRESHOLD") };
+        unsafe { std::env::remove_var("AXS_CB_RECOVERY_MS") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_N_BATCH") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_N_UBATCH") };
+        unsafe { std::env::remove_var("AXS_LLAMACPP_EXECUTOR_THREADS") };
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_limits() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_THREADS", "many") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_THREADS") };
+        assert!(err.contains("AXS_LLAMACPP_THREADS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_executor_threads() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_EXECUTOR_THREADS", "many") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_EXECUTOR_THREADS") };
+        assert!(err.contains("AXS_LLAMACPP_EXECUTOR_THREADS"), "got: {err}");
+    }
+
+    #[test]
+    fn try_env_rejects_malformed_runtime_bools() {
+        let _guard = crate::test_env::lock();
+        unsafe { std::env::set_var("AXS_LLAMACPP_FLASH_ATTN", "sometimes") };
+
+        let err = LlamaCppConfig::try_from_env().unwrap_err().to_string();
+
+        unsafe { std::env::remove_var("AXS_LLAMACPP_FLASH_ATTN") };
+        assert!(err.contains("AXS_LLAMACPP_FLASH_ATTN"), "got: {err}");
     }
 }

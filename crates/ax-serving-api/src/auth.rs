@@ -3,15 +3,24 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use ax_serving_protocol::RequestId as ProtocolRequestId;
 use axum::extract::Request;
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use uuid::Uuid;
 
 /// Request correlation ID inserted by middleware for downstream handlers.
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
+
+/// Gateway-owned request identity used by the worker protocol and dispatch attempts.
+///
+/// This ID is always generated at the trust boundary. A caller-provided
+/// `X-Request-ID` remains available as a correlation value but cannot choose
+/// the internal request identity used for retries and fencing.
+#[derive(Clone, Copy, Debug)]
+pub struct AxRequestId(pub ProtocolRequestId);
 
 /// Load API keys from the `AXS_API_KEY` environment variable (comma-separated).
 ///
@@ -19,7 +28,17 @@ pub struct RequestId(pub String);
 /// (`start_servers`) enforces that an empty set is only permitted when
 /// `AXS_ALLOW_NO_AUTH=true` is explicitly set.
 pub fn load_api_keys() -> Arc<HashSet<String>> {
-    let keys: HashSet<String> = std::env::var("AXS_API_KEY")
+    load_key_set("AXS_API_KEY")
+}
+
+/// Load operator credentials. Public client credentials are intentionally not
+/// accepted by the gateway's admin and worker-management routes.
+pub fn load_admin_api_keys() -> Arc<HashSet<String>> {
+    load_key_set("AXS_ADMIN_API_KEY")
+}
+
+fn load_key_set(name: &str) -> Arc<HashSet<String>> {
+    let keys: HashSet<String> = std::env::var(name)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -27,6 +46,12 @@ pub fn load_api_keys() -> Arc<HashSet<String>> {
         .map(String::from)
         .collect();
     Arc::new(keys)
+}
+
+#[derive(Clone)]
+pub struct GatewayAuthState {
+    pub public_keys: Arc<HashSet<String>>,
+    pub admin_keys: Arc<HashSet<String>>,
 }
 
 /// Constant-time string equality helper for secret comparisons.
@@ -53,22 +78,97 @@ pub(crate) fn has_valid_api_key(candidate: &str, keys: &HashSet<String>) -> bool
         .any(|expected| constant_time_eq_str(candidate, expected))
 }
 
+/// Extract a bearer token from an Authorization header value.
+///
+/// HTTP authentication schemes are case-insensitive. Require at least one
+/// whitespace separator between the scheme and token.
+pub(crate) fn bearer_token_from_authorization(value: &str) -> Option<&str> {
+    let mut parts = value.trim_start().splitn(2, char::is_whitespace);
+    let scheme = parts.next()?;
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 /// Returns `true` if the given path is exempt from authentication.
 ///
-/// Monitoring endpoints remain unauthenticated so Prometheus scrapers,
-/// load-balancer health probes, and the embedded dashboard work without
-/// Bearer tokens.  `/v1/metrics` is also exempt: the dashboard fetches it
-/// on every poll tick and it is the JSON counterpart of the already-exempt
-/// Prometheus `/metrics` endpoint.
+/// Minimal load-balancer probes remain unauthenticated. Metrics, diagnostics,
+/// and dashboards are operator surfaces and use the independent admin key.
 ///
 /// Only read-only license state (`GET /v1/license`) is exempt; mutating
 /// endpoints (`POST /v1/license`, `DELETE /v1/workers/{id}`) require auth.
 fn is_exempt(method: &Method, path: &str) -> bool {
     path == "/health"
+        || path == "/livez"
+        || path == "/readyz"
+        || (*method == Method::GET && path == "/v1/license")
+}
+
+fn is_admin_path(method: &Method, path: &str) -> bool {
+    path.starts_with("/admin/v1/")
+        || path == "/admin/v1/deployments"
+        || path.starts_with("/v1/admin/")
+        || path == "/v1/workers"
+        || path.starts_with("/v1/workers/")
         || path == "/metrics"
         || path == "/v1/metrics"
         || path == "/dashboard"
-        || (*method == Method::GET && path == "/v1/license")
+        || (path == "/v1/license" && *method != Method::GET)
+}
+
+pub async fn gateway_auth_middleware(
+    axum::extract::State(state): axum::extract::State<GatewayAuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if is_exempt(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+    let admin_path = is_admin_path(request.method(), request.uri().path());
+    let required_keys = if admin_path {
+        &state.admin_keys
+    } else {
+        &state.public_keys
+    };
+    if required_keys.is_empty()
+        && (!admin_path || state.public_keys.is_empty() && state.admin_keys.is_empty())
+    {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token_from_authorization)
+        .is_some_and(|candidate| has_valid_api_key(candidate.trim(), required_keys));
+    if authorized {
+        return next.run(request).await;
+    }
+
+    let request_id = request
+        .extensions()
+        .get::<AxRequestId>()
+        .map(|value| value.0)
+        .unwrap_or_default();
+    let mut response = crate::orchestration::error::ax_error_response(
+        StatusCode::UNAUTHORIZED,
+        request_id,
+        if admin_path {
+            "AXS_ADMIN_UNAUTHORIZED"
+        } else {
+            "AXS_UNAUTHORIZED"
+        },
+        "missing or invalid credential",
+        false,
+        ax_serving_protocol::AdmissionPhase::Authentication,
+    );
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
 }
 
 /// Axum middleware: validates `Authorization: Bearer <key>` on every request.
@@ -96,22 +196,26 @@ pub async fn auth_middleware(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(bearer_token_from_authorization)
         .map(|key| has_valid_api_key(key.trim(), &keys))
         .unwrap_or(false);
 
     if authorized {
         next.run(request).await
     } else {
-        // RFC 7235 §4.1: a 401 response MUST include WWW-Authenticate so
-        // conforming clients know the expected authentication scheme.
-        let mut resp = (
+        let request_id = request
+            .extensions()
+            .get::<AxRequestId>()
+            .map(|value| value.0)
+            .unwrap_or_default();
+        let mut resp = crate::orchestration::error::ax_error_response(
             StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": "unauthorized: missing or invalid API key"
-            })),
-        )
-            .into_response();
+            request_id,
+            "AXS_UNAUTHORIZED",
+            "missing or invalid API key",
+            false,
+            ax_serving_protocol::AdmissionPhase::Authentication,
+        );
         resp.headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         resp
@@ -130,10 +234,12 @@ pub async fn request_id_and_headers_middleware(request: Request, next: Next) -> 
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    let ax_request_id = ProtocolRequestId::new();
     let mut request = request;
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
+    request.extensions_mut().insert(AxRequestId(ax_request_id));
 
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -142,6 +248,9 @@ pub async fn request_id_and_headers_middleware(request: Request, next: Next) -> 
         headers.insert("x-request-id", v);
     } else {
         headers.insert("x-request-id", HeaderValue::from_static("unknown"));
+    }
+    if let Ok(value) = HeaderValue::from_str(&ax_request_id.to_string()) {
+        headers.insert(ax_serving_protocol::REQUEST_ID_HEADER, value);
     }
     headers.insert(
         "x-content-type-options",
@@ -159,9 +268,11 @@ mod tests {
     #[test]
     fn exempt_paths_match_exactly() {
         assert!(is_exempt(&Method::GET, "/health"));
-        assert!(is_exempt(&Method::GET, "/metrics"));
-        assert!(is_exempt(&Method::GET, "/v1/metrics"));
-        assert!(is_exempt(&Method::GET, "/dashboard"));
+        assert!(is_exempt(&Method::GET, "/livez"));
+        assert!(is_exempt(&Method::GET, "/readyz"));
+        assert!(!is_exempt(&Method::GET, "/metrics"));
+        assert!(!is_exempt(&Method::GET, "/v1/metrics"));
+        assert!(!is_exempt(&Method::GET, "/dashboard"));
         assert!(is_exempt(&Method::GET, "/v1/license"));
         assert!(!is_exempt(&Method::POST, "/v1/license"));
         assert!(!is_exempt(&Method::DELETE, "/v1/workers/abc-123"));
@@ -172,24 +283,29 @@ mod tests {
     }
 
     #[test]
-    fn bearer_token_trim_after_prefix_strip() {
-        // Simulate what auth_middleware does: strip prefix then trim.
+    fn bearer_token_parser_accepts_case_insensitive_scheme_and_whitespace() {
         let cases = [
-            ("Bearer secret", Some("secret")),   // normal
-            ("Bearer  secret", Some("secret")),  // double space after Bearer
-            ("Bearer secret ", Some("secret")),  // trailing space on token
-            ("Bearer  secret ", Some("secret")), // both
-            ("Token secret", None),              // wrong scheme
-            ("secret", None),                    // no scheme
+            ("Bearer secret", Some("secret")),
+            ("bearer secret", Some("secret")),
+            ("BEARER secret", Some("secret")),
+            ("Bearer  secret", Some("secret")),
+            ("Bearer\tsecret", Some("secret")),
+            ("Bearer secret ", Some("secret")),
+            (" Bearer secret", Some("secret")),
+            ("Token secret", None),
+            ("Bearer", None),
+            ("Bearer ", None),
+            ("Bearersecret", None),
+            ("secret", None),
         ];
         let mut keys = std::collections::HashSet::new();
         keys.insert("secret".to_string());
         for (header, expected_key) in cases {
-            let result = header.strip_prefix("Bearer ").map(|k| k.trim().to_string());
-            assert_eq!(result.as_deref(), expected_key, "header: {header:?}");
+            let result = bearer_token_from_authorization(header);
+            assert_eq!(result, expected_key, "header: {header:?}");
             if let Some(k) = result {
                 assert!(
-                    has_valid_api_key(&k, &keys),
+                    has_valid_api_key(k, &keys),
                     "trimmed key should be found in set"
                 );
             }
@@ -235,6 +351,20 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(keys, auth_middleware))
     }
 
+    fn gateway_auth_app(state: GatewayAuthState) -> axum::Router {
+        axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "models" }))
+            .route(
+                "/admin/v1/deployments",
+                axum::routing::get(|| async { "admin" }),
+            )
+            .route("/metrics", axum::routing::get(|| async { "metrics" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                gateway_auth_middleware,
+            ))
+    }
+
     #[tokio::test]
     async fn auth_middleware_empty_key_set_allows_all() {
         use tower::ServiceExt;
@@ -254,6 +384,19 @@ mod tests {
         let req = axum::http::Request::builder()
             .uri("/v1/models")
             .header("Authorization", "Bearer correct-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_lowercase_bearer_scheme() {
+        use tower::ServiceExt;
+        let app = auth_app(make_keys(&["correct-key"]));
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("Authorization", "bearer correct-key")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -294,6 +437,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_metrics_require_admin_key_not_public_key() {
+        use tower::ServiceExt;
+
+        let app = gateway_auth_app(GatewayAuthState {
+            public_keys: make_keys(&["public-key"]),
+            admin_keys: make_keys(&["admin-key"]),
+        });
+        let public_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .header("Authorization", "Bearer public-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_response.status(), StatusCode::UNAUTHORIZED);
+
+        let admin_response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .header("Authorization", "Bearer admin-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn auth_middleware_exempt_health_bypasses_key_check() {
         use tower::ServiceExt;
         // Even with a required key, /health is always accessible.
@@ -304,6 +481,53 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gateway_auth_separates_public_and_admin_credentials() {
+        use tower::ServiceExt;
+
+        let app = gateway_auth_app(GatewayAuthState {
+            public_keys: make_keys(&["public-key"]),
+            admin_keys: make_keys(&["admin-key"]),
+        });
+        let public_models = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .header("authorization", "Bearer public-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_models.status(), StatusCode::OK);
+
+        let public_admin = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/deployments")
+                    .header("authorization", "Bearer public-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_admin.status(), StatusCode::UNAUTHORIZED);
+
+        let admin = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/deployments")
+                    .header("authorization", "Bearer admin-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::OK);
     }
 
     // ── request_id_and_headers_middleware tests ────────────────────────────────

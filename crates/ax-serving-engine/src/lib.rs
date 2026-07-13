@@ -28,7 +28,7 @@ pub mod thermal;
 
 use std::path::Path;
 
-pub use ax_engine::AxEngineBackend;
+pub use ax_engine::{AxEngineBackend, is_ax_engine_model_artifacts};
 #[cfg(feature = "libllama")]
 pub use libllama::LibLlamaBackend;
 pub use llamacpp::{LlamaCppBackend, LlamaCppConfig};
@@ -45,6 +45,17 @@ pub(crate) fn stream_token_batch_size() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_STREAM_TOKEN_BATCH_SIZE)
         .clamp(1, MAX_STREAM_TOKEN_BATCH_SIZE)
+}
+
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 }
 
 /// Return the current process resident set size in bytes.
@@ -107,7 +118,7 @@ pub struct LoadConfig {
     /// Per-load backend routing override. When `Some`, overrides the global
     /// `backends.yaml` routing config for this specific load call.
     ///
-    /// Accepted values: `"llama_cpp"`, `"native"`, `"lib_llama"`, `"auto"`.
+    /// Accepted values: `"llama_cpp"`, `"native"`, `"mlx"`, `"lib_llama"`, `"auto"`.
     /// `None` = use routing config (`backends.yaml`).
     pub backend_hint: Option<String>,
     /// Explicitly enable embedding mode for llama-server (`--embedding` flag).
@@ -210,6 +221,12 @@ pub struct ChatMessage {
     pub role: String,
     /// Plain string or multipart array (e.g. `[{"type":"text",...},{"type":"image_url",...}]`).
     pub content: serde_json::Value,
+    /// Optional display name from OpenAI-compatible chat messages.
+    pub name: Option<String>,
+    /// Raw OpenAI-compatible `tool_calls` array for assistant messages.
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool call ID for `tool` role messages.
+    pub tool_call_id: Option<String>,
 }
 
 /// Parameters controlling the generation sampler.
@@ -385,6 +402,20 @@ pub struct CacheTelemetry {
     pub max_batch_size: u32,
 }
 
+impl CacheTelemetry {
+    pub fn saturating_add_assign(&mut self, other: &Self) {
+        self.kv_pages_used = self.kv_pages_used.saturating_add(other.kv_pages_used);
+        self.kv_pages_total = self.kv_pages_total.saturating_add(other.kv_pages_total);
+        self.prefix_reusable_tokens = self
+            .prefix_reusable_tokens
+            .saturating_add(other.prefix_reusable_tokens);
+        self.active_batch_size = self
+            .active_batch_size
+            .saturating_add(other.active_batch_size);
+        self.max_batch_size = self.max_batch_size.saturating_add(other.max_batch_size);
+    }
+}
+
 // ── InferenceBackend trait ────────────────────────────────────────────────────
 
 /// Core inference interface implemented by concrete backend adapters.
@@ -483,5 +514,36 @@ pub trait InferenceBackend: Send + Sync {
     fn eval_tokens(&self, handle: ModelHandle, tokens: &[u32]) -> anyhow::Result<u32> {
         let _ = (handle, tokens);
         Err(anyhow::anyhow!("eval_tokens not supported by this backend"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CacheTelemetry;
+
+    #[test]
+    fn cache_telemetry_merge_saturates_counters() {
+        let mut total = CacheTelemetry {
+            kv_pages_used: u64::MAX,
+            kv_pages_total: 10,
+            prefix_reusable_tokens: u64::MAX - 1,
+            active_batch_size: u32::MAX,
+            max_batch_size: 1,
+        };
+        let other = CacheTelemetry {
+            kv_pages_used: 1,
+            kv_pages_total: u64::MAX,
+            prefix_reusable_tokens: 10,
+            active_batch_size: 1,
+            max_batch_size: u32::MAX,
+        };
+
+        total.saturating_add_assign(&other);
+
+        assert_eq!(total.kv_pages_used, u64::MAX);
+        assert_eq!(total.kv_pages_total, u64::MAX);
+        assert_eq!(total.prefix_reusable_tokens, u64::MAX);
+        assert_eq!(total.active_batch_size, u32::MAX);
+        assert_eq!(total.max_batch_size, u32::MAX);
     }
 }
