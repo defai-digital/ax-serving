@@ -88,7 +88,8 @@ CI builds both `gateway` and `agent` image targets and verifies their non-root c
 
 The dependency lock uses the patched PyO3 0.29.0, crossbeam-epoch 0.9.20, anyhow 1.0.103, and
 memmap2 0.9.11 releases. Remote RustSec remains the authoritative dependency-audit gate; the
-unmaintained-only `paste` notice is inherited by the frozen embedded AX Engine compatibility graph.
+unmaintained-only `paste` notice is inherited by compatibility dependencies through both the
+current tokenizer stack and the frozen embedded AX Engine/Metal graph.
 
 ## Release blockers
 
@@ -98,7 +99,8 @@ until all of the following are attached to a source digest:
 
 1. Pinned AX Engine and one pinned CUDA runtime pass registration, readiness, inventory, inference,
    streaming, cancellation, drain, credential, and generic-`5xx` conformance.
-2. All three gateway platform jobs and both portable container targets pass remotely.
+2. Both portable gateway jobs, the embedded macOS compatibility job, and both portable container
+   targets pass remotely.
 3. Direct-runtime, through-gateway, and mixed-fleet artifacts pass NFR-001, NFR-002, and NFR-007.
 4. The 32-worker, 256-stream, two-gateway Redis/Valkey envelope passes restart, partition, drain,
    rollout, rollback, overload, and at least 60 minutes of soak.

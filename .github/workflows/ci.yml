@@ -43,7 +43,7 @@ jobs:
     env:
       AXS_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -97,11 +97,11 @@ jobs:
       PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
       AXS_ALLOW_NO_AUTH: 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - uses: Swatinem/rust-cache@v2
@@ -126,13 +126,13 @@ jobs:
     name: SDK conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: sdk/javascript/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - name: JavaScript SDK
@@ -149,17 +149,19 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependency lockfile
+        run: cargo audit --file Cargo.lock
 
   deployment:
     name: Container and Kubernetes conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-kubectl@v5
         with:
           version: v1.31.2
       - name: Render Kubernetes base
@@ -187,7 +189,7 @@ jobs:
     needs: [gateway-linux, embedded-macos, sdk, security, deployment]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require populated benchmark evidence
         run: |
           python3 - <<'PY'
@@ -231,7 +233,7 @@ jobs:
     env:
       PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/ci-install-native-deps.sh
@@ -247,7 +249,7 @@ jobs:
     env:
       PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/ci-install-native-deps.sh
@@ -259,7 +261,7 @@ jobs:
             -m "${{ inputs.model_path }}" \
             --duration-min 60 \
             --json target/ci/smoke-soak-result.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: smoke-soak-result
