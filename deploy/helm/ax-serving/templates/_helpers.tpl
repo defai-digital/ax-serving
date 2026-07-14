@@ -63,13 +63,20 @@ app.kubernetes.io/component: gateway
 {{- if le (int .Values.gateway.terminationGracePeriodSeconds) $hard -}}
 {{- fail "gateway.terminationGracePeriodSeconds must be greater than gateway.shutdown.hardSeconds" -}}
 {{- end -}}
-{{- /* Multi-replica gateways require shared fleet state. Prefer explicit
-     fleet_store=redis/valkey; redis.existingSecret is accepted as operator
-     proof of a shared store when config is supplied via existingConfigMap. */ -}}
+{{- /* Multi-replica gateways require shared fleet state.
+     AXS_REDIS_URL alone does NOT switch the app off memory store — fleet_store
+     must be redis|valkey in the rendered config. redis.existingSecret is only
+     accepted as proof when config is opaque (existingConfigMap). */ -}}
 {{- if gt (int .Values.gateway.replicaCount) 1 -}}
+{{- if empty .Values.config.existingConfigMap -}}
 {{- $store := default "memory" .Values.config.inline.orchestrator.fleet_store | toString | lower -}}
-{{- if and (ne $store "redis") (ne $store "valkey") (empty .Values.redis.existingSecret) -}}
-{{- fail "replicaCount > 1 requires orchestrator.fleet_store=redis|valkey or redis.existingSecret" -}}
+{{- if and (ne $store "redis") (ne $store "valkey") -}}
+{{- fail "replicaCount > 1 requires orchestrator.fleet_store=redis|valkey in chart config (AXS_REDIS_URL / redis.existingSecret alone does not enable redis fleet store)" -}}
+{{- end -}}
+{{- else -}}
+{{- if empty .Values.redis.existingSecret -}}
+{{- fail "replicaCount > 1 with config.existingConfigMap requires redis.existingSecret (opaque config cannot be checked for fleet_store)" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.production.enabled (empty .Values.secrets.existingSecret) -}}
