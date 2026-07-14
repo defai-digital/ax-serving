@@ -6,12 +6,13 @@
 #
 # Measure with: python3 scripts/report_rust_loc.py
 # Threshold: warn when production LOC (after #[cfg(test)] mod stripping) > 1500
+# Stripping is string/comment-aware; re-run after heuristic changes before
+# adding/removing entries.
 
 crates/ax-serving-api/src/orchestration/registry.rs
 crates/ax-serving-api/src/orchestration/proxy_handlers.rs
 crates/ax-serving-api/src/orchestration/direct.rs
 crates/ax-serving-api/src/rest/inference.rs
-crates/ax-serving-api/src/config.rs
 crates/ax-serving-cli/src/support.rs
 crates/ax-serving-engine/src/llamacpp.rs
 crates/ax-serving-engine/src/mlx.rs

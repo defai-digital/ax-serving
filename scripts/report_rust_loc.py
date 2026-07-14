@@ -8,6 +8,8 @@ Usage:
   python3 scripts/report_rust_loc.py --allowlist scripts/loc_allowlist.txt
   python3 scripts/report_rust_loc.py --format markdown   # default: table
   python3 scripts/report_rust_loc.py --format tsv
+  python3 -m unittest scripts.test_report_rust_loc
+  # or: python3 scripts/test_report_rust_loc.py
 
 Thresholds (production LOC after heuristic test stripping):
   ok         ≤  800   preferred ownership unit
@@ -26,9 +28,17 @@ on existing giants until decomposition PRs land.
      followed (optionally after blank/comment/`#[...]` attribute lines) by
      `mod <name> {` / `mod <name>{` through the matching closing brace at the
      same brace depth as the opening `mod` line.
-  2. Do not claim accuracy for tests interleaved mid-function, for
-     `#[cfg(test)]` on items other than modules, or for macro-generated modules.
-  3. Counts are heuristic; re-measure with tokei/cloc if gating on exact numbers.
+  2. Brace matching is string/comment-aware: braces inside `"..."`, raw
+     strings (`r"..."`, `r#"..."#`, …), `'…'` char literals, `//` line
+     comments, and `/* … */` block comments do not affect depth. Without
+     this, fixture strings with unbalanced braces (common in config/YAML/JSON
+     tests) prevent the module from closing and leave the whole block unstripped.
+  3. Do not claim accuracy for tests interleaved mid-function, for
+     `#[cfg(test)]` on items other than modules (impl methods, free fns,
+     thread_local!, consts, etc. remain in PROD), or for macro-generated modules.
+     PROD is therefore still slightly high vs a true cfg-aware tool
+     (prefer tokei/cloc with conditionals if gating on exact numbers).
+  4. Counts are heuristic; re-measure with tokei/cloc if gating on exact numbers.
 
 No third-party dependencies (Python 3 stdlib only). No runtime behavior change.
 """
@@ -110,11 +120,141 @@ def iter_production_rs(root: Path) -> list[Path]:
     return sorted(out)
 
 
+def find_matching_brace_end(text: str, open_brace_index: int) -> int | None:
+    """
+    Given index of an opening `{`, return index of its matching `}` using
+    string/comment-aware scanning. Returns None if unbalanced.
+    """
+    # Start scanning after the opening brace with depth 1 effectively:
+    # we scan from open_brace_index and require the first char to be `{`.
+    if open_brace_index < 0 or open_brace_index >= len(text) or text[open_brace_index] != "{":
+        return None
+    # Reuse delta helper by scanning from the opening brace with a synthetic
+    # approach: start depth at 0 and include the opening brace.
+    depth = 0
+    i = open_brace_index
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl + 1
+            continue
+
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end < 0:
+                return None
+            i = end + 2
+            continue
+
+        # Raw string r"..." / r#"..."#
+        if ch == "r" and i + 1 < n and (text[i + 1] == '"' or text[i + 1] == "#"):
+            j = i + 1
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                j += 1
+                close = '"' + ("#" * hashes)
+                end = text.find(close, j)
+                if end < 0:
+                    return None
+                i = end + len(close)
+                continue
+
+        # br"..."
+        if (
+            ch == "b"
+            and i + 1 < n
+            and text[i + 1] == "r"
+            and i + 2 < n
+            and (text[i + 2] == '"' or text[i + 2] == "#")
+        ):
+            j = i + 2
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                j += 1
+                close = '"' + ("#" * hashes)
+                end = text.find(close, j)
+                if end < 0:
+                    return None
+                i = end + len(close)
+                continue
+
+        # b"..." or "..."
+        if ch == '"' or (ch == "b" and i + 1 < n and text[i + 1] == '"'):
+            if ch == "b":
+                i += 1
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == '"':
+                    i += 1
+                    break
+                i += 1
+            else:
+                return None
+            continue
+
+        if ch == "'":
+            if i + 1 < n and (text[i + 1].isalnum() or text[i + 1] == "_"):
+                j = i + 1
+                while j < n and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                if j < n and text[j] == "'" and j == i + 2:
+                    i = j + 1
+                    continue
+                if (
+                    i + 1 < n
+                    and text[i + 1] == "\\"
+                    and i + 3 < n
+                    and text[i + 3] == "'"
+                ):
+                    i = i + 4
+                    continue
+                i = j
+                continue
+            i += 1
+            if i < n and text[i] == "\\":
+                i += 2
+            elif i < n:
+                i += 1
+            if i < n and text[i] == "'":
+                i += 1
+            continue
+
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+            continue
+
+        i += 1
+
+    return None
+
+
 def strip_cfg_test_modules(text: str) -> tuple[str, int, bool]:
     """
     Best-effort strip of `#[cfg(test)]` + `mod name { ... }` blocks.
 
     Returns (remaining_text, stripped_line_count, found_any).
+    Brace matching is string/comment-aware (see module docstring).
     """
     lines = text.splitlines(keepends=True)
     n = len(lines)
@@ -131,35 +271,34 @@ def strip_cfg_test_modules(text: str) -> tuple[str, int, bool]:
             _BLANK_OR_COMMENT_RE.match(lines[j].rstrip("\n"))
             or _ATTR_RE.match(lines[j])
         ):
-            # Stop if we hit another cfg that isn't part of this item chain—
-            # still allow attributes; blank/comment OK.
             j += 1
         if j >= n or not _MOD_OPEN_RE.match(lines[j].rstrip("\n")):
             i += 1
             continue
-        # Brace match from the mod line.
-        depth = 0
-        k = j
-        closed = False
-        while k < n:
-            # Count braces outside of strings is not perfect; good enough
-            # for typical test modules.
-            line = lines[k]
-            for ch in line:
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        closed = True
-                        break
-            if closed:
-                break
-            k += 1
-        if not closed:
+
+        # Build text from mod line onward; string-aware match of opening `{`.
+        body = "".join(lines[j:])
+        rel_open = body.find("{")
+        if rel_open < 0:
+            i += 1
+            continue
+        abs_close = find_matching_brace_end(body, rel_open)
+        if abs_close is None:
             # Unbalanced — leave alone.
             i += 1
             continue
+
+        # Map closing-brace offset within body back to a line index.
+        acc = 0
+        k = j
+        while k < n:
+            if acc + len(lines[k]) > abs_close:
+                break
+            acc += len(lines[k])
+            k += 1
+        if k >= n:
+            k = n - 1
+
         # Mark i..k inclusive for stripping.
         for t in range(i, k + 1):
             keep[t] = False
@@ -365,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"allowlist: {allow_path} ({len(allow)} entries)")
     print(
-        "heuristic: strips #[cfg(test)] mod { ... } blocks; "
+        "heuristic: strips #[cfg(test)] mod { ... } blocks (string/comment-aware); "
         "counts are approximate (see script header)."
     )
     print()
@@ -392,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  warn not allowlisted:  {len(unallowlisted_warn)}")
     if warn_rows:
         print()
-        print("Warn files (prod > 1500):")
+        print(f"Warn files (prod > {SOFT_MAX}):")
         for r in warn_rows:
             tag = "allowlisted" if r.allowlisted else "NOT allowlisted"
             hard = " hard" if r.hard else ""
