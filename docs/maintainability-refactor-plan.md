@@ -9,6 +9,7 @@ This file preserves the March 2026 refactor snapshot. It is not a current
 architecture or completion ledger. Use ADR-013, the canonical PRD, technical
 specification, and `.internal/IMPLEMENTATION-STATUS.md` for current decisions
 and status; re-measure every file-size claim before scheduling follow-up work.
+Current LOC tooling: `python3 scripts/report_rust_loc.py` (soft thresholds + `scripts/loc_allowlist.txt`).
 
 ## 1. Purpose
 

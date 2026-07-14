@@ -1,0 +1,17 @@
+# scripts/loc_allowlist.txt — temporary; remove entries as module splits land
+#
+# Paths are repo-relative (POSIX). Used by scripts/report_rust_loc.py so known
+# giant production modules do not fail --strict checks while decomposition is
+# in progress. Soft mode (default) always exits 0 regardless.
+#
+# Measure with: python3 scripts/report_rust_loc.py
+# Threshold: warn when production LOC (after #[cfg(test)] mod stripping) > 1500
+
+crates/ax-serving-api/src/orchestration/registry.rs
+crates/ax-serving-api/src/orchestration/proxy_handlers.rs
+crates/ax-serving-api/src/orchestration/direct.rs
+crates/ax-serving-api/src/rest/inference.rs
+crates/ax-serving-api/src/config.rs
+crates/ax-serving-cli/src/support.rs
+crates/ax-serving-engine/src/llamacpp.rs
+crates/ax-serving-engine/src/mlx.rs
