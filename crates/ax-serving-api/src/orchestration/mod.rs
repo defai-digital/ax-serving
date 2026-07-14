@@ -651,10 +651,16 @@ pub async fn start_orchestrator(
 
     // Wire the shutdown watch into both listeners so they drain open connections
     // instead of dropping them abruptly.
+    //
+    // IMPORTANT: the hard process deadline is measured from when the shutdown
+    // signal arrives (drain start), never from process start. Wrapping the whole
+    // serve future in a timeout from t=0 would kill long-lived gateways.
     let internal_shutdown = shutdown_rx.clone();
     let public_shutdown = shutdown_rx.clone();
+    let hard_shutdown_rx = shutdown_rx;
     let drain_ops = Arc::clone(&layer.ops);
-    let hard_deadline = std::time::Duration::from_secs(layer.ops.shutdown.hard_secs);
+    let hard_deadlines = layer.ops.shutdown;
+
     let serve = async {
         tokio::try_join!(
             async {
@@ -669,13 +675,17 @@ pub async fn start_orchestrator(
                         while !*rx.borrow() {
                             rx.changed().await.ok();
                         }
+                        let shutdown_started = std::time::Instant::now();
                         // Keep control plane up through drain so agents can finish cleanup.
-                        // Public path stops first after propagation + drain.
-                        let hard = ops.shutdown.hard_secs;
-                        let _ = tokio::time::sleep(std::time::Duration::from_secs(
-                            hard.saturating_sub(1).max(1),
-                        ))
-                        .await;
+                        // Exit this future before the hard deadline so the hard-exit
+                        // select arm remains the last-resort force-stop.
+                        let keep_alive = ops
+                            .shutdown
+                            .remaining_until_hard(shutdown_started, std::time::Instant::now())
+                            .saturating_sub(std::time::Duration::from_secs(1));
+                        if !keep_alive.is_zero() {
+                            tokio::time::sleep(keep_alive).await;
+                        }
                     }
                 })
                 .await
@@ -693,13 +703,19 @@ pub async fn start_orchestrator(
                         while !*rx.borrow() {
                             rx.changed().await.ok();
                         }
+                        let shutdown_started = std::time::Instant::now();
                         ops.begin_drain();
                         tokio::time::sleep(std::time::Duration::from_millis(
                             ops.shutdown.propagation_ms,
                         ))
                         .await;
-                        let drain_deadline = std::time::Instant::now()
-                            + std::time::Duration::from_secs(ops.shutdown.drain_secs);
+                        let drain_budget =
+                            std::time::Duration::from_secs(ops.shutdown.drain_secs);
+                        let hard_remaining =
+                            ops.shutdown
+                                .remaining_until_hard(shutdown_started, std::time::Instant::now());
+                        let drain_cap = drain_budget.min(hard_remaining);
+                        let drain_deadline = std::time::Instant::now() + drain_cap;
                         while ops.inflight() > 0 && std::time::Instant::now() < drain_deadline {
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
@@ -718,9 +734,25 @@ pub async fn start_orchestrator(
         Ok::<(), anyhow::Error>(())
     };
 
-    match tokio::time::timeout(hard_deadline, serve).await {
-        Ok(result) => result?,
-        Err(_) => {
+    // Hard exit only after the shutdown signal; duration is hard_secs from that Instant.
+    let hard_exit = async move {
+        let mut rx = hard_shutdown_rx;
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+        let shutdown_started = std::time::Instant::now();
+        let remaining =
+            hard_deadlines.remaining_until_hard(shutdown_started, std::time::Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+    };
+
+    tokio::select! {
+        result = serve => result?,
+        _ = hard_exit => {
             warn!("gateway hard shutdown deadline reached; exiting");
         }
     }

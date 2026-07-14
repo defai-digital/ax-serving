@@ -132,6 +132,18 @@ impl ShutdownDeadlines {
         }
         Ok(())
     }
+
+    /// Hard process-exit deadline measured from when shutdown begins (SIGTERM/SIGINT),
+    /// never from process start. Callers must pass the Instant captured at drain start.
+    pub fn hard_deadline_at(self, shutdown_started_at: Instant) -> Instant {
+        shutdown_started_at + std::time::Duration::from_secs(self.hard_secs)
+    }
+
+    /// Remaining time until [`Self::hard_deadline_at`], clamped to zero if already past.
+    pub fn remaining_until_hard(self, shutdown_started_at: Instant, now: Instant) -> std::time::Duration {
+        self.hard_deadline_at(shutdown_started_at)
+            .saturating_duration_since(now)
+    }
 }
 
 #[derive(Debug)]
@@ -393,6 +405,36 @@ mod tests {
         let d = ShutdownDeadlines::new(5_000, 300, 330).unwrap();
         assert!(d.validate_termination_grace(360).is_ok());
         assert!(d.validate_termination_grace(330).is_err());
+    }
+
+    #[test]
+    fn hard_deadline_is_relative_to_shutdown_start_not_process_start() {
+        let d = ShutdownDeadlines::new(5_000, 300, 330).unwrap();
+        // Simulate a process that has already been up for an hour before SIGTERM.
+        let process_start = Instant::now();
+        let shutdown_started = process_start + std::time::Duration::from_secs(3_600);
+        let deadline = d.hard_deadline_at(shutdown_started);
+
+        assert_eq!(
+            deadline.duration_since(shutdown_started),
+            std::time::Duration::from_secs(330),
+            "hard deadline must be hard_secs after shutdown begins"
+        );
+        // A bug that starts the hard timer at process start would expire ~330s after
+        // process_start, which is far in the past relative to shutdown_started.
+        let wrong_process_start_deadline = process_start + std::time::Duration::from_secs(330);
+        assert!(
+            deadline > wrong_process_start_deadline,
+            "hard deadline must not be measured from process start"
+        );
+        assert_eq!(
+            d.remaining_until_hard(shutdown_started, shutdown_started),
+            std::time::Duration::from_secs(330)
+        );
+        assert_eq!(
+            d.remaining_until_hard(shutdown_started, deadline),
+            std::time::Duration::ZERO
+        );
     }
 
     #[test]
