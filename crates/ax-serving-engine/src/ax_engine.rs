@@ -6,9 +6,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicU64, Ordering},
+    mpsc,
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -85,8 +87,139 @@ fn push_stream_token_piece(
     flush_stream_token_batch(tx, buffer, buffered_pieces)
 }
 
+/// Commands executed exclusively on the model owner thread so the MLX/Metal
+/// `EngineSession` never migrates across OS threads (engine thread-local contract).
+enum OwnerCommand {
+    Generate {
+        request: GenerateRequest,
+        params: GenerationParams,
+        tokenizer: Tokenizer,
+        tx: tokio::sync::mpsc::Sender<GenerateEvent>,
+    },
+    Embed {
+        batch: Vec<Vec<u32>>,
+        pooling: EmbeddingPooling,
+        normalize: bool,
+        reply: mpsc::Sender<Result<Vec<Vec<f32>>>>,
+    },
+    Eval {
+        request: GenerateRequest,
+        reply: mpsc::Sender<Result<u32>>,
+    },
+    Shutdown {
+        reply: mpsc::Sender<()>,
+    },
+}
+
+struct SessionOwner {
+    cmd_tx: mpsc::Sender<OwnerCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SessionOwner {
+    fn spawn(session_config: EngineSessionConfig) -> Result<Self> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<OwnerCommand>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<()>>(1);
+        let join = std::thread::Builder::new()
+            .name("ax-engine-owner".into())
+            .spawn(move || {
+                let mut session = match EngineSession::new(session_config) {
+                    Ok(session) => {
+                        let _ = ready_tx.send(Ok(()));
+                        session
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!(err.to_string())));
+                        return;
+                    }
+                };
+
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        OwnerCommand::Generate {
+                            request,
+                            params,
+                            tokenizer,
+                            tx,
+                        } => {
+                            if let Err(err) =
+                                run_generate_on_session(&mut session, &tokenizer, request, params, tx.clone())
+                            {
+                                let _ = tx.blocking_send(GenerateEvent::Error(err.to_string()));
+                            }
+                        }
+                        OwnerCommand::Embed {
+                            batch,
+                            pooling,
+                            normalize,
+                            reply,
+                        } => {
+                            let result = session
+                                .embed_batch(&batch, pooling, normalize)
+                                .map_err(|err| anyhow::anyhow!("ax-engine embedding failed: {err}"));
+                            let _ = reply.send(result);
+                        }
+                        OwnerCommand::Eval { request, reply } => {
+                            let result = session
+                                .generate_with_request_id(next_request_id(), request)
+                                .map_err(|err| anyhow::anyhow!("ax-engine eval generation failed: {err}"))
+                                .and_then(|response| {
+                                    response.output_tokens.first().copied().ok_or_else(|| {
+                                        anyhow::anyhow!("ax-engine eval did not produce a token")
+                                    })
+                                });
+                            let _ = reply.send(result);
+                        }
+                        OwnerCommand::Shutdown { reply } => {
+                            drop(session);
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("failed to spawn ax-engine owner thread")?;
+
+        ready_rx
+            .recv()
+            .context("ax-engine owner thread exited before load readiness")?
+            .context("ax-engine failed to load model on owner thread")?;
+
+        Ok(Self {
+            cmd_tx,
+            join: Some(join),
+        })
+    }
+
+    fn send(&self, cmd: OwnerCommand) -> Result<()> {
+        self.cmd_tx
+            .send(cmd)
+            .map_err(|_| anyhow::anyhow!("ax-engine owner thread is not running"))
+    }
+
+    fn shutdown(&mut self) {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .cmd_tx
+            .send(OwnerCommand::Shutdown { reply: reply_tx })
+            .is_ok()
+        {
+            let _ = reply_rx.recv_timeout(Duration::from_secs(30));
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for SessionOwner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 struct LoadedModel {
-    session: Mutex<EngineSession>,
+    owner: SessionOwner,
     tokenizer: Tokenizer,
     metadata: ModelMetadata,
     model_id: String,
@@ -95,8 +228,8 @@ struct LoadedModel {
     embedding_pooling: EmbeddingPooling,
 }
 
-// SAFETY: AX Engine session access is serialized by `session`, and the other
-// fields are immutable after load.
+// SAFETY: session work is confined to the owner thread; other fields are
+// immutable after load. Commands are Send.
 unsafe impl Send for LoadedModel {}
 unsafe impl Sync for LoadedModel {}
 
@@ -811,24 +944,19 @@ fn stats_from_response(
     }
 }
 
-fn run_generate(
-    loaded: Arc<LoadedModel>,
-    input: GenerateInput,
+fn run_generate_on_session(
+    session: &mut EngineSession,
+    tokenizer: &Tokenizer,
+    request: GenerateRequest,
     params: GenerationParams,
     tx: tokio::sync::mpsc::Sender<GenerateEvent>,
 ) -> Result<()> {
-    ensure_supported_generation_params(&params)?;
-    let request = build_generate_request(&loaded, input, &params)?;
     let prompt_tokens = request.input_tokens.len();
     let request_id = next_request_id();
     let emit_logprobs = params.logprobs.unwrap_or(false);
     let top_logprobs = params.top_logprobs.unwrap_or(0);
     let stream_batch_size = crate::stream_token_batch_size();
 
-    let mut session = loaded.session.lock().unwrap_or_else(|err| {
-        warn!("ax-engine session mutex poisoned; recovering from poisoned state");
-        err.into_inner()
-    });
     let mut state = session
         .stream_generate_state_with_request_id(request_id, request)
         .context("ax-engine failed to start generation stream")?;
@@ -858,7 +986,7 @@ fn run_generate(
                     emitted_tokens += 1;
                     first_token_at.get_or_insert_with(Instant::now);
 
-                    let piece = decode_tokens(&loaded.tokenizer, &[token])?;
+                    let piece = decode_tokens(tokenizer, &[token])?;
                     let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
                     if emit_logprobs {
                         // Keep Token and TokenLogprob events 1:1. When the
@@ -1003,8 +1131,8 @@ impl InferenceBackend for AxEngineBackend {
             let _ = embedding_pooling;
         }
 
-        let session =
-            EngineSession::new(session_config).context("ax-engine failed to load model")?;
+        // Construct EngineSession on the dedicated owner thread only.
+        let owner = SessionOwner::spawn(session_config)?;
         let rss_after = current_rss_bytes();
         let (metadata, architecture) = metadata_from_artifacts(
             &model_dir,
@@ -1024,7 +1152,7 @@ impl InferenceBackend for AxEngineBackend {
 
         let handle = next_handle();
         let loaded = Arc::new(LoadedModel {
-            session: Mutex::new(session),
+            owner,
             tokenizer,
             metadata: metadata.clone(),
             model_id,
@@ -1038,11 +1166,13 @@ impl InferenceBackend for AxEngineBackend {
     }
 
     fn unload_model(&self, handle: ModelHandle) -> Result<()> {
-        anyhow::ensure!(
-            self.models_write().remove(&handle).is_some(),
-            "no model loaded with handle {:?}",
-            handle
-        );
+        let Some(loaded) = self.models_write().remove(&handle) else {
+            anyhow::bail!("no model loaded with handle {:?}", handle);
+        };
+        // Shut down owner thread (drops session on that thread) before Arc drop.
+        if let Ok(mut unique) = Arc::try_unwrap(loaded) {
+            unique.owner.shutdown();
+        }
         Ok(())
     }
 
@@ -1055,24 +1185,13 @@ impl InferenceBackend for AxEngineBackend {
     ) -> Result<()> {
         ensure_supported_generation_params(&params)?;
         let loaded = self.get_model(handle)?;
-        std::thread::Builder::new()
-            .name("ax-engine-generate".into())
-            .spawn(move || {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_generate(loaded, input, params, tx.clone())
-                })) {
-                    Ok(Err(err)) => {
-                        let _ = tx.blocking_send(GenerateEvent::Error(err.to_string()));
-                    }
-                    Err(_panic) => {
-                        let _ = tx.blocking_send(GenerateEvent::Error(
-                            "internal panic in ax-engine generate".into(),
-                        ));
-                    }
-                    Ok(Ok(())) => {}
-                }
-            })
-            .context("failed to spawn ax-engine generation thread")?;
+        let request = build_generate_request(&loaded, input, &params)?;
+        loaded.owner.send(OwnerCommand::Generate {
+            request,
+            params,
+            tokenizer: loaded.tokenizer.clone(),
+            tx,
+        })?;
         Ok(())
     }
 
@@ -1121,13 +1240,16 @@ impl InferenceBackend for AxEngineBackend {
             }
         }
         let prompt_tokens = saturating_token_count(batch.iter().map(Vec::len));
-        let session = loaded.session.lock().unwrap_or_else(|err| {
-            warn!("ax-engine session mutex poisoned during embed; recovering");
-            err.into_inner()
-        });
-        let embeddings = session
-            .embed_batch(&batch, loaded.embedding_pooling, config.normalize)
-            .context("ax-engine embedding failed")?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        loaded.owner.send(OwnerCommand::Embed {
+            batch,
+            pooling: loaded.embedding_pooling,
+            normalize: config.normalize,
+            reply: reply_tx,
+        })?;
+        let embeddings = reply_rx
+            .recv()
+            .context("ax-engine owner thread dropped embed reply")??;
         Ok(EmbedResult {
             embeddings,
             prompt_tokens,
@@ -1146,18 +1268,14 @@ impl InferenceBackend for AxEngineBackend {
             stop_sequences: Vec::new(),
             metadata: None,
         };
-        let mut session = loaded.session.lock().unwrap_or_else(|err| {
-            warn!("ax-engine session mutex poisoned during eval; recovering");
-            err.into_inner()
-        });
-        let response = session
-            .generate_with_request_id(next_request_id(), request)
-            .context("ax-engine eval generation failed")?;
-        response
-            .output_tokens
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("ax-engine eval did not produce a token"))
+        let (reply_tx, reply_rx) = mpsc::channel();
+        loaded.owner.send(OwnerCommand::Eval {
+            request,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .recv()
+            .context("ax-engine owner thread dropped eval reply")?
     }
 }
 
@@ -1171,11 +1289,43 @@ fn saturating_token_count(lengths: impl IntoIterator<Item = usize>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendType, ChatMessage, ChatRole, GenerationParams, LoadConfig, StopPieceAction,
-        consume_stop_piece, ensure_supported_generation_params, infer_render_architecture,
-        normalize_chat_messages, parse_chat_role, render_chat_messages, saturating_token_count,
-        session_config_for_model,
+        AxEngineBackend, BackendType, ChatMessage, ChatRole, GenerationParams, LoadConfig,
+        StopPieceAction, consume_stop_piece, ensure_supported_generation_params,
+        infer_render_architecture, normalize_chat_messages, parse_chat_role, render_chat_messages,
+        saturating_token_count, session_config_for_model,
     };
+    use crate::{InferenceBackend, ModelHandle};
+
+    #[test]
+    fn unload_unknown_handle_fails_closed() {
+        let backend = AxEngineBackend::new();
+        let err = backend.unload_model(ModelHandle(42)).unwrap_err();
+        assert!(err.to_string().contains("no model loaded"));
+    }
+
+    #[test]
+    fn owner_thread_name_documents_single_owner_contract() {
+        // Structural guard: generation must be dispatched via owner commands,
+        // not a per-request OS thread (regression of thread-local MLX violation).
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ax_engine.rs"));
+        // Strip tests so this assertion does not match its own source.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(
+            production.contains("ax-engine-owner"),
+            "expected dedicated owner thread name"
+        );
+        assert!(
+            production.contains("OwnerCommand::Generate"),
+            "generate must enqueue work on the owner thread"
+        );
+        assert!(
+            !production.contains(".name(\"ax-engine-generate\""),
+            "per-request generate threads must not be reintroduced"
+        );
+    }
 
     #[test]
     fn gguf_native_loads_are_rejected_for_v4_sdk() {

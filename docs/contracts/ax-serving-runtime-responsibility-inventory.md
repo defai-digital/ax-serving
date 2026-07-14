@@ -30,7 +30,8 @@ toward the PRD target architecture:
 | Metrics, audit, fleet diagnostics | Operator surface | Keep in AX Serving | Gateway |
 | `ax-runtime-agent` / `ax-thor-agent` proxy | Runtime adapter | Keep as thin OpenAI-compatible runtime adapter | Adapter |
 | `ax-serving serve` local worker | Embedded Mac compatibility worker | Keep only as migration bridge | Compatibility |
-| Native ax-engine backend inside serving crate | Direct runtime execution | Isolated behind `embedded-compat`; prefer the AX Engine agent | Compatibility |
+| Native ax-engine backend inside serving crate | Direct runtime execution | Isolated behind `embedded-compat`; prefer the AX Engine agent + HTTP `ax-engine-server` (see LAN discovery design 2026-07-14) | Compatibility |
+| LAN mDNS discovery (`_ax-engine._tcp`) | Lab/home peer find | Opt-in browse/advertise only; never replaces register/heartbeat tokens | Bootstrap |
 | llama.cpp subprocess backend | Direct runtime execution | Deprecate after runtime-node deployments cover migration needs | Compatibility |
 | MLX subprocess backend | Direct runtime execution | Deprecate or adapterize after runtime-node replacement is validated | Compatibility |
 | optional libllama direct backend | Direct runtime execution | Deprecate unless required for shim compatibility | Compatibility |

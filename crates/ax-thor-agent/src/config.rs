@@ -105,12 +105,88 @@ fn load_model_capabilities() -> Result<Vec<ProtocolCapability>> {
 }
 
 fn load_control_plane_url() -> Result<String> {
-    let raw = std::env::var("AXS_CONTROL_PLANE_URL")
+    let explicit = std::env::var("AXS_CONTROL_PLANE_URL")
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .context("AXS_CONTROL_PLANE_URL is required")?;
-    normalize_http_base_url(&raw, "AXS_CONTROL_PLANE_URL")
+        .filter(|v| !v.is_empty());
+
+    let lan_enabled = ax_serving_discovery::discover_lan_enabled();
+    let mut candidates = Vec::new();
+    if explicit.is_none() && lan_enabled {
+        let filter =
+            ax_serving_discovery::filter_from_env_for(ax_serving_discovery::DiscoveredKind::AxServingGateway);
+        let timeout = ax_serving_discovery::discover_timeout_from_env();
+        tracing::info!(
+            ?timeout,
+            cluster = ?filter.cluster,
+            "AXS_DISCOVER_LAN enabled; browsing for _ax-serving-gateway._tcp"
+        );
+        candidates = ax_serving_discovery::browse_gateways(timeout, &filter)
+            .context("LAN discovery browse for AX Serving gateway failed")?;
+    }
+
+    let filter =
+        ax_serving_discovery::filter_from_env_for(ax_serving_discovery::DiscoveredKind::AxServingGateway);
+    let resolved = ax_serving_discovery::resolve_base_url(
+        explicit.as_deref(),
+        lan_enabled && explicit.is_none(),
+        &candidates,
+        &filter,
+        None,
+        ax_serving_discovery::ResolveRole::Gateway,
+    )
+    .context("AXS_CONTROL_PLANE_URL is required (or enable AXS_DISCOVER_LAN with a gateway advertising on the LAN)")?;
+    normalize_http_base_url(&resolved, "AXS_CONTROL_PLANE_URL")
+}
+
+/// Resolve the upstream runtime HTTP base URL.
+///
+/// Priority:
+/// 1. Explicit `AXS_NODE_RUNTIME_URL` / legacy aliases
+/// 2. When `AXS_DISCOVER_LAN=1` and runtime is `ax_engine`, mDNS browse
+/// 3. Loopback default (legacy local agent bring-up)
+fn resolve_runtime_url(runtime_kind: &str) -> Result<String> {
+    let explicit = load_first_optional_string_env(&[
+        "AXS_NODE_RUNTIME_URL",
+        "AXS_THOR_RUNTIME_URL",
+        "AXS_SGLANG_URL",
+    ]);
+
+    let kind = runtime_kind.trim().to_ascii_lowercase().replace('-', "_");
+    let can_discover = matches!(kind.as_str(), "ax_engine" | "axengine" | "native");
+    let lan_enabled = ax_serving_discovery::discover_lan_enabled() && can_discover;
+
+    let mut candidates = Vec::new();
+    if explicit.is_none() && lan_enabled {
+        let filter = ax_serving_discovery::filter_from_env();
+        let timeout = ax_serving_discovery::discover_timeout_from_env();
+        tracing::info!(
+            ?timeout,
+            cluster = ?filter.cluster,
+            "AXS_DISCOVER_LAN enabled; browsing for _ax-engine._tcp"
+        );
+        candidates = ax_serving_discovery::browse_engines(timeout, &filter)
+            .context("LAN discovery browse for AX Engine failed")?;
+        if let Ok(selected) = ax_serving_discovery::select_unique_engine(&candidates, &filter) {
+            tracing::info!(
+                base_url = %selected.base_url,
+                instance = %selected.instance_name,
+                model = ?selected.model_id,
+                "resolved AX Engine runtime via LAN discovery"
+            );
+        }
+    }
+
+    let filter = ax_serving_discovery::filter_from_env();
+    let resolved = ax_serving_discovery::resolve_base_url(
+        explicit.as_deref(),
+        lan_enabled && explicit.is_none(),
+        &candidates,
+        &filter,
+        Some(DEFAULT_RUNTIME_URL),
+        ax_serving_discovery::ResolveRole::Engine,
+    )?;
+    Ok(resolved)
 }
 
 fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
@@ -302,18 +378,13 @@ impl ThorConfig {
         if !matches!(tls_profile.as_str(), "loopback_dev" | "trusted_mesh") {
             bail!("invalid AXS_TLS_PROFILE: expected loopback_dev or trusted_mesh");
         }
-        let runtime_url = load_first_optional_string_env(&[
-            "AXS_NODE_RUNTIME_URL",
-            "AXS_THOR_RUNTIME_URL",
-            "AXS_SGLANG_URL",
-        ])
-        .unwrap_or_else(|| DEFAULT_RUNTIME_URL.into());
         let runtime = load_first_optional_string_env(&[
             "AXS_NODE_RUNTIME",
             "AXS_THOR_RUNTIME",
             "AXS_THOR_BACKEND",
         ])
         .unwrap_or_else(|| DEFAULT_RUNTIME.into());
+        let runtime_url = resolve_runtime_url(&runtime)?;
         let runtime_version =
             load_optional_string_env("AXS_RUNTIME_VERSION").unwrap_or_else(|| "unknown".into());
         let listen_addr: SocketAddr =

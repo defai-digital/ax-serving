@@ -81,6 +81,47 @@ AXS_NODE_MAX_INFLIGHT=8 \
 target/release/ax-runtime-agent
 ```
 
+### LAN discovery (lab / home)
+
+On a multi-Mac LAN, engines and the gateway can advertise via mDNS so agents
+resolve URLs without hard-coding IPs. This is **not** exo-style model sharding —
+each engine still serves whole models; the gateway routes whole requests.
+
+```bash
+# Gateway Mac — advertise control plane `_ax-serving-gateway._tcp` on internal port
+ax-serving-api --host 0.0.0.0 --port 18080 \
+  --internal-port 19090 \
+  --advertise-lan --lan-cluster home-lab
+# (set orchestrator.internal_bind_addr to a non-loopback host in config/env)
+
+# Mac Studio — bind on LAN and advertise DNS-SD `_ax-engine._tcp`
+ax-engine-server --host 0.0.0.0 --port 8080 \
+  --mlx --mlx-model-artifacts-dir /path/to/artifacts \
+  --api-key "$AX_ENGINE_API_KEY" \
+  --advertise-lan --lan-cluster home-lab
+
+# Operator laptop — list peers
+ax-servingctl discover --role all --cluster home-lab --verify --json
+
+# Agent (can resolve both control plane and engine when env URLs are unset)
+AXS_DISCOVER_LAN=1 \
+AXS_DISCOVER_LAN_CLUSTER=home-lab \
+AXS_NODE_RUNTIME=ax_engine \
+AXS_RUNTIME_API_KEY=$AX_ENGINE_API_KEY \
+AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
+AXS_NODE_ADVERTISED_ADDR=<routable-host>:18081 \
+AXS_DISPATCH_TOKEN=$DISPATCH \
+AXS_TLS_PROFILE=trusted_mesh \
+target/release/ax-runtime-agent
+```
+
+Leave `AXS_NODE_RUNTIME_URL` / `AXS_CONTROL_PLANE_URL` unset when using
+`AXS_DISCOVER_LAN=1`. If several peers match, set
+`AXS_DISCOVER_LAN_INSTANCE`, `AXS_DISCOVER_LAN_GATEWAY_INSTANCE`, or
+`AXS_DISCOVER_LAN_INSTANCE_ID`. See
+`docs/designs/ax-engine-integration-and-lan-discovery-2026-07-14.md` and
+`ax-engine` `docs/LAN-DISCOVERY.md`.
+
 The agent does not link the runtime SDK. It discovers readiness, inventory,
 capabilities, and common metrics over HTTP, then proxies request and stream
 bytes. Runtime credentials use `AXS_RUNTIME_API_KEY`; client credentials are

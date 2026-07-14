@@ -90,6 +90,29 @@ enum Command {
         #[command(subcommand)]
         command: ProbeCommand,
     },
+    /// Browse the local LAN for AX Engine / gateway mDNS advertisements.
+    Discover {
+        /// DNS-SD role to browse: `engine` (default), `gateway`, or `all`.
+        #[arg(long, default_value = "engine")]
+        role: String,
+        /// Optional cluster / namespace filter (matches TXT `cluster`).
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Substring filter on DNS-SD instance name.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Exact TXT `instance` id filter.
+        #[arg(long)]
+        instance_id: Option<String>,
+        /// Browse window in seconds (default 3).
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+        /// Optionally HTTP-verify each engine via `GET /v1/discovery`.
+        #[arg(long, default_value_t = false)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,5 +314,14 @@ fn main() -> Result<()> {
             ProbeCommand::Ready { url } => support::run_probe(url, "readyz"),
             ProbeCommand::Routable { url } => support::run_probe(url, "routablez"),
         },
+        Command::Discover {
+            role,
+            cluster,
+            instance,
+            instance_id,
+            timeout_secs,
+            verify,
+            json,
+        } => support::run_discover(role, cluster, instance, instance_id, timeout_secs, verify, json),
     }
 }

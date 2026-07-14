@@ -1,0 +1,16 @@
+[package]
+name = "ax-serving-discovery"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+description = "LAN mDNS/DNS-SD browse helpers for AX Engine and AX Serving gateway discovery"
+
+[dependencies]
+anyhow = { workspace = true }
+mdns-sd = "0.11"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

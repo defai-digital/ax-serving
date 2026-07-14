@@ -62,6 +62,23 @@ struct Cli {
     /// Overrides AXS_DISPATCH_POLICY.
     #[arg(long)]
     policy: Option<String>,
+
+    /// Opt-in mDNS advertise of the *internal* control plane
+    /// (`_ax-serving-gateway._tcp`) so agents can resolve AXS_CONTROL_PLANE_URL.
+    #[arg(long, default_value_t = false)]
+    advertise_lan: bool,
+
+    /// Optional cluster / namespace TXT label for LAN isolation.
+    #[arg(long)]
+    lan_cluster: Option<String>,
+
+    /// DNS-SD instance name (default: hostname or ax-serving-gateway).
+    #[arg(long)]
+    lan_instance_name: Option<String>,
+
+    /// IPv4 published in mDNS (default: detected private address).
+    #[arg(long)]
+    lan_advertise_host: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -73,8 +90,8 @@ fn main() -> Result<()> {
 
     // Load config from YAML (with env-var overrides).
     let mut serve_config = ServeConfig::load_default()?;
-    if let Some(h) = cli.host {
-        serve_config.orchestrator.host = h;
+    if let Some(ref h) = cli.host {
+        serve_config.orchestrator.host = h.clone();
     }
     if let Some(p) = cli.port {
         serve_config.orchestrator.port = p;
@@ -82,14 +99,17 @@ fn main() -> Result<()> {
     if let Some(p) = cli.internal_port {
         serve_config.orchestrator.internal_port = p;
     }
-    if let Some(pol) = cli.policy {
-        serve_config.orchestrator.dispatch_policy = pol;
+    if let Some(ref pol) = cli.policy {
+        serve_config.orchestrator.dispatch_policy = pol.clone();
     }
     serve_config.validate()?;
 
     let config = serve_config.orchestrator;
     let license_config = serve_config.license;
     let project_policy = serve_config.project_policy;
+
+    // Keep advertiser alive for process lifetime (agents browse internal port).
+    let _lan = maybe_start_gateway_advertise(&cli, &config)?;
 
     eprintln!(
         "[ax-serving-api] starting: mode=direct public={}:{} internal={}:{} policy={}",
@@ -104,4 +124,74 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(start_orchestrator(config, license_config, project_policy))
+}
+
+fn maybe_start_gateway_advertise(
+    cli: &Cli,
+    config: &ax_serving_api::config::OrchestratorConfig,
+) -> Result<Option<ax_serving_discovery::LanAdvertiser>> {
+    let advertise = cli.advertise_lan
+        || ax_serving_discovery::env_truthy("AXS_ADVERTISE_LAN")
+        || ax_serving_discovery::env_truthy("AXS_GATEWAY_ADVERTISE_LAN");
+    if !advertise {
+        return Ok(None);
+    }
+
+    let bind_host = config.internal_bind_addr.as_str();
+    if matches!(bind_host, "127.0.0.1" | "localhost" | "::1") {
+        anyhow::bail!(
+            "--advertise-lan requires a non-loopback orchestrator.internal_bind_addr \
+             (agents must reach the control plane from the LAN)"
+        );
+    }
+
+    let explicit_host = cli
+        .lan_advertise_host
+        .clone()
+        .or_else(|| std::env::var("AXS_LAN_ADVERTISE_HOST").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let advertise_ip =
+        ax_serving_discovery::pick_advertise_ipv4(explicit_host.as_deref(), bind_host)?;
+    let cluster = cli
+        .lan_cluster
+        .clone()
+        .or_else(|| std::env::var("AXS_LAN_CLUSTER").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let instance_name = cli
+        .lan_instance_name
+        .clone()
+        .or_else(|| std::env::var("AXS_LAN_INSTANCE_NAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ax-serving-gateway".into());
+    let instance_id = format!(
+        "axsgw-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let auth_required = std::env::var("AXS_WORKER_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("AXS_INTERNAL_API_TOKEN").ok())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let advertiser = ax_serving_discovery::LanAdvertiser::start_gateway(
+        &instance_name,
+        config.internal_port,
+        advertise_ip,
+        env!("CARGO_PKG_VERSION"),
+        auth_required,
+        cluster,
+        instance_id,
+    )?;
+    eprintln!(
+        "[ax-serving-api] LAN mDNS advertise on {advertise_ip}:{} (_ax-serving-gateway._tcp)",
+        config.internal_port
+    );
+    Ok(Some(advertiser))
 }

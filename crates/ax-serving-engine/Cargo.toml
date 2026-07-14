@@ -12,7 +12,15 @@ metal = []
 libllama = []
 
 [dependencies]
-# ax-engine native backend.
+# ax-engine native backend (embedded-compat only).
+#
+# Best-practice production path is HTTP runtime-node:
+#   ax-engine-server + ax-runtime-agent + portable ax-serving-api
+# See docs/designs/ax-engine-integration-and-lan-discovery-2026-07-14.md
+#
+# Pin is deliberate; bump only after a certification matrix. For local co-dev
+# against a sibling checkout, override with a path dependency:
+#   ax-engine-sdk = { path = "../../ax-engine/crates/ax-engine-sdk", features = ["mlx-native"] }
 ax-engine-sdk = { git = "https://github.com/defai-digital/ax-engine.git", tag = "v4.10.0", features = ["mlx-native"] }
 # Async runtime
 tokio = { workspace = true }

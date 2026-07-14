@@ -28,6 +28,7 @@ required-features = ["gateway"]
 ax-serving-engine = { path = "../ax-serving-engine", optional = true }
 ax-serving-api = { path = "../ax-serving-api", default-features = false }
 ax-serving-observability = { path = "../ax-serving-observability" }
+ax-serving-discovery = { path = "../ax-serving-discovery" }
 
 tokio = { workspace = true }
 clap = { workspace = true }

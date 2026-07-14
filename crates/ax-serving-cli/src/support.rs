@@ -2157,3 +2157,180 @@ pub fn run_probe(base_url: String, probe: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Browse LAN mDNS advertisements for AX Engine / gateway services.
+pub fn run_discover(
+    role: String,
+    cluster: Option<String>,
+    instance: Option<String>,
+    instance_id: Option<String>,
+    timeout_secs: u64,
+    verify: bool,
+    json: bool,
+) -> Result<()> {
+    use ax_serving_discovery::{BrowseFilter, DiscoveredKind, DiscoveredService};
+
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let filter = BrowseFilter {
+        cluster,
+        instance_name: instance,
+        instance_id,
+        kind: None,
+    };
+
+    let role = role.trim().to_ascii_lowercase();
+    let mut services: Vec<DiscoveredService> = Vec::new();
+    match role.as_str() {
+        "engine" | "ax_engine" | "ax-engine" => {
+            services.extend(ax_serving_discovery::browse_engines(timeout, &filter)?);
+        }
+        "gateway" | "ax_serving_gateway" | "ax-serving-gateway" => {
+            services.extend(ax_serving_discovery::browse_gateways(timeout, &filter)?);
+        }
+        "all" => {
+            services.extend(ax_serving_discovery::browse_engines(timeout, &filter)?);
+            services.extend(ax_serving_discovery::browse_gateways(timeout, &filter)?);
+        }
+        other => anyhow::bail!("unknown discover role '{other}'; expected engine, gateway, or all"),
+    }
+
+    let client = if verify {
+        Some(
+            Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .context("failed to build HTTP client for discovery verify")?,
+        )
+    } else {
+        None
+    };
+
+    #[derive(Serialize)]
+    struct DiscoverRow {
+        kind: String,
+        instance_name: String,
+        base_url: String,
+        port: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cluster: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verify_status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verify_model_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        join_hint: Option<String>,
+    }
+
+    let rows: Vec<DiscoverRow> = services
+        .into_iter()
+        .map(|svc| {
+            let kind = match svc.kind {
+                DiscoveredKind::AxEngine => "ax_engine",
+                DiscoveredKind::AxServingGateway => "ax_serving_gateway",
+                DiscoveredKind::Unknown => "unknown",
+            }
+            .to_string();
+            let mut verify_status = None;
+            let mut verify_model_id = None;
+            if let Some(client) = client.as_ref()
+                && matches!(svc.kind, DiscoveredKind::AxEngine | DiscoveredKind::Unknown)
+            {
+                let url = format!("{}/v1/discovery", svc.base_url.trim_end_matches('/'));
+                match client.get(&url).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        verify_status = Some("ok".into());
+                        if let Ok(body) = resp.json::<Value>() {
+                            verify_model_id = body
+                                .get("model_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                        }
+                    }
+                    Ok(resp) => verify_status = Some(format!("http {}", resp.status().as_u16())),
+                    Err(err) => verify_status = Some(format!("error: {err}")),
+                }
+            }
+            let join_hint = if matches!(svc.kind, DiscoveredKind::AxEngine) {
+                Some(format!(
+                    "AXS_NODE_RUNTIME=ax_engine AXS_NODE_RUNTIME_URL={} AXS_DISCOVER_LAN=0 ax-runtime-agent",
+                    svc.base_url
+                ))
+            } else {
+                None
+            };
+            DiscoverRow {
+                kind,
+                instance_name: svc.instance_name,
+                base_url: svc.base_url,
+                port: svc.port,
+                version: svc.version,
+                model_id: svc.model_id,
+                auth: svc.auth,
+                cluster: svc.cluster,
+                instance_id: svc.instance_id,
+                verify_status,
+                verify_model_id,
+                join_hint,
+            }
+        })
+        .collect();
+
+    #[derive(Serialize)]
+    struct DiscoverReport {
+        command: &'static str,
+        status: &'static str,
+        count: usize,
+        services: Vec<DiscoverRow>,
+    }
+
+    let report = DiscoverReport {
+        command: "ax-servingctl discover",
+        status: if rows.is_empty() {
+            STATUS_FAIL
+        } else {
+            STATUS_OK
+        },
+        count: rows.len(),
+        services: rows,
+    };
+
+    if json {
+        emit_json(&report)?;
+    } else if report.services.is_empty() {
+        println!("No LAN services found (role={role}, timeout={timeout_secs}s).");
+        println!("Ensure ax-engine-server runs with --advertise-lan on a non-loopback bind.");
+    } else {
+        println!("Found {} service(s):", report.count);
+        for row in &report.services {
+            println!(
+                "  [{kind}] {name}  {url}  model={model} auth={auth} cluster={cluster}",
+                kind = row.kind,
+                name = row.instance_name,
+                url = row.base_url,
+                model = row.model_id.as_deref().unwrap_or("-"),
+                auth = row.auth.as_deref().unwrap_or("-"),
+                cluster = row.cluster.as_deref().unwrap_or("-"),
+            );
+            if let Some(status) = &row.verify_status {
+                println!(
+                    "           verify={status} verify_model={}",
+                    row.verify_model_id.as_deref().unwrap_or("-")
+                );
+            }
+            if let Some(hint) = &row.join_hint {
+                println!("           join: {hint}");
+            }
+        }
+    }
+    // Empty browse is a soft failure for operators/scripts.
+    exit_if(report.count == 0);
+    Ok(())
+}
