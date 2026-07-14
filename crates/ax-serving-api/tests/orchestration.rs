@@ -3,19 +3,21 @@
 //! Each test spins up real in-process axum servers bound to ephemeral ports
 //! so that `DirectDispatcher` exercises actual HTTP round-trips.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 use ax_serving_api::orchestration::{
     LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     direct::DirectDispatcher,
     fleet_state::{FleetStateStore, MemoryFleetStateStore},
     internal_routes::{
-        InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
-        router as internal_router,
+        InternalAuthState, InternalState, parse_allowed_node_cidrs, router as internal_router,
     },
     policy::{DispatchContext, DispatchPolicy, policy_from_str},
     queue::{AcquireResult, GlobalQueue, GlobalQueueConfig, OverloadPolicy},
@@ -33,237 +35,9 @@ use ax_serving_protocol::{
     RuntimeModelDescriptor, RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId,
     WorkerDescriptor as ProtocolWorkerDescriptor, WorkerId as ProtocolWorkerId, WorkerInstanceId,
 };
-use axum::{Router, middleware, routing::post};
+use axum::{Router, middleware};
 use reqwest::Client;
 use tower::ServiceExt;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct TestConfigHome {
-    _guard: MutexGuard<'static, ()>,
-    _dir: tempfile::TempDir,
-    previous_xdg: Option<std::ffi::OsString>,
-    previous_home: Option<std::ffi::OsString>,
-}
-
-impl TestConfigHome {
-    fn new() -> Self {
-        let guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let previous_home = std::env::var_os("HOME");
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            std::env::set_var("HOME", dir.path());
-        }
-        Self {
-            _guard: guard,
-            _dir: dir,
-            previous_xdg,
-            previous_home,
-        }
-    }
-}
-
-impl Drop for TestConfigHome {
-    fn drop(&mut self) {
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            match &self.previous_xdg {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-}
-
-struct EnvVarsGuard {
-    _guard: MutexGuard<'static, ()>,
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvVarsGuard {
-    fn new() -> Self {
-        let guard = ENV_LOCK.lock().unwrap();
-        Self {
-            _guard: guard,
-            previous: Vec::new(),
-        }
-    }
-
-    fn set(&mut self, key: &'static str, value: &str) {
-        self.previous.push((key, std::env::var_os(key)));
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove(&mut self, key: &'static str) {
-        self.previous.push((key, std::env::var_os(key)));
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-}
-
-impl Drop for EnvVarsGuard {
-    fn drop(&mut self) {
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            for (key, previous) in self.previous.iter().rev() {
-                match previous {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
-/// Spawn a minimal axum mock worker on an ephemeral port.
-///
-/// Returns `None` if the loopback socket cannot be bound (e.g. in restricted
-/// sandbox environments). Tests that receive `None` must skip via
-/// `skip_if_no_socket!`.
-///
-/// Every POST to `/v1/chat/completions` returns the given `status` and `body`.
-/// The server runs until the test process exits.
-async fn spawn_mock_worker(status: u16, body: &'static str) -> Option<SocketAddr> {
-    let response = move || async move {
-        axum::response::Response::builder()
-            .status(status)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body))
-            .unwrap()
-    };
-    let app = Router::new()
-        .route("/v1/chat/completions", post(response))
-        .route("/v1/completions", post(response))
-        .route("/v1/embeddings", post(response));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    Some(addr)
-}
-
-async fn spawn_not_admitted_worker() -> Option<SocketAddr> {
-    let response = || async move {
-        axum::response::Response::builder()
-            .status(503)
-            .header("content-type", "application/json")
-            .header("x-ax-admission-state", "not-admitted")
-            .body(axum::body::Body::from(
-                r#"{"error":{"code":"AXS_WORKER_CAPACITY","retryable":true,"phase":"pre_admission"}}"#,
-            ))
-            .unwrap()
-    };
-    let app = Router::new()
-        .route("/v1/chat/completions", post(response))
-        .route("/v1/completions", post(response))
-        .route("/v1/embeddings", post(response));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    Some(addr)
-}
-
-#[derive(Default)]
-struct EchoWorkerState {
-    models: Mutex<Vec<String>>,
-    public_authorization_seen: Mutex<bool>,
-}
-
-async fn spawn_echo_model_worker() -> Option<(SocketAddr, Arc<EchoWorkerState>)> {
-    use axum::Json;
-    use axum::extract::State;
-    use axum::http::HeaderMap;
-
-    async fn echo(
-        State(state): State<Arc<EchoWorkerState>>,
-        headers: HeaderMap,
-        Json(body): Json<serde_json::Value>,
-    ) -> Json<serde_json::Value> {
-        let model = body["model"].as_str().unwrap_or_default().to_string();
-        state.models.lock().unwrap().push(model.clone());
-        if headers.contains_key(axum::http::header::AUTHORIZATION) {
-            *state.public_authorization_seen.lock().unwrap() = true;
-        }
-        Json(serde_json::json!({
-            "id": "echo",
-            "object": "chat.completion",
-            "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
-        }))
-    }
-
-    let state = Arc::new(EchoWorkerState::default());
-    let app = Router::new()
-        .route("/v1/chat/completions", post(echo))
-        .with_state(Arc::clone(&state));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    Some((addr, state))
-}
-
-fn proxy_router_with_key(layer: Arc<OrchestratorLayer>, key: &str) -> Router {
-    layer.set_public_auth_required(true);
-    let mut keys = HashSet::new();
-    keys.insert(key.to_string());
-    ax_serving_api::orchestration::proxy_router(layer)
-        .route_layer(middleware::from_fn_with_state(
-            Arc::new(keys),
-            ax_serving_api::auth::auth_middleware,
-        ))
-        .layer(middleware::from_fn(
-            ax_serving_api::auth::request_id_and_headers_middleware,
-        ))
-}
-
-/// Unwrap a `spawn_mock_worker` / `TcpListener::bind` result, skipping the
-/// test if loopback socket binding is unavailable (e.g. sandbox environments).
-macro_rules! skip_if_no_socket {
-    ($expr:expr) => {
-        match $expr {
-            Some(v) => v,
-            None => {
-                eprintln!("test skipped: loopback socket bind unavailable in this environment");
-                return;
-            }
-        }
-    };
-}
-
-fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
-    RegisterRequest {
-        worker_id: None,
-        addr: addr.to_string(),
-        capabilities: RegisterCapabilities::Legacy(caps.iter().map(|s| s.to_string()).collect()),
-        backend: "native".into(),
-        max_inflight: 8,
-        friendly_name: None,
-        chip_model: None,
-        worker_pool: None,
-        node_class: None,
-        ..Default::default()
-    }
-}
 
 #[tokio::test]
 async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
@@ -354,18 +128,6 @@ fn sample_project_policy(default_project: Option<&str>) -> ProjectPolicyConfig {
             },
         ],
     }
-}
-
-fn reg_req_with_pool(
-    addr: SocketAddr,
-    caps: &[&str],
-    worker_pool: Option<&str>,
-    node_class: Option<&str>,
-) -> RegisterRequest {
-    let mut req = reg_req(addr, caps);
-    req.worker_pool = worker_pool.map(str::to_string);
-    req.node_class = node_class.map(str::to_string);
-    req
 }
 
 struct CountingPolicy {
@@ -3627,67 +3389,6 @@ async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
 }
 
-// ── Overload scenario helpers ─────────────────────────────────────────────────
-
-/// Spawn an `OrchestratorLayer`-backed proxy server on an ephemeral port.
-///
-/// Returns the bound address and an `Arc` to the layer so tests can
-/// manipulate the queue (hold permits, register workers) directly.
-async fn spawn_orchestrator_with_layer(
-    cfg: ax_serving_api::orchestration::OrchestratorConfig,
-) -> Option<(
-    std::net::SocketAddr,
-    Arc<ax_serving_api::orchestration::OrchestratorLayer>,
-)> {
-    use ax_serving_api::orchestration::{OrchestratorLayer, proxy_router};
-    let layer = Arc::new(
-        OrchestratorLayer::new(
-            cfg,
-            ax_serving_api::config::LicenseConfig::default(),
-            ProjectPolicyConfig::default(),
-        )
-        .ok()?,
-    );
-    let router = proxy_router(Arc::clone(&layer));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .ok();
-    });
-    Some((addr, layer))
-}
-
-async fn spawn_internal_router_with_auth(
-    state: InternalState,
-    auth_state: Option<InternalAuthState>,
-) -> Option<SocketAddr> {
-    let app = if let Some(auth_state) = auth_state {
-        internal_router(state).route_layer(middleware::from_fn_with_state(
-            auth_state,
-            internal_auth_middleware,
-        ))
-    } else {
-        internal_router(state)
-    };
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .ok();
-    });
-    Some(addr)
-}
-
 // ── Step 3: Overload scenario tests ───────────────────────────────────────────
 
 /// Queue full (Reject policy) → HTTP 429 + X-Queue-Depth header.
@@ -3942,73 +3643,6 @@ async fn test_generic_5xx_does_not_create_reroute_storm() {
         "generic runtime errors do not prove worker failure"
     );
     assert_eq!(unhealthy, 0);
-}
-
-// ── Step 5: SSE chaos helper ──────────────────────────────────────────────────
-
-/// Spawn a mock worker that returns a streaming SSE response.
-///
-/// Emits `tokens` chunks. If `drop_after` is `Some(n)`, the response body
-/// ends cleanly after `n` chunks (no `[DONE]`), simulating a mid-stream drop.
-/// If `drop_after` is `None`, `tokens` chunks are emitted followed by `[DONE]`.
-async fn spawn_sse_worker(
-    tokens: usize,
-    drop_after: Option<usize>,
-) -> Option<std::net::SocketAddr> {
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        axum::routing::post(move || async move {
-            let emit_count = drop_after.unwrap_or(tokens);
-            let mut chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = (0..emit_count)
-                .map(|i| {
-                    let s = format!(
-                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"tok{i}\"}}}}]}}\n\n"
-                    );
-                    Ok(axum::body::Bytes::from(s))
-                })
-                .collect();
-            if drop_after.is_none() {
-                chunks.push(Ok(axum::body::Bytes::from("data: [DONE]\n\n")));
-            }
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "text/event-stream")
-                .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
-                .unwrap()
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    Some(addr)
-}
-
-async fn spawn_delayed_first_byte_worker(delay: std::time::Duration) -> Option<SocketAddr> {
-    let handler = move || {
-        let delay = delay;
-        async move {
-            let stream = futures::stream::once(async move {
-                tokio::time::sleep(delay).await;
-                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
-                    b"data: {\"choices\":[]}\n\n",
-                ))
-            });
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "text/event-stream")
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap()
-        }
-    };
-    let app = Router::new().route("/v1/chat/completions", post(handler));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    Some(addr)
 }
 
 #[tokio::test]
