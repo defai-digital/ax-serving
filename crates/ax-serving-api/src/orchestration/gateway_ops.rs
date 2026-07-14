@@ -3,6 +3,7 @@
 //! Keep this module free of Axum handlers so unit tests can exercise the pure
 //! state machine without starting listeners.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -200,13 +201,6 @@ impl GatewayOperationalState {
         self.draining.load(Ordering::SeqCst)
     }
 
-    pub fn admit_request(&self) -> Option<AcceptedRequestGuard<'_>> {
-        if self.is_draining() {
-            return None;
-        }
-        Some(AcceptedRequestGuard::new(self))
-    }
-
     pub fn inflight(&self) -> u64 {
         self.accepted_inflight.load(Ordering::Relaxed)
     }
@@ -277,20 +271,41 @@ impl GatewayOperationalState {
 }
 
 /// RAII guard that tracks accepted inference work for drain.
-pub struct AcceptedRequestGuard<'a> {
-    state: &'a GatewayOperationalState,
+///
+/// Owned (`Arc`) so it can be moved into a streaming response body and held
+/// until the stream ends — not only until the Axum handler returns.
+pub struct AcceptedRequestGuard {
+    state: Arc<GatewayOperationalState>,
 }
 
-impl<'a> AcceptedRequestGuard<'a> {
-    fn new(state: &'a GatewayOperationalState) -> Self {
+impl AcceptedRequestGuard {
+    /// Admit one request if the gateway is not draining.
+    ///
+    /// Uses a post-increment drain re-check so concurrent `begin_drain` cannot
+    /// leave newly accepted work counted after the drain bit is set.
+    pub fn try_admit(state: &Arc<GatewayOperationalState>) -> Option<Self> {
+        if state.is_draining() {
+            return None;
+        }
         state.accepted_inflight.fetch_add(1, Ordering::Relaxed);
-        Self { state }
+        // Re-check after the increment so a concurrent begin_drain is observed.
+        if state.is_draining() {
+            state.accepted_inflight.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self {
+            state: Arc::clone(state),
+        })
     }
 }
 
-impl Drop for AcceptedRequestGuard<'_> {
+impl Drop for AcceptedRequestGuard {
     fn drop(&mut self) {
-        self.state.accepted_inflight.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.state.accepted_inflight.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
     }
 }
 
@@ -384,17 +399,36 @@ mod tests {
 
     #[test]
     fn drain_blocks_admission_and_readyz() {
-        let state = ops(ReadyzMode::ControlPlane);
+        let state = Arc::new(ops(ReadyzMode::ControlPlane));
         state.mark_config_validated();
         state.mark_listeners_ready();
-        let guard = state.admit_request().expect("admit");
+        let guard = AcceptedRequestGuard::try_admit(&state).expect("admit");
         assert_eq!(state.inflight(), 1);
         state.begin_drain();
-        assert!(state.admit_request().is_none());
+        assert!(AcceptedRequestGuard::try_admit(&state).is_none());
         let assessment = state.ready_assessment(1_000_000, 0);
         assert!(!assessment.ready);
         assert_eq!(assessment.reason.as_deref(), Some("draining"));
         drop(guard);
+        assert_eq!(state.inflight(), 0);
+    }
+
+    #[test]
+    fn admission_guard_is_owned_and_survives_handler_return_semantics() {
+        // Streaming responses must keep the guard after the handler returns.
+        // An owned Arc-backed guard can be moved into a stream task; a borrow
+        // tied to the handler stack cannot.
+        let state = Arc::new(ops(ReadyzMode::ControlPlane));
+        let guard = AcceptedRequestGuard::try_admit(&state).expect("admit");
+        assert_eq!(state.inflight(), 1);
+        let moved = std::thread::spawn(move || {
+            // Guard still owns the slot across the move (stream body analogue).
+            guard
+        })
+        .join()
+        .expect("join");
+        assert_eq!(state.inflight(), 1);
+        drop(moved);
         assert_eq!(state.inflight(), 0);
     }
 

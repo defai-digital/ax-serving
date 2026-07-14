@@ -50,18 +50,17 @@ impl WorkerEndpoint {
                 return Err("advertise endpoint uses a disallowed destination address".into());
             }
         } else {
-            // Basic DNS hostname validation (labels, no spaces).
+            // DNS hostnames only (IPv6 literals are handled above via IpAddr).
+            // Labels: alphanumeric and hyphen; dots separate labels; no underscores.
             if host.contains(' ')
                 || host.starts_with('.')
                 || host.ends_with('.')
+                || host.contains("..")
                 || !host
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
             {
-                // Allow bracketed IPv6 host forms already handled by Url; reject junk.
-                if !host.starts_with('[') {
-                    return Err("advertise endpoint host is not a valid DNS name or IP".into());
-                }
+                return Err("advertise endpoint host is not a valid DNS name or IP".into());
             }
         }
         let port = url
@@ -198,6 +197,9 @@ mod tests {
         assert!(WorkerEndpoint::parse("http://0.0.0.0:18081").is_err());
         assert!(WorkerEndpoint::parse("http://10.0.0.1:18081/v1").is_err());
         assert!(WorkerEndpoint::parse("http://user:pass@10.0.0.1:18081").is_err());
+        assert!(WorkerEndpoint::parse("http://169.254.1.1:18081").is_err());
+        assert!(WorkerEndpoint::parse("http://not a host:18081").is_err());
+        assert!(WorkerEndpoint::parse("http://bad_host:18081").is_err());
     }
 
     #[test]

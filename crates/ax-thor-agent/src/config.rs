@@ -189,13 +189,17 @@ fn parse_advertised_url(raw: &str) -> Result<String> {
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("advertised URL is missing a host"))?;
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && ip.is_unspecified()
-    {
-        bail!(
-            "advertised address {candidate} is a wildcard; set \
-             AXS_NODE_ADVERTISED_URL or AXS_NODE_ADVERTISED_ADDR to a routable host"
-        );
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let link_local = match ip {
+            std::net::IpAddr::V4(v4) => v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+        };
+        if ip.is_unspecified() || ip.is_multicast() || link_local {
+            bail!(
+                "advertised address {candidate} is not routable (wildcard, multicast, or link-local); set \
+                 AXS_NODE_ADVERTISED_URL or AXS_NODE_ADVERTISED_ADDR to a routable host"
+            );
+        }
     }
     let port = url
         .port_or_known_default()
@@ -504,6 +508,18 @@ mod tests {
     fn parse_advertised_url_accepts_dns_host() {
         let url = parse_advertised_url("https://agent.runtime.svc.cluster.local:18443").unwrap();
         assert_eq!(url, "https://agent.runtime.svc.cluster.local:18443");
+    }
+
+    #[test]
+    fn parse_advertised_url_rejects_link_local_and_multicast() {
+        let err = parse_advertised_url("http://169.254.10.1:18081")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not routable"), "got: {err}");
+        let err = parse_advertised_url("http://224.0.0.1:18081")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not routable"), "got: {err}");
     }
 
     #[test]

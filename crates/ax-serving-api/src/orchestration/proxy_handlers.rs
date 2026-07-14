@@ -67,7 +67,9 @@ async fn proxy_inference(
     worker_path: &'static str,
     request_id: ax_serving_protocol::RequestId,
 ) -> axum::response::Response {
-    let Some(_admission_guard) = layer.ops.admit_request() else {
+    let Some(admission_guard) =
+        super::gateway_ops::AcceptedRequestGuard::try_admit(&layer.ops)
+    else {
         let mut response = ax_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             request_id,
@@ -436,15 +438,18 @@ async fn proxy_inference(
     }
 
     // For streaming responses the body is delivered lazily after this handler
-    // returns.  Carry the permit inside the body stream so the global
-    // concurrency slot is held until the stream ends or the client disconnects.
-    // This matches the non-streaming path semantics: forward() buffers the full
-    // body before returning, so the permit there is held for the entire
-    // inference duration as well.
+    // returns. Carry the queue/tenant permits AND the drain admission guard
+    // inside the body stream so both concurrency accounting and drain
+    // inflight stay held until the stream ends or the client disconnects.
+    // Non-streaming path: forward() buffers the full body before returning, so
+    // dropping permits here still covers the full inference duration.
     if stream {
         let (parts, old_body) = resp.into_parts();
         let guarded = futures::stream::unfold(
-            (old_body.into_data_stream(), Some((permit, tenant_permit))),
+            (
+                old_body.into_data_stream(),
+                Some((permit, tenant_permit, admission_guard)),
+            ),
             |(mut data_stream, permits): (BodyDataStream, Option<_>)| async move {
                 use futures::StreamExt as _;
                 match data_stream.next().await {
@@ -460,6 +465,7 @@ async fn proxy_inference(
     } else {
         drop(permit);
         drop(tenant_permit);
+        drop(admission_guard);
         resp
     }
 }

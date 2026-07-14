@@ -63,8 +63,14 @@ app.kubernetes.io/component: gateway
 {{- if le (int .Values.gateway.terminationGracePeriodSeconds) $hard -}}
 {{- fail "gateway.terminationGracePeriodSeconds must be greater than gateway.shutdown.hardSeconds" -}}
 {{- end -}}
-{{- if and (gt (int .Values.gateway.replicaCount) 1) (eq (default "memory" .Values.config.inline.orchestrator.fleet_store) "memory") (empty .Values.config.existingConfigMap) -}}
-{{- fail "replicaCount > 1 requires orchestrator.fleet_store=redis (shared fleet state)" -}}
+{{- /* Multi-replica gateways require shared fleet state. Prefer explicit
+     fleet_store=redis/valkey; redis.existingSecret is accepted as operator
+     proof of a shared store when config is supplied via existingConfigMap. */ -}}
+{{- if gt (int .Values.gateway.replicaCount) 1 -}}
+{{- $store := default "memory" .Values.config.inline.orchestrator.fleet_store | toString | lower -}}
+{{- if and (ne $store "redis") (ne $store "valkey") (empty .Values.redis.existingSecret) -}}
+{{- fail "replicaCount > 1 requires orchestrator.fleet_store=redis|valkey or redis.existingSecret" -}}
+{{- end -}}
 {{- end -}}
 {{- if and .Values.production.enabled (empty .Values.secrets.existingSecret) -}}
 {{- fail "production.enabled requires secrets.existingSecret" -}}
