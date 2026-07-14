@@ -6,13 +6,15 @@
 //! cannot remove a recovered worker.
 
 use super::super::worker_endpoint::WorkerEndpoint;
-use super::WorkerRegistry;
 use super::types::{WorkerHealth, WorkerId};
+use super::WorkerRegistry;
 
 impl WorkerRegistry {
     /// Remove a worker entirely (drain-complete or explicit eviction).
     pub fn evict(&self, id: WorkerId) {
-        self.inner.remove(&id);
+        if let Some((_, entry)) = self.inner.remove(&id) {
+            self.unindex_worker(id, &entry.capabilities.models);
+        }
         self.protocol_sessions
             .retain(|_, session| session.internal_id != id);
     }
@@ -24,17 +26,17 @@ impl WorkerRegistry {
     /// before the probe result returns, so failed probes must not evict a worker
     /// that has already recovered or moved to a different address.
     pub fn evict_if_unhealthy_at_addr(&self, id: WorkerId, addr: &WorkerEndpoint) -> bool {
-        let removed = self
-            .inner
-            .remove_if(&id, |_, entry| {
-                &entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
-            })
-            .is_some();
-        if removed {
+        let removed = self.inner.remove_if(&id, |_, entry| {
+            &entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
+        });
+        if let Some((_, entry)) = removed {
+            self.unindex_worker(id, &entry.capabilities.models);
             self.protocol_sessions
                 .retain(|_, session| session.internal_id != id);
+            true
+        } else {
+            false
         }
-        removed
     }
 
     // ── Health ticker ─────────────────────────────────────────────────────────
@@ -81,16 +83,18 @@ impl WorkerRegistry {
 
         // Second pass: remove only entries that are still stale. This closes the
         // race where a heartbeat or re-registration refreshes the worker after
-        // the first pass but before removal.
+        // the first pass but before removal. Unindex only on successful remove.
         for id in &evicted {
-            self.inner.remove_if(id, |_, entry| {
+            if let Some((_, entry)) = self.inner.remove_if(id, |_, entry| {
                 let age_ms = entry.last_heartbeat.elapsed().as_millis() as u64;
                 if entry.drain {
                     age_ms > ttl_ms
                 } else {
                     age_ms > ttl_ms && matches!(entry.health, WorkerHealth::Dead)
                 }
-            });
+            }) {
+                self.unindex_worker(*id, &entry.capabilities.models);
+            }
         }
 
         if !evicted.is_empty() {

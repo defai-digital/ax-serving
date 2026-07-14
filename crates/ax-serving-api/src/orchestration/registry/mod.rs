@@ -17,6 +17,7 @@
 
 mod eligibility;
 mod health_tick;
+mod index;
 mod legacy_register;
 mod normalize;
 mod protocol_session;
@@ -30,6 +31,7 @@ pub use types::{
     WorkerStatus,
 };
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -63,10 +65,18 @@ const MAX_WORKER_INFLIGHT: usize = 1_000_000;
 /// The only operation that must touch all entries is `tick()` (health eviction);
 /// it iterates every shard with `iter_mut()`, collecting dead IDs, then removes
 /// them in a second pass.
+///
+/// # Model secondary index
+///
+/// `by_model` maps post-normalization model ids → set of advertising
+/// [`WorkerId`]s (membership only). Selection clones candidates then applies
+/// live fail-closed filters. Disable via `AXS_WORKER_MODEL_INDEX=0` (full scan).
 #[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<DashMap<WorkerId, WorkerEntry>>,
     protocol_sessions: Arc<DashMap<ProtocolWorkerId, ProtocolSession>>,
+    /// model_id → workers that advertise it (post-normalization capabilities.models).
+    by_model: Arc<DashMap<String, HashSet<WorkerId>>>,
 }
 
 impl WorkerRegistry {
@@ -74,6 +84,7 @@ impl WorkerRegistry {
         Self {
             inner: Arc::new(DashMap::new()),
             protocol_sessions: Arc::new(DashMap::new()),
+            by_model: Arc::new(DashMap::new()),
         }
     }
 }
@@ -2434,5 +2445,352 @@ mod tests {
         ));
         assert_eq!(registry.eligible_workers("m1").len(), 1);
         assert_eq!(registry.get_snapshot(id).unwrap().runtime_ready, Some(true));
+    }
+
+    // ── Model secondary index ─────────────────────────────────────────────────
+
+    fn worker_id_set(workers: &[WorkerStatus]) -> HashSet<WorkerId> {
+        workers.iter().map(|w| w.id).collect()
+    }
+
+    fn endpoint_id_set(endpoints: &[WorkerModelEndpoint]) -> HashSet<WorkerId> {
+        endpoints.iter().map(|e| e.worker.id).collect()
+    }
+
+    fn id_set(ids: impl IntoIterator<Item = WorkerId>) -> HashSet<WorkerId> {
+        ids.into_iter().collect()
+    }
+
+    #[test]
+    fn model_index_consistent_after_register_and_reregister() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1", "m2"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+
+        // Re-register with a different model set (add m3, drop m2).
+        r.register(
+            RegisterRequest {
+                worker_id: Some(id.to_string()),
+                ..reg_req("127.0.0.1:8081", &["m1", "m3"], 4)
+            },
+            5000,
+        );
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("m1")), id_set([id]));
+        assert!(r.eligible_workers("m2").is_empty());
+        assert_eq!(worker_id_set(&r.eligible_workers("m3")), id_set([id]));
+    }
+
+    #[test]
+    fn empty_heartbeat_clears_models_from_index() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1", "m2"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+        assert!(!r.eligible_workers("m1").is_empty());
+
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                // Empty model_ids clears all models from capabilities.
+                model_ids: vec![],
+                ..Default::default()
+            },
+        ));
+        r.assert_index_consistent();
+        assert!(r.eligible_workers("m1").is_empty());
+        assert!(r.eligible_workers("m2").is_empty());
+        assert!(r.by_model.get("m1").is_none());
+        assert!(r.by_model.get("m2").is_none());
+    }
+
+    #[test]
+    fn tick_and_evict_remove_from_index() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+
+        r.evict(id);
+        r.assert_index_consistent();
+        assert!(r.eligible_workers("m1").is_empty());
+        assert!(r.by_model.get("m1").is_none());
+
+        let r2 = WorkerRegistry::new();
+        r2.register(reg_req("127.0.0.1:8082", &["m2"], 4), 5000);
+        r2.assert_index_consistent();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let evicted = r2.tick(1);
+        assert!(!evicted.is_empty());
+        r2.assert_index_consistent();
+        assert!(r2.eligible_workers("m2").is_empty());
+        assert!(r2.by_model.get("m2").is_none());
+    }
+
+    #[test]
+    fn evict_if_unhealthy_at_addr_unindexes() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.mark_unhealthy(id);
+        let addr = r.get_snapshot(id).unwrap().addr.clone();
+        let endpoint = crate::orchestration::worker_endpoint::WorkerEndpoint::parse(&addr)
+            .expect("registered addr");
+        assert!(r.evict_if_unhealthy_at_addr(id, &endpoint));
+        r.assert_index_consistent();
+        assert!(r.by_model.get("m1").is_none());
+    }
+
+    #[test]
+    fn indexed_selection_set_equals_full_scan_oracle() {
+        let r = WorkerRegistry::new();
+        let blue = WorkerId::parse(
+            &r.register(
+                RegisterRequest {
+                    worker_pool: Some("blue".into()),
+                    ..reg_req("127.0.0.1:8081", &["m1", "shared"], 4)
+                },
+                5000,
+            )
+            .worker_id,
+        )
+        .unwrap();
+        let green = WorkerId::parse(
+            &r.register(
+                RegisterRequest {
+                    worker_pool: Some("green".into()),
+                    ..reg_req("127.0.0.1:8082", &["m1"], 4)
+                },
+                5000,
+            )
+            .worker_id,
+        )
+        .unwrap();
+        let _other = r.register(reg_req("127.0.0.1:8083", &["other"], 2), 5000);
+        r.assert_index_consistent();
+
+        let indexed = r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, None, None);
+        let oracle = r.dispatch_workers_filtered_full_scan(
+            "m1",
+            RequestKind::Llm,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(worker_id_set(&indexed), worker_id_set(&oracle));
+        assert_eq!(worker_id_set(&indexed), id_set([blue, green]));
+
+        // Preferred pool partition: set equality (order may differ).
+        let preferred =
+            r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, Some("blue"), None);
+        let preferred_oracle = r.dispatch_workers_filtered_full_scan(
+            "m1",
+            RequestKind::Llm,
+            None,
+            None,
+            Some("blue"),
+            false,
+            None,
+        );
+        assert_eq!(worker_id_set(&preferred), worker_id_set(&preferred_oracle));
+        assert_eq!(worker_id_set(&preferred), id_set([blue]));
+
+        // eligible_model_endpoints (inventory-backed workers only match when inventory has the model).
+        // Legacy caps alone may not populate inventory — register with inventory for endpoint path.
+        let r_ep = WorkerRegistry::new();
+        let inv = vec![crate::orchestration::registry::ModelInventoryEntry {
+            id: "m1".into(),
+            max_context: Some(8192),
+            max_output_tokens: Some(2048),
+            modalities: vec!["text".into()],
+            protocol_capabilities: vec![],
+            supported_operations: vec!["llm".into()],
+            ..Default::default()
+        }];
+        let ep_id = WorkerId::parse(
+            &r_ep
+                .register(
+                    RegisterRequest {
+                        capabilities: RegisterCapabilities::Structured(
+                            crate::orchestration::registry::WorkerCapabilities {
+                                llm: true,
+                                embedding: false,
+                                vision: false,
+                                models: vec!["m1".into()],
+                                max_context: Some(8192),
+                            },
+                        ),
+                        model_inventory: inv.clone(),
+                        addr: "127.0.0.1:8090".into(),
+                        backend: "native".into(),
+                        max_inflight: 4,
+                        ..Default::default()
+                    },
+                    5000,
+                )
+                .worker_id,
+        )
+        .unwrap();
+        r_ep.register(
+            RegisterRequest {
+                capabilities: RegisterCapabilities::Structured(
+                    crate::orchestration::registry::WorkerCapabilities {
+                        llm: true,
+                        embedding: false,
+                        vision: false,
+                        models: vec!["m2".into()],
+                        max_context: Some(8192),
+                    },
+                ),
+                model_inventory: vec![crate::orchestration::registry::ModelInventoryEntry {
+                    id: "m2".into(),
+                    max_context: Some(8192),
+                    modalities: vec!["text".into()],
+                    supported_operations: vec!["llm".into()],
+                    ..Default::default()
+                }],
+                addr: "127.0.0.1:8091".into(),
+                backend: "native".into(),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5000,
+        );
+        r_ep.assert_index_consistent();
+
+        let modalities = BTreeSet::from(["text".to_string()]);
+        let caps = BTreeSet::new();
+        let indexed_ep = r_ep.eligible_model_endpoints(
+            "m1",
+            RequestKind::Llm,
+            None,
+            None,
+            None,
+            &modalities,
+            &caps,
+            None,
+        );
+        let oracle_ep = r_ep.eligible_model_endpoints_full_scan(
+            "m1",
+            RequestKind::Llm,
+            None,
+            None,
+            None,
+            &modalities,
+            &caps,
+            None,
+        );
+        assert_eq!(endpoint_id_set(&indexed_ep), endpoint_id_set(&oracle_ep));
+        assert_eq!(endpoint_id_set(&indexed_ep), id_set([ep_id]));
+    }
+
+    #[test]
+    fn kill_switch_forces_full_scan_selection() {
+        // Isolated: tests run with --test-threads=1 for this module suite.
+        let prev = std::env::var("AXS_WORKER_MODEL_INDEX").ok();
+        // SAFETY: single-threaded test suite for registry; restore on exit.
+        unsafe { std::env::set_var("AXS_WORKER_MODEL_INDEX", "0") };
+
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        // Index is still maintained on mutations even when selection is kill-switched.
+        r.assert_index_consistent();
+        assert!(!index::worker_model_index_enabled());
+
+        let workers = r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, None, None);
+        assert_eq!(worker_id_set(&workers), id_set([id]));
+        assert!(!r.eligible_workers("m1").is_empty());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AXS_WORKER_MODEL_INDEX", v) },
+            None => unsafe { std::env::remove_var("AXS_WORKER_MODEL_INDEX") },
+        }
+    }
+
+    #[test]
+    fn concurrent_heartbeat_model_flip_keeps_index_consistent() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let r = WorkerRegistry::new();
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            let resp = r.register(
+                reg_req(&format!("127.0.0.1:81{i:02}"), &["alpha", "beta"], 4),
+                5000,
+            );
+            ids.push(WorkerId::parse(&resp.worker_id).unwrap());
+        }
+        r.assert_index_consistent();
+
+        let barrier = Arc::new(Barrier::new(ids.len() + 1));
+        let mut handles = Vec::new();
+        for (i, id) in ids.iter().copied().enumerate() {
+            let reg = r.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for round in 0..40 {
+                    let models = if (round + i) % 2 == 0 {
+                        vec!["alpha".into(), "gamma".into()]
+                    } else {
+                        vec!["beta".into()]
+                    };
+                    assert!(reg.heartbeat(
+                        id,
+                        HeartbeatRequest {
+                            model_ids: models,
+                            ..Default::default()
+                        },
+                    ));
+                    // Concurrent selection smoke.
+                    let _ = reg.dispatch_workers_filtered(
+                        "alpha",
+                        RequestKind::Llm,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    let _ = reg.dispatch_workers_filtered(
+                        "beta",
+                        RequestKind::Llm,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }));
+        }
+        barrier.wait();
+        for h in handles {
+            h.join().expect("heartbeat stress thread");
+        }
+        r.assert_index_consistent();
+
+        // Final selection set-equality vs full-scan oracle.
+        for model in ["alpha", "beta", "gamma", "missing"] {
+            let indexed =
+                r.dispatch_workers_filtered(model, RequestKind::Llm, None, None, None, None);
+            let oracle = r.dispatch_workers_filtered_full_scan(
+                model,
+                RequestKind::Llm,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            assert_eq!(
+                worker_id_set(&indexed),
+                worker_id_set(&oracle),
+                "model {model}"
+            );
+        }
     }
 }

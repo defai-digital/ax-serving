@@ -119,9 +119,14 @@ impl WorkerRegistry {
         };
         refresh_capabilities_from_operation_summary(&mut capabilities, &supported_operations);
 
+        // Capture old models under the entry critical section so reindex sees a
+        // coherent (old, new) pair for this worker id.
+        let mut old_models: Vec<String> = Vec::new();
+        let mut new_models: Vec<String> = Vec::new();
         self.inner
             .entry(id)
             .and_modify(|existing| {
+                old_models = existing.capabilities.models.clone();
                 let mut updated_capabilities = capabilities.clone();
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr.clone();
@@ -183,57 +188,64 @@ impl WorkerRegistry {
                 existing.chip_model = chip_model.clone();
                 existing.worker_pool = worker_pool.clone();
                 existing.node_class = node_class.clone();
+                new_models = existing.capabilities.models.clone();
             })
-            .or_insert_with(|| WorkerEntry {
-                id,
-                addr,
-                capabilities,
-                model_inventory,
-                capability_source,
-                backend,
-                runtime,
-                runtime_mode,
-                runtime_version,
-                hardware_class,
-                runtime_endpoint,
-                protocol_worker_id: None,
-                worker_instance_id: None,
-                registration_id: None,
-                trust_domain: None,
-                agent_name: None,
-                supported_operations,
-                supported_operations_explicit: !explicit_supported_operations_empty,
-                max_inflight,
-                inflight: Arc::new(AtomicUsize::new(0)),
-                reported_inflight: 0,
-                health: WorkerHealth::Healthy,
-                last_heartbeat: Instant::now(),
-                runtime_ready: None,
-                runtime_state: None,
-                runtime_status_reason: None,
-                observed_at_unix_ms: None,
-                protocol_version: None,
-                agent_version: None,
-                drain: false,
-                thermal_state: String::new(),
-                rss_bytes: 0,
-                friendly_name,
-                chip_model,
-                worker_pool,
-                node_class,
-                active_sequences: 0,
-                decode_tok_per_sec: 0.0,
-                ttft_p95_ms: 0,
-                queue_depth: 0,
-                error_rate: 0.0,
-                kv_pages_used: 0,
-                kv_pages_total: 0,
-                kv_utilization: None,
-                prefix_reusable_tokens: 0,
-                active_batch_size: 0,
-                max_batch_size: 0,
-                batch_utilization: None,
+            .or_insert_with(|| {
+                new_models = capabilities.models.clone();
+                WorkerEntry {
+                    id,
+                    addr,
+                    capabilities,
+                    model_inventory,
+                    capability_source,
+                    backend,
+                    runtime,
+                    runtime_mode,
+                    runtime_version,
+                    hardware_class,
+                    runtime_endpoint,
+                    protocol_worker_id: None,
+                    worker_instance_id: None,
+                    registration_id: None,
+                    trust_domain: None,
+                    agent_name: None,
+                    supported_operations,
+                    supported_operations_explicit: !explicit_supported_operations_empty,
+                    max_inflight,
+                    inflight: Arc::new(AtomicUsize::new(0)),
+                    reported_inflight: 0,
+                    health: WorkerHealth::Healthy,
+                    last_heartbeat: Instant::now(),
+                    runtime_ready: None,
+                    runtime_state: None,
+                    runtime_status_reason: None,
+                    observed_at_unix_ms: None,
+                    protocol_version: None,
+                    agent_version: None,
+                    drain: false,
+                    thermal_state: String::new(),
+                    rss_bytes: 0,
+                    friendly_name,
+                    chip_model,
+                    worker_pool,
+                    node_class,
+                    active_sequences: 0,
+                    decode_tok_per_sec: 0.0,
+                    ttft_p95_ms: 0,
+                    queue_depth: 0,
+                    error_rate: 0.0,
+                    kv_pages_used: 0,
+                    kv_pages_total: 0,
+                    kv_utilization: None,
+                    prefix_reusable_tokens: 0,
+                    active_batch_size: 0,
+                    max_batch_size: 0,
+                    batch_utilization: None,
+                }
             });
+
+        // Index update after entry write (add-before-remove inside reindex).
+        self.reindex_worker(id, &old_models, &new_models);
 
         RegisterResponse {
             worker_id: id.to_string(),
@@ -243,8 +255,9 @@ impl WorkerRegistry {
 
     /// Record a heartbeat.  Returns `false` if the worker is not registered.
     pub fn heartbeat(&self, id: WorkerId, req: HeartbeatRequest) -> bool {
-        match self.inner.get_mut(&id) {
+        let (old_models, new_models) = match self.inner.get_mut(&id) {
             Some(mut e) => {
+                let old_models = e.capabilities.models.clone();
                 let runtime_ready = req.runtime_ready;
                 let runtime_state = normalize_optional_string(req.runtime_state);
                 let runtime_status_reason = normalize_optional_string(req.runtime_status_reason);
@@ -316,10 +329,14 @@ impl WorkerRegistry {
                 e.active_batch_size = req.active_batch_size;
                 e.max_batch_size = req.max_batch_size;
                 e.batch_utilization = req.batch_utilization.map(ratio_or_zero);
-                true
+                let new_models = e.capabilities.models.clone();
+                (old_models, new_models)
             }
-            None => false,
-        }
+            None => return false,
+        };
+        // Reindex after releasing the entry lock (add-before-remove).
+        self.reindex_worker(id, &old_models, &new_models);
+        true
     }
 
     /// Start graceful drain.  Returns `false` if worker not found.

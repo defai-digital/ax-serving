@@ -1,12 +1,12 @@
 //! Registry eligibility and dispatch candidate queries.
 //!
-//! Full-scan over the worker map (no secondary index yet). Fail-closed
-//! filters live here so a later index PR can plug in without re-touching
-//! mutation paths.
+//! Selection prefers the model→worker secondary index (`by_model`) when
+//! enabled (`AXS_WORKER_MODEL_INDEX`, default on). Candidates are cloned from
+//! the index then live-filtered fail-closed. Kill-switch `0`/`false`/`off`
+//! forces a full scan of `inner`.
 
 use std::collections::BTreeSet;
 
-use super::WorkerRegistry;
 use super::normalize::{
     backend_filter_from_hint, effective_inflight, runtime_filter_from_hint, worker_status_of,
 };
@@ -14,6 +14,7 @@ use super::types::{
     BackendKind, CapabilitySource, ModelInventoryEntry, RequestKind, RuntimeKind, WorkerEntry,
     WorkerHealth, WorkerId, WorkerModelEndpoint, WorkerStatus,
 };
+use super::WorkerRegistry;
 
 impl WorkerRegistry {
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -87,6 +88,237 @@ impl WorkerRegistry {
         let preferred_pool = preferred_pool
             .map(str::trim)
             .filter(|pool| !pool.is_empty());
+
+        let Some(preferred_pool) = preferred_pool else {
+            return self.collect_dispatch_candidates(
+                model_id,
+                request_kind,
+                backend_filter.as_ref(),
+                runtime_filter.as_ref(),
+                min_context,
+                excluded_id,
+            );
+        };
+
+        let mut preferred_workers = Vec::new();
+        let mut fallback_workers = Vec::new();
+
+        self.for_each_model_candidate(model_id, |e| {
+            let in_preferred_pool = e.worker_pool.as_deref() == Some(preferred_pool);
+            let matches_without_exclusion = dispatch_filter_matches(
+                e,
+                model_id,
+                request_kind,
+                backend_filter.as_ref(),
+                runtime_filter.as_ref(),
+                min_context,
+                None,
+            );
+
+            if !matches_without_exclusion {
+                return;
+            }
+            if excluded_id == Some(e.id) {
+                return;
+            }
+
+            let worker = worker_status_of(e);
+            if in_preferred_pool {
+                preferred_workers.push(worker);
+            } else {
+                fallback_workers.push(worker);
+            }
+        });
+
+        if require_preferred_pool || !preferred_workers.is_empty() {
+            preferred_workers
+        } else {
+            fallback_workers
+        }
+    }
+
+    /// Build strict model-scoped endpoint snapshots for explicit deployment routing.
+    ///
+    /// Unlike the legacy compatibility queries, unknown context, output, modality,
+    /// or protocol-capability limits fail closed when the request declares them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eligible_model_endpoints(
+        &self,
+        runtime_model_id: &str,
+        request_kind: RequestKind,
+        runtime_hint: Option<&str>,
+        minimum_context_tokens: Option<u64>,
+        max_output_tokens: Option<u64>,
+        required_modalities: &BTreeSet<String>,
+        required_capabilities: &BTreeSet<ax_serving_protocol::ProtocolCapability>,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerModelEndpoint> {
+        let backend_filter = backend_filter_from_hint(runtime_hint);
+        let runtime_filter = runtime_filter_from_hint(runtime_hint);
+        let mut out = Vec::new();
+        self.for_each_model_candidate(runtime_model_id, |entry| {
+            if !dispatch_filter_matches(
+                entry,
+                runtime_model_id,
+                request_kind,
+                backend_filter.as_ref(),
+                runtime_filter.as_ref(),
+                None,
+                excluded_id,
+            ) || effective_inflight(entry) >= entry.max_inflight
+            {
+                return;
+            }
+            let Some(model) = entry
+                .model_inventory
+                .iter()
+                .find(|model| model.id == runtime_model_id)
+            else {
+                return;
+            };
+            if minimum_context_tokens.is_some_and(|required| {
+                model
+                    .max_context
+                    .map(u64::from)
+                    .is_none_or(|limit| limit < required)
+            }) || max_output_tokens.is_some_and(|required| {
+                model.max_output_tokens.is_none_or(|limit| limit < required)
+            }) || !required_modalities.iter().all(|required| {
+                model
+                    .modalities
+                    .iter()
+                    .any(|observed| observed.eq_ignore_ascii_case(required))
+            }) || !required_capabilities.iter().all(|required| {
+                model
+                    .protocol_capabilities
+                    .iter()
+                    .any(|observed| observed == required.as_str())
+            }) {
+                return;
+            }
+
+            out.push(WorkerModelEndpoint {
+                worker: worker_status_of(entry),
+                worker_pool: entry.worker_pool.clone(),
+                node_class: entry.node_class.clone(),
+                hardware_class: entry.hardware_class.clone(),
+                runtime_kind: entry.runtime.as_str().to_string(),
+                runtime_version: entry.runtime_version.clone(),
+                trust_domain: entry.trust_domain.clone(),
+                protocol_worker_id: entry.protocol_worker_id.clone(),
+                worker_instance_id: entry.worker_instance_id.clone(),
+                registration_id: entry.registration_id.clone(),
+                model: model.clone(),
+            });
+        });
+        out
+    }
+
+    /// Conservative compatibility guard for retries in legacy deployment mode.
+    ///
+    /// Compatibility mode has no operator-certified equivalence graph, so a
+    /// retry may stay only inside the same runtime/pool cohort and must not
+    /// cross any observed model-identity difference.
+    pub fn legacy_retry_compatible(
+        &self,
+        source_id: WorkerId,
+        target_id: WorkerId,
+        model_id: &str,
+    ) -> bool {
+        let Some(source) = self.inner.get(&source_id) else {
+            return false;
+        };
+        let Some(target) = self.inner.get(&target_id) else {
+            return false;
+        };
+        if source.runtime != target.runtime
+            || source.worker_pool != target.worker_pool
+            || (source.trust_domain.is_some() || target.trust_domain.is_some())
+                && source.trust_domain != target.trust_domain
+        {
+            return false;
+        }
+        let source_model = source
+            .model_inventory
+            .iter()
+            .find(|model| model.id == model_id);
+        let target_model = target
+            .model_inventory
+            .iter()
+            .find(|model| model.id == model_id);
+        match (source_model, target_model) {
+            (Some(source), Some(target)) => legacy_model_identity_matches(source, target),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Visit live entries that may advertise `model_id`.
+    ///
+    /// Indexed path: clone candidate ids from `by_model`, then look up `inner`.
+    /// Kill-switch / missing index path: full-scan `inner`.
+    fn for_each_model_candidate(&self, model_id: &str, mut visit: impl FnMut(&WorkerEntry)) {
+        if let Some(candidate_ids) = self.indexed_candidate_ids(model_id) {
+            for id in candidate_ids {
+                let Some(guard) = self.inner.get(&id) else {
+                    // Stale index membership: worker gone; skip (fail-closed).
+                    continue;
+                };
+                visit(guard.value());
+            }
+            return;
+        }
+
+        // Full-scan path (AXS_WORKER_MODEL_INDEX kill-switch).
+        for item in self.inner.iter() {
+            visit(item.value());
+        }
+    }
+
+    fn collect_dispatch_candidates(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_filter: Option<&BackendKind>,
+        runtime_filter: Option<&RuntimeKind>,
+        min_context: Option<u32>,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerStatus> {
+        let mut out = Vec::new();
+        self.for_each_model_candidate(model_id, |e| {
+            if dispatch_filter_matches(
+                e,
+                model_id,
+                request_kind,
+                backend_filter,
+                runtime_filter,
+                min_context,
+                excluded_id,
+            ) {
+                out.push(worker_status_of(e));
+            }
+        });
+        out
+    }
+
+    /// Full-scan oracle used by consistency tests (ignores the secondary index).
+    #[cfg(test)]
+    pub(crate) fn dispatch_workers_filtered_full_scan(
+        &self,
+        model_id: &str,
+        request_kind: RequestKind,
+        backend_hint: Option<&str>,
+        min_context: Option<u32>,
+        preferred_pool: Option<&str>,
+        require_preferred_pool: bool,
+        excluded_id: Option<WorkerId>,
+    ) -> Vec<WorkerStatus> {
+        let backend_filter = backend_filter_from_hint(backend_hint);
+        let runtime_filter = runtime_filter_from_hint(backend_hint);
+        let preferred_pool = preferred_pool
+            .map(str::trim)
+            .filter(|pool| !pool.is_empty());
+
         let Some(preferred_pool) = preferred_pool else {
             return self
                 .inner
@@ -106,9 +338,9 @@ impl WorkerRegistry {
                 })
                 .collect();
         };
+
         let mut preferred_workers = Vec::new();
         let mut fallback_workers = Vec::new();
-
         for r in self.inner.iter() {
             let e = r.value();
             let in_preferred_pool = e.worker_pool.as_deref() == Some(preferred_pool);
@@ -121,14 +353,9 @@ impl WorkerRegistry {
                 min_context,
                 None,
             );
-
-            if !matches_without_exclusion {
+            if !matches_without_exclusion || excluded_id == Some(e.id) {
                 continue;
             }
-            if excluded_id == Some(e.id) {
-                continue;
-            }
-
             let worker = worker_status_of(e);
             if in_preferred_pool {
                 preferred_workers.push(worker);
@@ -136,7 +363,6 @@ impl WorkerRegistry {
                 fallback_workers.push(worker);
             }
         }
-
         if require_preferred_pool || !preferred_workers.is_empty() {
             preferred_workers
         } else {
@@ -144,12 +370,10 @@ impl WorkerRegistry {
         }
     }
 
-    /// Build strict model-scoped endpoint snapshots for explicit deployment routing.
-    ///
-    /// Unlike the legacy compatibility queries, unknown context, output, modality,
-    /// or protocol-capability limits fail closed when the request declares them.
+    /// Full-scan oracle for `eligible_model_endpoints` (ignores secondary index).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn eligible_model_endpoints(
+    pub(crate) fn eligible_model_endpoints_full_scan(
         &self,
         runtime_model_id: &str,
         request_kind: RequestKind,
@@ -218,45 +442,6 @@ impl WorkerRegistry {
                 })
             })
             .collect()
-    }
-
-    /// Conservative compatibility guard for retries in legacy deployment mode.
-    ///
-    /// Compatibility mode has no operator-certified equivalence graph, so a
-    /// retry may stay only inside the same runtime/pool cohort and must not
-    /// cross any observed model-identity difference.
-    pub fn legacy_retry_compatible(
-        &self,
-        source_id: WorkerId,
-        target_id: WorkerId,
-        model_id: &str,
-    ) -> bool {
-        let Some(source) = self.inner.get(&source_id) else {
-            return false;
-        };
-        let Some(target) = self.inner.get(&target_id) else {
-            return false;
-        };
-        if source.runtime != target.runtime
-            || source.worker_pool != target.worker_pool
-            || (source.trust_domain.is_some() || target.trust_domain.is_some())
-                && source.trust_domain != target.trust_domain
-        {
-            return false;
-        }
-        let source_model = source
-            .model_inventory
-            .iter()
-            .find(|model| model.id == model_id);
-        let target_model = target
-            .model_inventory
-            .iter()
-            .find(|model| model.id == model_id);
-        match (source_model, target_model) {
-            (Some(source), Some(target)) => legacy_model_identity_matches(source, target),
-            (None, None) => true,
-            _ => false,
-        }
     }
 }
 

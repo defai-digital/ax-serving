@@ -16,10 +16,8 @@ use ax_serving_protocol::{
     WorkerId as ProtocolWorkerId,
 };
 
-use super::super::fleet_state::{SharedWorkerRecord, unix_time_millis};
+use super::super::fleet_state::{unix_time_millis, SharedWorkerRecord};
 use super::super::worker_endpoint::WorkerEndpoint;
-use super::MAX_WORKER_INFLIGHT;
-use super::WorkerRegistry;
 use super::normalize::{
     constant_time_digest_eq, lease_token_digest, legacy_heartbeat_from_observation,
     legacy_heartbeat_from_protocol, protocol_model_inventory, protocol_supported_operations,
@@ -28,6 +26,8 @@ use super::types::{
     ProtocolRegistryError, ProtocolSession, RegisterCapabilities, RegisterRequest,
     WorkerCapabilities, WorkerId,
 };
+use super::WorkerRegistry;
+use super::MAX_WORKER_INFLIGHT;
 
 impl WorkerRegistry {
     /// Register a protocol-v1 runtime agent while retaining the legacy
@@ -314,7 +314,11 @@ impl WorkerRegistry {
         let Some((_, session)) = self.protocol_sessions.remove(worker_id) else {
             return false;
         };
-        self.inner.remove(&session.internal_id);
+        // register_protocol/restore already reindexed via register/heartbeat;
+        // unindex here so the secondary index does not retain a dead WorkerId.
+        if let Some((_, entry)) = self.inner.remove(&session.internal_id) {
+            self.unindex_worker(session.internal_id, &entry.capabilities.models);
+        }
         true
     }
 
