@@ -40,7 +40,7 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "dependencies": {
     "zod": "^3.24.1"
