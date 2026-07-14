@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 use super::super::worker_endpoint::WorkerEndpoint;
+use super::index::reindex_into;
 use super::MAX_WORKER_INFLIGHT;
 use super::WorkerRegistry;
 use super::normalize::{
@@ -119,14 +120,14 @@ impl WorkerRegistry {
         };
         refresh_capabilities_from_operation_summary(&mut capabilities, &supported_operations);
 
-        // Capture old models under the entry critical section so reindex sees a
-        // coherent (old, new) pair for this worker id.
-        let mut old_models: Vec<String> = Vec::new();
-        let mut new_models: Vec<String> = Vec::new();
+        // Reindex under the entry write guard so concurrent same-id register /
+        // heartbeat diffs cannot be applied out of order (permanent under-index).
+        // Clone by_model Arc first so the free function does not re-borrow `self`.
+        let by_model = self.by_model_handle();
         self.inner
             .entry(id)
             .and_modify(|existing| {
-                old_models = existing.capabilities.models.clone();
+                let old_models = existing.capabilities.models.clone();
                 let mut updated_capabilities = capabilities.clone();
                 // Idempotent re-registration: update mutable fields, reset health.
                 existing.addr = addr.clone();
@@ -188,10 +189,12 @@ impl WorkerRegistry {
                 existing.chip_model = chip_model.clone();
                 existing.worker_pool = worker_pool.clone();
                 existing.node_class = node_class.clone();
-                new_models = existing.capabilities.models.clone();
+                let new_models = existing.capabilities.models.clone();
+                reindex_into(&by_model, id, &old_models, &new_models);
             })
             .or_insert_with(|| {
-                new_models = capabilities.models.clone();
+                let new_models = capabilities.models.clone();
+                reindex_into(&by_model, id, &[], &new_models);
                 WorkerEntry {
                     id,
                     addr,
@@ -244,9 +247,6 @@ impl WorkerRegistry {
                 }
             });
 
-        // Index update after entry write (add-before-remove inside reindex).
-        self.reindex_worker(id, &old_models, &new_models);
-
         RegisterResponse {
             worker_id: id.to_string(),
             heartbeat_interval_ms,
@@ -255,7 +255,10 @@ impl WorkerRegistry {
 
     /// Record a heartbeat.  Returns `false` if the worker is not registered.
     pub fn heartbeat(&self, id: WorkerId, req: HeartbeatRequest) -> bool {
-        let (old_models, new_models) = match self.inner.get_mut(&id) {
+        // Reindex under the entry write guard so concurrent same-id heartbeats
+        // cannot apply (old, new) diffs out of order.
+        let by_model = self.by_model_handle();
+        match self.inner.get_mut(&id) {
             Some(mut e) => {
                 let old_models = e.capabilities.models.clone();
                 let runtime_ready = req.runtime_ready;
@@ -330,13 +333,11 @@ impl WorkerRegistry {
                 e.max_batch_size = req.max_batch_size;
                 e.batch_utilization = req.batch_utilization.map(ratio_or_zero);
                 let new_models = e.capabilities.models.clone();
-                (old_models, new_models)
+                reindex_into(&by_model, id, &old_models, &new_models);
+                true
             }
-            None => return false,
-        };
-        // Reindex after releasing the entry lock (add-before-remove).
-        self.reindex_worker(id, &old_models, &new_models);
-        true
+            None => false,
+        }
     }
 
     /// Start graceful drain.  Returns `false` if worker not found.

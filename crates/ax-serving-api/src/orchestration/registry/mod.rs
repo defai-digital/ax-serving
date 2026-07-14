@@ -2689,9 +2689,10 @@ mod tests {
 
     #[test]
     fn kill_switch_forces_full_scan_selection() {
-        // Isolated: tests run with --test-threads=1 for this module suite.
+        // Prefer --test-threads=1 when mutating process env; restore on exit.
         let prev = std::env::var("AXS_WORKER_MODEL_INDEX").ok();
-        // SAFETY: single-threaded test suite for registry; restore on exit.
+        // SAFETY: env mutation is process-global; callers should run this suite
+        // with --test-threads=1. Always restore below.
         unsafe { std::env::set_var("AXS_WORKER_MODEL_INDEX", "0") };
 
         let r = WorkerRegistry::new();
@@ -2700,7 +2701,17 @@ mod tests {
         // Index is still maintained on mutations even when selection is kill-switched.
         r.assert_index_consistent();
         assert!(!index::worker_model_index_enabled());
+        // Prove the full-scan path is taken: kill-switch makes index lookup return None.
+        assert!(r.indexed_candidate_ids("m1").is_none());
 
+        // Poison the index: clear membership so indexed path would under-route.
+        r.by_model.clear();
+        assert!(
+            r.by_model.get("m1").is_none(),
+            "poisoned index must not list m1"
+        );
+
+        // Full-scan still finds the live worker.
         let workers = r.dispatch_workers_filtered("m1", RequestKind::Llm, None, None, None, None);
         assert_eq!(worker_id_set(&workers), id_set([id]));
         assert!(!r.eligible_workers("m1").is_empty());
@@ -2792,5 +2803,217 @@ mod tests {
                 "model {model}"
             );
         }
+    }
+
+    #[test]
+    fn same_worker_concurrent_model_flip_keeps_index_consistent() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Two threads hammer the same sticky WorkerId with disjoint model sets.
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8200", &["A", "B"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for models in [
+            vec!["A".to_string()],
+            vec!["B".to_string()],
+        ] {
+            let reg = r.clone();
+            let b = Arc::clone(&barrier);
+            let models = models.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for _ in 0..80 {
+                    assert!(reg.heartbeat(
+                        id,
+                        HeartbeatRequest {
+                            model_ids: models.clone(),
+                            ..Default::default()
+                        },
+                    ));
+                    let _ = reg.eligible_workers("A");
+                    let _ = reg.eligible_workers("B");
+                }
+            }));
+        }
+        barrier.wait();
+        for h in handles {
+            h.join().expect("same-worker heartbeat thread");
+        }
+        r.assert_index_consistent();
+        for model in ["A", "B"] {
+            let indexed =
+                r.dispatch_workers_filtered(model, RequestKind::Llm, None, None, None, None);
+            let oracle = r.dispatch_workers_filtered_full_scan(
+                model,
+                RequestKind::Llm,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            assert_eq!(
+                worker_id_set(&indexed),
+                worker_id_set(&oracle),
+                "model {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_model_flips_on_same_worker_stay_indexed() {
+        // Deterministic same-worker model flip sequence that used to under-index
+        // when reindex ran after releasing the entry lock with reordered diffs.
+        // Production now reindexes under the entry write guard.
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8201", &["A", "B"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+
+        // HB1: shrink to [A]
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                model_ids: vec!["A".into()],
+                ..Default::default()
+            },
+        ));
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("A")), id_set([id]));
+        assert!(r.eligible_workers("B").is_empty());
+
+        // HB2: flip to [B] (disjoint from A)
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                model_ids: vec!["B".into()],
+                ..Default::default()
+            },
+        ));
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("B")), id_set([id]));
+        assert!(r.eligible_workers("A").is_empty());
+
+        // Same-model heartbeat is a no-op reindex and must not clear membership.
+        assert!(r.heartbeat(
+            id,
+            HeartbeatRequest {
+                model_ids: vec!["B".into()],
+                ..Default::default()
+            },
+        ));
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("B")), id_set([id]));
+    }
+
+    #[test]
+    fn stale_unindex_after_reregister_does_not_strip_live_membership() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8202", &["M"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.assert_index_consistent();
+
+        // Capture models that an evict path would unindex.
+        let removed_models = r
+            .inner
+            .get(&id)
+            .map(|e| e.capabilities.models.clone())
+            .unwrap_or_default();
+        assert_eq!(removed_models, vec!["M".to_string()]);
+
+        // Evict, then sticky re-register the same WorkerId with the same model.
+        r.evict(id);
+        assert!(r.inner.get(&id).is_none());
+        r.register(
+            RegisterRequest {
+                worker_id: Some(id.to_string()),
+                ..reg_req("127.0.0.1:8202", &["M"], 4)
+            },
+            5000,
+        );
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("M")), id_set([id]));
+
+        // Delayed stale unindex (as if remove completed before re-register but
+        // unindex ran after). Live-aware unindex must not strip the new membership.
+        r.unindex_worker(id, &removed_models);
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("M")), id_set([id]));
+
+        // Also prove repair path: poison-remove then unindex with repair.
+        if let Some(mut set) = r.by_model.get_mut("M") {
+            set.remove(&id);
+        }
+        // Entry still advertises M; unindex with empty list is no-op, so repair
+        // via re-register reindex (already consistent) or explicit reindex:
+        r.reindex_worker(id, &[], &["M".into()]);
+        r.assert_index_consistent();
+        assert_eq!(worker_id_set(&r.eligible_workers("M")), id_set([id]));
+    }
+
+    #[test]
+    fn tick_evict_racing_sticky_reregister_keeps_index_consistent() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8203", &["M"], 4), 5000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let reg_evict = r.clone();
+        let reg_reg = r.clone();
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let t_evict = thread::spawn(move || {
+            b1.wait();
+            for _ in 0..40 {
+                // Force TTL expiry: mark unhealthy then probe-evict, or plain evict.
+                reg_evict.evict(id);
+            }
+        });
+        let t_reg = thread::spawn(move || {
+            b2.wait();
+            for _ in 0..40 {
+                reg_reg.register(
+                    RegisterRequest {
+                        worker_id: Some(id.to_string()),
+                        ..reg_req("127.0.0.1:8203", &["M"], 4)
+                    },
+                    5000,
+                );
+            }
+        });
+        barrier.wait();
+        t_evict.join().unwrap();
+        t_reg.join().unwrap();
+
+        // Final sticky register so a live entry remains for the oracle.
+        r.register(
+            RegisterRequest {
+                worker_id: Some(id.to_string()),
+                ..reg_req("127.0.0.1:8203", &["M"], 4)
+            },
+            5000,
+        );
+        r.assert_index_consistent();
+        let indexed = r.dispatch_workers_filtered("M", RequestKind::Llm, None, None, None, None);
+        let oracle = r.dispatch_workers_filtered_full_scan(
+            "M",
+            RequestKind::Llm,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(worker_id_set(&indexed), worker_id_set(&oracle));
+        assert_eq!(worker_id_set(&indexed), id_set([id]));
     }
 }

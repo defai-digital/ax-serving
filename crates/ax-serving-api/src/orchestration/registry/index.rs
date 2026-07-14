@@ -22,6 +22,16 @@
 //! under-route (silent 503). Selection clones candidate `WorkerId`s from the
 //! index before looking up `inner`.
 //!
+//! **Same-worker reindex runs under the `inner` entry write guard** so the
+//! captured (old, new) pair is applied in the same critical section as the
+//! entry mutation. Callers use [`reindex_into`] with a cloned `by_model` `Arc`
+//! while still holding the entry guard — concurrent heartbeats/registers on
+//! the same `WorkerId` cannot reorder diffs (DashMap per-key serialization).
+//!
+//! **Unindex is live-state aware** with a post-remove repair: never strip a
+//! model a re-registered entry still advertises; if a strip races a reinsert,
+//! membership is restored from the live entry.
+//!
 //! # Kill-switch
 //!
 //! Env-only (no `OrchestratorConfig` field):
@@ -29,8 +39,11 @@
 //! - Set to `0` / `false` / `off` / `no` to force full-scan selection for safety
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use super::types::WorkerId;
+use dashmap::DashMap;
+
+use super::types::{WorkerEntry, WorkerId};
 use super::WorkerRegistry;
 
 /// Whether the model→worker secondary index is used for selection.
@@ -48,52 +61,115 @@ pub(crate) fn worker_model_index_enabled() -> bool {
     }
 }
 
-impl WorkerRegistry {
-    /// Update membership for `id` after `capabilities.models` changed.
-    ///
-    /// **Add new model keys before remove old** (prefer brief over-include).
-    /// Empty index sets are pruned when the last worker leaves a model key.
-    pub(crate) fn reindex_worker(
-        &self,
-        id: WorkerId,
-        old_models: &[String],
-        new_models: &[String],
-    ) {
-        let old: HashSet<&str> = old_models.iter().map(String::as_str).collect();
-        let new: HashSet<&str> = new_models.iter().map(String::as_str).collect();
+/// Apply a model-set membership diff for `id` into `by_model`.
+///
+/// **Add new model keys before remove old** (prefer brief over-include).
+/// Empty index sets are pruned when the last worker leaves a model key.
+///
+/// # Concurrency
+///
+/// Call this **while holding the `inner` write guard for `id`** (register
+/// `and_modify` / `or_insert_with`, or heartbeat `get_mut`) so concurrent
+/// same-worker mutations cannot apply diffs out of order. The free function
+/// form takes `by_model` separately so the entry guard can keep borrowing
+/// `inner` while the index is updated.
+pub(crate) fn reindex_into(
+    by_model: &DashMap<String, HashSet<WorkerId>>,
+    id: WorkerId,
+    old_models: &[String],
+    new_models: &[String],
+) {
+    let old: HashSet<&str> = old_models.iter().map(String::as_str).collect();
+    let new: HashSet<&str> = new_models.iter().map(String::as_str).collect();
 
-        // Phase 1: add memberships not already present under old.
-        for model in new.iter().filter(|m| !old.contains(*m)) {
-            self.by_model
-                .entry((*model).to_string())
+    // Phase 1: add memberships not already present under old.
+    for model in new.iter().filter(|m| !old.contains(*m)) {
+        by_model
+            .entry((*model).to_string())
+            .or_default()
+            .insert(id);
+    }
+
+    // Phase 2: remove memberships no longer advertised.
+    // Safe under entry-write serialization: live models == new_models.
+    for model in old.iter().filter(|m| !new.contains(*m)) {
+        force_remove_worker_from_model(by_model, id, model);
+    }
+}
+
+/// Drop model memberships for `id` (evict / remove paths).
+///
+/// Live-state aware: if `id` was re-registered and still advertises a model,
+/// that membership is **not** stripped. After a force-remove, membership is
+/// **repaired** if a concurrent re-register re-advertised the model between
+/// the live check and the strip (check → remove → re-register → repair).
+pub(crate) fn unindex_into(
+    inner: &DashMap<WorkerId, WorkerEntry>,
+    by_model: &DashMap<String, HashSet<WorkerId>>,
+    id: WorkerId,
+    models: &[String],
+) {
+    for model in models {
+        // Do not strip if the live entry still advertises this model
+        // (re-register / heartbeat after remove of a previous incarnation).
+        if live_advertises(inner, id, model) {
+            continue;
+        }
+        force_remove_worker_from_model(by_model, id, model);
+        // Repair race: remove completed just as a re-register re-advertised `model`.
+        if live_advertises(inner, id, model) {
+            by_model
+                .entry(model.clone())
                 .or_default()
                 .insert(id);
         }
+    }
+}
 
-        // Phase 2: remove memberships no longer advertised.
-        for model in old.iter().filter(|m| !new.contains(*m)) {
-            self.remove_worker_from_model(id, model);
-        }
+fn live_advertises(
+    inner: &DashMap<WorkerId, WorkerEntry>,
+    id: WorkerId,
+    model: &str,
+) -> bool {
+    inner
+        .get(&id)
+        .is_some_and(|entry| entry.capabilities.models.iter().any(|m| m == model))
+}
+
+fn force_remove_worker_from_model(
+    by_model: &DashMap<String, HashSet<WorkerId>>,
+    id: WorkerId,
+    model: &str,
+) {
+    let should_prune = if let Some(mut set) = by_model.get_mut(model) {
+        set.remove(&id);
+        set.is_empty()
+    } else {
+        false
+    };
+    if should_prune {
+        // Race-safe prune: only remove if still empty when we hold the shard.
+        by_model.remove_if(model, |_, set| set.is_empty());
+    }
+}
+
+impl WorkerRegistry {
+    /// Update membership for `id` after `capabilities.models` changed.
+    ///
+    /// Prefer [`reindex_into`] while holding the entry guard. This wrapper is
+    /// for call sites that already serialized the mutation.
+    pub(crate) fn reindex_worker(&self, id: WorkerId, old_models: &[String], new_models: &[String]) {
+        reindex_into(&self.by_model, id, old_models, new_models);
     }
 
     /// Drop all model memberships for `id` (evict / remove paths).
     pub(crate) fn unindex_worker(&self, id: WorkerId, models: &[String]) {
-        for model in models {
-            self.remove_worker_from_model(id, model.as_str());
-        }
+        unindex_into(&self.inner, &self.by_model, id, models);
     }
 
-    fn remove_worker_from_model(&self, id: WorkerId, model: &str) {
-        let should_prune = if let Some(mut set) = self.by_model.get_mut(model) {
-            set.remove(&id);
-            set.is_empty()
-        } else {
-            false
-        };
-        if should_prune {
-            // Race-safe prune: only remove if still empty when we hold the shard.
-            self.by_model.remove_if(model, |_, set| set.is_empty());
-        }
+    /// Clone of the index map for use while an `inner` entry guard is held.
+    pub(crate) fn by_model_handle(&self) -> Arc<DashMap<String, HashSet<WorkerId>>> {
+        Arc::clone(&self.by_model)
     }
 
     /// Clone candidate worker ids that advertise `model_id`.
