@@ -334,6 +334,19 @@ pub struct OrchestratorConfig {
     pub deployments: Vec<DeploymentSpec>,
     /// Operator-certified equivalence policies for cross-pool routing.
     pub equivalence_classes: Vec<EquivalencePolicy>,
+
+    /// `/readyz` mode: `control_plane` (default) or `eligible_workers` (legacy).
+    /// env: `AXS_READYZ_MODE`
+    pub readyz_mode: String,
+    /// Max age of the last successful fleet-store operation before readiness fails.
+    /// env: `AXS_FLEET_STORE_READY_MAX_STALE_MS`
+    pub fleet_store_ready_max_stale_ms: u64,
+    /// Time between readiness failure and listener shutdown. env: `AXS_SHUTDOWN_PROPAGATION_MS`
+    pub shutdown_propagation_ms: u64,
+    /// Maximum graceful wait for accepted work. env: `AXS_SHUTDOWN_DRAIN_SECS`
+    pub shutdown_drain_secs: u64,
+    /// Final process deadline including propagation and cleanup. env: `AXS_SHUTDOWN_HARD_SECS`
+    pub shutdown_hard_secs: u64,
 }
 
 impl Default for OrchestratorConfig {
@@ -370,6 +383,11 @@ impl Default for OrchestratorConfig {
             pools: Vec::new(),
             deployments: Vec::new(),
             equivalence_classes: Vec::new(),
+            readyz_mode: "control_plane".into(),
+            fleet_store_ready_max_stale_ms: 15_000,
+            shutdown_propagation_ms: 5_000,
+            shutdown_drain_secs: 300,
+            shutdown_hard_secs: 330,
         }
     }
 }
@@ -697,13 +715,40 @@ impl ServeConfig {
         if self.orchestrator.fleet_key_prefix.trim().is_empty() {
             anyhow::bail!("orchestrator.fleet_key_prefix must not be empty");
         }
-        if normalize_config_token(&self.orchestrator.deployment_mode) == "explicit"
-            && self.orchestrator.deployments.is_empty()
-        {
-            anyhow::bail!("explicit deployment_mode requires at least one deployment");
-        }
+        // Explicit mode may start with an empty deployment catalog so a fresh
+        // gateway can become ready and await operator/admin deployment create.
+        // Cross-runtime certification still requires declared deployments.
         if self.orchestrator.request_timeout_secs == 0 {
             anyhow::bail!("orchestrator.request_timeout_secs must be > 0");
+        }
+        match self.orchestrator.readyz_mode.trim().to_ascii_lowercase().as_str() {
+            "control_plane" | "control-plane" | "controlplane" | "eligible_workers"
+            | "eligible-workers" | "eligibleworkers" | "legacy" => {}
+            other => anyhow::bail!(
+                "unknown orchestrator.readyz_mode '{other}'; valid: control_plane, eligible_workers"
+            ),
+        }
+        let combined_ms = self
+            .orchestrator
+            .shutdown_propagation_ms
+            .saturating_add(self.orchestrator.shutdown_drain_secs.saturating_mul(1000));
+        let hard_ms = self.orchestrator.shutdown_hard_secs.saturating_mul(1000);
+        if hard_ms <= combined_ms {
+            anyhow::bail!(
+                "orchestrator.shutdown_hard_secs ({}) must exceed propagation_ms + drain_secs ({}ms)",
+                self.orchestrator.shutdown_hard_secs,
+                combined_ms
+            );
+        }
+        if self.orchestrator.fleet_store_ready_max_stale_ms == 0 {
+            anyhow::bail!("orchestrator.fleet_store_ready_max_stale_ms must be > 0");
+        }
+        if self.orchestrator.shutdown_drain_secs < self.orchestrator.request_timeout_secs {
+            anyhow::bail!(
+                "orchestrator.shutdown_drain_secs ({}) must be >= request_timeout_secs ({})",
+                self.orchestrator.shutdown_drain_secs,
+                self.orchestrator.request_timeout_secs
+            );
         }
         if self.orchestrator.first_byte_timeout_ms == 0 {
             anyhow::bail!("orchestrator.first_byte_timeout_ms must be > 0");
@@ -999,6 +1044,21 @@ impl ServeConfig {
         }
         if let Some(ms) = env_parse::<u64>("AXS_STREAM_IDLE_TIMEOUT_MS")? {
             self.orchestrator.stream_idle_timeout_ms = ms.max(1);
+        }
+        if let Some(v) = env_str("AXS_READYZ_MODE")? {
+            self.orchestrator.readyz_mode = v;
+        }
+        if let Some(ms) = env_parse::<u64>("AXS_FLEET_STORE_READY_MAX_STALE_MS")? {
+            self.orchestrator.fleet_store_ready_max_stale_ms = ms.max(1);
+        }
+        if let Some(ms) = env_parse::<u64>("AXS_SHUTDOWN_PROPAGATION_MS")? {
+            self.orchestrator.shutdown_propagation_ms = ms;
+        }
+        if let Some(secs) = env_parse::<u64>("AXS_SHUTDOWN_DRAIN_SECS")? {
+            self.orchestrator.shutdown_drain_secs = secs;
+        }
+        if let Some(secs) = env_parse::<u64>("AXS_SHUTDOWN_HARD_SECS")? {
+            self.orchestrator.shutdown_hard_secs = secs;
         }
 
         // ── License / dashboard ───────────────────────────────────────────────

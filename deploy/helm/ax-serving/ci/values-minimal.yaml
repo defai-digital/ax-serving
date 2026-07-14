@@ -1,0 +1,5 @@
+gateway:
+  replicaCount: 1
+image:
+  repository: ax-serving-gateway
+  tag: test

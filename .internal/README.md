@@ -10,6 +10,16 @@ Public operator and integration documentation remains under [`../docs`](../docs/
 - [Hybrid runtime control-plane technical specification](specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
 - [Implementation and certification status](IMPLEMENTATION-STATUS.md)
 
+## Deployment documents
+
+- [CPU-only container deployment requirements](prd/PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md)
+- [ADR-014: CPU-only OCI and Helm deployment](adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
+- [CPU-only OCI and Helm technical specification](specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
+
+The deployment documents extend the core product documents. They define the target supported
+packaging and operations surface without changing the runtime-neutral ownership boundary in
+ADR-013.
+
 ## Document precedence
 
 When documents conflict, use this order:

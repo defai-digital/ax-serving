@@ -1,0 +1,13 @@
+{{- if or .Values.podDisruptionBudget.enabled (gt (int .Values.gateway.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ax-serving.fullname" . }}
+  labels:
+    {{- include "ax-serving.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "ax-serving.selectorLabels" . | nindent 6 }}
+{{- end }}

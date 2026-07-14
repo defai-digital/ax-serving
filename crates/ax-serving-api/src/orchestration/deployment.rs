@@ -138,9 +138,9 @@ impl DeploymentCatalog {
         {
             anyhow::bail!("deployment declarations require orchestrator.deployment_mode=explicit");
         }
-        if mode == DeploymentMode::Explicit && deployments.is_empty() {
-            anyhow::bail!("explicit deployment mode requires at least one deployment");
-        }
+        // Explicit mode may start empty so a gateway can install and become
+        // ready before operators create deployments via admin APIs or config.
+
 
         let mut pool_map = BTreeMap::new();
         for mut pool in pools {

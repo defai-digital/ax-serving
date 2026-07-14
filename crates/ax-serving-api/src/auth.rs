@@ -104,6 +104,7 @@ fn is_exempt(method: &Method, path: &str) -> bool {
     path == "/health"
         || path == "/livez"
         || path == "/readyz"
+        || path == "/routablez"
         || (*method == Method::GET && path == "/v1/license")
 }
 
@@ -270,6 +271,7 @@ mod tests {
         assert!(is_exempt(&Method::GET, "/health"));
         assert!(is_exempt(&Method::GET, "/livez"));
         assert!(is_exempt(&Method::GET, "/readyz"));
+        assert!(is_exempt(&Method::GET, "/routablez"));
         assert!(!is_exempt(&Method::GET, "/metrics"));
         assert!(!is_exempt(&Method::GET, "/v1/metrics"));
         assert!(!is_exempt(&Method::GET, "/dashboard"));

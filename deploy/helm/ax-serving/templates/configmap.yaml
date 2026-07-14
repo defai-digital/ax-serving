@@ -1,0 +1,11 @@
+{{- if not .Values.config.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ax-serving.fullname" . }}-config
+  labels:
+    {{- include "ax-serving.labels" . | nindent 4 }}
+data:
+  {{ .Values.config.key }}: |
+{{- toYaml .Values.config.inline | nindent 4 }}
+{{- end }}

@@ -153,15 +153,59 @@ fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
     }
 }
 
-fn default_advertised_addr(listen_addr: SocketAddr) -> SocketAddr {
-    if listen_addr.ip().is_unspecified() {
+fn default_advertised_url(listen_addr: SocketAddr) -> String {
+    let addr = if listen_addr.ip().is_unspecified() {
         match listen_addr {
             SocketAddr::V4(addr) => SocketAddr::from(([127, 0, 0, 1], addr.port())),
             SocketAddr::V6(addr) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port())),
         }
     } else {
         listen_addr
+    };
+    format!("http://{addr}")
+}
+
+/// Parse `AXS_NODE_ADVERTISED_URL` or legacy `AXS_NODE_ADVERTISED_ADDR`.
+fn parse_advertised_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("advertised URL is empty");
     }
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let url = reqwest::Url::parse(&candidate).context("invalid advertised URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("advertised URL must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("advertised URL must not contain credentials");
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        bail!("advertised URL must not contain a path, query, or fragment");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("advertised URL is missing a host"))?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && ip.is_unspecified()
+    {
+        bail!(
+            "advertised address {candidate} is a wildcard; set \
+             AXS_NODE_ADVERTISED_URL or AXS_NODE_ADVERTISED_ADDR to a routable host"
+        );
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("advertised URL is missing a port"))?;
+    let host_for_url = if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        format!("[{ip}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("{}://{}:{}", url.scheme(), host_for_url, port))
 }
 
 #[derive(Clone)]
@@ -180,7 +224,8 @@ pub struct ThorConfig {
     pub worker_id: String,
     pub trust_domain: String,
     pub listen_addr: SocketAddr,
-    pub advertised_addr: SocketAddr,
+    /// Canonical advertise base URL (`http(s)://host:port`), possibly DNS.
+    pub advertised_url: String,
     pub max_inflight: usize,
     pub worker_pool: Option<String>,
     pub node_class: String,
@@ -222,7 +267,7 @@ impl std::fmt::Debug for ThorConfig {
             .field("worker_id", &self.worker_id)
             .field("trust_domain", &self.trust_domain)
             .field("listen_addr", &self.listen_addr)
-            .field("advertised_addr", &self.advertised_addr)
+            .field("advertised_url", &self.advertised_url)
             .field("max_inflight", &self.max_inflight)
             .field("worker_pool", &self.worker_pool)
             .field("node_class", &self.node_class)
@@ -272,23 +317,22 @@ impl ThorConfig {
                 .unwrap_or_else(|| DEFAULT_THOR_LISTEN_ADDR.into())
                 .parse()
                 .context("invalid AXS_NODE_LISTEN_ADDR or AXS_THOR_LISTEN_ADDR")?;
-        let advertised_addr = load_first_optional_string_env(&[
+        let advertised_raw = load_first_optional_string_env(&[
+            "AXS_NODE_ADVERTISED_URL",
             "AXS_NODE_ADVERTISED_ADDR",
             "AXS_THOR_ADVERTISED_ADDR",
         ]);
-        let advertised_addr: SocketAddr = match advertised_addr {
-            Some(raw) => raw
-                .parse()
-                .context("invalid AXS_NODE_ADVERTISED_ADDR or AXS_THOR_ADVERTISED_ADDR")?,
-            None => default_advertised_addr(listen_addr),
+        let advertised_url = match advertised_raw {
+            Some(raw) => parse_advertised_url(&raw).context(
+                "invalid AXS_NODE_ADVERTISED_URL / AXS_NODE_ADVERTISED_ADDR / AXS_THOR_ADVERTISED_ADDR",
+            )?,
+            None => default_advertised_url(listen_addr),
         };
-        if advertised_addr.ip().is_unspecified() {
-            bail!(
-                "advertised address {advertised_addr} is a wildcard; set \
-                 AXS_NODE_ADVERTISED_ADDR or AXS_THOR_ADVERTISED_ADDR to a routable IP"
-            );
-        }
-        let default_worker_id = format!("node-{}-{}", advertised_addr.ip(), advertised_addr.port());
+        let default_worker_id = advertised_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .replace([':', '/', '[', ']'], "-");
+        let default_worker_id = format!("node-{default_worker_id}");
         let worker_id = load_optional_string_env("AXS_NODE_ID").unwrap_or(default_worker_id);
         ax_serving_protocol::WorkerId::new(worker_id.clone()).context("invalid AXS_NODE_ID")?;
         let trust_domain = load_optional_string_env("AXS_TRUST_DOMAIN")
@@ -351,7 +395,7 @@ impl ThorConfig {
             worker_id,
             trust_domain,
             listen_addr,
-            advertised_addr,
+            advertised_url,
             max_inflight,
             worker_pool,
             node_class,
@@ -369,7 +413,7 @@ impl ThorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThorConfig, default_advertised_addr, normalize_http_base_url};
+    use super::{ThorConfig, default_advertised_url, normalize_http_base_url, parse_advertised_url};
     use std::ffi::OsString;
 
     struct EnvGuard {
@@ -416,7 +460,7 @@ mod tests {
 
         let config = ThorConfig::from_env().unwrap();
         assert_eq!(config.listen_addr.to_string(), "0.0.0.0:18081");
-        assert_eq!(config.advertised_addr.to_string(), "127.0.0.1:18081");
+        assert_eq!(config.advertised_url, "http://127.0.0.1:18081");
         assert_eq!(config.runtime, "vllm");
         assert_eq!(config.hardware_class, "thor");
     }
@@ -434,7 +478,7 @@ mod tests {
 
         let config = ThorConfig::from_env().unwrap();
         assert_eq!(config.listen_addr.to_string(), "0.0.0.0:18081");
-        assert_eq!(config.advertised_addr.to_string(), "127.0.0.1:18081");
+        assert_eq!(config.advertised_url, "http://127.0.0.1:18081");
     }
 
     #[test]
@@ -451,9 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn default_advertised_addr_preserves_routable_listen_addr() {
+    fn default_advertised_url_preserves_routable_listen_addr() {
         let listen = "10.0.0.7:18081".parse().unwrap();
-        assert_eq!(default_advertised_addr(listen), listen);
+        assert_eq!(default_advertised_url(listen), "http://10.0.0.7:18081");
+    }
+
+    #[test]
+    fn parse_advertised_url_accepts_dns_host() {
+        let url = parse_advertised_url("https://agent.runtime.svc.cluster.local:18443").unwrap();
+        assert_eq!(url, "https://agent.runtime.svc.cluster.local:18443");
     }
 
     #[test]
@@ -522,7 +572,7 @@ mod tests {
         assert_eq!(config.runtime_url, "http://127.0.0.1:9000");
         assert_eq!(config.runtime, "ax_engine");
         assert_eq!(config.listen_addr.to_string(), "127.0.0.1:18091");
-        assert_eq!(config.advertised_addr.to_string(), "127.0.0.1:18092");
+        assert_eq!(config.advertised_url, "http://127.0.0.1:18092");
         assert_eq!(config.max_inflight, 12);
         assert_eq!(config.worker_pool.as_deref(), Some("mac"));
         assert_eq!(config.node_class, "mac-studio");
@@ -531,15 +581,39 @@ mod tests {
     }
 
     #[test]
-    fn from_env_rejects_invalid_advertised_addr() {
+    fn from_env_accepts_dns_advertised_hostname() {
         let _lock = crate::test_env::lock();
         let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
         let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
         let _advertised = EnvGuard::set("AXS_THOR_ADVERTISED_ADDR", "thor-node.local:18081");
         let _node_advertised = EnvGuard::remove("AXS_NODE_ADVERTISED_ADDR");
+        let _node_url = EnvGuard::remove("AXS_NODE_ADVERTISED_URL");
+        let _dispatch_token = EnvGuard::set("AXS_DISPATCH_TOKEN", "test-dispatch-token");
+        let _tls_profile = EnvGuard::set("AXS_TLS_PROFILE", "trusted_mesh");
 
-        let err = ThorConfig::from_env().unwrap_err();
-        assert!(err.to_string().contains("AXS_THOR_ADVERTISED_ADDR"));
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.advertised_url, "http://thor-node.local:18081");
+    }
+
+    #[test]
+    fn from_env_accepts_advertised_url_env() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
+        let _url = EnvGuard::set(
+            "AXS_NODE_ADVERTISED_URL",
+            "https://ax-runtime-agent.runtime.svc.cluster.local:18443",
+        );
+        let _legacy = EnvGuard::remove("AXS_THOR_ADVERTISED_ADDR");
+        let _node_advertised = EnvGuard::remove("AXS_NODE_ADVERTISED_ADDR");
+        let _dispatch_token = EnvGuard::set("AXS_DISPATCH_TOKEN", "test-dispatch-token");
+        let _tls_profile = EnvGuard::set("AXS_TLS_PROFILE", "trusted_mesh");
+
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(
+            config.advertised_url,
+            "https://ax-runtime-agent.runtime.svc.cluster.local:18443"
+        );
     }
 
     #[test]
@@ -549,10 +623,16 @@ mod tests {
         let _listen = EnvGuard::set("AXS_THOR_LISTEN_ADDR", "0.0.0.0:18081");
         let _advertised = EnvGuard::set("AXS_THOR_ADVERTISED_ADDR", "0.0.0.0:18081");
         let _node_advertised = EnvGuard::remove("AXS_NODE_ADVERTISED_ADDR");
+        let _node_url = EnvGuard::remove("AXS_NODE_ADVERTISED_URL");
+        let _dispatch_token = EnvGuard::set("AXS_DISPATCH_TOKEN", "test-dispatch-token");
+        let _tls_profile = EnvGuard::set("AXS_TLS_PROFILE", "trusted_mesh");
 
         let err = ThorConfig::from_env().unwrap_err();
-        assert!(err.to_string().contains("advertised address"));
-        assert!(err.to_string().contains("wildcard"));
+        let err = format!("{err:#}");
+        assert!(
+            err.to_lowercase().contains("wildcard") || err.contains("0.0.0.0"),
+            "got: {err}"
+        );
     }
 
     #[test]

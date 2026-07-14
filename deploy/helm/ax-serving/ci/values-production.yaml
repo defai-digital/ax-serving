@@ -1,0 +1,38 @@
+production:
+  enabled: true
+  requireImageDigest: true
+
+image:
+  repository: ghcr.io/defai-digital/ax-serving-gateway
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+gateway:
+  replicaCount: 2
+  terminationGracePeriodSeconds: 360
+
+config:
+  inline:
+    orchestrator:
+      host: "0.0.0.0"
+      port: 18080
+      internal_bind_addr: "0.0.0.0"
+      internal_port: 19090
+      deployment_mode: "explicit"
+      tls_profile: "trusted_mesh"
+      fleet_store: "redis"
+      gateway_id: "gateway-from-pod"
+      readyz_mode: "control_plane"
+      request_timeout_secs: 300
+      shutdown_propagation_ms: 5000
+      shutdown_drain_secs: 300
+      shutdown_hard_secs: 330
+
+secrets:
+  existingSecret: ax-serving-secrets
+
+redis:
+  existingSecret: ax-serving-secrets
+  urlKey: redis-url
+
+podDisruptionBudget:
+  enabled: true

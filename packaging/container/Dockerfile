@@ -8,9 +8,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
+# Explicit portable feature set — never rely on Cargo defaults for release images.
+# Optional BuildKit cache mounts when DOCKER_BUILDKIT=1; plain RUN works on legacy builders.
 RUN cargo build --locked --release \
-    -p ax-serving-cli --bin ax-serving-api --bin ax-servingctl \
-    -p ax-thor-agent --bin ax-runtime-agent
+      -p ax-serving-cli --no-default-features --features gateway \
+      --bin ax-serving-api --bin ax-servingctl \
+    && cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent
 
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
@@ -24,6 +27,8 @@ FROM runtime-base AS gateway
 COPY --from=builder /src/target/release/ax-serving-api /usr/local/bin/ax-serving-api
 COPY --from=builder /src/target/release/ax-servingctl /usr/local/bin/ax-servingctl
 EXPOSE 18080 19090
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+  CMD ["/usr/local/bin/ax-servingctl", "probe", "live", "--url", "http://127.0.0.1:18080"]
 ENTRYPOINT ["/usr/local/bin/ax-serving-api"]
 
 FROM runtime-base AS agent

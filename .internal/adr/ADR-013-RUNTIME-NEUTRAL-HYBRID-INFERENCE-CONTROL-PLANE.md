@@ -9,6 +9,7 @@
 | Supersedes | Any design assumption that the API gateway must link an inference runtime SDK |
 | Related PRD | [AX Serving product requirements](../prd/PRD-AX-SERVING.md) |
 | Implementation | [Hybrid runtime control-plane spec](../specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md) |
+| Deployment extension | [ADR-014: CPU-only OCI and Helm deployment](ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
 
 ## Context
 
@@ -176,6 +177,9 @@ header forwarding by default. Non-loopback links use TLS, with mTLS preferred fo
 - A native AX Engine integration uses its supported HTTP/server contract through the agent. If a
   future embedding use case requires direct SDK access, the session must live on a dedicated owner
   thread inside a runtime-specific compatibility process, not inside the gateway.
+- CPU-only OCI images, the first-party Helm chart, runtime-agent placement, probe semantics, and
+  container lifecycle are governed by ADR-014. Those artifacts must preserve this runtime-neutral
+  dependency boundary and must not request accelerator resources.
 
 ## Consequences
 
@@ -278,6 +282,8 @@ If any answer is no, the change requires a new ADR or an amendment to this one.
 
 - [AX Serving product requirements](../prd/PRD-AX-SERVING.md)
 - [Hybrid runtime control-plane technical specification](../specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
+- [ADR-014: CPU-only OCI and Helm deployment](ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
+- [CPU-only OCI and Helm technical specification](../specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
 - [AX Serving runtime responsibility inventory](../../docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Kubernetes Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension)
 - [InferencePool API](https://gateway-api-inference-extension.sigs.k8s.io/api-types/inferencepool/)

@@ -4,10 +4,13 @@
 | --- | --- |
 | Status | Canonical target; architecture implemented, production certification pending |
 | Owner | AX Serving maintainers |
-| Last updated | 2026-07-12 |
+| Last updated | 2026-07-14 |
 | Applies to | AX Serving 3.x target architecture |
 | Architecture decision | [ADR-013](../adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md) |
 | Technical specification | [Hybrid runtime control-plane spec](../specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md) |
+| Deployment requirements | [CPU-only container deployment PRD](PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md) |
+| Deployment decision | [ADR-014](../adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
+| Deployment specification | [CPU-only OCI and Helm spec](../specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
 | Evidence status | [Implementation and certification status](../IMPLEMENTATION-STATUS.md) |
 
 ## 1. Executive summary
@@ -76,6 +79,8 @@ for the scheduling and cache systems already implemented by AX Engine and vLLM.
 - Provide one OpenAI-compatible API for certified AX Engine and CUDA runtime deployments.
 - Run the API gateway without model weights, Metal, MLX, CUDA, or an embedded runtime SDK.
 - Support gateways on Apple Silicon macOS and Linux (`x86_64` and `aarch64`).
+- Publish CPU-only OCI gateway and runtime-agent images and a first-party Helm chart. Docker must
+  support local and evaluation deployments without requiring Kubernetes.
 - Discover runtime readiness, models, operations, limits, and telemetry through a versioned worker
   protocol.
 - Route only to endpoints that satisfy the request's hard requirements.
@@ -93,7 +98,8 @@ for the scheduling and cache systems already implemented by AX Engine and vLLM.
   models.
 - Support image inputs, tool calling, structured output, and future OpenAI-compatible operations
   when a deployment advertises the corresponding capability.
-- Integrate with Kubernetes or another orchestrator without requiring it for small deployments.
+- Support optional Kubernetes Gateway API or other orchestrator integrations without requiring
+  those integrations for Docker deployments.
 
 ## 5. Non-goals
 
@@ -474,6 +480,9 @@ the following are true:
 
 - [ADR-013: Runtime-neutral hybrid inference control plane](../adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md)
 - [Hybrid runtime control-plane technical specification](../specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
+- [CPU-only container deployment requirements](PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md)
+- [ADR-014: CPU-only OCI and Helm deployment](../adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
+- [CPU-only OCI and Helm technical specification](../specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
 - [AX Serving node contract](../../docs/contracts/ax-serving-node-contract.md)
 - [Runtime responsibility inventory](../../docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Public contract inventory](../../docs/contracts/ax-serving-public-contract-inventory.md)

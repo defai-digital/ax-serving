@@ -1,0 +1,14 @@
+orchestrator:
+  host: "0.0.0.0"
+  port: 18080
+  internal_bind_addr: "0.0.0.0"
+  internal_port: 19090
+  deployment_mode: "explicit"
+  tls_profile: "trusted_mesh"
+  fleet_store: "redis"
+  gateway_id: "gateway-compose-1"
+  readyz_mode: "control_plane"
+  request_timeout_secs: 30
+  shutdown_propagation_ms: 5000
+  shutdown_drain_secs: 30
+  shutdown_hard_secs: 40

@@ -26,6 +26,7 @@ pub mod deployment_lifecycle;
 pub mod direct;
 pub mod error;
 pub mod fleet_state;
+pub mod gateway_ops;
 pub mod health_ticker;
 pub mod internal_routes;
 pub mod jobs;
@@ -38,6 +39,7 @@ mod proxy_handlers;
 pub mod queue;
 pub mod registry;
 pub mod request_profile;
+pub mod worker_endpoint;
 
 use std::future::pending;
 use std::sync::Arc;
@@ -60,6 +62,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use self::deployment::{DeploymentCatalog, DeploymentCatalogStore};
 use self::direct::DirectDispatcher;
 use self::fleet_state::{FleetStateStore, store_from_config, unix_time_millis};
+use self::gateway_ops::{GatewayOperationalState, ReadyzMode, ShutdownDeadlines};
 use self::health_ticker::HealthTicker;
 use self::internal_routes::{
     InternalAuthState, InternalState, internal_auth_middleware, parse_allowed_node_cidrs,
@@ -118,6 +121,8 @@ pub struct OrchestratorLayer {
     pub public_auth_required: AtomicBool,
     /// In-process audit log for admin and worker lifecycle actions.
     pub audit: Arc<AuditLog>,
+    /// Process readiness, routability, drain, and inflight accounting.
+    pub ops: Arc<GatewayOperationalState>,
 }
 
 impl OrchestratorLayer {
@@ -150,6 +155,20 @@ impl OrchestratorLayer {
             wait_ms: config.global_queue_wait_ms,
             overload_policy: queue_policy,
         };
+        let readyz_mode = ReadyzMode::parse(&config.readyz_mode).map_err(anyhow::Error::msg)?;
+        let shutdown = ShutdownDeadlines::new(
+            config.shutdown_propagation_ms,
+            config.shutdown_drain_secs,
+            config.shutdown_hard_secs,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let ops = Arc::new(GatewayOperationalState::new(
+            &config.fleet_store,
+            readyz_mode,
+            config.fleet_store_ready_max_stale_ms,
+            shutdown,
+        ));
+        ops.mark_config_validated();
         let layer = Self {
             registry: WorkerRegistry::new(),
             policy: Arc::from(policy),
@@ -171,6 +190,7 @@ impl OrchestratorLayer {
             project_policy: Arc::new(project_policy),
             public_auth_required: AtomicBool::new(false),
             audit: AuditLog::default_shared(),
+            ops,
         };
         layer.audit.record(
             "system",
@@ -197,7 +217,16 @@ impl OrchestratorLayer {
 
     pub async fn reconcile_fleet_state(&self) -> Result<usize> {
         let now = unix_time_millis();
-        let records = self.fleet_store.list().await?;
+        let records = match self.fleet_store.list().await {
+            Ok(records) => {
+                self.ops.fleet_store_health.record_success(now);
+                records
+            }
+            Err(error) => {
+                self.ops.fleet_store_health.record_failure();
+                return Err(error);
+            }
+        };
         let mut active_worker_ids = std::collections::BTreeSet::new();
         let mut restored = 0usize;
         for record in records {
@@ -278,6 +307,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/health", get(proxy_health))
         .route("/livez", get(proxy_liveness))
         .route("/readyz", get(proxy_readiness))
+        .route("/routablez", get(proxy_routability))
         .route("/v1/metrics", get(proxy_metrics))
         .route("/metrics", get(proxy_prometheus_metrics))
         .route("/v1/admin/status", get(proxy_admin_status))
@@ -610,40 +640,90 @@ pub async fn start_orchestrator(
         let _ = shutdown_tx_clone.send(true);
     });
 
+    layer.ops.mark_listeners_ready();
+    // Memory fleet store is always ready; seed success so redis readiness has a baseline after first reconcile.
+    if layer.fleet_store.kind() == "memory" {
+        layer
+            .ops
+            .fleet_store_health
+            .record_success(unix_time_millis());
+    }
+
     // Wire the shutdown watch into both listeners so they drain open connections
     // instead of dropping them abruptly.
     let internal_shutdown = shutdown_rx.clone();
-    let public_shutdown = shutdown_rx;
-    tokio::try_join!(
-        async {
-            axum::serve(
-                internal_listener,
-                internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let mut rx = internal_shutdown;
-                while !*rx.borrow() {
-                    rx.changed().await.ok();
-                }
-            })
-            .await
-            .map_err(anyhow::Error::from)
-        },
-        async {
-            axum::serve(
-                public_listener,
-                public_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let mut rx = public_shutdown;
-                while !*rx.borrow() {
-                    rx.changed().await.ok();
-                }
-            })
-            .await
-            .map_err(anyhow::Error::from)
-        },
-    )?;
+    let public_shutdown = shutdown_rx.clone();
+    let drain_ops = Arc::clone(&layer.ops);
+    let hard_deadline = std::time::Duration::from_secs(layer.ops.shutdown.hard_secs);
+    let serve = async {
+        tokio::try_join!(
+            async {
+                axum::serve(
+                    internal_listener,
+                    internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown({
+                    let mut rx = internal_shutdown;
+                    let ops = Arc::clone(&drain_ops);
+                    async move {
+                        while !*rx.borrow() {
+                            rx.changed().await.ok();
+                        }
+                        // Keep control plane up through drain so agents can finish cleanup.
+                        // Public path stops first after propagation + drain.
+                        let hard = ops.shutdown.hard_secs;
+                        let _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            hard.saturating_sub(1).max(1),
+                        ))
+                        .await;
+                    }
+                })
+                .await
+                .map_err(anyhow::Error::from)
+            },
+            async {
+                axum::serve(
+                    public_listener,
+                    public_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown({
+                    let mut rx = public_shutdown;
+                    let ops = Arc::clone(&drain_ops);
+                    async move {
+                        while !*rx.borrow() {
+                            rx.changed().await.ok();
+                        }
+                        ops.begin_drain();
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            ops.shutdown.propagation_ms,
+                        ))
+                        .await;
+                        let drain_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(ops.shutdown.drain_secs);
+                        while ops.inflight() > 0 && std::time::Instant::now() < drain_deadline {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        if ops.inflight() > 0 {
+                            warn!(
+                                inflight = ops.inflight(),
+                                "gateway drain deadline reached with accepted work remaining"
+                            );
+                        }
+                    }
+                })
+                .await
+                .map_err(anyhow::Error::from)
+            },
+        )?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(hard_deadline, serve).await {
+        Ok(result) => result?,
+        Err(_) => {
+            warn!("gateway hard shutdown deadline reached; exiting");
+        }
+    }
 
     Ok(())
 }

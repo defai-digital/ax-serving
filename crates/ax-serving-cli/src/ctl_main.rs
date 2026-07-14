@@ -85,6 +85,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Probe gateway liveness, readiness, or routability (no credentials).
+    Probe {
+        #[command(subcommand)]
+        command: ProbeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProbeCommand {
+    /// Process liveness (`GET /livez`).
+    Live {
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+    },
+    /// Control-plane readiness (`GET /readyz`).
+    Ready {
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+    },
+    /// Fleet routability (`GET /routablez`).
+    Routable {
+        #[arg(long, default_value = "http://127.0.0.1:18080")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -262,5 +286,10 @@ fn main() -> Result<()> {
             api_key,
             json,
         } => support::run_smoke_test(url, model, prompt, max_tokens, api_key, json),
+        Command::Probe { command } => match command {
+            ProbeCommand::Live { url } => support::run_probe(url, "livez"),
+            ProbeCommand::Ready { url } => support::run_probe(url, "readyz"),
+            ProbeCommand::Routable { url } => support::run_probe(url, "routablez"),
+        },
     }
 }

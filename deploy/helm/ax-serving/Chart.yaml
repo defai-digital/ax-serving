@@ -1,0 +1,13 @@
+apiVersion: v2
+name: ax-serving
+description: CPU-only AX Serving gateway (no inference runtimes or accelerators)
+type: application
+version: 0.1.0
+appVersion: "3.0.0"
+keywords:
+  - inference
+  - gateway
+  - llm
+home: https://github.com/defai-digital/ax-serving
+maintainers:
+  - name: AX Serving maintainers

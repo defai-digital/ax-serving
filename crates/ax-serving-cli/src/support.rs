@@ -2139,3 +2139,21 @@ mod tests {
         }
     }
 }
+
+/// Unauthenticated probe for Docker HEALTHCHECK / Compose depends_on.
+pub fn run_probe(base_url: String, probe: &str) -> Result<()> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), probe);
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("probe request failed: {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("probe {probe} returned HTTP {status}");
+    }
+    Ok(())
+}

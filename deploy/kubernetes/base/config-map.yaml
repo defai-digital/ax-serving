@@ -12,7 +12,7 @@ data:
       worker_heartbeat_ms: 5000
       worker_ttl_ms: 15000
       dispatch_policy: "inference_aware"
-      deployment_mode: "legacy_compat"
+      deployment_mode: "explicit"
       telemetry_stale_ms: 10000
       max_dispatch_attempts: 2
       tls_profile: "trusted_mesh"
@@ -29,3 +29,8 @@ data:
       global_queue_wait_ms: 10000
       global_queue_policy: "queue"
       tenant_max_concurrent: 64
+      readyz_mode: "control_plane"
+      fleet_store_ready_max_stale_ms: 15000
+      shutdown_propagation_ms: 5000
+      shutdown_drain_secs: 300
+      shutdown_hard_secs: 330

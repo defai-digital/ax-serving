@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "production": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "requireImageDigest": { "type": "boolean" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^(sha256:[a-fA-F0-9]{64})?$" }
+      },
+      "required": ["repository"]
+    },
+    "gateway": {
+      "type": "object",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "requests": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            },
+            "limits": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            }
+          }
+        },
+        "shutdown": {
+          "type": "object",
+          "properties": {
+            "propagationMilliseconds": { "type": "integer", "minimum": 0 },
+            "drainSeconds": { "type": "integer", "minimum": 1 },
+            "hardSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tolerations": { "type": "array" },
+        "runtimeClassName": { "type": "string" }
+      }
+    }
+  }
+}

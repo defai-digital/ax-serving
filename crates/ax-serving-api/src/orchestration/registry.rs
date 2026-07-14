@@ -16,7 +16,7 @@
 //! Unhealthy within 10 s and is evicted at 15 s.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use super::worker_endpoint::WorkerEndpoint;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -257,7 +257,7 @@ impl WorkerHealth {
 /// Internal mutable entry held under the registry lock.
 pub struct WorkerEntry {
     pub id: WorkerId,
-    pub addr: SocketAddr,
+    pub addr: WorkerEndpoint,
     pub capabilities: WorkerCapabilities,
     /// Optional runtime-reported per-model metadata.
     pub model_inventory: Vec<ModelInventoryEntry>,
@@ -570,7 +570,7 @@ pub struct HeartbeatRequest {
 #[derive(Clone)]
 pub struct WorkerStatus {
     pub id: WorkerId,
-    pub addr: SocketAddr,
+    pub addr: WorkerEndpoint,
     pub inflight: usize,
     pub max_inflight: usize,
     /// Active inference sequences (token-cost dispatch).  0 = unknown (legacy worker).
@@ -757,9 +757,9 @@ impl WorkerRegistry {
             .and_then(WorkerId::parse)
             .unwrap_or_default();
 
-        // Sentinel: loopback on the reserved port 1 so the registry isn't
-        // poisoned but the worker will never receive real traffic.
-        let addr: SocketAddr = match raw_addr.parse() {
+        // Sentinel loopback endpoint so a malformed registration cannot be
+        // selected for real dispatch but still appears in diagnostics.
+        let addr = match WorkerEndpoint::parse(&raw_addr) {
             Ok(addr) => addr,
             Err(err) => {
                 warn!(
@@ -767,7 +767,7 @@ impl WorkerRegistry {
                     err = %err,
                     "worker registered with unparseable address; it will never receive traffic"
                 );
-                SocketAddr::from(([127, 0, 0, 1], 1))
+                WorkerEndpoint::parse("http://127.0.0.1:1").expect("static sentinel endpoint")
             }
         };
         let max_inflight = max_inflight.clamp(1, MAX_WORKER_INFLIGHT);
@@ -828,7 +828,7 @@ impl WorkerRegistry {
             .and_modify(|existing| {
                 let mut updated_capabilities = capabilities.clone();
                 // Idempotent re-registration: update mutable fields, reset health.
-                existing.addr = addr;
+                existing.addr = addr.clone();
                 existing.model_inventory = if incoming_model_inventory_empty {
                     retain_model_inventory_for_ids(
                         &existing.model_inventory,
@@ -950,7 +950,7 @@ impl WorkerRegistry {
     pub fn register_protocol(
         &self,
         request: ProtocolRegisterRequest,
-        addr: SocketAddr,
+        addr: WorkerEndpoint,
         negotiated: NegotiatedProtocol,
         heartbeat_interval_ms: u64,
         lease_ttl_ms: u64,
@@ -1195,7 +1195,7 @@ impl WorkerRegistry {
             protocol: session.negotiated.clone(),
             agent: session.agent.clone(),
             registration: session.registration.clone(),
-            addr: entry.addr,
+            addr: entry.addr.clone(),
             last_sequence: session.last_sequence,
             inventory_generation: session.inventory_generation,
             heartbeat_interval_ms: session.heartbeat_interval_ms,
@@ -1491,11 +1491,11 @@ impl WorkerRegistry {
     /// workers. A heartbeat or re-registration can make that snapshot stale
     /// before the probe result returns, so failed probes must not evict a worker
     /// that has already recovered or moved to a different address.
-    pub fn evict_if_unhealthy_at_addr(&self, id: WorkerId, addr: SocketAddr) -> bool {
+    pub fn evict_if_unhealthy_at_addr(&self, id: WorkerId, addr: &WorkerEndpoint) -> bool {
         let removed = self
             .inner
             .remove_if(&id, |_, entry| {
-                entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
+                &entry.addr == addr && matches!(entry.health, WorkerHealth::Unhealthy { .. })
             })
             .is_some();
         if removed {
@@ -1769,12 +1769,12 @@ impl WorkerRegistry {
     }
 
     /// Workers currently in `Unhealthy` state — used by the health ticker for
-    /// active TCP probing.  Returns `(WorkerId, SocketAddr)` pairs.
-    pub fn list_unhealthy_addrs(&self) -> Vec<(WorkerId, std::net::SocketAddr)> {
+    /// active TCP probing.  Returns `(WorkerId, WorkerEndpoint)` pairs.
+    pub fn list_unhealthy_addrs(&self) -> Vec<(WorkerId, WorkerEndpoint)> {
         self.inner
             .iter()
             .filter(|r| matches!(r.value().health, WorkerHealth::Unhealthy { .. }))
-            .map(|r| (r.value().id, r.value().addr))
+            .map(|r| (r.value().id, r.value().addr.clone()))
             .collect()
     }
 
@@ -2292,7 +2292,7 @@ fn worker_status_of(e: &WorkerEntry) -> WorkerStatus {
     let batch_headroom = worker_batch_utilization(e).map(|value| 1.0 - value);
     WorkerStatus {
         id: e.id,
-        addr: e.addr,
+        addr: e.addr.clone(),
         inflight: effective_inflight(e),
         max_inflight: e.max_inflight,
         active_sequences: e.active_sequences,
@@ -2798,7 +2798,10 @@ mod tests {
         );
         let vision_workers = r.eligible_workers_for("vision-model", RequestKind::Vision);
         assert_eq!(vision_workers.len(), 1);
-        assert_eq!(vision_workers[0].addr.to_string(), "127.0.0.1:8082");
+        assert_eq!(
+            vision_workers[0].addr.to_string(),
+            "http://127.0.0.1:8082"
+        );
     }
 
     #[test]
@@ -4366,7 +4369,7 @@ mod tests {
         let unhealthy = r.list_unhealthy_addrs();
         assert_eq!(unhealthy.len(), 1);
         assert_eq!(unhealthy[0].0, id1);
-        assert_eq!(unhealthy[0].1.to_string(), "127.0.0.1:8081");
+        assert_eq!(unhealthy[0].1.to_string(), "http://127.0.0.1:8081");
     }
 
     #[test]
@@ -4431,7 +4434,7 @@ mod tests {
         let id = WorkerId::parse(&resp.worker_id).unwrap();
         let snap = r.get_snapshot(id).unwrap();
         // The sentinel address is "127.0.0.1:1".
-        assert_eq!(snap.addr, "127.0.0.1:1");
+        assert_eq!(snap.addr, "http://127.0.0.1:1");
         // Other fields should still be set correctly.
         assert_eq!(snap.max_inflight, 4);
         // The registry should still contain this entry (not poisoned/absent).

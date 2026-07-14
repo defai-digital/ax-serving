@@ -5,7 +5,7 @@
 //! gateway that accepted the client request.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use super::worker_endpoint::WorkerEndpoint;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,7 +50,7 @@ pub struct SharedWorkerRecord {
     pub protocol: ProtocolDescriptor,
     pub agent: AgentDescriptor,
     pub registration: RegisterWorkerRequest,
-    pub addr: SocketAddr,
+    pub addr: WorkerEndpoint,
     pub last_sequence: u64,
     pub inventory_generation: u64,
     pub heartbeat_interval_ms: u64,
@@ -946,7 +946,7 @@ mod tests {
             protocol: registration.protocol.clone(),
             agent: registration.agent.clone(),
             registration,
-            addr: "127.0.0.1:18081".parse().unwrap(),
+            addr: "http://127.0.0.1:18081".parse().unwrap(),
             last_sequence: 1,
             inventory_generation: 1,
             heartbeat_interval_ms: 5_000,

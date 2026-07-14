@@ -38,8 +38,15 @@ runtime, Redis, or affinity secrets.
 ## Health and readiness
 
 - `/livez` `200` means the gateway process can answer HTTP.
-- `/readyz` `200` means at least one worker is currently eligible; `503` means
-  the gateway must not receive new inference traffic.
+- `/readyz` `200` means the control plane is ready (config, listeners, fleet
+  store). It does **not** require an eligible worker. Production installs use
+  this so agents can register during bootstrap. Legacy
+  `AXS_READYZ_MODE=eligible_workers` restores the old worker-gated behavior.
+- `/routablez` `200` means at least one worker is currently eligible for
+  inference; `503` means capacity is unavailable (structured inference 503 with
+  `Retry-After` applies). AX Fabric should use `/routablez` (or
+  `workers.eligible > 0` from `/health`) as serving capacity readiness, not
+  merely process readiness.
 - `/health` always returns a JSON fleet summary while the process is live.
 
 Relevant `/health` fields:
@@ -58,8 +65,8 @@ queue.shed_total
 queue.timeout_total
 ```
 
-AX Fabric must use `/readyz` or `workers.eligible > 0`, not merely a live
-process, as serving readiness.
+AX Fabric must use `/routablez` or `workers.eligible > 0`, not merely
+`/livez`/`/readyz` process readiness, as serving capacity readiness.
 
 ## Model inventory
 

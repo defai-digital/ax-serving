@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ax-serving.fullname" . }}-control
+  labels:
+    {{- include "ax-serving.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.control.type }}
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "ax-serving.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.service.control.port }}
+      targetPort: control

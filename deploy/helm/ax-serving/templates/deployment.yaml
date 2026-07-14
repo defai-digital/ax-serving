@@ -1,0 +1,182 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ax-serving.fullname" . }}
+  labels:
+    {{- include "ax-serving.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.gateway.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "ax-serving.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ax-serving.selectorLabels" . | nindent 8 }}
+        {{- with .Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if not .Values.config.existingConfigMap }}
+        checksum/config: {{ toYaml .Values.config.inline | sha256sum }}
+        {{- end }}
+        {{- if .Values.config.restartNonce }}
+        checksum/config-nonce: {{ .Values.config.restartNonce | quote }}
+        {{- end }}
+        {{- if .Values.secrets.restartNonce }}
+        checksum/secret-nonce: {{ .Values.secrets.restartNonce | quote }}
+        {{- end }}
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ax-serving.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.gateway.priorityClassName }}
+      priorityClassName: {{ .Values.gateway.priorityClassName }}
+      {{- end }}
+      {{- if .Values.gateway.runtimeClassName }}
+      runtimeClassName: {{ .Values.gateway.runtimeClassName }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "ax-serving.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: public
+              containerPort: 18080
+            - name: control
+              containerPort: 19090
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AXS_GATEWAY_ID
+              value: "gateway-$(POD_NAME)"
+            - name: AXS_CONFIG
+              value: /etc/ax-serving/{{ .Values.config.key }}
+            - name: AXS_READYZ_MODE
+              value: "control_plane"
+            - name: AXS_SHUTDOWN_PROPAGATION_MS
+              value: {{ .Values.gateway.shutdown.propagationMilliseconds | quote }}
+            - name: AXS_SHUTDOWN_DRAIN_SECS
+              value: {{ .Values.gateway.shutdown.drainSeconds | quote }}
+            - name: AXS_SHUTDOWN_HARD_SECS
+              value: {{ .Values.gateway.shutdown.hardSeconds | quote }}
+            {{- if .Values.secrets.existingSecret }}
+            - name: AXS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.apiKey }}
+            - name: AXS_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.adminApiKey }}
+            - name: AXS_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.internalApiToken }}
+            - name: AXS_DISPATCH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.dispatchToken }}
+            - name: AXS_CACHE_AFFINITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.cacheAffinitySecret }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.redis.existingSecret }}
+            - name: AXS_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.existingSecret }}
+                  key: {{ .Values.redis.urlKey }}
+            {{- else if .Values.secrets.existingSecret }}
+            - name: AXS_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.redis.urlKey }}
+                  optional: true
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ax-serving
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: public
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: public
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: public
+            periodSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: {{ if .Values.config.existingConfigMap }}{{ .Values.config.existingConfigMap }}{{ else }}{{ include "ax-serving.fullname" . }}-config{{ end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

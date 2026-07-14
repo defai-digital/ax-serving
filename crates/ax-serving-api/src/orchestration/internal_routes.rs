@@ -186,38 +186,8 @@ fn gateway_protocol_capabilities() -> BTreeSet<ProtocolCapability> {
     .collect()
 }
 
-fn advertised_socket_addr(raw: &str) -> Result<SocketAddr, String> {
-    let url =
-        reqwest::Url::parse(raw).map_err(|error| format!("invalid advertise_url: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("advertise_url must use http or https".into());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("advertise_url must not contain credentials".into());
-    }
-    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
-        return Err("advertise_url must not contain a path, query, or fragment".into());
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "advertise_url is missing a host".to_string())?;
-    let ip = host
-        .parse::<std::net::IpAddr>()
-        .map_err(|_| "advertise_url must use an IP address in protocol v1".to_string())?;
-    if ip.is_unspecified() || ip.is_multicast() || is_link_local(ip) {
-        return Err("advertise_url uses a disallowed destination address".into());
-    }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| "advertise_url is missing a port".to_string())?;
-    Ok(SocketAddr::new(ip, port))
-}
-
-fn is_link_local(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => ip.is_link_local(),
-        std::net::IpAddr::V6(ip) => ip.is_unicast_link_local(),
-    }
+fn advertised_endpoint(raw: &str) -> Result<super::worker_endpoint::WorkerEndpoint, String> {
+    super::worker_endpoint::WorkerEndpoint::parse(raw)
 }
 
 fn validate_observation_age(observed_at: time::OffsetDateTime) -> Result<(), String> {
@@ -419,20 +389,21 @@ async fn handle_register(State(s): State<InternalState>, body: Bytes) -> impl In
         }
     };
     // Validate addr before registering — a malformed addr would silently route
-    // to 127.0.0.1:1 in the registry, accepting the worker but never sending it traffic.
-    let Ok(addr) = req.addr.parse::<SocketAddr>() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "invalid worker addr '{}': must be a valid host:port",
-                req.addr
-            ),
-        )
-            .into_response();
+    // to a sentinel endpoint in the registry, accepting the worker but never
+    // sending it traffic.
+    let addr = match advertised_endpoint(&req.addr) {
+        Ok(addr) => addr,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid worker addr '{}': {error}", req.addr),
+            )
+                .into_response();
+        }
     };
 
     // Detect remote (non-loopback) workers for the license reminder.
-    if !addr.ip().is_loopback() {
+    if !addr.is_loopback() {
         s.license.mark_remote_worker_seen();
     }
     let resp = s.registry.register(req, s.config.worker_heartbeat_ms);
@@ -444,7 +415,7 @@ async fn handle_protocol_register(
     state: &InternalState,
     request: RegisterWorkerRequest,
 ) -> Response {
-    let addr = match advertised_socket_addr(&request.worker.advertise_url) {
+    let addr = match advertised_endpoint(&request.worker.advertise_url) {
         Ok(addr) => addr,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
@@ -474,7 +445,7 @@ async fn handle_protocol_register(
         }
     };
 
-    if !addr.ip().is_loopback() {
+    if !addr.is_loopback() {
         state.license.mark_remote_worker_seen();
     }
     let stable_id = request.worker.id.clone();

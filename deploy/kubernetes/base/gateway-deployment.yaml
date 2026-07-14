@@ -21,7 +21,7 @@ spec:
     spec:
       serviceAccountName: ax-serving-gateway
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 90
+      terminationGracePeriodSeconds: 360
       securityContext:
         runAsNonRoot: true
         seccompProfile:

@@ -58,6 +58,8 @@ spec:
               value: http://127.0.0.1:8000
             - name: AXS_NODE_LISTEN_ADDR
               value: 0.0.0.0:18081
+            - name: AXS_NODE_ADVERTISED_URL
+              value: "http://$(POD_IP):18081"
             - name: AXS_NODE_ADVERTISED_ADDR
               value: "$(POD_IP):18081"
             - name: AXS_NODE_ID

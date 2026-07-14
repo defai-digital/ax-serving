@@ -1,0 +1,111 @@
+production:
+  enabled: false
+  requireImageDigest: true
+
+image:
+  repository: ghcr.io/defai-digital/ax-serving-gateway
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+gateway:
+  # Non-production default is a single replica; multi-replica requires Redis.
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  terminationGracePeriodSeconds: 360
+  shutdown:
+    propagationMilliseconds: 5000
+    drainSeconds: 300
+    hardSeconds: 330
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  runtimeClassName: ""
+
+config:
+  existingConfigMap: ""
+  key: serving.yaml
+  inline:
+    orchestrator:
+      host: "0.0.0.0"
+      port: 18080
+      internal_bind_addr: "0.0.0.0"
+      internal_port: 19090
+      deployment_mode: "explicit"
+      tls_profile: "trusted_mesh"
+      fleet_store: "memory"
+      gateway_id: "gateway-from-pod"
+      readyz_mode: "control_plane"
+      request_timeout_secs: 300
+      shutdown_propagation_ms: 5000
+      shutdown_drain_secs: 300
+      shutdown_hard_secs: 330
+  restartNonce: ""
+
+secrets:
+  existingSecret: ""
+  restartNonce: ""
+  keys:
+    apiKey: api-key
+    adminApiKey: admin-api-key
+    internalApiToken: internal-api-token
+    dispatchToken: dispatch-token
+    cacheAffinitySecret: cache-affinity-secret
+
+redis:
+  existingSecret: ""
+  urlKey: redis-url
+
+service:
+  public:
+    type: ClusterIP
+    port: 80
+  control:
+    type: ClusterIP
+    port: 19090
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+gatewayApi:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+  publicFrom: []
+  controlFrom: []
+  redisTo: []
+  agentTo: []
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+serviceMonitor:
+  enabled: false

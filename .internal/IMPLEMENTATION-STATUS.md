@@ -2,16 +2,36 @@
 
 | Field | Value |
 | --- | --- |
-| Snapshot | Working tree reviewed 2026-07-12 |
+| Snapshot | Runtime implementation reviewed 2026-07-12; deployment surfaces reviewed 2026-07-14 |
 | Architecture | Implemented in source; not yet a released certification |
 | Production claim | Blocked until every PRD release gate has retained evidence |
 | Canonical requirements | [PRD](prd/PRD-AX-SERVING.md) |
 | Architecture decision | [ADR-013](adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md) |
 | Detailed design | [Technical specification](specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md) |
+| Deployment requirements | [CPU-only deployment PRD](prd/PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md) |
+| Deployment decision | [ADR-014](adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
+| Deployment design | [CPU-only OCI and Helm spec](specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
 
 This ledger separates code completion from deployment certification. A passing mock or unit test is
 implementation evidence, not proof that a pinned AX Engine/vLLM fleet satisfies the production
 envelope.
+
+## CPU-only container and Helm deployment status
+
+ADR-014 is accepted and the deployment PRD and technical specification are approved. Their status
+is **implementation pending**; the repository must not yet claim a supported Helm installation or
+a production-qualified OCI release.
+
+| Area | Current evidence | Remaining work |
+| --- | --- | --- |
+| CPU-only binaries | The portable gateway and runtime-agent dependency boundaries exclude accelerator runtime SDKs. | Retain platform and forbidden-dependency evidence for every image release. |
+| OCI build | `packaging/container/Dockerfile` has separate gateway and agent targets, and CI builds both as non-root images. | Publish signed multi-architecture images, SBOMs, provenance, vulnerability results, and immutable digests. |
+| Docker evaluation | The image build surface exists. | Add the supported Compose topology, pinned image references, health behavior, and end-to-end smoke test. |
+| Kubernetes baseline | Kustomize manifests cover a gateway, Services, PDB, NetworkPolicy, and an example runtime agent. | Correct readiness/bootstrap, shutdown, external-peer networking, secret, and production-default gaps; retain Kustomize only as an example during migration. |
+| Helm | No first-party chart exists. | Implement the chart, values schema, render matrix, install/upgrade/rollback tests, documentation, signing, and OCI publication. |
+| Runtime availability | Current readiness is coupled to worker eligibility. | Separate `/readyz` from `/routablez` and make worker-control discovery available while no runtime is routable. |
+| Runtime agents | The portable agent and example sidecar path exist. | Add DNS/URI advertised endpoints and certify sidecar, separate CPU Deployment, and external-host patterns. |
+| Release integration | CI validates container build basics; the release workflow does not publish the complete deployment set. | Link source, gateway image, agent image, chart, SBOM, signatures, and evidence in one release manifest. |
 
 ## Requirement status
 

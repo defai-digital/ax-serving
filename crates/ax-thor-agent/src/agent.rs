@@ -198,7 +198,7 @@ fn registration_body(
         worker: WorkerDescriptor {
             id: worker_id,
             instance_id,
-            advertise_url: format!("http://{}", config.advertised_addr),
+            advertise_url: config.advertised_url.clone(),
             pool_id: pool,
             trust_domain,
             labels,
@@ -655,7 +655,7 @@ mod tests {
             worker_id: "worker-test".into(),
             trust_domain: "test".into(),
             listen_addr: "127.0.0.1:18081".parse().unwrap(),
-            advertised_addr: "127.0.0.1:18081".parse().unwrap(),
+            advertised_url: "http://127.0.0.1:18081".into(),
             max_inflight: 8,
             worker_pool: None,
             node_class: "thor".into(),

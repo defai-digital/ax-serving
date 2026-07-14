@@ -1,0 +1,81 @@
+# CPU-only evaluation stack. Not an HA or production certification surface.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: packaging/container/Dockerfile
+      target: gateway
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "18080:18080"
+      - "19090:19090"
+    environment:
+      AXS_ALLOW_NO_AUTH: "true"
+      AXS_ORCHESTRATOR_HOST: "0.0.0.0"
+      AXS_ORCHESTRATOR_PORT: "18080"
+      AXS_INTERNAL_BIND_ADDR: "0.0.0.0"
+      AXS_INTERNAL_PORT: "19090"
+      AXS_FLEET_STORE: "redis"
+      AXS_REDIS_URL: "redis://redis:6379"
+      AXS_GATEWAY_ID: "gateway-compose-1"
+      AXS_DEPLOYMENT_MODE: "explicit"
+      AXS_TLS_PROFILE: "trusted_mesh"
+      AXS_READYZ_MODE: "control_plane"
+      AXS_SHUTDOWN_PROPAGATION_MS: "5000"
+      AXS_SHUTDOWN_DRAIN_SECS: "30"
+      AXS_SHUTDOWN_HARD_SECS: "40"
+      AXS_DISPATCHER_TIMEOUT_SECS: "30"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ax-servingctl", "probe", "ready", "--url", "http://127.0.0.1:18080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+  # Optional: point AXS_NODE_RUNTIME_URL at a host or remote OpenAI-compatible runtime.
+  runtime-agent:
+    profiles: ["agent"]
+    build:
+      context: ../..
+      dockerfile: packaging/container/Dockerfile
+      target: agent
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      AXS_CONTROL_PLANE_URL: "http://gateway:19090"
+      AXS_NODE_LISTEN_ADDR: "0.0.0.0:18081"
+      AXS_NODE_ADVERTISED_URL: "http://runtime-agent:18081"
+      AXS_NODE_RUNTIME_URL: "${AXS_NODE_RUNTIME_URL:-http://host.docker.internal:8000}"
+      AXS_DISPATCH_TOKEN: "${AXS_DISPATCH_TOKEN:-}"
+      AXS_WORKER_TOKEN: "${AXS_WORKER_TOKEN:-}"
+      AXS_TLS_PROFILE: "trusted_mesh"
+      AXS_NODE_RUNTIME: "${AXS_NODE_RUNTIME:-vllm}"
+      AXS_NODE_HARDWARE_CLASS: "cpu"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped

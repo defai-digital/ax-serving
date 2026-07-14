@@ -3,10 +3,11 @@
 | Field | Value |
 | --- | --- |
 | Status | Approved; core migration implemented, certification pending |
-| Last updated | 2026-07-12 |
+| Last updated | 2026-07-14 |
 | Target | AX Serving 3.x |
 | PRD | [AX Serving product requirements](../prd/PRD-AX-SERVING.md) |
 | Decision | [ADR-013](../adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md) |
+| Deployment specification | [CPU-only OCI and Helm deployment](TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md) |
 
 ## 1. Purpose
 
@@ -19,6 +20,11 @@ This remains the target-state specification. The core source migration is implem
 platform, performance, resilience, and release certification remain governed by the
 [implementation status ledger](../IMPLEMENTATION-STATUS.md). Existing v1 APIs remain compatible
 unless a section explicitly marks them for deprecation.
+
+OCI image composition, Docker and Compose behavior, Helm values and templates, Kubernetes probe
+semantics, and release publication are defined by the CPU-only deployment specification. That
+specification extends this protocol and control-plane design; it does not add inference execution
+to the gateway or runtime agent.
 
 ## 2. Historical current-state review
 
@@ -1363,6 +1369,9 @@ The architecture migration is complete when:
 
 - [AX Serving product requirements](../prd/PRD-AX-SERVING.md)
 - [ADR-013](../adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md)
+- [CPU-only container deployment requirements](../prd/PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md)
+- [ADR-014: CPU-only OCI and Helm deployment](../adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
+- [CPU-only OCI and Helm technical specification](TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
 - [AX Serving node contract](../../docs/contracts/ax-serving-node-contract.md)
 - [Runtime responsibility inventory](../../docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Public contract inventory](../../docs/contracts/ax-serving-public-contract-inventory.md)

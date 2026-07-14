@@ -890,7 +890,7 @@ impl DirectDispatcher {
                 }
             };
             attempt_number = attempt_number.saturating_add(1);
-            let url = worker_url(candidate.endpoint.worker.addr, path);
+            let url = worker_url(&candidate.endpoint.worker.addr, path);
             debug!(
                 request_id = %profile.request_id,
                 %attempt_id,
@@ -1206,7 +1206,7 @@ impl DirectDispatcher {
         self.record_selection(selection_started, SelectionOutcome::Selected);
 
         let selected_id = selected.id;
-        let url = worker_url(selected.addr, path);
+        let url = worker_url(&selected.addr, path);
         // `Bytes::clone` is shallow, and soft pool preferences can hide fallback
         // candidates from the initial selection set. Keep a retry body so the
         // reroute pass can relax soft preferences after excluding the failed worker.
@@ -1499,7 +1499,7 @@ impl DirectDispatcher {
         self.record_selection(selection_started, SelectionOutcome::Selected);
 
         let selected2_id = selected2.id;
-        let url2 = worker_url(selected2.addr, path);
+        let url2 = worker_url(&selected2.addr, path);
         let Some(inflight_counter2) = registry.inflight_counter(selected2_id) else {
             warn!(
                 worker_id = %selected2_id,
@@ -1883,14 +1883,8 @@ impl Default for DirectDispatcher {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn worker_url(addr: std::net::SocketAddr, path: &str) -> String {
-    if path.starts_with('/') {
-        format!("http://{addr}{path}")
-    } else {
-        // Ensure the path is always rooted — callers should always pass a
-        // leading slash, but guard against that to avoid silently routing to "/".
-        format!("http://{addr}/{path}")
-    }
+fn worker_url(addr: &super::worker_endpoint::WorkerEndpoint, path: &str) -> String {
+    addr.join_path(path)
 }
 
 fn routing_trace_enabled() -> bool {
@@ -1974,18 +1968,18 @@ mod tests {
 
     #[test]
     fn worker_url_with_leading_slash() {
-        let addr: std::net::SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let addr = super::super::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
         assert_eq!(
-            worker_url(addr, "/v1/chat/completions"),
+            worker_url(&addr, "/v1/chat/completions"),
             "http://127.0.0.1:8081/v1/chat/completions"
         );
     }
 
     #[test]
     fn worker_url_without_leading_slash_adds_root() {
-        let addr: std::net::SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let addr = super::super::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
         assert_eq!(
-            worker_url(addr, "v1/completions"),
+            worker_url(&addr, "v1/completions"),
             "http://127.0.0.1:8081/v1/completions"
         );
     }

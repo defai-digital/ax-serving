@@ -67,6 +67,24 @@ async fn proxy_inference(
     worker_path: &'static str,
     request_id: ax_serving_protocol::RequestId,
 ) -> axum::response::Response {
+    let Some(_admission_guard) = layer.ops.admit_request() else {
+        let mut response = ax_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            request_id,
+            "gateway_draining",
+            "gateway is draining and not accepting new inference requests",
+            true,
+            ax_serving_protocol::AdmissionPhase::Admission,
+        );
+        if let Ok(value) = HeaderValue::from_str(&layer.retry_after_secs.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response.headers_mut().insert(
+            HeaderName::from_static("x-ax-admission-state"),
+            HeaderValue::from_static("not-admitted"),
+        );
+        return response;
+    };
     if let Err(error) = validate_unique_routing_fields(&body) {
         return ax_error_response(
             StatusCode::BAD_REQUEST,
@@ -1046,26 +1064,78 @@ pub(super) async fn proxy_health(State(layer): State<Arc<OrchestratorLayer>>) ->
     }))
 }
 
-pub(super) async fn proxy_liveness() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+pub(super) async fn proxy_liveness(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    Json(layer.ops.live_response())
 }
 
 pub(super) async fn proxy_readiness(
     State(layer): State<Arc<OrchestratorLayer>>,
 ) -> impl IntoResponse {
     let eligible = layer.registry.eligible_healthy_count();
-    let ready = eligible > 0;
-    (
-        if ready {
+    let assessment = layer
+        .ops
+        .ready_assessment(super::fleet_state::unix_time_millis(), eligible);
+    let mut body = serde_json::json!({
+        "status": assessment.status,
+        "fleet_store": assessment.fleet_store,
+        "draining": assessment.draining,
+    });
+    if let Some(reason) = &assessment.reason {
+        body["reason"] = serde_json::json!(reason);
+    }
+    if let Some(retry) = assessment.retry_after_seconds {
+        body["retry_after_seconds"] = serde_json::json!(retry);
+    }
+    // Compatibility field for legacy consumers during migration.
+    body["eligible_workers"] = serde_json::json!(eligible);
+    let mut response = (
+        if assessment.ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        Json(serde_json::json!({
-            "status": if ready { "ready" } else { "not_ready" },
-            "eligible_workers": eligible,
-        })),
+        Json(body),
     )
+        .into_response();
+    if let Some(retry) = assessment.retry_after_seconds
+        && let Ok(value) = HeaderValue::from_str(&retry.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+pub(super) async fn proxy_routability(
+    State(layer): State<Arc<OrchestratorLayer>>,
+) -> impl IntoResponse {
+    let eligible = layer.registry.eligible_healthy_count();
+    let assessment = layer.ops.routable_assessment(eligible);
+    // Unauthenticated summary intentionally omits worker IDs and model details.
+    let body = if assessment.routable {
+        serde_json::json!({ "status": "routable" })
+    } else {
+        serde_json::json!({
+            "status": "not_routable",
+            "retry_after_seconds": assessment.retry_after_seconds.unwrap_or(5),
+        })
+    };
+    let mut response = (
+        if assessment.routable {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(body),
+    )
+        .into_response();
+    if let Some(retry) = assessment.retry_after_seconds
+        && let Ok(value) = HeaderValue::from_str(&retry.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 pub(super) async fn proxy_metrics(

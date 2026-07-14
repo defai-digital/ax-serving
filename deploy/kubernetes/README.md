@@ -47,12 +47,14 @@ Apply only after replacing the placeholders:
 kubectl apply -k deploy/kubernetes/base
 ```
 
-The gateway exposes `/livez` for process liveness, `/readyz` for routable
-worker readiness, and `/health` for the JSON fleet summary. Prometheus scrapes
-`/metrics` with the admin bearer credential; do not put that credential in a
-PodMonitor or ServiceMonitor checked into source. A new gateway remains
-unready until at least one compatible worker is eligible; this prevents an
-empty replica from receiving inference traffic.
+The gateway exposes `/livez` for process liveness, `/readyz` for control-plane
+readiness (configuration, listeners, fleet store — not worker capacity),
+`/routablez` for fleet capacity, and `/health` for the JSON fleet summary.
+Prometheus scrapes `/metrics` with the admin bearer credential; do not put that
+credential in a PodMonitor or ServiceMonitor checked into source. A fresh
+gateway becomes ready without workers so runtime agents can register through the
+private control Service; inference returns structured 503 until `/routablez` is
+true.
 
 The runtime-agent example is deliberately excluded from the base
 Kustomization. Runtime images, GPU resources, model revisions, adapter

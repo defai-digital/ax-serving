@@ -275,7 +275,11 @@ async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
         )
         .unwrap(),
     );
+    // In-process tests do not bind sockets; mark listeners ready to exercise
+    // control-plane readiness independent of worker capacity.
+    layer.ops.mark_listeners_ready();
     let app = ax_serving_api::orchestration::proxy_router(layer);
+    // Control-plane readiness must succeed with zero workers so agents can register.
     let readiness = app
         .clone()
         .oneshot(
@@ -286,8 +290,20 @@ async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
         )
         .await
         .unwrap();
+    assert_eq!(readiness.status(), axum::http::StatusCode::OK);
+
+    let routability = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/routablez")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        readiness.status(),
+        routability.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
 
@@ -535,7 +551,10 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
                     }),
                 },
             },
-            worker_addr,
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(&format!(
+                "http://{worker_addr}"
+            ))
+            .unwrap(),
             NegotiatedProtocol {
                 version: CURRENT_PROTOCOL,
                 capabilities: BTreeSet::new(),

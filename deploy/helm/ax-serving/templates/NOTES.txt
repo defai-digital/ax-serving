@@ -1,0 +1,15 @@
+AX Serving gateway installed (CPU-only control plane).
+
+1. Public Service:  {{ include "ax-serving.fullname" . }}:{{ .Values.service.public.port }}
+2. Control Service: {{ include "ax-serving.fullname" . }}-control:{{ .Values.service.control.port }}
+
+Probes:
+  /livez      — process liveness
+  /readyz     — control-plane readiness (does not require workers)
+  /routablez  — fleet capacity (eligible runtimes)
+
+Production notes:
+  - Provide secrets via secrets.existingSecret (no chart-generated credentials).
+  - Multi-replica installs require Redis/Valkey shared fleet state.
+  - Runtime agents and GPU runtimes are deployed outside this chart.
+  - trusted_mesh asserts platform transport; this chart does not create TLS.
