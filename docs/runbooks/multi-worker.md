@@ -209,8 +209,9 @@ Public probes:
 
 ```bash
 curl -fsS http://gateway:18080/livez
-curl -fsS http://gateway:18080/readyz
-curl -sS http://gateway:18080/health | jq .
+curl -fsS http://gateway:18080/readyz       # control-plane ready (default; no workers required)
+curl -fsS http://gateway:18080/routablez   # capacity: 200 only with eligible workers
+curl -sS http://gateway:18080/health | jq .  # status "ok" means capacity, not process readiness
 curl -sS http://gateway:18080/v1/models \
   -H 'Authorization: Bearer public-client-key' | jq .
 ```
@@ -229,10 +230,22 @@ curl -sS http://gateway:19090/internal/workers \
 Expected before traffic:
 
 - `/livez` is `200` on every process;
-- `/readyz` is `200` only on gateways with at least one eligible endpoint;
+- `/readyz` is `200` when the control plane is ready (config, listeners, fleet
+  store, not draining). Default `readyz_mode=control_plane` does **not** require
+  workers so agents can register during bootstrap;
+- `/routablez` is `200` only when at least one eligible healthy non-draining
+  endpoint is present (serving capacity). Use this for traffic readiness, not
+  `/readyz` alone;
+- `/health` `"status": "ok"` means capacity (`workers.eligible > 0`), not the
+  same signal as control-plane `/readyz`;
 - every worker has a current protocol lease and ready runtime observation;
 - explicit deployment identity matches the catalog;
 - no unexpected legacy registration participates in certified routing.
+
+Legacy: set `orchestrator.readyz_mode = eligible_workers` or
+`AXS_READYZ_MODE=eligible_workers` to restore worker-gated `/readyz` during
+Fabric migration. Production installs keep the control-plane default and probe
+capacity via `/routablez`.
 
 ## 7. Request and retry contract
 
@@ -396,7 +409,20 @@ credentials.
 
 ### `/readyz` is `503`
 
-Check, in order:
+Under the default `control_plane` mode this means the **control plane** is not
+ready (config/listeners starting, gateway draining, or fleet store
+stale/unavailable)—not missing workers. Check, in order:
+
+1. process still starting (listeners not marked ready) or active drain/shutdown;
+2. Redis/fleet-store connectivity and last successful store operation age;
+3. configuration validation failures at startup.
+
+If you intentionally run `readyz_mode=eligible_workers`, then also walk the
+capacity checklist under `/routablez` is `503` below.
+
+### `/routablez` is `503` (or `/health` status is `degraded`)
+
+Serving capacity is unavailable. Check, in order:
 
 1. runtime process readiness and `/v1/models`;
 2. agent heartbeat and observation timestamp;

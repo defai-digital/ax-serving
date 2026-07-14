@@ -29,7 +29,7 @@ a production-qualified OCI release.
 | Docker evaluation | The image build surface exists. | Add the supported Compose topology, pinned image references, health behavior, and end-to-end smoke test. |
 | Kubernetes baseline | Kustomize manifests cover a gateway, Services, PDB, NetworkPolicy, and an example runtime agent. | Correct readiness/bootstrap, shutdown, external-peer networking, secret, and production-default gaps; retain Kustomize only as an example during migration. |
 | Helm | No first-party chart exists. | Implement the chart, values schema, render matrix, install/upgrade/rollback tests, documentation, signing, and OCI publication. |
-| Runtime availability | Current readiness is coupled to worker eligibility. | Separate `/readyz` from `/routablez` and make worker-control discovery available while no runtime is routable. |
+| Runtime availability | `/readyz` defaults to `control_plane` (config, listeners, fleet store; no workers required); `/routablez` reports eligible capacity; `/health` `"ok"` means capacity. Legacy `readyz_mode=eligible_workers` retained for Fabric migration. | Certify production probe wiring (Helm/K8s probes use `/readyz` + capacity via `/routablez` or eligible gauges); keep public docs and runbooks aligned. |
 | Runtime agents | The portable agent and example sidecar path exist. | Add DNS/URI advertised endpoints and certify sidecar, separate CPU Deployment, and external-host patterns. |
 | Release integration | CI validates container build basics; the release workflow does not publish the complete deployment set. | Link source, gateway image, agent image, chart, SBOM, signatures, and evidence in one release manifest. |
 

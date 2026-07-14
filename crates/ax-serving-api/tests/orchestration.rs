@@ -109,6 +109,128 @@ async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
     assert!(!body.contains("worker_id="));
 }
 
+/// Legacy `readyz_mode=eligible_workers` must gate `/readyz` on capacity via HTTP.
+///
+/// Default control-plane readiness (zero workers → `/readyz` 200, `/routablez` 503)
+/// is covered by `gateway_prometheus_metrics_are_normalized_and_low_cardinality`.
+#[tokio::test]
+async fn legacy_eligible_workers_readyz_mode_gates_http_probe() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig {
+                readyz_mode: "eligible_workers".into(),
+                ..OrchestratorConfig::default()
+            },
+            LicenseConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    // In-process tests do not bind sockets; mark listeners ready so the only
+    // remaining gate is worker eligibility under legacy mode.
+    layer.ops.mark_listeners_ready();
+    let app = ax_serving_api::orchestration::proxy_router(Arc::clone(&layer));
+
+    // Zero workers: control plane would be ready, but legacy mode returns 503.
+    let readiness = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        readiness.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        readiness
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    let not_ready_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(readiness.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        not_ready_body.get("reason").and_then(|v| v.as_str()),
+        Some("no_eligible_workers")
+    );
+    assert_eq!(
+        not_ready_body
+            .get("eligible_workers")
+            .and_then(|v| v.as_u64()),
+        Some(0)
+    );
+
+    // Capacity probe remains independent of readyz_mode.
+    let routability = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/routablez")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        routability.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // One eligible worker restores legacy /readyz and /routablez.
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    layer.registry.register(reg_req(addr, &["probe-model"]), 5000);
+    assert_eq!(layer.registry.eligible_healthy_count(), 1);
+
+    let ready_with_worker = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_with_worker.status(), axum::http::StatusCode::OK);
+    let ready_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(ready_with_worker.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        ready_body.get("status").and_then(|v| v.as_str()),
+        Some("ready")
+    );
+    assert_eq!(
+        ready_body
+            .get("eligible_workers")
+            .and_then(|v| v.as_u64()),
+        Some(1)
+    );
+
+    let routable_with_worker = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/routablez")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(routable_with_worker.status(), axum::http::StatusCode::OK);
+}
+
 fn sample_project_policy(default_project: Option<&str>) -> ProjectPolicyConfig {
     ProjectPolicyConfig {
         enabled: true,

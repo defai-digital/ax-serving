@@ -139,9 +139,16 @@ Portable gateway inference endpoints:
 
 Health and observability:
 
-- `GET /livez` — process liveness;
-- `GET /readyz` — `200` only when at least one worker is routable;
-- `GET /health` — JSON fleet health summary;
+- `GET /livez` — process liveness (gateway can answer HTTP);
+- `GET /readyz` — control-plane readiness by default: config validated, listeners
+  ready, fleet store healthy, and not draining. Does **not** require workers.
+  Set `orchestrator.readyz_mode = eligible_workers` (or `AXS_READYZ_MODE`) for
+  the legacy worker-gated behavior used during Fabric migration;
+- `GET /routablez` — serving capacity: `200` when at least one eligible healthy
+  non-draining worker is present, otherwise `503` with `Retry-After`;
+- `GET /health` — JSON fleet summary; `"status": "ok"` means capacity
+  (`workers.eligible > 0`), not process readiness — use `/routablez` or
+  eligible count for capacity, not `/readyz` alone under the default mode;
 - `GET /v1/metrics` — admin-authenticated JSON operational metrics;
 - `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
 - `GET /dashboard` — compatibility convenience UI, usable only behind an

@@ -42,9 +42,17 @@ evidence and must not be used as authentication or user identifiers.
 
 ## Health and observability
 
-- `GET /livez` — process liveness;
-- `GET /readyz` — routable readiness;
-- `GET /health` — JSON fleet summary;
+- `GET /livez` — process liveness (gateway process can answer HTTP);
+- `GET /readyz` — control-plane readiness by default (config, listeners, fleet
+  store, not draining). Does **not** require an eligible worker. Legacy
+  `orchestrator.readyz_mode = eligible_workers` / `AXS_READYZ_MODE=eligible_workers`
+  restores worker-gated readiness for Fabric migration;
+- `GET /routablez` — serving capacity readiness (`200` when
+  `eligible_healthy_count > 0`, else `503` + `Retry-After`). AX Fabric and
+  capacity monitoring should use this probe (or `workers.eligible > 0`);
+- `GET /health` — JSON fleet summary; `"status": "ok"` reflects capacity
+  (eligible workers), not control-plane readiness, and is not interchangeable
+  with `/readyz` under `control_plane` mode;
 - `GET /v1/metrics` — admin-authenticated JSON operational metrics;
 - `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
 - `GET /dashboard` — admin-authenticated compatibility convenience UI; its DOM is not a
