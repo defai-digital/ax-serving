@@ -24,12 +24,12 @@ use super::registry::{BackendKind, RuntimeKind};
 use super::request_profile::{PriorityClass, RequestProfile, validate_unique_routing_fields};
 use crate::auth::{AxRequestId, RequestId};
 use crate::project_policy;
-use crate::rest::schema::{
-    EmbeddingsInput, InputMessage, MAX_CONTENT_BYTES, MAX_EMBEDDING_INPUTS,
-    MAX_EMBEDDING_TOTAL_BYTES, MAX_EMBEDDING_TOTAL_TOKENS, MAX_MAX_TOKENS, MAX_MESSAGES,
-    MessageContent,
-};
+use crate::rest::schema::{EmbeddingsInput, InputMessage, MessageContent};
 use crate::utils::request_meta::{audit_actor, default_audit_limit};
+use crate::utils::request_shape::{
+    ShapeError, validate_chat_messages, validate_embeddings_input, validate_max_tokens,
+    validate_model_id, validate_prompt,
+};
 
 // ── Shared inference proxy ────────────────────────────────────────────────────
 
@@ -115,14 +115,14 @@ async fn proxy_inference(
             );
         }
     };
-    let model_id = match validate_proxy_model_id(meta.model.clone()) {
+    let model_id = match validate_model_id(meta.model.clone()) {
         Ok(model_id) => model_id,
-        Err((status, error)) => {
+        Err(error) => {
             return ax_error_response(
-                status,
+                error.status,
                 request_id,
                 "AXS_INVALID_MODEL",
-                error,
+                error.message,
                 false,
                 ax_serving_protocol::AdmissionPhase::Admission,
             );
@@ -148,12 +148,12 @@ async fn proxy_inference(
     };
     let _embedding_input = match validate_proxy_request_shape(worker_path, &meta) {
         Ok(input) => input,
-        Err((status, error)) => {
+        Err(error) => {
             return ax_error_response(
-                status,
+                error.status,
                 request_id,
                 "AXS_INVALID_REQUEST_SHAPE",
-                error,
+                error.message,
                 false,
                 ax_serving_protocol::AdmissionPhase::Admission,
             );
@@ -631,233 +631,36 @@ fn build_request_profile(
 fn validate_proxy_request_shape(
     worker_path: &str,
     meta: &ProxyRequestMeta,
-) -> Result<Option<EmbeddingsInput>, (StatusCode, String)> {
+) -> Result<Option<EmbeddingsInput>, ShapeError> {
     match worker_path {
         "/v1/chat/completions" => {
-            validate_proxy_max_tokens(meta.max_tokens)?;
-            validate_proxy_chat_messages(&meta.messages)?;
+            validate_max_tokens(meta.max_tokens)?;
+            validate_chat_messages(&meta.messages)?;
             Ok(None)
         }
         "/v1/completions" => {
-            validate_proxy_max_tokens(meta.max_tokens)?;
-            validate_proxy_prompt(meta.prompt.as_deref())?;
+            validate_max_tokens(meta.max_tokens)?;
+            validate_prompt(meta.prompt.as_deref())?;
             Ok(None)
         }
         "/v1/embeddings" => {
             let Some(input) = meta.input.as_ref() else {
-                return Err((StatusCode::BAD_REQUEST, "missing field: input".to_string()));
+                return Err(ShapeError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "missing field: input".to_string(),
+                });
             };
             let input = serde_json::from_value::<EmbeddingsInput>(input.clone()).map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "invalid embedding input".to_string(),
-                )
+                ShapeError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "invalid embedding input".to_string(),
+                }
             })?;
-            validate_proxy_embeddings_input(&input)?;
+            validate_embeddings_input(&input)?;
             Ok(Some(input))
         }
         _ => Ok(None),
     }
-}
-
-fn validate_proxy_max_tokens(max_tokens: Option<u32>) -> Result<(), (StatusCode, String)> {
-    if matches!(max_tokens, Some(0)) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "max_tokens must be >= 1".to_string(),
-        ));
-    }
-    if matches!(max_tokens, Some(n) if n > MAX_MAX_TOKENS) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("max_tokens exceeds limit ({MAX_MAX_TOKENS})"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_proxy_chat_messages(messages: &[InputMessage]) -> Result<(), (StatusCode, String)> {
-    if messages.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "messages must not be empty".to_string(),
-        ));
-    }
-    if messages.len() > MAX_MESSAGES {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("too many messages (max {MAX_MESSAGES})"),
-        ));
-    }
-    for message in messages {
-        if message.content.is_none()
-            && !(message.role.eq_ignore_ascii_case("assistant") && message.tool_calls.is_some())
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "message content is required unless assistant tool_calls are present".to_string(),
-            ));
-        }
-        if message
-            .content
-            .as_ref()
-            .is_some_and(|content| content.byte_len() > MAX_CONTENT_BYTES)
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "message content exceeds 32 KB limit".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_proxy_prompt(prompt: Option<&str>) -> Result<(), (StatusCode, String)> {
-    let Some(prompt) = prompt else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prompt must not be empty".to_string(),
-        ));
-    };
-    if prompt.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prompt must not be empty".to_string(),
-        ));
-    }
-    if prompt.len() > MAX_CONTENT_BYTES {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prompt exceeds 32 KB limit".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_proxy_embeddings_input(input: &EmbeddingsInput) -> Result<(), (StatusCode, String)> {
-    match input {
-        EmbeddingsInput::One(text) => validate_proxy_embedding_text(text, 0),
-        EmbeddingsInput::Many(texts) => {
-            if texts.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "input must not be empty".to_string(),
-                ));
-            }
-            if texts.len() > MAX_EMBEDDING_INPUTS {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"),
-                ));
-            }
-            let mut total_bytes = 0usize;
-            for (idx, text) in texts.iter().enumerate() {
-                validate_proxy_embedding_text(text, idx)?;
-                total_bytes = total_bytes.saturating_add(text.len());
-            }
-            if total_bytes > MAX_EMBEDDING_TOTAL_BYTES {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "embedding input text exceeds total limit of {MAX_EMBEDDING_TOTAL_BYTES} bytes"
-                    ),
-                ));
-            }
-            Ok(())
-        }
-        EmbeddingsInput::OneTokens(tokens) => validate_proxy_embedding_tokens(tokens, 0),
-        EmbeddingsInput::ManyTokens(seqs) => {
-            if seqs.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "input must not be empty".to_string(),
-                ));
-            }
-            if seqs.len() > MAX_EMBEDDING_INPUTS {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("too many embedding inputs (max {MAX_EMBEDDING_INPUTS})"),
-                ));
-            }
-            let mut total_tokens = 0usize;
-            for (idx, tokens) in seqs.iter().enumerate() {
-                validate_proxy_embedding_tokens(tokens, idx)?;
-                total_tokens = total_tokens.saturating_add(tokens.len());
-            }
-            if total_tokens > MAX_EMBEDDING_TOTAL_TOKENS {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "embedding token input exceeds total limit of {MAX_EMBEDDING_TOTAL_TOKENS}"
-                    ),
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn validate_proxy_embedding_text(text: &str, index: usize) -> Result<(), (StatusCode, String)> {
-    if text.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("embedding input at index {index} must not be empty"),
-        ));
-    }
-    if text.len() > MAX_CONTENT_BYTES {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("embedding input at index {index} exceeds {MAX_CONTENT_BYTES} bytes"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_proxy_embedding_tokens(
-    tokens: &[u32],
-    index: usize,
-) -> Result<(), (StatusCode, String)> {
-    if tokens.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("embedding token input at index {index} must not be empty"),
-        ));
-    }
-    if tokens.len() > MAX_EMBEDDING_TOTAL_TOKENS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "embedding token input at index {index} exceeds {MAX_EMBEDDING_TOTAL_TOKENS} tokens"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode, String)> {
-    let Some(model) = model else {
-        return Err((StatusCode::BAD_REQUEST, "missing field: model".to_string()));
-    };
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "model must not be empty".to_string(),
-        ));
-    }
-    if model != trimmed {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "model contains unsupported whitespace".to_string(),
-        ));
-    }
-    LogicalModelId::new(model.clone()).map_err(|error| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid model identifier: {error}"),
-        )
-    })?;
-    Ok(model)
 }
 
 fn validate_dispatch_hint(hint: Option<String>) -> Result<Option<String>, String> {
