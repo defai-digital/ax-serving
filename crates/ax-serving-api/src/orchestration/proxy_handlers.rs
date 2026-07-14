@@ -67,8 +67,7 @@ async fn proxy_inference(
     worker_path: &'static str,
     request_id: ax_serving_protocol::RequestId,
 ) -> axum::response::Response {
-    let Some(admission_guard) =
-        super::gateway_ops::AcceptedRequestGuard::try_admit(&layer.ops)
+    let Some(admission_guard) = super::gateway_ops::AcceptedRequestGuard::try_admit(&layer.ops)
     else {
         let mut response = ax_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1357,6 +1356,20 @@ pub(super) async fn proxy_prometheus_metrics(
         "Aggregate requests currently reserved on workers.",
         "gauge",
         total_inflight as u64,
+    );
+    prometheus_metric(
+        &mut body,
+        "axs_gateway_reservation_renew_tasks",
+        "Active per-attempt shared reservation renew loops.",
+        "gauge",
+        dispatch.reservation_renew_tasks,
+    );
+    let _ = writeln!(
+        body,
+        "# HELP axs_gateway_reservation_renew_total Shared reservation renew outcomes.\n# TYPE axs_gateway_reservation_renew_total counter\naxs_gateway_reservation_renew_total{{result=\"ok\"}} {}\naxs_gateway_reservation_renew_total{{result=\"fenced\"}} {}\naxs_gateway_reservation_renew_total{{result=\"error\"}} {}",
+        dispatch.reservation_renew_ok_total,
+        dispatch.reservation_renew_fenced_total,
+        dispatch.reservation_renew_error_total,
     );
 
     (

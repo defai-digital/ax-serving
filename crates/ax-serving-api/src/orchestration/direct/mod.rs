@@ -13,178 +13,43 @@
 //! Streaming responses (SSE, `text/event-stream`) are forwarded chunk-by-chunk
 //! without buffering so time-to-first-token is not impacted.
 
+mod attempt;
+mod client;
+mod headers;
+mod metrics;
+mod reservation;
+mod retry_policy;
+mod stream_proxy;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::body::Bytes;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::{Stream, StreamExt as _, TryStreamExt as _};
-use opentelemetry::propagation::Injector;
 use reqwest::Client;
-use tracing::{Instrument as _, debug, error, info_span, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use tracing::{Instrument as _, debug, info_span, warn};
 
+use self::attempt::{AttemptGuard, InflightGuard};
+use self::client::{
+    DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT_SECS, build_dispatcher_client,
+    parse_dispatch_token, worker_url,
+};
+use self::headers::{attach_dispatch_auth, current_trace_headers};
+use self::metrics::{DispatchMetrics, SelectionOutcome};
+use self::reservation::{ReservationAcquireError, reserve_attempt};
+use self::retry_policy::{is_retryable_connect_failure, is_typed_not_admitted};
+use self::stream_proxy::drain_worker_error_response;
 use super::deployment::DeploymentCatalog;
 use super::error::ax_error_response;
-use super::fleet_state::{FleetStateStore, ReservationResult};
+use super::fleet_state::FleetStateStore;
 use super::policy::{DispatchContext, DispatchPolicy};
 use super::registry::{RequestKind, WorkerId, WorkerRegistry};
 use super::request_profile::{RequestProfile, rewrite_runtime_model};
 
-struct TraceHeaderInjector(HeaderMap);
-
-impl Injector for TraceHeaderInjector {
-    fn set(&mut self, key: &str, value: String) {
-        if !matches!(key, "traceparent" | "tracestate" | "baggage") || value.len() > 1024 {
-            return;
-        }
-        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
-            return;
-        };
-        let Ok(value) = HeaderValue::from_str(&value) else {
-            return;
-        };
-        self.0.insert(name, value);
-    }
-}
-
-fn current_trace_headers() -> HeaderMap {
-    let context = tracing::Span::current().context();
-    let mut injector = TraceHeaderInjector(HeaderMap::new());
-    opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&context, &mut injector);
-    });
-    injector.0
-}
-
-// ── InflightGuard ─────────────────────────────────────────────────────────────
-
-/// RAII guard: increments a counter on creation, decrements on drop.
-struct InflightGuard(Arc<AtomicUsize>);
-
-impl InflightGuard {
-    #[cfg(test)]
-    fn acquire(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(Arc::clone(counter))
-    }
-
-    fn try_acquire(counter: &Arc<AtomicUsize>, max_inflight: usize) -> Option<Self> {
-        let max_inflight = max_inflight.max(1);
-        let mut current = counter.load(Ordering::Acquire);
-        loop {
-            if current >= max_inflight {
-                return None;
-            }
-            match counter.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Self(Arc::clone(counter))),
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            });
-    }
-}
-
-struct SharedReservationGuard {
-    store: Arc<dyn FleetStateStore>,
-    worker_id: ax_serving_protocol::WorkerId,
-    attempt_id: ax_serving_protocol::AttemptId,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl SharedReservationGuard {
-    fn new(
-        store: Arc<dyn FleetStateStore>,
-        worker_id: ax_serving_protocol::WorkerId,
-        attempt_id: ax_serving_protocol::AttemptId,
-        max_concurrent: usize,
-        ttl_ms: u64,
-    ) -> Self {
-        let (stop, mut stopped) = tokio::sync::oneshot::channel();
-        let renew_store = Arc::clone(&store);
-        let renew_worker = worker_id.clone();
-        let renew_every = std::time::Duration::from_millis((ttl_ms / 3).max(250));
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(renew_every) => {
-                        match renew_store
-                            .try_reserve(
-                                &renew_worker,
-                                attempt_id,
-                                max_concurrent,
-                                ttl_ms,
-                            )
-                            .await
-                        {
-                            Ok(ReservationResult::Reserved) => {}
-                            Ok(ReservationResult::Saturated) => {
-                                warn!(%renew_worker, %attempt_id, "shared dispatch reservation renewal was fenced");
-                                break;
-                            }
-                            Err(error) => {
-                                warn!(%renew_worker, %attempt_id, %error, "shared dispatch reservation renewal failed");
-                            }
-                        }
-                    }
-                    _ = &mut stopped => break,
-                }
-            }
-        });
-        Self {
-            store,
-            worker_id,
-            attempt_id,
-            stop: Some(stop),
-        }
-    }
-}
-
-impl Drop for SharedReservationGuard {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        let store = Arc::clone(&self.store);
-        let worker_id = self.worker_id.clone();
-        let attempt_id = self.attempt_id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(error) = store.release_reservation(&worker_id, attempt_id).await {
-                    warn!(%worker_id, %attempt_id, %error, "shared dispatch reservation release failed");
-                }
-            });
-        }
-    }
-}
-
-struct AttemptGuard {
-    _inflight: InflightGuard,
-    _reservation: Option<SharedReservationGuard>,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ReservationAcquireError {
-    #[error("worker reservation capacity exhausted")]
-    Saturated,
-    #[error("shared fleet state is unavailable")]
-    Store(#[source] anyhow::Error),
-}
+pub use self::metrics::{
+    DispatchMetricsSnapshot, GATEWAY_LATENCY_BUCKETS_US, LatencyHistogramSnapshot,
+};
 
 // ── DirectDispatcher ──────────────────────────────────────────────────────────
 
@@ -202,320 +67,6 @@ pub struct DirectDispatcher {
     stream_idle_timeout: std::time::Duration,
     fleet_store: Option<Arc<dyn FleetStateStore>>,
     reservation_ttl_ms: u64,
-}
-
-#[derive(Debug, Default)]
-struct DispatchMetrics {
-    requests_total: AtomicU64,
-    attempts_total: AtomicU64,
-    completed_total: AtomicU64,
-    failed_total: AtomicU64,
-    cancelled_total: AtomicU64,
-    endpoint_selection: AtomicLatencyHistogram,
-    response_headers: AtomicLatencyHistogram,
-    attempt_duration: AtomicLatencyHistogram,
-    time_to_first_byte: AtomicLatencyHistogram,
-    stream_duration: AtomicLatencyHistogram,
-    selection_selected_total: AtomicU64,
-    selection_no_candidate_total: AtomicU64,
-    selection_at_capacity_total: AtomicU64,
-    selection_error_total: AtomicU64,
-}
-
-/// Fixed, cumulative microsecond buckets keep the dispatch hot path lock-free
-/// and prevent unbounded label/cardinality growth.
-pub const GATEWAY_LATENCY_BUCKETS_US: [u64; 9] =
-    [50, 100, 250, 500, 1_000, 2_000, 5_000, 15_000, u64::MAX];
-
-#[derive(Debug)]
-struct AtomicLatencyHistogram {
-    count: AtomicU64,
-    sum_us: AtomicU64,
-    cumulative_buckets: [AtomicU64; GATEWAY_LATENCY_BUCKETS_US.len()],
-}
-
-impl Default for AtomicLatencyHistogram {
-    fn default() -> Self {
-        Self {
-            count: AtomicU64::new(0),
-            sum_us: AtomicU64::new(0),
-            cumulative_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-        }
-    }
-}
-
-impl AtomicLatencyHistogram {
-    fn record(&self, elapsed: std::time::Duration) {
-        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        self.count.fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .sum_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(elapsed_us))
-            });
-        for (index, upper_bound) in GATEWAY_LATENCY_BUCKETS_US.iter().enumerate() {
-            if elapsed_us <= *upper_bound {
-                self.cumulative_buckets[index].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    fn snapshot(&self) -> LatencyHistogramSnapshot {
-        LatencyHistogramSnapshot {
-            count: self.count.load(Ordering::Relaxed),
-            sum_us: self.sum_us.load(Ordering::Relaxed),
-            cumulative_buckets: std::array::from_fn(|index| {
-                self.cumulative_buckets[index].load(Ordering::Relaxed)
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LatencyHistogramSnapshot {
-    pub count: u64,
-    pub sum_us: u64,
-    pub cumulative_buckets: [u64; GATEWAY_LATENCY_BUCKETS_US.len()],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectionOutcome {
-    Selected,
-    NoCandidate,
-    AtCapacity,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DispatchMetricsSnapshot {
-    pub requests_total: u64,
-    pub attempts_total: u64,
-    pub completed_total: u64,
-    pub failed_total: u64,
-    pub cancelled_total: u64,
-    pub retries_total: u64,
-    pub endpoint_selection: LatencyHistogramSnapshot,
-    pub response_headers: LatencyHistogramSnapshot,
-    pub attempt_duration: LatencyHistogramSnapshot,
-    pub time_to_first_byte: LatencyHistogramSnapshot,
-    pub stream_duration: LatencyHistogramSnapshot,
-    pub selection_selected_total: u64,
-    pub selection_no_candidate_total: u64,
-    pub selection_at_capacity_total: u64,
-    pub selection_error_total: u64,
-}
-
-struct DispatchOutcomeGuard {
-    metrics: Arc<DispatchMetrics>,
-    resolved: bool,
-    successful_response: bool,
-    attempt_started: std::time::Instant,
-    first_byte_recorded: bool,
-}
-
-impl DispatchOutcomeGuard {
-    fn new(
-        metrics: Arc<DispatchMetrics>,
-        successful_response: bool,
-        attempt_started: std::time::Instant,
-    ) -> Self {
-        Self {
-            metrics,
-            resolved: false,
-            successful_response,
-            attempt_started,
-            first_byte_recorded: false,
-        }
-    }
-
-    fn first_byte(&mut self) {
-        if !self.first_byte_recorded {
-            self.metrics
-                .time_to_first_byte
-                .record(self.attempt_started.elapsed());
-            self.first_byte_recorded = true;
-        }
-    }
-
-    fn finish_timing(&self) {
-        let elapsed = self.attempt_started.elapsed();
-        self.metrics.attempt_duration.record(elapsed);
-        self.metrics.stream_duration.record(elapsed);
-    }
-
-    fn completed(&mut self) {
-        if !self.resolved {
-            self.finish_timing();
-            if self.successful_response {
-                self.metrics.completed_total.fetch_add(1, Ordering::Relaxed);
-            }
-            self.resolved = true;
-        }
-    }
-
-    fn failed(&mut self) {
-        if !self.resolved {
-            self.finish_timing();
-            if self.successful_response {
-                self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
-            }
-            self.resolved = true;
-        }
-    }
-}
-
-impl Drop for DispatchOutcomeGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.finish_timing();
-            if self.successful_response {
-                self.metrics.cancelled_total.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// TCP connect timeout for the dispatcher's reqwest client.
-/// Short enough to fail fast on unreachable workers without blocking the queue.
-const DISPATCHER_CONNECT_TIMEOUT_SECS: u64 = 5;
-/// Default pool size and request timeout matching serving.example.yaml defaults.
-const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
-/// Maximum buffered non-streaming worker response body.
-const MAX_WORKER_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Debug)]
-enum WorkerBodyError {
-    TooLarge,
-    Read(reqwest::Error),
-}
-
-fn response_declares_oversize(content_length: Option<u64>, max_bytes: usize) -> bool {
-    content_length.is_some_and(|len| len > max_bytes as u64)
-}
-
-fn append_limited_body_chunk(
-    body: &mut Vec<u8>,
-    chunk: &[u8],
-    max_bytes: usize,
-) -> Result<(), WorkerBodyError> {
-    let next_len = body
-        .len()
-        .checked_add(chunk.len())
-        .ok_or(WorkerBodyError::TooLarge)?;
-    if next_len > max_bytes {
-        return Err(WorkerBodyError::TooLarge);
-    }
-    body.extend_from_slice(chunk);
-    Ok(())
-}
-
-fn add_limited_body_len(
-    current_len: usize,
-    chunk_len: usize,
-    max_bytes: usize,
-) -> Result<usize, WorkerBodyError> {
-    let next_len = current_len
-        .checked_add(chunk_len)
-        .ok_or(WorkerBodyError::TooLarge)?;
-    if next_len > max_bytes {
-        return Err(WorkerBodyError::TooLarge);
-    }
-    Ok(next_len)
-}
-
-async fn read_worker_response_body_limited(
-    resp: reqwest::Response,
-    max_bytes: usize,
-) -> Result<Bytes, WorkerBodyError> {
-    if response_declares_oversize(resp.content_length(), max_bytes) {
-        return Err(WorkerBodyError::TooLarge);
-    }
-
-    let mut body = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        append_limited_body_chunk(&mut body, &chunk.map_err(WorkerBodyError::Read)?, max_bytes)?;
-    }
-    Ok(Bytes::from(body))
-}
-
-fn should_forward_worker_header(name: &HeaderName, include_content_length: bool) -> bool {
-    let name = name.as_str();
-    !matches!(
-        name,
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "set-cookie"
-            | "www-authenticate"
-            | "x-ax-admission-state"
-            | "x-ax-attempt-id"
-            | "x-ax-dispatch-token"
-            | "x-ax-deployment-id"
-            | "x-ax-pool-id"
-    ) && (include_content_length || name != header::CONTENT_LENGTH.as_str())
-}
-
-fn response_builder_with_worker_headers(
-    status: StatusCode,
-    headers: &HeaderMap,
-    include_content_length: bool,
-) -> axum::http::response::Builder {
-    let mut builder = axum::response::Response::builder().status(status);
-    for (name, value) in headers {
-        if should_forward_worker_header(name, include_content_length) {
-            builder = builder.header(name, value);
-        }
-    }
-    if !headers.contains_key(header::CONTENT_TYPE) {
-        builder = builder.header(header::CONTENT_TYPE, "application/json");
-    }
-    builder
-}
-
-async fn drain_worker_error_response(resp: reqwest::Response, url: &str) {
-    if response_declares_oversize(resp.content_length(), MAX_WORKER_RESPONSE_BODY_BYTES) {
-        warn!(
-            %url,
-            content_length = resp.content_length().unwrap_or_default(),
-            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
-            "skipping oversized worker error response drain"
-        );
-        return;
-    }
-
-    let mut total_len = 0usize;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(chunk) => {
-                match add_limited_body_len(total_len, chunk.len(), MAX_WORKER_RESPONSE_BODY_BYTES) {
-                    Ok(next_len) => total_len = next_len,
-                    Err(WorkerBodyError::TooLarge) => {
-                        warn!(
-                            %url,
-                            limit = MAX_WORKER_RESPONSE_BODY_BYTES,
-                            "stopping oversized worker error response drain"
-                        );
-                        return;
-                    }
-                    Err(WorkerBodyError::Read(_)) => {
-                        unreachable!("length accounting does not read")
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(%url, err = %err, "draining worker error response failed");
-                return;
-            }
-        }
-    }
 }
 
 impl DirectDispatcher {
@@ -545,35 +96,8 @@ impl DirectDispatcher {
         stream_idle_timeout_ms: u64,
         dispatch_token: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let client = match Client::builder()
-            .pool_max_idle_per_host(pool_max_idle_per_host)
-            .connect_timeout(std::time::Duration::from_secs(
-                DISPATCHER_CONNECT_TIMEOUT_SECS,
-            ))
-            .timeout(std::time::Duration::from_secs(request_timeout_secs))
-            .build()
-        {
-            Ok(client) => client,
-            Err(err) => {
-                warn!(
-                    %err,
-                    pool_max_idle_per_host,
-                    request_timeout_secs,
-                    "failed to build tuned reqwest client; falling back to default client"
-                );
-                Client::new()
-            }
-        };
-
-        let dispatch_token = dispatch_token
-            .map(|token| {
-                let mut value = HeaderValue::from_str(token).map_err(|_| {
-                    anyhow::anyhow!("AXS_DISPATCH_TOKEN is not a valid HTTP header")
-                })?;
-                value.set_sensitive(true);
-                Ok::<_, anyhow::Error>(value)
-            })
-            .transpose()?;
+        let client = build_dispatcher_client(pool_max_idle_per_host, request_timeout_secs);
+        let dispatch_token = parse_dispatch_token(dispatch_token)?;
 
         Ok(Self {
             client,
@@ -595,45 +119,6 @@ impl DirectDispatcher {
         self.fleet_store = Some(fleet_store);
         self.reservation_ttl_ms = reservation_ttl_ms.max(1_000);
         self
-    }
-
-    async fn reserve_attempt(
-        &self,
-        worker_id: Option<ax_serving_protocol::WorkerId>,
-        attempt_id: ax_serving_protocol::AttemptId,
-        max_concurrent: usize,
-    ) -> Result<Option<SharedReservationGuard>, ReservationAcquireError> {
-        let (Some(store), Some(worker_id)) = (&self.fleet_store, worker_id) else {
-            return Ok(None);
-        };
-        match store
-            .try_reserve(
-                &worker_id,
-                attempt_id,
-                max_concurrent,
-                self.reservation_ttl_ms,
-            )
-            .await
-            .map_err(ReservationAcquireError::Store)?
-        {
-            ReservationResult::Reserved => Ok(Some(SharedReservationGuard::new(
-                Arc::clone(store),
-                worker_id,
-                attempt_id,
-                max_concurrent,
-                self.reservation_ttl_ms,
-            ))),
-            ReservationResult::Saturated => Err(ReservationAcquireError::Saturated),
-        }
-    }
-
-    fn attach_dispatch_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.dispatch_token.as_ref() {
-            Some(value) => {
-                builder.header(ax_serving_protocol::DISPATCH_TOKEN_HEADER, value.clone())
-            }
-            None => builder,
-        }
     }
 
     /// Total number of reroutes performed since startup.
@@ -685,6 +170,19 @@ impl DirectDispatcher {
                 .selection_at_capacity_total
                 .load(Ordering::Relaxed),
             selection_error_total: self.metrics.selection_error_total.load(Ordering::Relaxed),
+            reservation_renew_tasks: self.metrics.reservation_renew_tasks.load(Ordering::Relaxed),
+            reservation_renew_ok_total: self
+                .metrics
+                .reservation_renew_ok_total
+                .load(Ordering::Relaxed),
+            reservation_renew_fenced_total: self
+                .metrics
+                .reservation_renew_fenced_total
+                .load(Ordering::Relaxed),
+            reservation_renew_error_total: self
+                .metrics
+                .reservation_renew_error_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -714,6 +212,7 @@ impl DirectDispatcher {
             cache_affinity_key: profile.cache_affinity_key,
             telemetry_stale_ms,
         };
+        // At most one safe retry (attempts clamped to 1..=2).
         let maximum_attempts = max_dispatch_attempts.clamp(1, 2);
         let mut attempt_number = 0u8;
         let mut excluded_id = None;
@@ -841,13 +340,15 @@ impl DirectDispatcher {
                 .protocol_worker_id
                 .as_deref()
                 .and_then(|value| value.parse::<ax_serving_protocol::WorkerId>().ok());
-            let reservation = match self
-                .reserve_attempt(
-                    protocol_worker_id,
-                    attempt_id,
-                    candidate.endpoint.worker.max_inflight,
-                )
-                .await
+            let reservation = match reserve_attempt(
+                self.fleet_store.as_ref(),
+                &self.metrics,
+                self.reservation_ttl_ms,
+                protocol_worker_id,
+                attempt_id,
+                candidate.endpoint.worker.max_inflight,
+            )
+            .await
             {
                 Ok(reservation) => reservation,
                 Err(ReservationAcquireError::Saturated) => {
@@ -915,21 +416,21 @@ impl DirectDispatcher {
                 http.response.status_code = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
             );
-            let request = self
-                .attach_dispatch_auth(self.client.post(&url))
-                .header("content-type", "application/json")
-                .header(
-                    ax_serving_protocol::REQUEST_ID_HEADER,
-                    profile.request_id.to_string(),
-                )
-                .header(
-                    ax_serving_protocol::ATTEMPT_ID_HEADER,
-                    attempt_id.to_string(),
-                )
-                .header("x-ax-deployment-id", candidate.deployment.id.to_string())
-                .header("x-ax-pool-id", candidate.pool.id.to_string())
-                .timeout(remaining)
-                .body(rewritten_body);
+            let request =
+                attach_dispatch_auth(self.client.post(&url), self.dispatch_token.as_ref())
+                    .header("content-type", "application/json")
+                    .header(
+                        ax_serving_protocol::REQUEST_ID_HEADER,
+                        profile.request_id.to_string(),
+                    )
+                    .header(
+                        ax_serving_protocol::ATTEMPT_ID_HEADER,
+                        attempt_id.to_string(),
+                    )
+                    .header("x-ax-deployment-id", candidate.deployment.id.to_string())
+                    .header("x-ax-pool-id", candidate.pool.id.to_string())
+                    .timeout(remaining)
+                    .body(rewritten_body);
             let response_headers_started = std::time::Instant::now();
             let result = async move { request.headers(current_trace_headers()).send().await }
                 .instrument(dispatch_span.clone())
@@ -949,8 +450,9 @@ impl DirectDispatcher {
             let retryable_connect_failure = result
                 .as_ref()
                 .err()
-                .is_some_and(|error| error.is_connect() && !error.is_timeout());
+                .is_some_and(is_retryable_connect_failure);
             let retryable_not_admitted = result.as_ref().ok().is_some_and(is_typed_not_admitted);
+            // Safe retry only before commitment: connect fail or typed pre-admission.
             if attempt_number < maximum_attempts
                 && (retryable_connect_failure || retryable_not_admitted)
             {
@@ -1266,9 +768,15 @@ impl DirectDispatcher {
         let reservation_worker_id = registry
             .protocol_identity_for_internal(selected_id)
             .map(|(worker_id, _)| worker_id);
-        let reservation = match self
-            .reserve_attempt(reservation_worker_id, attempt_id, selected.max_inflight)
-            .await
+        let reservation = match reserve_attempt(
+            self.fleet_store.as_ref(),
+            &self.metrics,
+            self.reservation_ttl_ms,
+            reservation_worker_id,
+            attempt_id,
+            selected.max_inflight,
+        )
+        .await
         {
             Ok(reservation) => reservation,
             Err(ReservationAcquireError::Saturated) => {
@@ -1309,18 +817,18 @@ impl DirectDispatcher {
             _reservation: reservation,
         };
 
-        let mut request = self
-            .attach_dispatch_auth(self.client.post(&url))
-            .header("content-type", "application/json")
-            .header(
-                ax_serving_protocol::REQUEST_ID_HEADER,
-                request_id.to_string(),
-            )
-            .header(
-                ax_serving_protocol::ATTEMPT_ID_HEADER,
-                attempt_id.to_string(),
-            )
-            .body(body);
+        let mut request =
+            attach_dispatch_auth(self.client.post(&url), self.dispatch_token.as_ref())
+                .header("content-type", "application/json")
+                .header(
+                    ax_serving_protocol::REQUEST_ID_HEADER,
+                    request_id.to_string(),
+                )
+                .header(
+                    ax_serving_protocol::ATTEMPT_ID_HEADER,
+                    attempt_id.to_string(),
+                )
+                .body(body);
         if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
@@ -1366,9 +874,11 @@ impl DirectDispatcher {
         let retryable_connect_failure = result
             .as_ref()
             .err()
-            .is_some_and(|error| error.is_connect() && !error.is_timeout());
+            .is_some_and(is_retryable_connect_failure);
         let retryable_not_admitted = result.as_ref().ok().is_some_and(is_typed_not_admitted);
 
+        // At most one safe retry: connect fail or typed not-admitted only.
+        // Never retry after commitment (headers/stream already building below).
         if retryable_connect_failure || retryable_not_admitted {
             match &result {
                 Err(error) => warn!(%url, err = %error, "worker connect failed, rerouting"),
@@ -1535,9 +1045,15 @@ impl DirectDispatcher {
         let reservation_worker_id = registry
             .protocol_identity_for_internal(selected2_id)
             .map(|(worker_id, _)| worker_id);
-        let reservation = match self
-            .reserve_attempt(reservation_worker_id, attempt_id, selected2.max_inflight)
-            .await
+        let reservation = match reserve_attempt(
+            self.fleet_store.as_ref(),
+            &self.metrics,
+            self.reservation_ttl_ms,
+            reservation_worker_id,
+            attempt_id,
+            selected2.max_inflight,
+        )
+        .await
         {
             Ok(reservation) => reservation,
             Err(ReservationAcquireError::Saturated) => {
@@ -1574,18 +1090,18 @@ impl DirectDispatcher {
             _reservation: reservation,
         };
 
-        let mut request = self
-            .attach_dispatch_auth(self.client.post(&url2))
-            .header("content-type", "application/json")
-            .header(
-                ax_serving_protocol::REQUEST_ID_HEADER,
-                request_id.to_string(),
-            )
-            .header(
-                ax_serving_protocol::ATTEMPT_ID_HEADER,
-                attempt_id.to_string(),
-            )
-            .body(body);
+        let mut request =
+            attach_dispatch_auth(self.client.post(&url2), self.dispatch_token.as_ref())
+                .header("content-type", "application/json")
+                .header(
+                    ax_serving_protocol::REQUEST_ID_HEADER,
+                    request_id.to_string(),
+                )
+                .header(
+                    ax_serving_protocol::ATTEMPT_ID_HEADER,
+                    attempt_id.to_string(),
+                )
+                .body(body);
         if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
@@ -1671,208 +1187,6 @@ impl DirectDispatcher {
             "reroute",
         )
     }
-
-    /// Build an axum `Response` from a reqwest result.
-    ///
-    /// For streaming responses the `guard` lives inside the stream and is
-    /// dropped when the stream is exhausted or the client disconnects.
-    async fn build_response(
-        &self,
-        result: reqwest::Result<reqwest::Response>,
-        url: String,
-        stream: bool,
-        guard: AttemptGuard,
-        attempt_started: std::time::Instant,
-    ) -> Response {
-        match result {
-            Err(e) => {
-                self.metrics
-                    .attempt_duration
-                    .record(attempt_started.elapsed());
-                warn!(%url, err = %e, "dispatch request failed");
-                worker_failure_response(e.to_string())
-            }
-            Ok(resp) => {
-                let status = StatusCode::from_u16(resp.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let headers = resp.headers().clone();
-
-                if stream {
-                    type GuardedResponseStream =
-                        std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
-                    let byte_stream: GuardedResponseStream =
-                        Box::pin(resp.bytes_stream().map_err(std::io::Error::other));
-                    let stream_url = url.clone();
-                    let first_byte_timeout = self.first_byte_timeout;
-                    let stream_idle_timeout = self.stream_idle_timeout;
-                    let outcome = Some(DispatchOutcomeGuard::new(
-                        Arc::clone(&self.metrics),
-                        status.is_success(),
-                        attempt_started,
-                    ));
-                    let guarded = futures::stream::unfold(
-                        (byte_stream, Some(guard), outcome, 0usize, false, true),
-                        move |(mut inner, guard, mut outcome, total_len, done, first_byte): (
-                            GuardedResponseStream,
-                            Option<AttemptGuard>,
-                            Option<DispatchOutcomeGuard>,
-                            usize,
-                            bool,
-                            bool,
-                        )| {
-                            let stream_url = stream_url.clone();
-                            async move {
-                                if done {
-                                    drop(guard);
-                                    drop(outcome);
-                                    return None;
-                                }
-                                let wait = if first_byte {
-                                    first_byte_timeout
-                                } else {
-                                    stream_idle_timeout
-                                };
-                                match tokio::time::timeout(wait, inner.next()).await {
-                                    Err(_) => {
-                                        error!(
-                                            url = %stream_url,
-                                            timeout_ms = wait.as_millis(),
-                                            first_byte,
-                                            "worker streaming response deadline expired"
-                                        );
-                                        drop(guard);
-                                        if let Some(outcome) = outcome.as_mut() {
-                                            outcome.failed();
-                                        }
-                                        Some((
-                                            Err(std::io::Error::new(
-                                                std::io::ErrorKind::TimedOut,
-                                                if first_byte {
-                                                    "worker first-byte deadline expired"
-                                                } else {
-                                                    "worker stream idle deadline expired"
-                                                },
-                                            )),
-                                            (inner, None, None, total_len, true, false),
-                                        ))
-                                    }
-                                    Ok(Some(Ok(chunk))) => {
-                                        if let Some(outcome) = outcome.as_mut() {
-                                            outcome.first_byte();
-                                        }
-                                        match add_limited_body_len(
-                                            total_len,
-                                            chunk.len(),
-                                            MAX_WORKER_RESPONSE_BODY_BYTES,
-                                        ) {
-                                            Ok(next_len) => Some((
-                                                Ok(chunk),
-                                                (inner, guard, outcome, next_len, false, false),
-                                            )),
-                                            Err(WorkerBodyError::TooLarge) => {
-                                                error!(
-                                                    url = %stream_url,
-                                                    limit = MAX_WORKER_RESPONSE_BODY_BYTES,
-                                                    "worker streaming response body exceeded size limit"
-                                                );
-                                                drop(guard);
-                                                if let Some(outcome) = outcome.as_mut() {
-                                                    outcome.failed();
-                                                }
-                                                Some((
-                                                    Err(std::io::Error::new(
-                                                        std::io::ErrorKind::InvalidData,
-                                                        "worker streaming response body exceeded size limit",
-                                                    )),
-                                                    (inner, None, None, total_len, true, false),
-                                                ))
-                                            }
-                                            Err(WorkerBodyError::Read(_)) => {
-                                                unreachable!("length accounting does not read")
-                                            }
-                                        }
-                                    }
-                                    Ok(Some(Err(err))) => {
-                                        drop(guard);
-                                        if let Some(outcome) = outcome.as_mut() {
-                                            outcome.failed();
-                                        }
-                                        Some((
-                                            Err(err),
-                                            (inner, None, None, total_len, true, false),
-                                        ))
-                                    }
-                                    Ok(None) => {
-                                        drop(guard);
-                                        if let Some(outcome) = outcome.as_mut() {
-                                            outcome.completed();
-                                        }
-                                        None
-                                    }
-                                }
-                            }
-                        },
-                    );
-
-                    response_builder_with_worker_headers(status, &headers, false)
-                        .body(Body::from_stream(guarded))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                } else {
-                    let body_result =
-                        read_worker_response_body_limited(resp, MAX_WORKER_RESPONSE_BODY_BYTES)
-                            .await;
-                    self.metrics
-                        .attempt_duration
-                        .record(attempt_started.elapsed());
-                    match body_result {
-                        Err(WorkerBodyError::TooLarge) => {
-                            error!(
-                                %url,
-                                limit = MAX_WORKER_RESPONSE_BODY_BYTES,
-                                "worker response body exceeded size limit"
-                            );
-                            worker_failure_response(format!(
-                                "worker response body exceeded {} byte limit",
-                                MAX_WORKER_RESPONSE_BODY_BYTES
-                            ))
-                        }
-                        Ok(bytes) => {
-                            if status.is_success() {
-                                self.metrics.completed_total.fetch_add(1, Ordering::Relaxed);
-                            }
-                            response_builder_with_worker_headers(status, &headers, true)
-                                .body(Body::from(bytes))
-                                .unwrap_or_else(|_| {
-                                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                })
-                        }
-                        Err(WorkerBodyError::Read(e)) => {
-                            error!(%url, err = %e, "reading worker response body failed");
-                            worker_failure_response(e.to_string())
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn request_hash(request_id: ax_serving_protocol::RequestId) -> u64 {
-    let bytes = request_id.as_uuid().into_bytes();
-    u64::from_le_bytes(
-        bytes[..8]
-            .try_into()
-            .expect("UUID has at least eight bytes"),
-    )
-}
-
-fn is_typed_not_admitted(response: &reqwest::Response) -> bool {
-    !response.status().is_success()
-        && response
-            .headers()
-            .get(ax_serving_protocol::ADMISSION_STATE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("not-admitted"))
 }
 
 impl Default for DirectDispatcher {
@@ -1883,8 +1197,13 @@ impl Default for DirectDispatcher {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn worker_url(addr: &super::worker_endpoint::WorkerEndpoint, path: &str) -> String {
-    addr.join_path(path)
+fn request_hash(request_id: ax_serving_protocol::RequestId) -> u64 {
+    let bytes = request_id.as_uuid().into_bytes();
+    u64::from_le_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("UUID has at least eight bytes"),
+    )
 }
 
 fn routing_trace_enabled() -> bool {
@@ -1943,10 +1262,14 @@ mod tests {
     use axum::body;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use super::metrics::AtomicLatencyHistogram;
+    use super::stream_proxy::{
+        MAX_WORKER_RESPONSE_BODY_BYTES, add_limited_body_len, append_limited_body_chunk,
+        response_declares_oversize,
+    };
     use super::{
-        AtomicLatencyHistogram, AttemptGuard, DirectDispatcher, GATEWAY_LATENCY_BUCKETS_US,
-        InflightGuard, InflightGuard as Guard, add_limited_body_len, append_limited_body_chunk,
-        response_declares_oversize, worker_url,
+        AttemptGuard, DirectDispatcher, GATEWAY_LATENCY_BUCKETS_US, InflightGuard,
+        InflightGuard as Guard, worker_url,
     };
 
     #[test]
@@ -1968,7 +1291,8 @@ mod tests {
 
     #[test]
     fn worker_url_with_leading_slash() {
-        let addr = super::super::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
+        let addr =
+            crate::orchestration::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
         assert_eq!(
             worker_url(&addr, "/v1/chat/completions"),
             "http://127.0.0.1:8081/v1/chat/completions"
@@ -1977,7 +1301,8 @@ mod tests {
 
     #[test]
     fn worker_url_without_leading_slash_adds_root() {
-        let addr = super::super::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
+        let addr =
+            crate::orchestration::worker_endpoint::WorkerEndpoint::parse("127.0.0.1:8081").unwrap();
         assert_eq!(
             worker_url(&addr, "v1/completions"),
             "http://127.0.0.1:8081/v1/completions"
@@ -2064,7 +1389,7 @@ mod tests {
             let _ = socket.read(&mut request).await.unwrap();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                super::MAX_WORKER_RESPONSE_BODY_BYTES + 1
+                MAX_WORKER_RESPONSE_BODY_BYTES + 1
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.flush().await.unwrap();
