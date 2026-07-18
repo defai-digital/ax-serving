@@ -28,9 +28,10 @@ use ax_serving_api::orchestration::{
 use ax_serving_api::rest::schema::MAX_CONTENT_BYTES;
 use ax_serving_protocol::{
     AgentDescriptor, CURRENT_PROTOCOL, CapacityObservation, DeploymentIdentity, DeploymentSpec,
-    HardwareDescriptor, LogicalModelId, NegotiatedProtocol, Operation, PoolId, PoolSpec,
-    ProtocolDescriptor, RegisterWorkerRequest as ProtocolRegisterRequest, RuntimeDescriptor,
-    RuntimeModelDescriptor, RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId,
+    DomainId, DomainSpec, ExecutionDomainKind, HardwareDescriptor, LogicalModelId,
+    NegotiatedProtocol, Operation, PoolId, PoolSpec, ProtocolDescriptor, QualificationState,
+    RegisterWorkerRequest as ProtocolRegisterRequest, RuntimeDescriptor, RuntimeModelDescriptor,
+    RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId,
     WorkerDescriptor as ProtocolWorkerDescriptor, WorkerId as ProtocolWorkerId, WorkerInstanceId,
 };
 use axum::{Router, middleware, routing::post};
@@ -184,6 +185,7 @@ async fn spawn_not_admitted_worker() -> Option<SocketAddr> {
 #[derive(Default)]
 struct EchoWorkerState {
     models: Mutex<Vec<String>>,
+    domain_ids: Mutex<Vec<String>>,
     public_authorization_seen: Mutex<bool>,
 }
 
@@ -199,6 +201,12 @@ async fn spawn_echo_model_worker() -> Option<(SocketAddr, Arc<EchoWorkerState>)>
     ) -> Json<serde_json::Value> {
         let model = body["model"].as_str().unwrap_or_default().to_string();
         state.models.lock().unwrap().push(model.clone());
+        if let Some(domain) = headers
+            .get("x-ax-domain-id")
+            .and_then(|value| value.to_str().ok())
+        {
+            state.domain_ids.lock().unwrap().push(domain.to_string());
+        }
         if headers.contains_key(axum::http::header::AUTHORIZATION) {
             *state.public_authorization_seen.lock().unwrap() = true;
         }
@@ -451,6 +459,7 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
     let pool_id = PoolId::new("cuda").unwrap();
     let logical_model = LogicalModelId::new("public/qwen").unwrap();
     let runtime_model = RuntimeModelId::new("Qwen/Qwen3-32B").unwrap();
+    let domain_id = DomainId::new("cuda-compat").unwrap();
     let config = OrchestratorConfig {
         deployment_mode: "explicit".into(),
         pools: vec![PoolSpec {
@@ -460,10 +469,21 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
             trust_domain: TrustDomainId::new("private").unwrap(),
             selector: BTreeMap::new(),
         }],
+        domains: vec![DomainSpec {
+            id: domain_id.clone(),
+            kind: ExecutionDomainKind::CompatibilityRuntimeEndpoint,
+            pool: pool_id.clone(),
+            trust_domain: TrustDomainId::new("private").unwrap(),
+            hardware_class: "cuda".into(),
+            required_qualification: QualificationState::Certified,
+            selector: BTreeMap::new(),
+            enabled: true,
+        }],
         deployments: vec![DeploymentSpec {
             id: ax_serving_protocol::DeploymentId::new("qwen-cuda").unwrap(),
             logical_model: logical_model.clone(),
             pool: pool_id.clone(),
+            domain: Some(domain_id.clone()),
             runtime_model_id: runtime_model.clone(),
             equivalence_class: None,
             expected_identity: None,
@@ -523,6 +543,8 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
                     memory_bytes: Some(80 * 1024 * 1024 * 1024),
                     hardware_class: Some("cuda".into()),
                 },
+                domain: None,
+                domain_observation: None,
                 observation: RuntimeObservation {
                     observed_at: time::OffsetDateTime::now_utc(),
                     runtime: RuntimeStatus::ready(),
@@ -599,7 +621,57 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
         worker_state.models.lock().unwrap().as_slice(),
         ["Qwen/Qwen3-32B"]
     );
+    assert_eq!(
+        worker_state.domain_ids.lock().unwrap().as_slice(),
+        ["cuda-compat"]
+    );
     assert!(!*worker_state.public_authorization_seen.lock().unwrap());
+    let decisions = layer.dispatcher.decision_records(10);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].selected_domain, domain_id);
+
+    let decision_response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/admin/decisions?limit=10")
+                .header(axum::http::header::AUTHORIZATION, "Bearer public-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(decision_response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(decision_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let decision_response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        decision_response["records"][0]["selected_domain"],
+        "cuda-compat"
+    );
+    assert_eq!(
+        decision_response["records"][0]["policy_id"],
+        "explicit-catalog"
+    );
+
+    let deployments_response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/admin/deployments")
+                .header(axum::http::header::AUTHORIZATION, "Bearer public-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deployments_response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(deployments_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let deployments_response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(deployments_response["domains"][0]["id"], "cuda-compat");
 
     let models = app
         .oneshot(

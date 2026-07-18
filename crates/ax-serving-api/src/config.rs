@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 #[cfg(feature = "embedded-compat")]
 use ax_serving_engine::{LlamaCppConfig, MlxConfig};
-use ax_serving_protocol::{DeploymentSpec, EquivalencePolicy, PoolSpec};
+use ax_serving_protocol::{DeploymentSpec, DomainSpec, EquivalencePolicy, PoolSpec};
 use serde::Deserialize;
 
 #[cfg(not(feature = "embedded-compat"))]
@@ -330,6 +330,8 @@ pub struct OrchestratorConfig {
 
     /// Homogeneous runtime pools used by explicit deployment routing.
     pub pools: Vec<PoolSpec>,
+    /// Independently operated execution and failure boundaries.
+    pub domains: Vec<DomainSpec>,
     /// Logical-model to runtime-deployment mappings.
     pub deployments: Vec<DeploymentSpec>,
     /// Operator-certified equivalence policies for cross-pool routing.
@@ -381,6 +383,7 @@ impl Default for OrchestratorConfig {
             tenant_max_concurrent: 0,
             cache_affinity_secret: None,
             pools: Vec::new(),
+            domains: Vec::new(),
             deployments: Vec::new(),
             equivalence_classes: Vec::new(),
             readyz_mode: "control_plane".into(),
@@ -721,7 +724,13 @@ impl ServeConfig {
         if self.orchestrator.request_timeout_secs == 0 {
             anyhow::bail!("orchestrator.request_timeout_secs must be > 0");
         }
-        match self.orchestrator.readyz_mode.trim().to_ascii_lowercase().as_str() {
+        match self
+            .orchestrator
+            .readyz_mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "control_plane" | "control-plane" | "controlplane" | "eligible_workers"
             | "eligible-workers" | "eligibleworkers" | "legacy" => {}
             other => anyhow::bail!(

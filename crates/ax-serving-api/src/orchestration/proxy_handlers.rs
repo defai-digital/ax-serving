@@ -67,8 +67,7 @@ async fn proxy_inference(
     worker_path: &'static str,
     request_id: ax_serving_protocol::RequestId,
 ) -> axum::response::Response {
-    let Some(admission_guard) =
-        super::gateway_ops::AcceptedRequestGuard::try_admit(&layer.ops)
+    let Some(admission_guard) = super::gateway_ops::AcceptedRequestGuard::try_admit(&layer.ops)
     else {
         let mut response = ax_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -624,6 +623,7 @@ fn build_request_profile(
         cache_affinity_key,
         required_pool,
         preferred_pool,
+        decision: Default::default(),
         runtime_hint,
         deadline: tokio::time::Instant::now() + request_timeout,
     })
@@ -1501,6 +1501,15 @@ pub(super) async fn proxy_admin_audit(
     }))
 }
 
+pub(super) async fn proxy_admin_decisions(
+    State(layer): State<Arc<OrchestratorLayer>>,
+    Query(query): Query<AuditQuery>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "records": layer.dispatcher.decision_records(query.limit),
+    }))
+}
+
 pub(super) async fn proxy_admin_fleet(
     State(layer): State<Arc<OrchestratorLayer>>,
 ) -> impl IntoResponse {
@@ -1546,6 +1555,7 @@ pub(super) async fn proxy_admin_deployments(
         "mode": catalog.mode(),
         "logical_models": catalog.logical_models(),
         "pools": catalog.pools().collect::<Vec<_>>(),
+        "domains": catalog.domains().collect::<Vec<_>>(),
         "deployments": catalog.deployments().collect::<Vec<_>>(),
         "equivalence_classes": catalog.equivalence_classes().collect::<Vec<_>>(),
     }))

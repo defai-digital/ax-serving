@@ -1,50 +1,44 @@
 # Competitive category map
 
-This document avoids version-specific feature claims. Recheck official project
-documentation at the time of any external comparison.
-
-## Compare matching layers
+Compare systems at the layer where they make decisions.
 
 | Category | Representative systems | AX relationship |
 | --- | --- | --- |
-| Local/runtime engine | AX Engine, llama.cpp | AX Engine is compared here under matched model and artifact contracts. |
-| CUDA serving runtime | vLLM, SGLang, TGI | AX Serving manages certified endpoints; it does not replace their token schedulers. |
-| Local application/runtime UX | Ollama, LM Studio | Usually a different buyer and operating model. |
-| Gateway/control plane | Inference gateways, Kubernetes inference routing, internal fleet platforms | AX Serving competes here on safe mixed-runtime operations. |
+| Apple/local inference runtime | AX Engine, llama.cpp | AX Engine is the execution-layer comparison. |
+| NVIDIA inference engine | vLLM, SGLang, TensorRT-LLM | Runs as a Dynamo backend; AX does not replace its token scheduler. |
+| NVIDIA distributed inference system | NVIDIA Dynamo | Owns worker routing, KV, disaggregation, planner, scaling, and backend lifecycle inside an NVIDIA domain. |
+| Cross-domain federation/control plane | Internal fleet platforms, multi-provider AI gateways | AX Serving competes here on private Mac + PC + Thor governance and safe semantic routing. |
+| Agent application framework | LangGraph, AutoGen, CrewAI and application stacks | Outside AX scope; they call the inference API. |
 
-Feature matrices become misleading when an engine's kernel feature is compared
-with a gateway's routing feature. Every comparison should state which process
-owns tokenization, batching, cache, lifecycle, admission, and fleet state.
+## Intended wedge
 
-## AX Serving's intended wedge
+- private fleets with useful Apple Silicon plus NVIDIA capacity;
+- separately operated NVIDIA PC and Thor domains;
+- central tenant/privacy/locality/cost/SLO policy above runtimes;
+- explicit model identity and fail-closed equivalence across artifact formats/runtimes;
+- conservative retry, decision audit/replay, HA state, drain, and rollout;
+- environments that want upstream Dynamo without making it the global Mac/tenant policy plane.
 
-- private fleets that contain Apple Silicon and CUDA capacity;
-- operators who want one API but cannot assume runtime artifacts are
-  semantically equivalent;
-- teams that need runtime-SDK isolation, conservative retries, drain, HA state,
-  and explicit trust boundaries;
-- environments where a small deployment should not require a large
-  orchestration stack.
+## Where another system is better
 
-## Where another product is likely better
+- one NVIDIA deployment: use Dynamo directly;
+- CUDA kernels/token scheduling: use and tune the backend runtime;
+- NVIDIA worker/KV routing and scaling: use Dynamo;
+- one Mac model: use AX Engine directly;
+- end-user desktop/chat UX: use a desktop/local application;
+- agent planning/tools/memory: use an agent framework;
+- standardized Kubernetes inference routing that already meets all identity/policy needs: integrate
+  with that platform instead of adding AX.
 
-- one model on one machine with no fleet control: use the runtime directly;
-- CUDA kernel and token-scheduler performance: use and tune vLLM/SGLang/TGI;
-- desktop model discovery and end-user chat UX: use a desktop/local product;
-- distributed graph execution across accelerators: use a runtime designed for
-  that execution model;
-- Kubernetes-native inference routing already standardized by the operator's
-  platform: integrate with that control plane unless AX Serving's identity and
-  mixed-runtime guarantees are materially needed.
+## Competitive evidence
 
-## Comparison evidence
+AX must not claim superiority from a feature checklist. It must report:
 
-Engine comparisons require matched source revision, tokenizer, template,
-sampler, token accounting, hardware, warmup, and quantization disclosure.
-Serving comparisons require direct-runtime baseline, same endpoint through AX
-Serving, and mixed-fleet fault/overload scenarios. Goodput, TTFT tails,
-availability correctness, duplicate commitments, and overhead matter more than
-an isolated best tokens-per-second number.
+- direct runtime/domain versus through-AX overhead;
+- policy correctness and duplicate-commitment behavior under faults;
+- cost/load, goodput, tail latency, privacy/locality, or operator-workflow value;
+- routing regret and quality-floor violations for adaptive policies;
+- exact AX, Dynamo, backend, image, model, tokenizer/template/quantization, and hardware identities.
 
-Do not publish “faster,” “production-grade,” scale, compatibility, or market
-leadership claims from mock tests, incomplete runs, or null baselines.
+The Dynamo adapter and Thor domain are not currently certified; public comparisons must preserve
+that status.

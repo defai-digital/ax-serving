@@ -5,16 +5,20 @@
 | Title | Stability and Change-Safety Hardening for AX Serving |
 | Author | _TBD_ |
 | Date | 2026-07-14 |
-| Status | Draft ready for implementation |
+| Status | Historical draft; source observations only |
 | Scope | Portable gateway (`ax-serving-api` orchestration path), tests, ops probes, evidence harness |
-| Architecture constraint | ADR-013 runtime-neutral hybrid inference control plane (accepted; not open for redesign) |
-| Deployment constraint | ADR-014 readiness/routability split and CPU-only packaging (accepted) |
+| Architecture constraint | Superseded by ADR-016 federated execution-domain architecture |
+| Deployment constraint | CPU-only/readiness rules retained in ADR-016, PRD, and consolidated specification |
 | Related status ledger | `.internal/IMPLEMENTATION-STATUS.md` |
 | Revision | 2026-07-14r2 — addresses design review issues 1–14 |
 
 ---
 
 ## Overview
+
+> **Historical notice (2026-07-15):** This plan predates ADR-016. Use it only for its source
+> maintainability observations. Old ADR references and direct CUDA topology below are historical,
+> not the current product architecture or implementation sequence.
 
 AX Serving’s product architecture is correct: a **runtime-neutral control plane** that selects endpoints and proxies streams, without owning KV/batching/token scheduling or embedding inference SDKs in the portable gateway. The primary engineering risks today are not architectural—they are **change-safety**, **hot-path cost under fleet growth**, **ops/probe clarity residual work**, and **missing production evidence**.
 
@@ -36,7 +40,7 @@ No product redesign. No retry-after-commitment. No NATS data plane. No fabricate
 
 ## Background & Motivation
 
-### Current architecture (must stay)
+### Historical architecture snapshot
 
 ```text
 client  →  AX Serving gateway  →  runtime agent  →  AX Engine / vLLM / SGLang
@@ -47,7 +51,7 @@ client  →  AX Serving gateway  →  runtime agent  →  AX Engine / vLLM / SGL
               └─ FleetStateStore (memory or Redis/Valkey HA)
 ```
 
-Non-negotiables from ADR-013:
+Non-negotiables retained by the canonical ADR-016 design:
 
 - Fail-closed routing (missing identity/capability ≠ equivalence).
 - Safe retry: at most one; only connect failure or typed pre-admission; never after client commitment.
@@ -64,11 +68,11 @@ Non-negotiables from ADR-013:
 | HA reservations | `SharedReservationGuard` spawns a tokio renew task per reserved attempt (`direct.rs`) | Task churn under concurrency; harder resource accounting |
 | Dual stack | Default `gateway` vs `embedded-compat` + `ax-serving-engine` | Divergent validation/helpers tax correctness |
 | Certification gap | NFR soak/goodput/multi-gateway Redis evidence missing; code/harness partially present | Cannot claim production readiness |
-| Historical plan | `docs/maintainability-refactor-plan.md` (2026-03-29) superseded by ADR-013 but still correct on giant modules/duplication | Use as maintainability signal only |
+| Historical plan | `docs/maintainability-refactor-plan.md` (2026-03-29) is superseded as architecture but still useful on giant modules/duplication | Use as maintainability signal only |
 
 ### What is already done (do not re-implement as greenfield)
 
-**Readiness split (ADR-014 intent) is largely implemented in code:**
+**The readiness/routability split retained by ADR-016 is largely implemented in code:**
 
 - Routes: `/livez`, `/readyz`, `/routablez` in `orchestration/mod.rs`.
 - Pure state machine: `gateway_ops::{ReadyzMode, GatewayOperationalState}` with unit tests.
@@ -111,7 +115,7 @@ Non-negotiables from ADR-013:
 
 ### Non-Goals
 
-- Redesign ADR-013 topology or ownership boundaries.
+- Redesign ADR-016 topology or ownership boundaries.
 - Re-embed engines in the portable gateway.
 - Add KV / continuous batching / token scheduling to the gateway.
 - Retry generic 5xx or buffer full streams for smarter retry.
@@ -399,7 +403,7 @@ flowchart TB
 #### Remaining engineering (small, high leverage)
 
 1. **Doc/contract/runbook fix (all required in PR-7):**
-   - Fix `README.md` health bullets to match ADR-014.
+   - Fix `README.md` health bullets to match the canonical readiness contract.
    - Fix public contract inventory `/readyz` wording.
    - Fix **`docs/runbooks/multi-worker.md`** worker-gated `/readyz` claims (same severity as README).
    - Align IMPLEMENTATION-STATUS deployment row with `control_plane` default.
@@ -745,7 +749,7 @@ Negligible for stable catalogs: O(sum of model advertisements). Example: 256 wor
 ### 1. Full rewrite of orchestration into a new crate/framework
 
 - **Pros:** Clean slate.
-- **Cons:** High regression risk; conflicts with ADR-013 “no new framework”; blocks certification.
+- **Cons:** High regression risk; conflicts with ADR-016 incremental migration; blocks certification.
 - **Decision:** Rejected.
 
 ### 2. Keep giant files; only add index and probes
@@ -757,7 +761,7 @@ Negligible for stable catalogs: O(sum of model advertisements). Example: 256 wor
 ### 3. Global eligible-worker counter instead of `/routablez`
 
 - **Pros:** Single probe.
-- **Cons:** Couples control plane to capacity (ADR-014 bootstrap deadlock); already fixed in code.
+- **Cons:** Couples control plane to capacity and recreates the documented bootstrap deadlock; already fixed in code.
 - **Decision:** Rejected; finish doc alignment only.
 
 ### 4. Precomputed fully eligible bitsets per model
@@ -769,7 +773,7 @@ Negligible for stable catalogs: O(sum of model advertisements). Example: 256 wor
 ### 5. Merge embedded-compat into portable gateway
 
 - **Pros:** One path.
-- **Cons:** Violates ADR-013/014 SDK-free gateway; rebuilds the original problem.
+- **Cons:** Violates ADR-016's SDK-free gateway boundary; rebuilds the original problem.
 - **Decision:** Rejected; reduce drift via shared portable helpers only.
 
 ### 6. Immediate shared reservation renewer
@@ -885,7 +889,7 @@ Avoid high-cardinality labels (no model_id on metrics).
 
 ## Key Decisions
 
-1. **Do not redesign product architecture** — ADR-013 hybrid control plane and ADR-014 probe model remain authoritative; this work is engineering hardening only.
+1. **Do not redesign product architecture** — ADR-016 and the consolidated PRD/spec are authoritative; this historical workstream is engineering hardening only.
 2. **Change-safety before speed** — behavior-preserving module splits and test fixtures land before the hot-path index so eligibility/retry logic is reviewable.
 3. **Membership index, not precomputed eligibility** — `model_id → WorkerId` is membership only; hard filters stay fail-closed on live entries; keys = post-normalization `capabilities.models`.
 4. **Readiness split is residual alignment, not a rewrite** — code already implements `/readyz` vs `/routablez` with `control_plane` default; finish docs/contracts/**runbooks**, `/health` ops language, and legacy HTTP tests.
@@ -907,8 +911,8 @@ Avoid high-cardinality labels (no model_id on metrics).
 
 ## References
 
-- `.internal/adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md`
-- `.internal/adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md`
+- `.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md`
+- `.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md`
 - `.internal/IMPLEMENTATION-STATUS.md`
 - `docs/maintainability-refactor-plan.md` (historical)
 - `docs/perf/service-tuning.md`

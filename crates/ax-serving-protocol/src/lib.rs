@@ -5,7 +5,9 @@
 //! accelerator libraries, and inference-runtime SDKs.
 
 pub mod admission;
+pub mod decision;
 pub mod deployment;
+pub mod domain;
 pub mod ids;
 pub mod lifecycle;
 pub mod operation;
@@ -17,13 +19,22 @@ pub use admission::{
     AxErrorEnvelope, AxErrorMetadata, CommitmentState, DISPATCH_TOKEN_HEADER, ErrorBody,
     REQUEST_ID_HEADER, RetryDecision,
 };
+pub use decision::{
+    CandidateDecision, CandidateRejectionReason, DecisionProfileV1, DecisionReasonCode,
+    DecisionRecordV1, DecisionValidationError, PolicyMode,
+};
 pub use deployment::{
-    DeploymentIdentity, DeploymentSpec, Digest, EquivalencePolicy, IdentityField, IdentityPolicy,
-    PoolSpec, RuntimeModelDescriptor,
+    DeploymentIdentity, DeploymentSpec, Digest, DigestError, EquivalencePolicy, IdentityField,
+    IdentityPolicy, PoolSpec, RuntimeModelDescriptor,
+};
+pub use domain::{
+    CompatibilityManifestDigest, DomainObservation, DomainSpec, DomainValidationError,
+    EndpointScope, ExecutionDomainDescriptor, ExecutionDomainKind, QualificationState,
 };
 pub use ids::{
-    AttemptId, DeploymentId, EquivalenceClassId, JobId, LogicalModelId, PoolId, RegistrationId,
-    RequestId, RuntimeModelId, TenantId, TrustDomainId, WorkerId, WorkerInstanceId,
+    AttemptId, DeploymentId, DomainId, EquivalenceClassId, JobId, LogicalModelId, PolicyId,
+    PolicyVersion, PoolId, RegistrationId, RequestId, RuntimeModelId, TenantId, TrustDomainId,
+    WorkerId, WorkerInstanceId,
 };
 pub use lifecycle::{
     DeploymentCommand, DeploymentControlRecord, DeploymentDesiredState, DeploymentJobAction,
@@ -35,8 +46,8 @@ pub use version::{
     negotiate_protocol,
 };
 pub use worker::{
-    AgentDescriptor, CapacityObservation, DrainDirective, HardwareDescriptor, HeartbeatRequest,
-    HeartbeatResponse, LeaseToken, RegisterWorkerRequest, RegisterWorkerResponse,
-    RuntimeDescriptor, RuntimeObservation, RuntimeState, RuntimeStatus, WorkerDescriptor,
-    WorkerState,
+    AgentDescriptor, CapacityError, CapacityObservation, DomainContractError, DrainDirective,
+    HardwareDescriptor, HeartbeatRequest, HeartbeatResponse, LeaseToken, RegisterWorkerRequest,
+    RegisterWorkerResponse, RuntimeDescriptor, RuntimeObservation, RuntimeState, RuntimeStatus,
+    WorkerDescriptor, WorkerState,
 };

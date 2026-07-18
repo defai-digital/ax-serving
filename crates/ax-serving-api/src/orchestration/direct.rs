@@ -13,8 +13,9 @@
 //! Streaming responses (SSE, `text/event-stream`) are forwarded chunk-by-chunk
 //! without buffering so time-to-first-token is not impacted.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -25,7 +26,11 @@ use reqwest::Client;
 use tracing::{Instrument as _, debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use super::deployment::DeploymentCatalog;
+use ax_serving_protocol::{
+    CandidateDecision, DecisionReasonCode, DecisionRecordV1, PolicyId, PolicyMode, PolicyVersion,
+};
+
+use super::deployment::{DeploymentCatalog, RouteCandidate};
 use super::error::ax_error_response;
 use super::fleet_state::{FleetStateStore, ReservationResult};
 use super::policy::{DispatchContext, DispatchPolicy};
@@ -191,7 +196,8 @@ enum ReservationAcquireError {
 /// HTTP proxy dispatcher for direct (no-broker) mode.
 ///
 /// Holds a shared `reqwest::Client` (connection-pool enabled).
-/// Stateless — all per-request state comes from `WorkerRegistry` and the policy.
+/// Per-request routing state comes from `WorkerRegistry` and the policy. Only a
+/// bounded, prompt-free decision journal is retained for operator diagnostics.
 #[derive(Clone)]
 pub struct DirectDispatcher {
     client: Client,
@@ -202,6 +208,54 @@ pub struct DirectDispatcher {
     stream_idle_timeout: std::time::Duration,
     fleet_store: Option<Arc<dyn FleetStateStore>>,
     reservation_ttl_ms: u64,
+    decision_journal: Arc<DecisionJournal>,
+}
+
+const DEFAULT_DECISION_JOURNAL_CAPACITY: usize = 256;
+const MAX_RECORDED_DECISION_CANDIDATES: usize = 128;
+
+#[derive(Debug)]
+struct DecisionJournal {
+    capacity: usize,
+    records: Mutex<VecDeque<DecisionRecordV1>>,
+}
+
+impl DecisionJournal {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            records: Mutex::new(VecDeque::with_capacity(capacity)),
+        }
+    }
+
+    fn record(&self, record: DecisionRecordV1) {
+        let mut records = self.records_lock();
+        if records.len() >= self.capacity {
+            records.pop_front();
+        }
+        records.push_back(record);
+    }
+
+    fn tail(&self, limit: usize) -> Vec<DecisionRecordV1> {
+        let records = self.records_lock();
+        let take = limit.min(records.len());
+        records
+            .iter()
+            .skip(records.len().saturating_sub(take))
+            .cloned()
+            .collect()
+    }
+
+    fn records_lock(&self) -> MutexGuard<'_, VecDeque<DecisionRecordV1>> {
+        match self.records.lock() {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "decision journal lock poisoned; continuing with retained records");
+                error.into_inner()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -458,6 +512,7 @@ fn should_forward_worker_header(name: &HeaderName, include_content_length: bool)
             | "x-ax-attempt-id"
             | "x-ax-dispatch-token"
             | "x-ax-deployment-id"
+            | "x-ax-domain-id"
             | "x-ax-pool-id"
     ) && (include_content_length || name != header::CONTENT_LENGTH.as_str())
 }
@@ -584,6 +639,7 @@ impl DirectDispatcher {
             stream_idle_timeout: std::time::Duration::from_millis(stream_idle_timeout_ms.max(1)),
             fleet_store: None,
             reservation_ttl_ms: 15_000,
+            decision_journal: Arc::new(DecisionJournal::new(DEFAULT_DECISION_JOURNAL_CAPACITY)),
         })
     }
 
@@ -645,6 +701,93 @@ impl DirectDispatcher {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         if !success {
             self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Return the most recent prompt-free domain decisions in chronological order.
+    pub fn decision_records(&self, limit: usize) -> Vec<DecisionRecordV1> {
+        self.decision_journal.tail(limit.clamp(1, 200))
+    }
+
+    fn record_domain_decision(
+        &self,
+        profile: &RequestProfile,
+        candidates: &[RouteCandidate],
+        selected: &RouteCandidate,
+    ) {
+        let Some(selected_domain) = selected.domain.as_ref() else {
+            return;
+        };
+
+        let mut seen = BTreeSet::new();
+        let mut candidate_summary = Vec::new();
+        for candidate in std::iter::once(selected).chain(candidates.iter()) {
+            let Some(domain) = candidate.domain.as_ref() else {
+                continue;
+            };
+            let key = (domain.id.clone(), candidate.deployment.id.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            candidate_summary.push(CandidateDecision {
+                domain: domain.id.clone(),
+                deployment: candidate.deployment.id.clone(),
+                eligible: true,
+                rejection_reasons: BTreeSet::new(),
+                normalized_score_microunits: None,
+            });
+            if candidate_summary.len() == MAX_RECORDED_DECISION_CANDIDATES {
+                break;
+            }
+        }
+
+        let mut observation_generations = BTreeMap::new();
+        for candidate in candidates {
+            if let Some(domain) = candidate.domain.as_ref() {
+                let generation = candidate
+                    .endpoint
+                    .domain_observation
+                    .as_ref()
+                    .map_or(0, |observation| observation.generation);
+                observation_generations
+                    .entry(domain.id.clone())
+                    .and_modify(|accepted: &mut u64| *accepted = (*accepted).max(generation))
+                    .or_insert(generation);
+            }
+        }
+
+        let mut reason_codes = BTreeSet::from([DecisionReasonCode::ExplicitDeployment]);
+        if profile.decision.required_domain.as_ref() == Some(&selected_domain.id) {
+            reason_codes.insert(DecisionReasonCode::RequiredDomain);
+        } else if profile.decision.preferred_domain.as_ref() == Some(&selected_domain.id) {
+            reason_codes.insert(DecisionReasonCode::PreferredDomain);
+        }
+        if candidate_summary.len() == 1 {
+            reason_codes.insert(DecisionReasonCode::OnlyEligible);
+        }
+
+        let record = DecisionRecordV1 {
+            request_id: profile.request_id,
+            operation: profile.operation.clone(),
+            logical_model: profile.logical_model.clone(),
+            routing_profile: profile.decision.routing_profile.clone(),
+            policy_id: PolicyId::new("explicit-catalog")
+                .expect("static decision policy id is valid"),
+            policy_version: PolicyVersion::new(env!("CARGO_PKG_VERSION"))
+                .expect("static decision policy version is valid"),
+            policy_mode: PolicyMode::Active,
+            candidate_summary,
+            selected_domain: selected_domain.id.clone(),
+            selected_deployment: selected.deployment.id.clone(),
+            reason_codes,
+            observation_generations,
+            predicted_cost_microusd: None,
+            predicted_latency_ms: None,
+            decided_at: time::OffsetDateTime::now_utc(),
+        };
+        match record.validate() {
+            Ok(()) => self.decision_journal.record(record),
+            Err(error) => warn!(%error, "discarding invalid bounded domain decision record"),
         }
     }
 
@@ -889,6 +1032,7 @@ impl DirectDispatcher {
                     );
                 }
             };
+            self.record_domain_decision(profile, &candidates, &candidate);
             attempt_number = attempt_number.saturating_add(1);
             let url = worker_url(&candidate.endpoint.worker.addr, path);
             debug!(
@@ -898,6 +1042,7 @@ impl DirectDispatcher {
                 worker_id = %selected_id,
                 deployment_id = %candidate.deployment.id,
                 pool_id = %candidate.pool.id,
+                domain_id = candidate.domain.as_ref().map(|domain| domain.id.as_str()),
                 runtime_kind = %candidate.endpoint.runtime_kind,
                 telemetry_age_ms = candidate.endpoint.worker.telemetry_age_ms,
                 "dispatch attempt selected"
@@ -911,11 +1056,16 @@ impl DirectDispatcher {
                 axs.attempt.number = attempt_number,
                 axs.deployment.id = %candidate.deployment.id,
                 axs.pool.id = %candidate.pool.id,
+                axs.domain.id = candidate
+                    .domain
+                    .as_ref()
+                    .map(|domain| domain.id.as_str())
+                    .unwrap_or(""),
                 axs.runtime.kind = %candidate.endpoint.runtime_kind,
                 http.response.status_code = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
             );
-            let request = self
+            let mut request = self
                 .attach_dispatch_auth(self.client.post(&url))
                 .header("content-type", "application/json")
                 .header(
@@ -930,6 +1080,9 @@ impl DirectDispatcher {
                 .header("x-ax-pool-id", candidate.pool.id.to_string())
                 .timeout(remaining)
                 .body(rewritten_body);
+            if let Some(domain) = candidate.domain.as_ref() {
+                request = request.header("x-ax-domain-id", domain.id.to_string());
+            }
             let response_headers_started = std::time::Instant::now();
             let result = async move { request.headers(current_trace_headers()).send().await }
                 .instrument(dispatch_span.clone())

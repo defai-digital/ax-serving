@@ -25,6 +25,9 @@ cp deploy/compose/.env.example deploy/compose/.env
 docker compose -f deploy/compose/compose.yaml --profile agent up --build
 ```
 
+This optional profile exercises the current node-agent compatibility path. It is not the future
+Dynamo Domain Adapter and does not certify NVIDIA PC or Thor federation.
+
 On macOS, AX Engine remains a native host process. Use
 `AXS_NODE_RUNTIME_URL=http://host.docker.internal:<port>` from the agent container,
 or run the agent natively with `AXS_NODE_ADVERTISED_URL`.
@@ -33,4 +36,4 @@ or run the agent natively with `AXS_NODE_ADVERTISED_URL`.
 
 - Compose uses `AXS_ALLOW_NO_AUTH=true` for evaluation only.
 - Gateway readiness does not depend on runtime capacity.
-- Images are built from portable features only (no AX Engine / CUDA / MLX).
+- Images are built from portable features only (no AX Engine, Dynamo, CUDA, or MLX SDK).

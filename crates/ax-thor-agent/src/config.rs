@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
-use ax_serving_protocol::{Digest, ProtocolCapability};
+use ax_serving_protocol::{
+    CompatibilityManifestDigest, Digest, DomainId, ProtocolCapability, QualificationState,
+};
 
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8000";
 const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
@@ -64,6 +66,17 @@ pub struct ModelIdentityConfig {
     pub capabilities: Vec<ProtocolCapability>,
 }
 
+/// Optional protocol-v1.1 node-domain declaration.
+///
+/// The runtime agent derives the domain kind from its runtime: AX Engine is a
+/// `mac_ax_engine` node and every other direct runtime is compatibility-only.
+#[derive(Clone, Debug)]
+pub struct ExecutionDomainConfig {
+    pub id: DomainId,
+    pub qualification: QualificationState,
+    pub compatibility_manifest: Option<CompatibilityManifestDigest>,
+}
+
 impl std::fmt::Debug for ModelIdentityConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -113,8 +126,9 @@ fn load_control_plane_url() -> Result<String> {
     let lan_enabled = ax_serving_discovery::discover_lan_enabled();
     let mut candidates = Vec::new();
     if explicit.is_none() && lan_enabled {
-        let filter =
-            ax_serving_discovery::filter_from_env_for(ax_serving_discovery::DiscoveredKind::AxServingGateway);
+        let filter = ax_serving_discovery::filter_from_env_for(
+            ax_serving_discovery::DiscoveredKind::AxServingGateway,
+        );
         let timeout = ax_serving_discovery::discover_timeout_from_env();
         tracing::info!(
             ?timeout,
@@ -125,8 +139,9 @@ fn load_control_plane_url() -> Result<String> {
             .context("LAN discovery browse for AX Serving gateway failed")?;
     }
 
-    let filter =
-        ax_serving_discovery::filter_from_env_for(ax_serving_discovery::DiscoveredKind::AxServingGateway);
+    let filter = ax_serving_discovery::filter_from_env_for(
+        ax_serving_discovery::DiscoveredKind::AxServingGateway,
+    );
     let resolved = ax_serving_discovery::resolve_base_url(
         explicit.as_deref(),
         lan_enabled && explicit.is_none(),
@@ -310,6 +325,8 @@ pub struct ThorConfig {
     pub worker_pool: Option<String>,
     pub node_class: String,
     pub hardware_class: String,
+    /// Optional explicit execution-domain identity advertised through protocol v1.1.
+    pub execution_domain: Option<ExecutionDomainConfig>,
     pub friendly_name: Option<String>,
     pub chip_model: Option<String>,
     /// env: `AXS_THOR_SHUTDOWN_TIMEOUT_SECS` (default 30)
@@ -352,6 +369,7 @@ impl std::fmt::Debug for ThorConfig {
             .field("worker_pool", &self.worker_pool)
             .field("node_class", &self.node_class)
             .field("hardware_class", &self.hardware_class)
+            .field("execution_domain", &self.execution_domain)
             .field("friendly_name", &self.friendly_name)
             .field("chip_model", &self.chip_model)
             .field("shutdown_timeout_secs", &self.shutdown_timeout_secs)
@@ -425,6 +443,29 @@ impl ThorConfig {
         let hardware_class =
             load_first_optional_string_env(&["AXS_NODE_HARDWARE_CLASS", "AXS_THOR_HARDWARE_CLASS"])
                 .unwrap_or_else(|| node_class.clone());
+        let domain_id = load_optional_string_env("AXS_NODE_DOMAIN_ID")
+            .map(DomainId::new)
+            .transpose()
+            .context("invalid AXS_NODE_DOMAIN_ID")?;
+        let domain_qualification = load_optional_string_env("AXS_NODE_DOMAIN_QUALIFICATION");
+        let domain_manifest = load_optional_string_env("AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST")
+            .map(CompatibilityManifestDigest::new)
+            .transpose()
+            .context("invalid AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST")?;
+        if domain_id.is_none() && (domain_qualification.is_some() || domain_manifest.is_some()) {
+            bail!(
+                "AXS_NODE_DOMAIN_ID is required when domain qualification or compatibility manifest is configured"
+            );
+        }
+        let execution_domain = domain_id
+            .map(|id| {
+                Ok::<_, anyhow::Error>(ExecutionDomainConfig {
+                    id,
+                    qualification: parse_domain_qualification(domain_qualification.as_deref())?,
+                    compatibility_manifest: domain_manifest,
+                })
+            })
+            .transpose()?;
         let friendly_name =
             load_first_optional_string_env(&["AXS_NODE_FRIENDLY_NAME", "AXS_THOR_FRIENDLY_NAME"]);
         let chip_model =
@@ -475,6 +516,7 @@ impl ThorConfig {
             worker_pool,
             node_class,
             hardware_class,
+            execution_domain,
             friendly_name,
             chip_model,
             shutdown_timeout_secs,
@@ -486,9 +528,29 @@ impl ThorConfig {
     }
 }
 
+fn parse_domain_qualification(value: Option<&str>) -> Result<QualificationState> {
+    match value
+        .unwrap_or("unverified")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "unverified" => Ok(QualificationState::Unverified),
+        "experimental" => Ok(QualificationState::Experimental),
+        "certified" => Ok(QualificationState::Certified),
+        "suspended" => Ok(QualificationState::Suspended),
+        other => bail!(
+            "invalid AXS_NODE_DOMAIN_QUALIFICATION {other:?}; expected unverified, experimental, certified, or suspended"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ThorConfig, default_advertised_url, normalize_http_base_url, parse_advertised_url};
+    use super::{
+        QualificationState, ThorConfig, default_advertised_url, normalize_http_base_url,
+        parse_advertised_url,
+    };
     use std::ffi::OsString;
 
     struct EnvGuard {
@@ -652,6 +714,9 @@ mod tests {
         let _pool = EnvGuard::set("AXS_NODE_WORKER_POOL", "mac");
         let _node_class = EnvGuard::set("AXS_NODE_CLASS", "mac-studio");
         let _hardware_class = EnvGuard::set("AXS_NODE_HARDWARE_CLASS", "mac");
+        let _domain_id = EnvGuard::set("AXS_NODE_DOMAIN_ID", "mac-studio-1");
+        let _domain_qualification = EnvGuard::set("AXS_NODE_DOMAIN_QUALIFICATION", "certified");
+        let _domain_manifest = EnvGuard::remove("AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST");
         let _embedding = EnvGuard::set("AXS_NODE_EMBEDDING", "true");
 
         let config = ThorConfig::from_env().unwrap();
@@ -664,7 +729,35 @@ mod tests {
         assert_eq!(config.worker_pool.as_deref(), Some("mac"));
         assert_eq!(config.node_class, "mac-studio");
         assert_eq!(config.hardware_class, "mac");
+        assert_eq!(
+            config
+                .execution_domain
+                .as_ref()
+                .map(|domain| domain.id.as_str()),
+            Some("mac-studio-1")
+        );
+        assert_eq!(
+            config
+                .execution_domain
+                .as_ref()
+                .map(|domain| domain.qualification),
+            Some(QualificationState::Certified)
+        );
         assert_eq!(config.embedding, Some(true));
+    }
+
+    #[test]
+    fn from_env_rejects_domain_metadata_without_domain_id() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _runtime_url = EnvGuard::set("AXS_NODE_RUNTIME_URL", "http://127.0.0.1:9000");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18091");
+        let _domain_id = EnvGuard::remove("AXS_NODE_DOMAIN_ID");
+        let _domain_qualification = EnvGuard::set("AXS_NODE_DOMAIN_QUALIFICATION", "certified");
+        let _domain_manifest = EnvGuard::remove("AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST");
+
+        let error = ThorConfig::from_env().unwrap_err().to_string();
+        assert!(error.contains("AXS_NODE_DOMAIN_ID"));
     }
 
     #[test]

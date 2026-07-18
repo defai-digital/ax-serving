@@ -136,6 +136,7 @@ mod tests {
             id: DeploymentId::new("qwen-cuda").unwrap(),
             logical_model: LogicalModelId::new("qwen/code").unwrap(),
             pool: PoolId::new("cuda").unwrap(),
+            domain: None,
             runtime_model_id: RuntimeModelId::new("Qwen/Qwen3").unwrap(),
             equivalence_class: None,
             expected_identity: None,

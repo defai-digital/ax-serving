@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Source contract; release stability follows tagged release notes |
-| Last updated | 2026-07-12 |
+| Last updated | 2026-07-15 |
 | Related | [Runtime-agent protocol](ax-serving-node-contract.md) |
 
 This inventory identifies supported integration boundaries. Internal Rust
@@ -43,13 +43,17 @@ evidence and must not be used as authentication or user identifiers.
 ## Health and observability
 
 - `GET /livez` — process liveness;
-- `GET /readyz` — routable readiness;
-- `GET /health` — JSON fleet summary;
+- `GET /readyz` — control-plane readiness by default; it does not require execution capacity;
+- `GET /routablez` — at least one eligible inference deployment;
+- `GET /health` — JSON control-plane and fleet-capacity summary;
 - `GET /v1/metrics` — admin-authenticated JSON operational metrics;
 - `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
 - `GET /dashboard` — admin-authenticated compatibility convenience UI; its DOM is not a
   contract. Browser access requires an authenticated reverse proxy that injects the admin bearer
   credential; the token must not be placed in a URL or browser storage.
+
+Legacy `AXS_READYZ_MODE=eligible_workers` restores worker-gated `/readyz` during migration. New
+deployments and capacity monitors use `/routablez`.
 
 Prometheus names documented in the operations runbook are contract within a
 protocol major. Metric label sets are intentionally bounded and may add
@@ -64,6 +68,7 @@ Read/diagnostic family:
 - `/v1/admin/startup-report`;
 - `/v1/admin/diagnostics`;
 - `/v1/admin/audit`;
+- `/v1/admin/decisions`;
 - `/v1/admin/policy`;
 - `/v1/admin/fleet`;
 - `/v1/admin/deployments`;
@@ -93,11 +98,19 @@ The cross-platform `ax-serving-protocol` crate and JSON fixtures define:
 - heartbeat, readiness, inventory, and capacity observations;
 - drain and deployment-job control;
 - deployment/model/equivalence identity;
+- execution-domain identity, qualification, desired state, and aggregate observations;
+- bounded decision profiles and records;
 - request/attempt/admission/error fields.
 
 New runtime integrations depend on this wire contract, not `InferenceBackend`
 or other embedded Rust traits. Legacy registration is a migration contract and
 cannot certify cross-runtime failover.
+
+The current source contract is protocol v1.1 with tolerant v1.0 fixtures. Domain descriptors,
+observations, configuration/catalog resolution, worker diagnostics, and bounded in-memory decision
+records are implemented. The Dynamo Domain Adapter, durable/offline replay, domain-specific HA
+reservations, and live support certification remain unreleased. One Dynamo deployment will register
+as one domain endpoint; its internal workers are never AX public/control-plane resources.
 
 ## Configuration
 
@@ -112,7 +125,7 @@ important trust-boundary variables are:
 - `AXS_TLS_PROFILE`;
 - `AXS_FLEET_STORE`, `AXS_REDIS_URL`, `AXS_FLEET_KEY_PREFIX`,
   `AXS_GATEWAY_ID`;
-- `AXS_DEPLOYMENT_MODE` and explicit pool/deployment/equivalence YAML;
+- `AXS_DEPLOYMENT_MODE` and explicit domain/pool/deployment/equivalence YAML;
 - queue, deadline, tenant, priority, and affinity controls documented in the
   quick start.
 
@@ -124,14 +137,14 @@ migration note.
 
 The `embedded-compat` feature includes macOS-only local inference, synchronous
 model mutation, and `ax.serving.v1` gRPC. Those APIs can depend on local paths,
-backend enums, and token-ID streams. They are not portable hybrid-gateway
+backend enums, and token-ID streams. They are not portable federation-gateway
 contracts and must not be required by a Linux gateway integration.
 
 ## SDKs
 
 The JavaScript and Python packages are convenience clients. Their released
 surface follows package versioning and tests. Python gRPC access targets the
-embedded compatibility service; portable hybrid clients should use REST/SSE.
+embedded compatibility service; portable federation clients should use REST/SSE.
 
 ## Non-contract surfaces
 

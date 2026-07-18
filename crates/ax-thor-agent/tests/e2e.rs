@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ax_serving_protocol::{DomainId, QualificationState};
 use ax_thor_agent::agent::{self, SharedRuntime};
-use ax_thor_agent::config::ThorConfig;
+use ax_thor_agent::config::{ExecutionDomainConfig, ThorConfig};
 use ax_thor_agent::proxy;
 use axum::{
     Json, Router,
@@ -58,6 +59,11 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         worker_pool: Some("thor".into()),
         node_class: "thor".into(),
         hardware_class: "thor".into(),
+        execution_domain: Some(ExecutionDomainConfig {
+            id: DomainId::new("thor-sglang-compat").unwrap(),
+            qualification: QualificationState::Experimental,
+            compatibility_manifest: None,
+        }),
         friendly_name: Some("thor-01".into()),
         chip_model: Some("RTX".into()),
         shutdown_timeout_secs: None,
@@ -84,6 +90,12 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert_eq!(registrations[0]["protocol"]["version"]["major"], 1);
     assert_eq!(registrations[0]["worker"]["id"], "worker-test");
     assert_eq!(registrations[0]["runtime"]["kind"], "sglang");
+    assert_eq!(
+        registrations[0]["domain"]["kind"],
+        "compatibility_runtime_endpoint"
+    );
+    assert_eq!(registrations[0]["domain"]["id"], "thor-sglang-compat");
+    assert_eq!(registrations[0]["domain_observation"]["ready"], true);
     assert_eq!(registrations[0]["hardware"]["hardware_class"], "thor");
     assert_eq!(
         registrations[0]["worker"]["advertise_url"],
@@ -141,6 +153,11 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
     assert_eq!(heartbeats[0].1["capacity"]["ttft_ewma_ms"], json!(118.0));
     assert_eq!(heartbeats[0].1["runtime"]["ready"], json!(true));
     assert_eq!(heartbeats[0].1["runtime"]["state"], json!("ready"));
+    assert_eq!(heartbeats[0].1["domain_observation"]["ready"], true);
+    assert_eq!(
+        heartbeats[0].1["domain_observation"]["aggregate_capacity"]["waiting_requests"],
+        json!(3)
+    );
     drop(heartbeats);
 
     let (proxy_base, _proxy_task) = spawn_server(proxy::router(
@@ -230,6 +247,7 @@ async fn thor_proxy_rejects_oversized_runtime_content_length_without_buffering()
         worker_pool: None,
         node_class: "thor".into(),
         hardware_class: "thor".into(),
+        execution_domain: None,
         friendly_name: None,
         chip_model: None,
         shutdown_timeout_secs: None,
@@ -294,6 +312,7 @@ async fn thor_proxy_accepts_valid_body_above_axum_default_limit() -> Result<()> 
         worker_pool: None,
         node_class: "thor".into(),
         hardware_class: "thor".into(),
+        execution_domain: None,
         friendly_name: None,
         chip_model: None,
         shutdown_timeout_secs: None,

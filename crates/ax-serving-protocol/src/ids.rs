@@ -183,6 +183,9 @@ model_id!(RuntimeModelId);
 model_id!(LogicalModelId);
 string_id!(DeploymentId);
 string_id!(EquivalenceClassId);
+string_id!(DomainId);
+string_id!(PolicyId);
+string_id!(PolicyVersion);
 string_id!(TrustDomainId);
 string_id!(TenantId);
 

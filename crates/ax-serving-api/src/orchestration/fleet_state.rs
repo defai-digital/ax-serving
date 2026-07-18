@@ -4,8 +4,8 @@
 //! streams, queue waiters, and HTTP connection state remain local to the
 //! gateway that accepted the client request.
 
-use std::future::Future;
 use super::worker_endpoint::WorkerEndpoint;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -930,6 +930,8 @@ mod tests {
                 memory_bytes: None,
                 hardware_class: Some("cuda".into()),
             },
+            domain: None,
+            domain_observation: None,
             observation: RuntimeObservation {
                 observed_at: time::OffsetDateTime::now_utc(),
                 runtime: RuntimeStatus::ready(),

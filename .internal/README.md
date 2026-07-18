@@ -1,33 +1,29 @@
-# AX Serving Internal Design Index
+# AX Serving internal design index
 
-This directory contains the canonical product and architecture contracts for AX Serving.
-Public operator and integration documentation remains under [`../docs`](../docs/).
+This directory contains the canonical target architecture and the evidence ledger. Public operator
+and integration documentation remains under [`../docs`](../docs/).
 
 ## Canonical documents
 
 - [Product requirements](prd/PRD-AX-SERVING.md)
-- [ADR-013: Runtime-neutral hybrid inference control plane](adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md)
-- [Hybrid runtime control-plane technical specification](specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
+- [ADR-016: Federated Dynamo and AX Engine control plane](adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md)
+- [Federated inference control-plane technical specification](specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md)
 - [Implementation and certification status](IMPLEMENTATION-STATUS.md)
 
-## Deployment documents
-
-- [CPU-only container deployment requirements](prd/PRD-CPU-ONLY-CONTAINER-DEPLOYMENT.md)
-- [ADR-014: CPU-only OCI and Helm deployment](adr/ADR-014-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
-- [CPU-only OCI and Helm technical specification](specs/TECH-SPEC-CPU-ONLY-OCI-AND-HELM-DEPLOYMENT.md)
-
-The deployment documents extend the core product documents. They define the target supported
-packaging and operations surface without changing the runtime-neutral ownership boundary in
-ADR-013.
+These four files are the only current internal product/design authorities. Earlier hybrid,
+CPU-only deployment, and agent-session ADR/PRD/spec packages were consolidated on 2026-07-15.
+Their valid requirements are now part of the canonical set.
 
 ## Document precedence
 
-When documents conflict, use this order:
+When documents conflict:
 
-1. Accepted ADRs define architecture decisions and ownership boundaries.
-2. The PRD defines product outcomes, requirements, and release gates.
-3. Technical specifications define the current implementation plan.
-4. Public documentation describes released behavior only.
+1. ADR-016 defines ownership and architecture boundaries.
+2. The PRD defines product outcomes, requirements, value gates, and release gates.
+3. The technical specification defines the target implementation and migration.
+4. The status ledger says what is actually implemented or certified.
+5. Public documentation describes released behavior only.
 
-Public documentation must not claim a capability until the corresponding PRD release gate has
-passed and the behavior is available in a released build.
+An implemented mock-tested type is not a live runtime certification. Generic Dynamo platform
+support is not Thor certification. Public claims require the corresponding retained release
+evidence.

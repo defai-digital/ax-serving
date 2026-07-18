@@ -1,7 +1,8 @@
 # ax-serving Helm chart
 
-First-party **CPU-only** gateway chart. Does not install AX Engine, vLLM, SGLang,
-GPU operators, device plugins, or model weights.
+First-party **CPU-only** gateway chart. It does not install AX Engine, NVIDIA Dynamo, vLLM,
+SGLang, TensorRT-LLM, GPU operators, device plugins, or model weights. Dynamo and Mac runtimes are
+separately operated execution domains.
 
 ## Install
 

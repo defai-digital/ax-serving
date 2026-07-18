@@ -1,43 +1,38 @@
-# Ideal deployment profile
+# Ideal customer and demand qualification
 
 AX Serving is worth evaluating when a team answers yes to several of these:
 
-- We operate more than one inference endpoint, pool, runtime, or hardware type.
-- Clients should use logical model names rather than know runtime addresses.
-- We need to drain or replace runtimes without changing client configuration.
-- Failover must not cross tokenizer/template/quantization identity silently.
-- Public, admin, worker, dispatch, and runtime credentials need separate trust
-  boundaries.
-- We need active-active gateways and shared capacity accounting.
-- We need tenant admission, priorities, diagnostics, or audit above runtimes.
-- Apple Silicon/MLX and CUDA capacity should coexist in one managed fleet.
+- We operate both Apple Silicon and NVIDIA inference capacity.
+- NVIDIA PC and Thor must be separate deployment, trust, or failure domains.
+- Clients should use logical models rather than runtime/domain addresses.
+- We need tenant, privacy, residency, locality, budget, or SLO policy above runtimes.
+- Failover must not silently cross tokenizer, template, quantization, revision, or trust boundaries.
+- We need central admission, audit, drain, rollout, diagnostics, or active-active state.
+- We can measure a representative workload and define a quality/safety floor.
 
-AX Serving is probably unnecessary when one stable runtime endpoint already
-meets availability, security, and operations needs. Another gateway may be a
-better choice when the organization is standardized on its APIs and does not
-need AX Serving's explicit identity/equivalence model.
+## Disqualifiers
 
-## Adoption prerequisites
+- One Dynamo endpoint satisfies all traffic and policy.
+- One Mac/AX Engine endpoint satisfies all traffic and policy.
+- The team expects AX to improve Dynamo's internal GPU scheduling.
+- The team wants an agent planner/tool/memory framework.
+- No owner can maintain model identity/equivalence and pinned compatibility manifests.
+- No workload or value metric exists to justify the extra hop/control plane.
 
-- a runtime endpoint with reliable readiness and model inventory;
-- immutable or at least traceable runtime/model artifacts;
-- an owner for deployment identity and equivalence certification;
-- workload traces and SLO definitions;
-- a secret and transport-security system for remote deployments;
-- durable Redis/Valkey for active-active state;
-- an incident owner willing to fail closed rather than bypass compatibility.
+## Required proof before adoption
 
-## Evaluation sequence
+Choose at least one measurable outcome:
 
-1. Run one runtime directly and through one gateway/agent.
-2. Validate streaming, cancellation, credential isolation, and drain.
-3. Add explicit deployment identity without cross-runtime equivalence.
-4. Certify a second deployment and test only the approved equivalence class.
-5. Add a second gateway and validate restart/partition behavior.
-6. Run target load, failure scenarios, and the 60-minute soak.
-7. Adopt only if overhead, goodput, safety, and operational burden meet the
-   team's stated criteria.
+- at least 20% lower NVIDIA load or measured cost while maintaining quality/SLO;
+- policy-correct availability during a domain outage/drain with no duplicate commitment;
+- zero privacy/locality violations while using one API;
+- a defined reduction in endpoint-specific client/operations work.
 
-Demand should be measured from completed evaluations and retained deployment
-evidence, not assumed from company size, model parameter count, or hardware
-brand.
+Also measure direct-domain versus through-AX overhead. If value does not exceed the operational and
+latency cost, deploy AX Engine or Dynamo directly and do not expand AX policy scope.
+
+## Current availability
+
+The current source contains the gateway and Mac-capable agent foundations. The final Dynamo domain
+adapter and Thor qualification remain roadmap work. See the
+[status ledger](../.internal/IMPLEMENTATION-STATUS.md) before planning a deployment.

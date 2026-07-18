@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use ax_serving_protocol::{
-    LogicalModelId, Operation, PoolId, ProtocolCapability, RequestId, TenantId,
+    DecisionProfileV1, LogicalModelId, Operation, PoolId, ProtocolCapability, RequestId, TenantId,
 };
 use serde::Serialize;
 
@@ -54,6 +54,9 @@ pub struct RequestProfile {
     pub cache_affinity_key: Option<u64>,
     pub required_pool: Option<PoolId>,
     pub preferred_pool: Option<PoolId>,
+    /// Versioned domain-policy inputs. P0 construction leaves client-facing
+    /// cost/quality hints unset until tenant policy can authenticate them.
+    pub decision: DecisionProfileV1,
     /// Compatibility constraint for clients that explicitly pin a runtime.
     pub runtime_hint: Option<String>,
     /// Absolute gateway deadline shared by admission, all attempts, and streaming.

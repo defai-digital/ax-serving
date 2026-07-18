@@ -5,8 +5,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    DeploymentId, EquivalenceClassId, LogicalModelId, Operation, PoolId, ProtocolCapability,
-    RuntimeModelId, TrustDomainId,
+    DeploymentId, DomainId, EquivalenceClassId, LogicalModelId, Operation, PoolId,
+    ProtocolCapability, RuntimeModelId, TrustDomainId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -220,6 +220,8 @@ pub struct DeploymentSpec {
     pub id: DeploymentId,
     pub logical_model: LogicalModelId,
     pub pool: PoolId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<DomainId>,
     pub runtime_model_id: RuntimeModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equivalence_class: Option<EquivalenceClassId>,

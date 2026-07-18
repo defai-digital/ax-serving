@@ -1,0 +1,417 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "AX Serving 的高價值產品策略",
+    "description": "從全 CUDA vLLM 替代方案、Mac 節點價值與現有證據成熟度，判斷 AX Serving 應聚焦的產品 wedge 與 go/no-go 門檻。",
+    "generatedAt": "2026-07-15T16:00:00Z",
+    "filters": [],
+    "cards": [],
+    "charts": [
+      {
+        "id": "evidence_maturity",
+        "title": "關鍵產品主張的證據成熟度",
+        "subtitle": "截至 2026 年 7 月 15 日；0＝未找到保留證據，3＝已由 production 或客戶驗證。這不是市場需求分數。",
+        "showDescription": true,
+        "headerMarkdown": "此圖回答的是「目前能證明什麼」，而不是「願景有多吸引人」。",
+        "intent": "比較 AX Serving 各項關鍵產品主張的現有證據成熟度。",
+        "question": "哪些主張已有可審計證據，哪些仍只是產品假設？",
+        "rationale": "六個離散面向、單一數值尺度且標籤較長，因此使用排序的水平長條圖。",
+        "type": "horizontalBar",
+        "dataset": "evidence_maturity",
+        "sourceId": "strategy_source_notes",
+        "encodings": {
+          "x": {
+            "field": "dimension",
+            "type": "nominal",
+            "label": "產品主張"
+          },
+          "y": {
+            "field": "evidence_level",
+            "type": "quantitative",
+            "label": "證據成熟度",
+            "format": "number"
+          },
+          "tooltip": [
+            {
+              "field": "evidence_label",
+              "type": "text",
+              "label": "狀態"
+            },
+            {
+              "field": "basis",
+              "type": "text",
+              "label": "判定依據"
+            }
+          ]
+        },
+        "xAxisTitle": "產品主張",
+        "yAxisTitle": "證據成熟度（0–3）",
+        "valueFormat": "number",
+        "layout": "wide",
+        "maxRows": 6,
+        "referenceLines": [
+          {
+            "value": 3,
+            "label": "已驗證",
+            "style": "dashed"
+          }
+        ],
+        "compatibleTypes": [
+          "bar",
+          "horizontalBar"
+        ],
+        "surface": {
+          "columns": 12,
+          "palette": "single-root"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "segment_decision",
+        "title": "客戶情境與 AX Serving 適配度",
+        "subtitle": "以 direct vLLM／vLLM Production Stack 為 homogeneous CUDA baseline；這是待客戶驗證的策略分群。",
+        "showDescription": true,
+        "headerMarkdown": "AX 不需要服務所有 inference 使用者；它需要在一個痛點昂貴、替代方案不足的 segment 成為明顯更好的選擇。",
+        "dataset": "segment_decision",
+        "density": "spacious",
+        "sourceId": "strategy_source_notes",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "priority",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "priority",
+            "label": "優先序",
+            "format": "number",
+            "type": "number",
+            "align": "right"
+          },
+          {
+            "field": "segment",
+            "label": "客戶情境",
+            "type": "text"
+          },
+          {
+            "field": "fit",
+            "label": "適配度",
+            "type": "text"
+          },
+          {
+            "field": "reason",
+            "label": "原因",
+            "type": "text"
+          },
+          {
+            "field": "product_action",
+            "label": "產品動作",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "strategy_source_notes",
+        "label": "AX Serving 高價值策略：來源與方法",
+        "path": "REPORTS/ax-serving-high-value-strategy-2026-07-15/source-notes.md",
+        "query": {
+          "engine": "ANSI SQL",
+          "language": "sql",
+          "executed_at": "2026-07-15T16:00:00Z",
+          "description": "將來源與方法筆記中逐項審核的六個產品主張，重現為報告使用的 evidence-maturity rows。",
+          "sql": "SELECT dimension, evidence_level, evidence_label, basis FROM (VALUES ('架構與 runtime 邊界', 2, '已實作，待 production certification', 'Canonical PRD 與 implementation ledger 記錄 runtime-neutral architecture 已在 source 實作。'), ('本地 correctness／contract tests', 2, '本地驗證完成，非 live runtime 證據', 'Implementation ledger 記錄本地 workspace tests 與 checks，並明確排除 production claim。'), ('Live AX Engine＋CUDA certification', 0, '尚無 retained certification artifact', 'Pinned AX Engine 與 CUDA runtime conformance 仍列為 release blocker。'), ('Mixed-fleet cost／SLO 優勢', 0, '尚無 qualifying benchmark artifact', 'PRD 要求 direct、through-gateway、mixed-fleet 比較；ledger 記錄 goodput 與 mixed-fleet evidence pending。'), ('客戶需求與 willingness-to-pay', 0, '本次來源中未找到', '未找到 customer interview、design-partner、usage、purchase 或 willingness-to-pay dataset。'), ('相對 all-CUDA alternatives 的差異化', 1, '已有 wedge 假設，尚無 comparative proof', 'Repo 定義 mixed-runtime／semantic-safety wedge；vLLM Production Stack 已覆蓋大量通用 serving 能力，硬體 plugin 亦已延伸至 Apple Silicon。')) AS t(dimension, evidence_level, evidence_label, basis)",
+          "filters": [
+            "Only claims material to the AX Serving high-value product decision",
+            "Repository and official product sources reviewed through 2026-07-15"
+          ],
+          "metric_definitions": [
+            "evidence_level: 0=no retained evidence found; 1=hypothesis or plan; 2=implemented or locally verified; 3=production- or customer-validated"
+          ]
+        }
+      },
+      {
+        "id": "ax_serving_prd",
+        "label": "AX Serving canonical PRD",
+        "path": ".internal/prd/PRD-AX-SERVING.md"
+      },
+      {
+        "id": "implementation_status",
+        "label": "AX Serving implementation and certification status",
+        "path": ".internal/IMPLEMENTATION-STATUS.md"
+      },
+      {
+        "id": "competitive_landscape",
+        "label": "AX Serving competitive category map",
+        "path": "docs/competitive-landscape.md"
+      },
+      {
+        "id": "use_cases",
+        "label": "AX Serving use cases and tradeoffs",
+        "path": "docs/advantages-and-use-cases.md"
+      },
+      {
+        "id": "vllm_production_stack",
+        "label": "vLLM Production Stack official documentation",
+        "href": "https://docs.vllm.ai/projects/production-stack/en/latest/"
+      },
+      {
+        "id": "vllm_semantic_router",
+        "label": "vLLM Semantic Router integration",
+        "href": "https://docs.vllm.ai/projects/production-stack/en/vllm-stack-0.1.10/use_cases/semantic-router-integration.html"
+      },
+      {
+        "id": "vllm_metal",
+        "label": "vLLM Metal Apple Silicon plugin",
+        "href": "https://github.com/vllm-project/vllm-metal"
+      },
+      {
+        "id": "apple_mac_studio",
+        "label": "Apple Mac Studio and M3 Ultra announcement",
+        "href": "https://www.apple.com/newsroom/2025/03/apple-unveils-new-mac-studio-the-most-powerful-mac-ever/"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# AX Serving 的高價值產品策略"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n- **你的競爭判斷大致正確。** vLLM engine 在技術架構上可以是 AX Serving 的 backend；但 vLLM Production Stack、Semantic Router 與硬體 plugin 生態在商業上已直接競爭 AX Serving 的 control-plane 願景。\n- **通用 feature 不是可信護城河。** Routing、autoscaling、semantic cache、model selection、privacy guard 或 Apple Silicon support，只要需求普遍且介面公開，就應假設 vLLM 生態可能吸收；vLLM-Metal 已經證明它會向 MLX／Apple Silicon 延伸。\n- **因此不建議把 AX Serving 當成獨立的通用 inference platform 投入。** 較合理的 default 是把它降級為 AX Code／Studio／BI 的薄型內部 policy／integration layer，CUDA 採 BYO vLLM endpoint，local runtime 則直接使用 AX Engine 或其他合適 runtime。\n- **只有付費證據能推翻這個結論。** 若具名客戶願意為 cross-site trust policy、certified semantic identity、audit 或 non-Kubernetes private operations 付費，而且 vLLM 生態無法合理滿足，再把 AX Serving 獨立化。"
+      },
+      {
+        "id": "evidence_finding",
+        "type": "markdown",
+        "sourceId": "strategy_source_notes",
+        "body": "## 工程成熟度明顯領先價值證據\n\n**目前最強的是架構與實作，最弱的是外部價值證明。** Canonical PRD、runtime-neutral protocol、strict model identity、lease／drain／retry boundary 與本地測試形成良好的工程基礎；但尚未形成一條可對客戶說明的因果鏈：AX Serving 被部署後，究竟省了多少 accelerator cost、降低多少 outage／operator effort，或解決哪個 vLLM Production Stack 無法解決的 blocker。\n\n下圖採用 0–3 的證據成熟度 rubric。零分代表在本次檢視的來源中沒有找到 retained evidence，不代表該需求必定不存在。"
+      },
+      {
+        "id": "evidence_chart",
+        "type": "chart",
+        "chartId": "evidence_maturity"
+      },
+      {
+        "id": "cuda_substitution",
+        "type": "markdown",
+        "sourceId": "vllm_production_stack",
+        "body": "## 全 CUDA 客戶已有很強的預設答案\n\n**AX 不能再把「routing、monitoring、autoscaling 或 semantic routing」單獨當成護城河。** vLLM Production Stack 已提供 Kubernetes deployment、router、observability、autoscaling、prefix／KV-aware routing，以及 Semantic Router integration。對 homogeneous CUDA 客戶，這些能力和既有 Kubernetes／gateway 生態會形成強烈的替代壓力。\n\n因此誠實的產品規則應該是：單一模型、單一 vLLM deployment，直接用 vLLM；標準 Kubernetes CUDA fleet 若現有 stack 已滿足需求，也不必加 AX。AX 只有在跨環境 policy、semantic identity、安全 failover、較輕量的 non-Kubernetes private deployment，或 runtime-neutral operations 能帶來可衡量結果時才應出現。"
+      },
+      {
+        "id": "copy_risk",
+        "type": "markdown",
+        "body": "## 應假設 vLLM 會吸收成功的通用能力\n\n**『他們可能學我們』不是悲觀，而是正確的競爭假設。** vLLM 已從高效 engine 延伸到 Production Stack、multi-model routing、KV-aware routing、Semantic Router、PII／prompt guard、semantic cache，以及 hardware plugins。其官方安裝文件也已列出 Apple Silicon，透過 community-maintained vLLM-Metal 以 MLX 作為主要 compute backend。\n\n這不表示每個 AX feature 都會立刻被複製；enterprise-specific policy、non-Kubernetes operations 或 deeply integrated workflow 可能不在其優先序。但 AX 不能把商業計畫建立在『vLLM 不會做』。凡是公開、通用、可單獨描述的 serving feature，都應視為低防禦性。真正較難複製的是 distribution、付費客戶關係、專有 outcome data、長期 certification、深度 vertical workflow integration，以及在匹配 benchmark 中證明的 execution advantage。 [vLLM Semantic Router](https://docs.vllm.ai/projects/production-stack/en/vllm-stack-0.1.10/use_cases/semantic-router-integration.html) · [vLLM-Metal](https://github.com/vllm-project/vllm-metal)"
+      },
+      {
+        "id": "mac_role",
+        "type": "markdown",
+        "body": "## Mac 是差異化 capacity，不是通用 server replacement\n\n**Mac 節點最可信的價值是 memory topology 與既有資產，而不是籠統的 privacy 或便宜。** Apple Silicon 可提供很大的 unified memory，適合單機容納大模型；若企業本來就有閒置的 Mac Studio，低優先背景任務的 marginal hardware cost 也可能很低。但「能放進記憶體」不等於 production goodput、tail latency 或 TCO 更好，而且 on-prem CUDA 同樣可以滿足 privacy。\n\nMac 應限定在三種情境：既有固定式 Mac capacity、無法依賴資料中心的 branch／air-gapped site、以及 memory-heavy 但 latency 不敏感的工作負載。員工 laptop scavenging、用 Mac 做高 concurrency primary serving、或未經 benchmark 就宣稱節能省錢，都不應成為產品主張。 [Apple 的官方規格只證明容量，不構成獨立 TCO 證據](https://www.apple.com/newsroom/2025/03/apple-unveils-new-mac-studio-the-most-powerful-mac-ever/)。"
+      },
+      {
+        "id": "segment_intro",
+        "type": "markdown",
+        "body": "## 最有價值的市場不是所有 AI inference 使用者\n\n**產品應集中在『已有多個 private inference environments，而且安全與營運錯誤很昂貴』的客戶。** 這個 segment 可能比全 CUDA 市場小，但只要 pain 夠深、budget owner 明確，仍可形成高價值產品。反過來，為單機或標準 CUDA cluster 增加一個 gateway，只會提高延遲、部署與認證負擔。"
+      },
+      {
+        "id": "segment_table",
+        "type": "table",
+        "tableId": "segment_decision"
+      },
+      {
+        "id": "product_scope",
+        "type": "markdown",
+        "body": "## 將 AX Serving 降級為產品內部能力，除非市場證明相反\n\n**目前建議的產品形態不是另一個獨立 inference platform，而是 AX vertical products 共用的薄型 integration／policy layer。**\n\n1. **AX Code／Studio／BI 擁有使用者價值：** 任務理解、repository／business context、tool permission、verification 與完成結果。\n2. **AX Serving 保持薄：** 統一 auth、endpoint policy、audit、model identity 與少量 safe failover，不重做 vLLM Production Stack。\n3. **CUDA 採 BYO endpoint：** 接受客戶已管理的 vLLM／SGLang URL、identity 與 telemetry；預設不替客戶在一般 PC node 安裝及營運 vLLM。\n4. **Local inference 直接化：** 單機 Mac 使用 AX Engine；單機 NVIDIA PC 依 workload 直接使用 vLLM、llama.cpp 或其他 runtime，沒有 fleet pain 就不經 AX Serving。\n5. **Intelligence 放在 workflow：** AX Code 的 compile／test outcome、AX BI 的 query correctness、AX Studio 的 privacy policy 產生的專有 outcome loop，比 generic prompt classification 更有防禦性。\n\n只有當 cross-site policy、semantic certification 或 private operations 出現具名付費客戶，AX Serving 才升級為獨立產品。"
+      },
+      {
+        "id": "go_no_go",
+        "type": "markdown",
+        "body": "## 用四個 go/no-go gate 決定是否繼續投資\n\n以下是管理門檻建議，不是由現有數據推導出的 industry benchmark：\n\n1. **Demand gate：** 找到至少 5 個願意提供真實 workload 的 design partners；至少 3 個有 recurring production use case、明確 budget owner，並能具體說明為何 direct vLLM／現有 gateway 不足。\n2. **Economic gate：** 在至少一個重複性 workload，於相同 quality 與 SLO 下證明至少 20% accelerator-cost 改善，或把一項高頻 operator workflow 的人工作業時間降低至少 50%。若兩者都沒有，mixed fleet 很可能只是技術展示。\n3. **Reliability gate：** 通過 canonical PRD 的 live runtime、fault injection、HA 與 soak gates；不得用 mock test 代替 production evidence。\n4. **Substitution gate：** 每個 pilot 必須記錄客戶為何選 AX，而不是 vLLM Production Stack、Kubernetes inference routing 或既有 API gateway。若答案只有『支援 Mac』，就還沒有足夠產品護城河。"
+      },
+      {
+        "id": "prd_guardrails",
+        "type": "markdown",
+        "sourceId": "ax_serving_prd",
+        "body": "## 技術 KPI 必須服從客戶結果\n\n**Primary outcome 應是 SLO-adjusted cost 或 operator time saved，而不是 routed request 數量。** 建議追蹤三個 primary KPI：同品質／SLO 下每個成功工作單位的總成本、可安全完成 rollout／drain／failover 的 operator time，以及由 AX policy 產生且持續使用的 production workload 數。\n\nGuardrails 沿用 PRD：gateway goodput loss 必須低於 3%、unsafe semantic failover 為零、duplicate committed request 為零、credential leakage 為零。只有技術 guardrail 全過且 primary outcome 有改善，才能稱為高價值。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 接下來只做能回答購買理由的工作\n\n1. **停止把 managed vLLM-on-PC 當成主要產品路徑。** 先支援客戶自帶的 vLLM endpoint；只有 shared workstation 或明確 multi-user serving 才值得協助部署。\n2. **把 vLLM 視為 competitor baseline。** 比較 direct vLLM、vLLM Production Stack 與 AX path，不只量 latency，也量部署時間、incident recovery、policy violation 與 operator effort。\n3. **驗證 AX Engine 真正差異。** 在 Apple Silicon 上與 vLLM-Metal、llama.cpp／其他 MLX runtime 做 matched benchmark；若沒有顯著 execution 或產品整合優勢，不把 Mac runtime 當護城河。\n4. **將 Intelligence 移到 vertical outcome。** 優先做 compile／test、SQL verification、document privacy 等 AX products 才能觀察的 closed loop，不做容易被複製的 generic task router。\n5. **先取得 design-partner commitment。** 未通過 demand、economic 與 substitution gate，就把 AX Serving 固定為內部元件，停止獨立平台式擴張。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 還需要回答的問題\n\n- 哪些具名客戶同時擁有 Mac 與 CUDA capacity？這些 Mac 是固定式節點還是員工裝置？\n- 他們目前為 inference downtime、GPU 閒置、rollout、security review 或多 endpoint integration 支付多少成本？\n- 哪一個工作負載可以安全地在 Mac 和 CUDA 間形成 certified equivalence？\n- 為什麼 vLLM Production Stack、KServe／Gateway API 或現有企業 gateway 不能解決？\n- 誰是 budget owner：AI platform、security、developer productivity，還是 business application team？\n- 使用者願意為 AX Serving 付費，還是只願意免費試用混合 routing？"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "body": "## Caveats and Assumptions\n\n- 本次檢視沒有可用的 customer interview、usage telemetry、win／loss、pricing、support-ticket、TCO 或 production mixed-fleet benchmark dataset，因此市場與 willingness-to-pay 判斷只能視為 provisional。\n- Repo 的 implementation ledger 是判斷現況最直接的來源；它明確區分 source implementation 與 live certification。\n- vLLM Production Stack、Semantic Router 與 vLLM-Metal 依 2026 年 7 月 15 日官方文件／project repository 核對，功能與成熟度仍會快速變動；vLLM-Metal 是 community-maintained plugin，不等於所有 upstream CUDA 功能已在 Mac 成熟。\n- 『vLLM 會吸收成功的通用 feature』是基於其已觀察到的 scope expansion 所作的競爭推論，不是確定的 roadmap 承諾；產品決策仍應採用這個保守假設。\n- Apple 的 unified-memory 規格證明容量，不證明與 CUDA 相比的 throughput、latency、energy 或 TCO 優勢；這些必須用匹配 workload 實測。\n- 報告中的 5 個 design partners、20% cost、50% operator-time 門檻是刻意設定的 provisional management gates，應在取得 baseline 與商業資料後重新校準。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-15T16:00:00Z",
+    "status": "ready",
+    "datasets": {
+      "evidence_maturity": [
+        {
+          "dimension": "架構與 runtime 邊界",
+          "evidence_level": 2,
+          "evidence_label": "已實作，待 production certification",
+          "basis": "Canonical PRD 與 implementation ledger 記錄 runtime-neutral architecture 已在 source 實作。"
+        },
+        {
+          "dimension": "本地 correctness／contract tests",
+          "evidence_level": 2,
+          "evidence_label": "本地驗證完成，非 live runtime 證據",
+          "basis": "Implementation ledger 記錄本地 workspace tests 與 checks，並明確排除 production claim。"
+        },
+        {
+          "dimension": "Live AX Engine＋CUDA certification",
+          "evidence_level": 0,
+          "evidence_label": "尚無 retained certification artifact",
+          "basis": "Pinned AX Engine 與 CUDA runtime conformance 仍列為 release blocker。"
+        },
+        {
+          "dimension": "Mixed-fleet cost／SLO 優勢",
+          "evidence_level": 0,
+          "evidence_label": "尚無 qualifying benchmark artifact",
+          "basis": "PRD 要求 direct、through-gateway、mixed-fleet 比較；ledger 記錄 goodput 與 mixed-fleet evidence pending。"
+        },
+        {
+          "dimension": "客戶需求與 willingness-to-pay",
+          "evidence_level": 0,
+          "evidence_label": "本次來源中未找到",
+          "basis": "未找到 customer interview、design-partner、usage、purchase 或 willingness-to-pay dataset。"
+        },
+        {
+          "dimension": "相對 all-CUDA alternatives 的差異化",
+          "evidence_level": 1,
+          "evidence_label": "已有 wedge 假設，尚無 comparative proof",
+          "basis": "Repo 定義 mixed-runtime／semantic-safety wedge；vLLM Production Stack 已覆蓋大量通用 serving 能力，硬體 plugin 亦已延伸至 Apple Silicon。"
+        }
+      ],
+      "segment_decision": [
+        {
+          "priority": 1,
+          "segment": "多個 private inference sites／clusters，具 policy、audit、data-residency 或 rollout pain",
+          "fit": "最值得驗證",
+          "reason": "錯誤與人工作業成本高，runtime-neutral identity 與安全 lifecycle 可能形成付費價值。",
+          "product_action": "鎖定 design partners，先證明 operator time、availability 或 cost 改善。"
+        },
+        {
+          "priority": 2,
+          "segment": "已持有固定式 Mac capacity，且同時有 CUDA 的 private fleet",
+          "fit": "實驗性 fit",
+          "reason": "可利用既有資產與 unified memory，但 vLLM-Metal／其他 MLX runtimes 降低了 AX 的硬體獨占性。",
+          "product_action": "先做 AX Engine、vLLM-Metal 與其他 local runtime 的 matched benchmark，再決定是否產品化。"
+        },
+        {
+          "priority": 3,
+          "segment": "All-CUDA multi-cluster，但不想採用大型 Kubernetes stack",
+          "fit": "弱／條件式 fit",
+          "reason": "輕量 control plane 可能有價值，但直接競爭 vLLM Production Stack 與其他成熟 gateways。",
+          "product_action": "若沒有具名 non-Kubernetes／policy blocker，預設使用既有 stack。"
+        },
+        {
+          "priority": 4,
+          "segment": "單一或標準 Kubernetes vLLM cluster",
+          "fit": "通常 poor fit",
+          "reason": "vLLM Production Stack 已提供 routing、observability、autoscaling 等常用能力。",
+          "product_action": "預設建議 direct vLLM；不要強迫增加 AX hop。"
+        },
+        {
+          "priority": 5,
+          "segment": "單機 Mac／單一 local model",
+          "fit": "poor fit for AX Serving",
+          "reason": "沒有 fleet、HA 或 centralized policy 時，AX Engine 或 selected runtime 直接使用更簡單。",
+          "product_action": "由 AX Engine／Studio 提供體驗，不將 Serving 放進必要路徑。"
+        },
+        {
+          "priority": 6,
+          "segment": "從零採購 Mac 以取代 production CUDA serving",
+          "fit": "目前不應 targeting",
+          "reason": "沒有 matched throughput、energy、TCO 與 supportability 證據。",
+          "product_action": "在 benchmark 證明前不作替代或省錢主張。"
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "strategy_source_notes",
+      "label": "AX Serving 高價值策略：來源與方法",
+      "path": "REPORTS/ax-serving-high-value-strategy-2026-07-15/source-notes.md",
+      "query": {
+        "engine": "ANSI SQL",
+        "language": "sql",
+        "executed_at": "2026-07-15T16:00:00Z",
+        "description": "將來源與方法筆記中逐項審核的六個產品主張，重現為報告使用的 evidence-maturity rows。",
+        "sql": "SELECT dimension, evidence_level, evidence_label, basis FROM (VALUES ('架構與 runtime 邊界', 2, '已實作，待 production certification', 'Canonical PRD 與 implementation ledger 記錄 runtime-neutral architecture 已在 source 實作。'), ('本地 correctness／contract tests', 2, '本地驗證完成，非 live runtime 證據', 'Implementation ledger 記錄本地 workspace tests 與 checks，並明確排除 production claim。'), ('Live AX Engine＋CUDA certification', 0, '尚無 retained certification artifact', 'Pinned AX Engine 與 CUDA runtime conformance 仍列為 release blocker。'), ('Mixed-fleet cost／SLO 優勢', 0, '尚無 qualifying benchmark artifact', 'PRD 要求 direct、through-gateway、mixed-fleet 比較；ledger 記錄 goodput 與 mixed-fleet evidence pending。'), ('客戶需求與 willingness-to-pay', 0, '本次來源中未找到', '未找到 customer interview、design-partner、usage、purchase 或 willingness-to-pay dataset。'), ('相對 all-CUDA alternatives 的差異化', 1, '已有 wedge 假設，尚無 comparative proof', 'Repo 定義 mixed-runtime／semantic-safety wedge；vLLM Production Stack 已覆蓋大量通用 serving 能力，硬體 plugin 亦已延伸至 Apple Silicon。')) AS t(dimension, evidence_level, evidence_label, basis)",
+        "filters": [
+          "Only claims material to the AX Serving high-value product decision",
+          "Repository and official product sources reviewed through 2026-07-15"
+        ],
+        "metric_definitions": [
+          "evidence_level: 0=no retained evidence found; 1=hypothesis or plan; 2=implemented or locally verified; 3=production- or customer-validated"
+        ]
+      }
+    },
+    {
+      "id": "ax_serving_prd",
+      "label": "AX Serving canonical PRD",
+      "path": ".internal/prd/PRD-AX-SERVING.md"
+    },
+    {
+      "id": "implementation_status",
+      "label": "AX Serving implementation and certification status",
+      "path": ".internal/IMPLEMENTATION-STATUS.md"
+    },
+    {
+      "id": "competitive_landscape",
+      "label": "AX Serving competitive category map",
+      "path": "docs/competitive-landscape.md"
+    },
+    {
+      "id": "use_cases",
+      "label": "AX Serving use cases and tradeoffs",
+      "path": "docs/advantages-and-use-cases.md"
+    },
+    {
+      "id": "vllm_production_stack",
+      "label": "vLLM Production Stack official documentation",
+      "href": "https://docs.vllm.ai/projects/production-stack/en/latest/"
+    },
+    {
+      "id": "vllm_semantic_router",
+      "label": "vLLM Semantic Router integration",
+      "href": "https://docs.vllm.ai/projects/production-stack/en/vllm-stack-0.1.10/use_cases/semantic-router-integration.html"
+    },
+    {
+      "id": "vllm_metal",
+      "label": "vLLM Metal Apple Silicon plugin",
+      "href": "https://github.com/vllm-project/vllm-metal"
+    },
+    {
+      "id": "apple_mac_studio",
+      "label": "Apple Mac Studio and M3 Ultra announcement",
+      "href": "https://www.apple.com/newsroom/2025/03/apple-unveils-new-mac-studio-the-most-powerful-mac-ever/"
+    }
+  ],
+  "package_info": {
+    "originUrl": "artifact://ax-serving-high-value-strategy-2026-07-15",
+    "controls": {
+      "edit": false,
+      "refresh": false
+    }
+  }
+}

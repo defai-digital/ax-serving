@@ -1,9 +1,13 @@
-# AX Serving explicit hybrid-fleet example.
+# AX Serving domain-aware migration example.
 #
 # This file demonstrates one logical alias backed by AX Engine on Apple
 # Silicon and vLLM on CUDA. Replace every identity value and certification
 # path with artifacts produced for your exact deployments. Do not copy the
 # placeholder digests into production.
+#
+# The CUDA entry is intentionally marked as a compatibility endpoint. The final NVIDIA production
+# profile replaces it with a `nvidia_dynamo_pc` domain registered by `ax-dynamo-adapter`; Thor uses
+# its own `nvidia_dynamo_thor` domain and pool.
 
 orchestrator:
   host: "0.0.0.0"
@@ -47,10 +51,31 @@ orchestrator:
       selector:
         worker_pool: "cuda-vllm"
 
+  domains:
+    - id: "mac-local"
+      kind: "mac_ax_engine"
+      pool: "mac-mlx"
+      trust_domain: "private"
+      hardware_class: "mac"
+      required_qualification: "certified"
+      selector:
+        worker_pool: "mac-mlx"
+      enabled: true
+    - id: "cuda-vllm-compat"
+      kind: "compatibility_runtime_endpoint"
+      pool: "cuda-vllm"
+      trust_domain: "private"
+      hardware_class: "pc-cuda"
+      required_qualification: "certified"
+      selector:
+        worker_pool: "cuda-vllm"
+      enabled: true
+
   deployments:
     - id: "qwen-mlx"
       logical_model: "qwen/code"
       pool: "mac-mlx"
+      domain: "mac-local"
       runtime_model_id: "mlx-community/Qwen3-Coder-Next-4bit"
       equivalence_class: "qwen-code-v1"
       expected_identity:
@@ -72,6 +97,7 @@ orchestrator:
     - id: "qwen-cuda"
       logical_model: "qwen/code"
       pool: "cuda-vllm"
+      domain: "cuda-vllm-compat"
       runtime_model_id: "Qwen/Qwen3-Coder-Next"
       equivalence_class: "qwen-code-v1"
       expected_identity:
@@ -119,3 +145,6 @@ orchestrator:
 #   AXS_MODEL_TEMPLATE_DIGEST=sha256:<template-digest>
 #   AXS_MODEL_QUANTIZATION=int4
 #   AXS_MODEL_MAX_OUTPUT_TOKENS=4096
+#   AXS_NODE_DOMAIN_ID=mac-local
+#   AXS_NODE_DOMAIN_QUALIFICATION=certified
+# Direct vLLM/SGLang agents may use domain ID cuda-vllm-compat only as a migration endpoint.

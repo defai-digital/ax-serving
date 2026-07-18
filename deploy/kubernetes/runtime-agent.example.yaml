@@ -1,3 +1,6 @@
+# Compatibility example: direct vLLM plus ax-runtime-agent is not the final NVIDIA production
+# architecture. The target uses a separately pinned Dynamo domain and Dynamo Domain Adapter.
+#
 # Copy this example into an environment overlay and replace every image,
 # runtime model, identity, credential, and resource value. Do not deploy the
 # placeholders as a production certification.

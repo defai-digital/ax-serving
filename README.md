@@ -3,78 +3,90 @@
 [![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-AX Serving is a runtime-neutral inference gateway and fleet control plane. It
-provides one OpenAI-compatible endpoint over AX Engine deployments on Apple
-Silicon and certified vLLM or SGLang deployments on CUDA.
+AX Serving is being built as a **federated heterogeneous inference control plane** for private AI
+fleets. It exposes one OpenAI-compatible API and governs execution across:
 
-AX Serving does not generate tokens. The selected runtime owns tokenization,
-chat templates, batching, KV cache, speculative decoding, distributed
-execution, and hardware kernels. AX Serving owns authentication, admission,
-fleet state, model deployment identity, endpoint selection, safe failover,
-streaming transport, and operator workflows.
+- Apple Silicon Macs running AX Engine through `ax-runtime-agent`;
+- NVIDIA GPU PCs managed inside an upstream NVIDIA Dynamo domain;
+- NVIDIA Thor devices managed inside a separate, independently qualified Dynamo domain.
 
-Project status: the runtime-neutral architecture is implemented in the source
-tree and covered by mock/conformance tests. It is not yet certified as a
-production-ready hybrid release. Live AX Engine plus CUDA certification,
-production-envelope latency/goodput measurements, and the required 60-minute
-soak artifacts must pass before that claim is made. See the
-[canonical PRD](.internal/prd/PRD-AX-SERVING.md) for the release gates.
+AX Serving selects a domain. Dynamo selects NVIDIA workers. AX Engine executes on Mac.
 
-## Product boundary
+AX Serving does not generate tokens or replace these systems. It owns public authentication,
+tenant and trust policy, logical models, deployment identity/equivalence, cross-domain admission,
+safe failover, audit, and operator workflows. Dynamo owns NVIDIA-local routing, KV-aware placement,
+disaggregation, planning, scaling, and backend execution. AX Engine owns Apple Silicon
+tokenization, templates, batching, caches, speculation, and kernels.
 
-The useful comparisons are at matching layers:
+## Project status
 
-| Layer | AX stack | Comparable project |
-| --- | --- | --- |
-| Inference runtime | AX Engine on MLX | llama.cpp or another local inference runtime |
-| Serving control plane | AX Serving | a vLLM-compatible gateway/control plane |
-| CUDA execution behind AX Serving | vLLM or SGLang | the same runtime used directly |
+The portable gateway, additive worker protocol v1.1, execution-domain catalog, explicit deployment
+and equivalence checks, bounded in-memory decision records, streaming/cancellation, safe pre-commit
+retry, HA fleet state, AX runtime agent, containers, Compose/Kubernetes, and Helm sources are
+implemented. Protocol v1.0 fixtures and endpoint migration behavior remain supported.
 
-AX Engine versus llama.cpp is an engine benchmark. AX Serving versus vLLM is
-not an engine benchmark: AX Serving complements vLLM by managing it alongside
-MLX runtimes. Serving measurements compare direct runtime traffic with the
-same traffic through AX Serving, then test mixed-fleet failure and overload
-behavior.
+The Dynamo Domain Adapter, durable/replayable decision storage, domain-aware HA reservations, and
+live federated certification are not yet implemented. NVIDIA Thor is a target experimental domain,
+not a current support claim. See the [status ledger](.internal/IMPLEMENTATION-STATUS.md) for exact
+evidence and blockers.
 
-In this repository, “hybrid” means a fleet containing MLX and CUDA deployment
-pools. One request attempt executes wholly on one compatible endpoint. AX
-Serving does not split a model, prefill/decode phase, or KV cache across MLX
-and CUDA.
+## Why AX Serving exists
 
-## Architecture
+| Layer | Owner |
+| --- | --- |
+| Cross-domain API, identity, tenant/privacy/locality policy, admission, audit | AX Serving |
+| NVIDIA PC/Thor worker routing, KV, prefill/decode, planner, scaling | NVIDIA Dynamo |
+| NVIDIA token execution | A Dynamo-certified vLLM, SGLang, or TensorRT-LLM backend |
+| Apple Silicon token execution | AX Engine |
+
+This product is useful when a fleet is genuinely heterogeneous or policy-segmented. If every
+request goes to one NVIDIA deployment with one policy, call Dynamo directly; AX Serving would add
+an unnecessary hop. AX Serving must prove value through cross-domain utilization, policy-correct
+availability, privacy/locality, cost/SLO improvement, or simpler operations.
+
+## Target architecture
 
 ```text
-OpenAI client
-     |
-     v
-AX Serving gateway ---- Redis/Valkey fleet state (HA profile)
-     |
-     +---- ax-runtime-agent ---- AX Engine / MLX
-     |
-     +---- ax-runtime-agent ---- vLLM or SGLang / CUDA
+OpenAI-compatible clients
+            |
+            v
+   AX Serving federation plane ---- Redis/Valkey (HA profile)
+            |
+            +---- Mac pool ---- ax-runtime-agent ---- AX Engine
+            |
+            +---- NVIDIA PC domain ---- ax-dynamo-adapter ---- Dynamo ---- backend workers
+            |
+            +---- NVIDIA Thor domain -- ax-dynamo-adapter ---- Dynamo ---- Thor workers
 ```
 
-The default `ax-serving-api` binary is portable and has no dependency on AX
-Engine, MLX, llama.cpp, Metal, or CUDA. The macOS-only embedded server and
-gRPC v1 API are isolated behind the `embedded-compat` feature.
+PC and Thor are always separate pools/domains by default. They do not share tensor-parallel groups,
+TensorRT engine artifacts, quantization artifacts, capacity calibration, or certification. One
+request attempt remains in one domain.
 
-Key safety properties:
+The canonical Dynamo upstream is
+[`https://github.com/ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo). The design uses pinned
+upstream releases and immutable NGC image digests through a service adapter; it does not maintain a
+private Dynamo fork. Release `v1.2.1` is the initial integration reference, not an unqualified
+support promise.
 
-- versioned worker protocol with runtime-authoritative readiness and inventory;
-- explicit logical models, pools, deployment identities, and equivalence classes;
-- fail-closed routing for stale, incompatible, draining, or overloaded workers;
-- at most one retry, only after a proven connect failure or authenticated typed
-  pre-admission rejection;
-- no retry after response commitment and no arbitrary-`5xx` rerouting;
-- byte-incremental SSE proxying with cancellation and phased deadlines;
-- separate public, admin, worker-control, dispatch, and runtime credentials;
-- Redis/Valkey lease fencing, shared capacity reservations, probe ownership,
-  and active-active gateway reconciliation;
-- asynchronous deployment create, update/roll, drain, delete, and job APIs.
+## Safety properties
 
-## Quick start: portable gateway and runtime agent
+- runtime-SDK-free portable gateway;
+- versioned registration, lease, readiness, inventory, and drain protocol;
+- explicit logical models, domains, pools, deployment identities, and equivalence classes;
+- hard policy/capability/identity filters before scoring;
+- missing or stale telemetry never interpreted as idle or compatible;
+- one AX retry at most, only after connect failure or authenticated typed non-admission;
+- no retry after admission ambiguity, response commitment, or first stream byte;
+- Dynamo owns all retry/migration inside an NVIDIA domain;
+- byte-incremental SSE, cancellation, and phased deadlines;
+- separate public, admin, worker-control, dispatch, Dynamo, runtime, and fleet-store credentials;
+- versioned, bounded, prompt-free routing decision diagnostics, with durable replay as a release gate;
+- offline evaluation, shadow, canary, and rollback before an adaptive policy becomes active.
 
-Build the portable binaries:
+## Quick start: current portable gateway and Mac agent
+
+Build the implemented portable binaries:
 
 ```bash
 cargo build --release \
@@ -88,24 +100,26 @@ Start a development gateway on loopback:
 AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
 ```
 
-Start an OpenAI-compatible runtime separately, then register it through the
-agent. This example assumes the runtime listens on port 8000 and reports its
-models from `/v1/models`:
+Start `ax-engine-server` separately, then attach the current agent:
 
 ```bash
 AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
-AXS_NODE_RUNTIME=vllm \
+AXS_NODE_RUNTIME=ax_engine \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
 AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
-AXS_NODE_HARDWARE_CLASS=pc-cuda \
-AXS_NODE_WORKER_POOL=cuda \
+AXS_NODE_HARDWARE_CLASS=apple-silicon \
+AXS_NODE_WORKER_POOL=mac-mlx \
+AXS_NODE_DOMAIN_ID=mac-local \
+AXS_NODE_DOMAIN_QUALIFICATION=experimental \
 target/release/ax-runtime-agent
 ```
 
-Use `AXS_NODE_RUNTIME=ax_engine` and an AX Engine OpenAI-compatible server URL
-for Apple Silicon. The public request model is the runtime model ID in
-`legacy_compat` mode:
+`AXS_NODE_DOMAIN_ID` is opt-in. AX Engine agents advertise `mac_ax_engine`; direct vLLM/SGLang
+agents can advertise only `compatibility_runtime_endpoint` and can never claim a Dynamo domain.
+Use `certified` only when the exact runtime/model deployment has retained qualification evidence.
+
+In `legacy_compat` mode, call the runtime model ID:
 
 ```bash
 curl -sS http://127.0.0.1:18080/v1/chat/completions \
@@ -118,19 +132,19 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-For cross-runtime routing, start from
-[`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml).
-Replace every placeholder identity and certification path. Do not enable an
-equivalence class until both deployment artifacts pass the same conformance
-workload.
+The current agent can also proxy direct vLLM/SGLang endpoints for migration and testing. That path
+is compatibility-only in the final design; it is not the target NVIDIA production architecture.
+The Dynamo Domain Adapter described by the canonical specification does not yet ship.
 
-See [QUICKSTART.md](QUICKSTART.md) for an authenticated setup and
-[the multi-worker runbook](docs/runbooks/multi-worker.md) for HA, drain,
-rollout, and incident procedures.
+For explicit deployment identity, start from
+[`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). It demonstrates explicit
+Mac and compatibility-domain declarations; the CUDA entry remains a migration example, not the
+target Dynamo production path. Replace every placeholder identity and never enable
+cross-deployment equivalence without a retained certification artifact.
 
 ## Public and operator APIs
 
-Portable gateway inference endpoints:
+Portable inference endpoints:
 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
@@ -140,17 +154,12 @@ Portable gateway inference endpoints:
 Health and observability:
 
 - `GET /livez` — process liveness;
-- `GET /readyz` — `200` only when at least one worker is routable;
-- `GET /health` — JSON fleet health summary;
-- `GET /v1/metrics` — admin-authenticated JSON operational metrics;
-- `GET /metrics` — admin-authenticated Prometheus `axs_gateway_*` metrics;
-- `GET /dashboard` — compatibility convenience UI, usable only behind an
-  authenticated admin reverse proxy that injects the bearer credential;
-- `GET /v1/admin/status`, `/diagnostics`, `/audit`, `/fleet`.
-
-Do not put an admin bearer token in a dashboard URL or browser storage. For
-production monitoring, scrape `/metrics` from the monitoring system and use
-the supplied Grafana dashboard instead of exposing `/dashboard` directly.
+- `GET /readyz` — control-plane readiness by default; does not require a routable domain;
+- `GET /routablez` — at least one eligible inference deployment;
+- `GET /health` — JSON control-plane and fleet-capacity summary;
+- `GET /v1/metrics` — admin-authenticated JSON metrics;
+- `GET /metrics` — admin-authenticated Prometheus metrics;
+- `GET /v1/admin/status`, `/diagnostics`, `/audit`, `/decisions`, `/fleet`, `/deployments`.
 
 Asynchronous lifecycle APIs:
 
@@ -159,110 +168,94 @@ Asynchronous lifecycle APIs:
 - `GET /admin/v1/jobs`
 - `GET /admin/v1/jobs/{id}`
 
-The portable operator client is built with the gateway and links no runtime
-SDK:
+These jobs currently represent AX desired/observed state. They do not prove that AX creates a
+Dynamo graph, downloads a model, or allocates a GPU. A certified external lifecycle controller is
+a later integration.
 
-```bash
-ax-servingctl status \
-  --url http://127.0.0.1:18080 \
-  --api-key public-key \
-  --admin-key admin-key \
-  --diagnostics --json
-```
-
-The portable gateway deliberately does not expose gRPC v1 or synchronous
-fleet model load/unload. Those contracts depend on gateway-local paths,
-backend enums, or token-ID streams and remain embedded compatibility only.
-`/v1/responses` is deferred until a runtime adapter passes its protocol
-conformance gate.
+The portable gateway deliberately does not expose gRPC v1, synchronous fleet model load/unload, or
+`/v1/responses`. The former are embedded compatibility contracts; Responses remains gated on
+end-to-end adapter certification.
 
 ## Security profiles
 
-Development may bind only to loopback with `AXS_TLS_PROFILE=loopback_dev` and
-must explicitly set `AXS_ALLOW_NO_AUTH=true` when public auth is absent.
-
-Remote deployments use `AXS_TLS_PROFILE=trusted_mesh`. This profile asserts
-that a trusted ingress/service mesh supplies TLS or mTLS; AX Serving does not
-create certificates itself.
+Loopback development requires `AXS_TLS_PROFILE=loopback_dev` and explicit
+`AXS_ALLOW_NO_AUTH=true` when public auth is absent. Remote deployments use
+`AXS_TLS_PROFILE=trusted_mesh`, where a trusted ingress or mesh supplies TLS/mTLS.
 
 | Credential | Purpose |
 | --- | --- |
 | `AXS_API_KEY` | Public inference clients |
-| `AXS_ADMIN_API_KEY` | Admin and worker-management routes |
-| `AXS_INTERNAL_API_TOKEN` | Gateway worker-control API credential |
-| `AXS_WORKER_TOKEN` | Agent copy of the worker-control credential |
-| `AXS_DISPATCH_TOKEN` | Gateway-to-agent inference dispatch |
-| `AXS_RUNTIME_API_KEY` | Agent-to-runtime authentication |
-| `AXS_REDIS_URL` | Shared HA state; treat as a secret |
-| `AXS_CACHE_AFFINITY_SECRET` | Tenant-scoped opaque affinity digest, 32+ bytes |
+| `AXS_ADMIN_API_KEY` | Admin and monitoring routes |
+| `AXS_INTERNAL_API_TOKEN` | Gateway worker/domain-control API |
+| `AXS_WORKER_TOKEN` | Adapter copy of the control credential |
+| `AXS_DISPATCH_TOKEN` | Gateway-to-adapter inference dispatch |
+| `AXS_RUNTIME_API_KEY` | Mac agent-to-AX Engine authentication |
+| future `AXS_DYNAMO_API_KEY` | Dynamo adapter-to-frontend authentication |
+| `AXS_REDIS_URL` | Shared AX HA state |
+| `AXS_CACHE_AFFINITY_SECRET` | Tenant-scoped opaque affinity derivation |
 
-Public `Authorization`, cookies, proxy credentials, and hop-by-hop headers are
-not forwarded to runtimes. Raw affinity hints are keyed with the operator
-secret and tenant ID, then discarded.
+Public authorization, cookies, proxy credentials, hop-by-hop headers, and AX internal headers are
+not forwarded to runtimes.
 
 ## Build and validation
 
-Portable checks, suitable for Linux and macOS:
+Portable checks:
 
 ```bash
 cargo check -p ax-serving-protocol
 cargo check -p ax-serving-api --no-default-features --features gateway
-cargo check -p ax-serving-cli --no-default-features --features gateway \
-  --bin ax-serving-api
+cargo check -p ax-serving-cli --no-default-features --features gateway --bin ax-serving-api
 cargo check -p ax-thor-agent
 ```
 
-Full workspace validation on supported macOS hosts:
+Repository validation:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-AXS_ALLOW_NO_AUTH=true cargo test --workspace --all-features
+cargo clippy --workspace --tests -- -D warnings
+cargo test --workspace --lib
+AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test orchestration
 ```
 
-Python 3.14 may require PyO3's forward-compatibility switch while PyO3 catches
-up:
-
-```bash
-PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo check --workspace
-```
-
-The release workflow rejects tags while benchmark evidence contains null
-baselines. Benchmark and soak commands must use release builds and retain raw,
-schema-versioned artifacts; incomplete files are not publishable evidence.
+Hardware-dependent compatibility and release tests require their pinned Mac, NVIDIA PC, or Thor
+environments. A skipped hardware test is not support evidence.
 
 ## Deployment
 
-- Single gateway development: in-memory fleet state and loopback agents.
-- Active-active gateway: Redis/Valkey shared state, unique `AXS_GATEWAY_ID`,
-  authenticated control/dispatch channels, and trusted transport.
-- Kubernetes baseline: [deploy/kubernetes](deploy/kubernetes/README.md).
+- Evaluation: one gateway, in-memory state, loopback or trusted private adapters.
+- HA candidate: two or more gateways, Redis/Valkey, unique gateway IDs, trusted transport, and
+  separate credentials.
 - Container targets: `gateway` and `agent` in
   [packaging/container/Dockerfile](packaging/container/Dockerfile).
+- Compose: [deploy/compose](deploy/compose/README.md).
+- Kubernetes baseline: [deploy/kubernetes](deploy/kubernetes/README.md).
+- First-party CPU-only chart: [deploy/helm/ax-serving](deploy/helm/ax-serving/README.md).
+
+The AX chart does not install Dynamo, GPU operators, AX Engine, backend runtimes, or model weights.
+Dynamo remains a separately pinned and operated execution domain.
 
 ## Repository layout
 
-- `crates/ax-serving-protocol` — portable worker/deployment wire contract;
-- `crates/ax-serving-api` — gateway, routing, HA state, lifecycle, REST/SSE;
-- `crates/ax-thor-agent` — generic AX Engine/vLLM/SGLang runtime agent;
+- `crates/ax-serving-protocol` — portable worker/deployment/domain protocol v1.1;
+- `crates/ax-serving-api` — gateway, catalog, routing, HA state, lifecycle, REST/SSE;
+- `crates/ax-thor-agent` — current package for the generic `ax-runtime-agent` binary;
 - `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
-- `crates/ax-serving-engine` — embedded compatibility backend abstraction;
+- `crates/ax-serving-engine` — embedded compatibility backends, not federation architecture;
 - `crates/ax-serving-bench` — benchmark, regression, and soak runners;
-- `crates/ax-serving-shim` and `crates/ax-serving-py` — compatibility bindings;
-- `.internal` — canonical PRD, ADR, and technical specification;
+- `deploy` — Compose, Kubernetes, Helm, monitoring, and alerting;
+- `.internal` — canonical ADR, PRD, technical specification, and status ledger;
 - `docs` — public contracts, operations, and performance guidance.
 
-## Canonical design documents
+## Canonical design
 
+- [ADR-016: Federated Dynamo and AX Engine control plane](.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md)
 - [Product requirements](.internal/prd/PRD-AX-SERVING.md)
-- [ADR-013: runtime-neutral hybrid inference control plane](.internal/adr/ADR-013-RUNTIME-NEUTRAL-HYBRID-INFERENCE-CONTROL-PLANE.md)
-- [Technical specification](.internal/specs/TECH-SPEC-HYBRID-RUNTIME-CONTROL-PLANE.md)
+- [Technical specification](.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md)
+- [Implementation and certification status](.internal/IMPLEMENTATION-STATUS.md)
+- [Runtime responsibility inventory](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Node protocol contract](docs/contracts/ax-serving-node-contract.md)
-- [Multi-worker operations](docs/runbooks/multi-worker.md)
-- [Service tuning and evidence](docs/perf/service-tuning.md)
 
 ## Licensing
 
-AX Serving is available under
-[AGPL-3.0-or-later](LICENSE). Separate commercial terms are described in
-[LICENSING.md](LICENSING.md) and [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+AX Serving is available under [AGPL-3.0-or-later](LICENSE). Separate commercial terms are
+described in [LICENSING.md](LICENSING.md) and [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).

@@ -3,16 +3,17 @@
 | Field | Value |
 | --- | --- |
 | Status | Proposed portable-gateway contract |
-| Last updated | 2026-07-12 |
+| Last updated | 2026-07-15 |
 
 AX Fabric should integrate with the portable AX Serving gateway over REST/SSE.
 It should not depend on embedded backend traits, local model paths, or gRPC v1
-for a hybrid fleet.
+for a federated fleet.
 
 ## Stable portable endpoints
 
 - `GET /livez`;
 - `GET /readyz`;
+- `GET /routablez`;
 - `GET /health`;
 - `GET /v1/models`;
 - `POST /v1/chat/completions`;
@@ -42,7 +43,7 @@ runtime, Redis, or affinity secrets.
   store). It does **not** require an eligible worker. Production installs use
   this so agents can register during bootstrap. Legacy
   `AXS_READYZ_MODE=eligible_workers` restores the old worker-gated behavior.
-- `/routablez` `200` means at least one worker is currently eligible for
+- `/routablez` `200` means at least one endpoint/domain is currently eligible for
   inference; `503` means capacity is unavailable (structured inference 503 with
   `Retry-After` applies). AX Fabric should use `/routablez` (or
   `workers.eligible > 0` from `/health`) as serving capacity readiness, not
@@ -77,6 +78,10 @@ configure logical aliases and avoid selecting runtime pools directly.
 The read API does not imply that every deployment behind an alias is
 equivalent. AX Serving's explicit catalog and equivalence policy enforce that
 internally.
+
+The final execution-domain and Dynamo adapter contract is approved design but not a released
+public contract. AX Fabric continues to use logical models and must not address Dynamo workers,
+PC/Thor pools, or Mac endpoints directly.
 
 ## Inference
 

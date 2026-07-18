@@ -1,0 +1,408 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "AX Serving 的差異化控制面策略",
+    "description": "判斷 AX Serving 是否應學習 vLLM 並成為更好的 Dynamo，以及應該擁有、整合或委派哪些能力。",
+    "generatedAt": "2026-07-15T15:00:16Z",
+    "filters": [],
+    "cards": [],
+    "charts": [
+      {
+        "id": "ownership_map",
+        "title": "AX 能力所有權分類",
+        "subtitle": "策略 rubric：0＝委派、1＝整合、2＝學習並標準化、3＝AX 核心自有；不是市場或效能分數。",
+        "showDescription": true,
+        "headerMarkdown": "AX 的核心應集中在跨 runtime correctness 與 enterprise policy，而不是 execution internals。",
+        "intent": "顯示 AX Serving 對六個能力層的所有權決策。",
+        "question": "哪些能力應由 AX 自有，哪些應交給 runtime 或 Dynamo？",
+        "rationale": "六個離散能力層、長文字標籤與單一 ordinal rubric，適合排序水平長條圖。",
+        "type": "horizontalBar",
+        "dataset": "ownership_decision",
+        "sourceId": "strategy_source_notes",
+        "encodings": {
+          "x": {
+            "field": "chart_label",
+            "type": "nominal",
+            "label": "能力層"
+          },
+          "y": {
+            "field": "ownership_level",
+            "type": "quantitative",
+            "label": "AX 所有權分類",
+            "format": "number"
+          },
+          "tooltip": [
+            {
+              "field": "ownership_label",
+              "type": "text",
+              "label": "決策"
+            },
+            {
+              "field": "reason",
+              "type": "text",
+              "label": "理由"
+            }
+          ]
+        },
+        "xAxisTitle": "能力層",
+        "yAxisTitle": "AX 所有權分類（0–3）",
+        "valueFormat": "number",
+        "layout": "wide",
+        "maxRows": 6,
+        "compatibleTypes": [
+          "bar",
+          "horizontalBar"
+        ],
+        "surface": {
+          "columns": 12,
+          "palette": "single-root"
+        }
+      }
+    ],
+    "tables": [],
+    "sources": [
+      {
+        "id": "strategy_source_notes",
+        "label": "AX Serving 與 Dynamo 策略：來源與方法",
+        "path": "REPORTS/ax-serving-dynamo-strategy-2026-07-15/source-notes.md",
+        "query": {
+          "engine": "ANSI SQL",
+          "language": "sql",
+          "executed_at": "2026-07-15T15:00:16Z",
+          "description": "依來源與方法筆記中的能力所有權 rubric，重現 ownership decision map 使用的六筆 reviewed rows。",
+          "sql": "SELECT priority, chart_label, layer, ownership_level, ownership_label, reference, ax_decision, reason FROM (VALUES (1, 'Execution runtime', 'Model execution、batching、KV、kernels', 0, '委派', 'vLLM／TensorRT-LLM／AX Engine', '委派', '這是 runtime 主場；AX 只需 conformance、capability 與 telemetry contract。'), (2, 'CUDA data plane', 'CUDA cluster 內的 disaggregation、RDMA、KV transfer、GPU scaling', 1, '整合，不重做', 'NVIDIA Dynamo', '整合，不重做', 'NVIDIA 已擁有硬體、網路與 backend 深度；AX 應把整個 cluster 視為 execution domain。'), (3, 'Control-plane patterns', 'Frontend／router／worker contracts、event plane、planner patterns', 2, '學習並標準化', 'vLLM Production Stack／Dynamo', '學習並標準化', '可吸收成熟的分層與觀測模式，但保持 wire-level、runtime-neutral 邊界。'), (4, 'Semantic identity', '跨 runtime identity、equivalence、safe failover', 3, '核心自有', 'AX Serving 現有 PRD／source', '核心自有', '這是 heterogeneous fleet 的 correctness boundary，且 repo 已有實作基礎。'), (5, 'Policy and audit', 'Private policy、trust、locality、tenant、audit', 3, '核心自有', 'AX Serving', '核心自有', '跨站點與企業政策不應下推到單一 runtime；也是最接近 budget owner 的層。'), (6, 'Adaptive policy', 'Quality／cost／latency adaptive policy', 3, '後續核心自有，先 shadow', 'AX product outcome data', '後續自有，先 shadow', '只有可靠 outcome label 與版本化 evaluation 存在時才形成真正 intelligence。')) AS t(priority, chart_label, layer, ownership_level, ownership_label, reference, ax_decision, reason) ORDER BY priority",
+          "filters": [
+            "Only capability layers material to the AX Serving versus Dynamo product decision",
+            "Sources reviewed through 2026-07-15"
+          ],
+          "metric_definitions": [
+            "ownership_level: 0=delegate, 1=integrate without rebuilding, 2=learn and standardize, 3=core AX ownership; a strategy classification, not a measured score"
+          ]
+        }
+      },
+      {
+        "id": "ax_serving_prd",
+        "label": "AX Serving canonical PRD",
+        "path": ".internal/prd/PRD-AX-SERVING.md"
+      },
+      {
+        "id": "implementation_status",
+        "label": "AX Serving implementation and certification status",
+        "path": ".internal/IMPLEMENTATION-STATUS.md"
+      },
+      {
+        "id": "market_positioning",
+        "label": "AX Serving market positioning",
+        "path": "docs/market-positioning.md"
+      },
+      {
+        "id": "icp_demand",
+        "label": "AX Serving ideal deployment profile",
+        "path": "docs/icp-and-demand.md"
+      },
+      {
+        "id": "agent_fabric_prd",
+        "label": "AX Serving agent-aware inference fabric PRD",
+        "path": ".internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md"
+      },
+      {
+        "id": "vllm_plugins",
+        "label": "vLLM Plugin System",
+        "href": "https://docs.vllm.ai/en/latest/design/plugin_system/"
+      },
+      {
+        "id": "vllm_production_stack",
+        "label": "vLLM Production Stack",
+        "href": "https://docs.vllm.ai/projects/production-stack/en/latest/"
+      },
+      {
+        "id": "dynamo_introduction",
+        "label": "NVIDIA Dynamo introduction and architecture",
+        "href": "https://docs.nvidia.com/dynamo/getting-started/introduction"
+      },
+      {
+        "id": "dynamo_repo",
+        "label": "Official ai-dynamo/dynamo upstream repository",
+        "href": "https://github.com/ai-dynamo/dynamo"
+      },
+      {
+        "id": "dynamo_support_matrix",
+        "label": "NVIDIA Dynamo hardware and platform support matrix",
+        "href": "https://docs.nvidia.com/dynamo/latest/resources/support-matrix"
+      },
+      {
+        "id": "thor_cuda",
+        "label": "Jetson AGX Thor CUDA container setup",
+        "href": "https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html"
+      },
+      {
+        "id": "dynamo_installation",
+        "label": "NVIDIA Dynamo local installation and requirements",
+        "href": "https://docs.nvidia.com/dynamo/latest/getting-started/local-installation"
+      },
+      {
+        "id": "dynamo_custom_backend",
+        "label": "NVIDIA Dynamo custom backend contract",
+        "href": "https://docs.nvidia.com/dynamo/latest/backends/custom-backend/writing-unified-backends"
+      },
+      {
+        "id": "dynamo_feature_matrix",
+        "label": "NVIDIA Dynamo backend feature matrix",
+        "href": "https://docs.nvidia.com/dynamo/latest/resources/feature-matrix"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# AX Serving 的差異化控制面策略"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n- **決策成立：新版 AX Serving 使用正式 upstream `ai-dynamo/dynamo` 與既有 AX Serving。** `ai-dynamo/dynamo` 是 NVIDIA 官方文件與 NGC releases 對應的 canonical project，不是第三方 fork。\n- **硬體分工清楚：** NVIDIA Thor 與 CUDA GPU PC 使用 Dynamo system；Apple Silicon Mac 使用 AX Engine。AX Serving 負責跨 domain 的 identity、policy、admission、audit 與 safe failover。\n- **Thor 與 GPU PC 必須是不同 hardware pools／deployment classes。** 不預設共享 TensorRT engine、quantization artifact、capacity envelope，也不跨兩者做 tensor parallel；AX 可以在兩個 pools 間選擇，Dynamo 在各 pool 內選 worker。\n- **整合方式應是 pinned upstream service 加 adapter，不是把兩個 codebase 混成 monolith。** 這能吸收 Dynamo 的 CUDA routing／KV／scaling，同時保留 AX 在 Mac、private policy、semantic equivalence 與簡單 operations 的產品價值。"
+      },
+      {
+        "id": "learn_not_copy",
+        "type": "markdown",
+        "body": "## 可以學架構，但不應複製整個產品範圍\n\n**從 vLLM 應學的是清楚的 execution ownership、runtime-authoritative telemetry、plugin contract、API conformance 與 benchmark discipline。** 從 Dynamo 應學的是 frontend／router／worker 分層、event-driven cache observation、planner 與 modular adoption。\n\n真正危險的是把每個看到的功能都搬進 AX Serving。Dynamo 已公開涵蓋 vLLM、SGLang、TensorRT-LLM、KV-aware routing、KVBM、NIXL、disaggregated serving、Planner、Grove 與 Kubernetes lifecycle。AX 若重做這些 CUDA 內部能力，不只需要追趕大量工程，也會破壞目前 repo 已定義的 runtime-neutral 邊界。 [vLLM Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system/) · [Dynamo Architecture](https://docs.nvidia.com/dynamo/getting-started/introduction)"
+      },
+      {
+        "id": "ownership_chart",
+        "type": "chart",
+        "chartId": "ownership_map"
+      },
+      {
+        "id": "winning_wedge",
+        "type": "markdown",
+        "body": "## AX 的勝場是私有異質 fleet，而不是 CUDA 內部\n\n**AX Serving 最可信的 wedge 是讓 private infrastructure 變得安全且無聊。** 使用者應該能用一個小型 gateway 與 agent，加入 Mac、edge host、直接 vLLM／TensorRT-LLM endpoint，以及一個完整 Dynamo cluster；不用先接受單一 runtime、單一 OS 或完整 Kubernetes stack。\n\nAX 的核心差異應收斂為五件事：\n\n1. **Simple operations：** node join、model publish、drain、rollout、rollback 與 diagnosis 有一致工作流。\n2. **Semantic safety：** model revision、tokenizer、template、quantization 與 capability 不相容時 fail closed。\n3. **Private policy：** tenant、trust domain、data locality、cloud fallback、budget 與 SLA 都能形成 typed policy。\n4. **Federation：** 管理 execution domains，而不重做每個 domain 的 scheduler。\n5. **Evidence loop：** 每次 routing／rollout 決策都可解釋、可重播，並以 production outcome 改版 policy。\n\n單純更漂亮的 UI 或多一個 routing algorithm 很容易被複製；長期較難複製的是 certified runtime matrix、跨版本 rollout knowledge、真實 workload outcome、failure corpus 與客戶信任。"
+      },
+      {
+        "id": "target_architecture",
+        "type": "markdown",
+        "body": "## 目標架構：AX 決定『去哪個 pool』，Dynamo／AX Engine 決定『怎麼跑』\n\n```text\nClients / AX Code / AX Studio / AX BI\n                   │\n              AX Serving\n     identity · policy · audit · federation\n                   │\n       ┌───────────┼──────────────┐\n       │           │              │\nNVIDIA PC pool  NVIDIA Thor pool  Apple Mac pool\nDynamo          Dynamo            AX runtime agent\n       │           │              │\nTRT-LLM/vLLM   certified backend  AX Engine\n```\n\n**Thor 與 GPU PC 可以由同一 AX Serving 管理，但先保持不同 Dynamo pools，必要時甚至不同 Dynamo deployments。** GPU PC 通常是 x86_64 discrete GPU；Thor 是 ARM64 Jetson／Blackwell SoC，driver、container、memory topology、模型 artifact 與性能 envelope 都不同。只有經過 matched certification，才允許同一 logical model 在兩個 pools 間 failover。\n\nDynamo 官方矩陣支援 ARM64、Ubuntu 24.04 與 Blackwell，Thor 官方也能執行 ARM64 CUDA 13 containers；但本次未找到明確的 Dynamo-on-Thor certified recipe，因此第一版必須標示為 experimental integration，而不是直接宣稱支援。 [Dynamo support matrix](https://docs.nvidia.com/dynamo/latest/resources/support-matrix) · [Thor CUDA setup](https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html)"
+      },
+      {
+        "id": "composition_rules",
+        "type": "markdown",
+        "body": "## 組合原則：依賴正式 upstream，不建立長期 fork\n\n**第一版把 Dynamo 當成外部、可替換且 pinned 的 execution-domain service。** 新增 `DynamoDomainAdapter`，對接 OpenAI API、health、model inventory、metrics 與 lifecycle；不要把 Dynamo 的 router／planner source 直接搬進 AX Serving。\n\n四個 correctness boundary 必須先定義：\n\n1. **每層一個 selector：** AX 選 NVIDIA PC、Thor 或 Mac pool；Dynamo 只選 NVIDIA pool 內 worker。\n2. **每層一個 retry owner：** AX 僅在 domain admission／response commitment 前切換 pool；Dynamo 負責 domain 內 migration。\n3. **Identity 由 AX 管理：** Dynamo model name 不足以代表 tokenizer、template、quantization 與 artifact equivalence。\n4. **Telemetry 分層：** AX 消費 pool capacity／SLO；不重建 Dynamo 的 worker-level KV 與 GPU state。\n\nUpstream codebase 主要採 Apache 2.0，可以作為 dependency／service 使用；若修改或重新散布，需遵守 license 與 notice 義務。 [Official upstream](https://github.com/ai-dynamo/dynamo)"
+      },
+      {
+        "id": "better_definition",
+        "type": "markdown",
+        "body": "## 『Better』必須代表更少時間、風險與成本\n\n**不能用 feature count 判斷 AX 是否比 Dynamo 更好。** 應比較 direct runtime、Dynamo 與 AX federation 三條路徑，量測 time-to-first-deployment、加入／汰換節點所需操作、upgrade／rollback 成功率、incident recovery、unsafe routing、gateway overhead，以及同品質／SLO 下的成功工作成本。\n\n目前沒有 customer 或 production dataset 可支持結論，因此採四個 provisional gates：\n\n- **Demand：** 至少三個 recurring design-partner workloads 與明確 budget owner。\n- **Usability：** 從空環境到第一個安全 request 的目標不超過十五分鐘。\n- **Correctness：** unsafe semantic failover 為零，gateway goodput loss 低於 canonical PRD 的 3% gate。\n- **Economic outcome：** operator time 至少降低 50%，或在品質／SLO guardrail 下成本至少改善 20%。\n\n這些是管理門檻，不是已觀察到的 industry baseline；未通過就停止擴 scope。"
+      },
+      {
+        "id": "recommended_next_steps",
+        "type": "markdown",
+        "body": "## 接下來先建立三個 domain adapters\n\n1. **Pin upstream。** 先以 Dynamo v1.2.1 release／container 建立相容矩陣，不追蹤 `main`，也不建立 private fork。\n2. **GPU PC adapter。** 先完成 x86_64 CUDA PC 的 Dynamo integration；backend 可從 TensorRT-LLM 開始，保留 vLLM capability fallback。\n3. **Thor certification spike。** 在實機核對 JetPack、CUDA、driver、Dynamo image、backend、streaming、cancellation、memory pressure 與長時間 soak；通過後才把 Thor 從 experimental 升級為 supported。\n4. **Mac adapter。** 保持現有 AX runtime agent → AX Engine 邊界，完成相同 model identity、health、drain 與 telemetry contract。\n5. **最後測跨 pool policy。** 先禁止自動 cross-pool failover；只有相同 logical model 的 artifact／tokenizer／template／quality corpus 通過後才建立 equivalence class。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 還需要回答的問題\n\n- Thor 的目標 backend 是 TensorRT-LLM、vLLM、SGLang，還是 Dynamo custom backend？哪一個有完整 ARM64／Jetson artifact？\n- Thor 是單機 edge pool，還是要和 GPU PC 組成 multi-node domain？第一版應預設前者。\n- 哪些 workload 真正需要在 GPU PC、Thor 與 Mac 三者間選擇，而不是固定部署？\n- 誰擁有 budget：AI platform、robotics／edge、security、IT operations，還是 AX vertical product team？\n- 若 NVIDIA 改善 edge deployment 與跨硬體能力，AX 剩下哪一項 outcome／data／certification 優勢？"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "body": "## Caveats and Assumptions\n\n- 本次來源沒有 customer interview、usage telemetry、pricing、win／loss、support ticket、TCO 或 willingness-to-pay 資料；市場判斷是 provisional。\n- Repo 文件與 source implementation 能證明產品邊界及部分工程能力，不能代替 live runtime、production soak 或 customer value evidence。\n- `ai-dynamo/dynamo` 是 NVIDIA 官方 canonical upstream；這不表示所有 Dynamo backend／container 已在 Jetson AGX Thor 認證。ARM64＋Blackwell support 只是必要條件。\n- Dynamo 與 vLLM 在 2026 年 7 月仍快速發展；其 API、backend pins 與 deployment surface 必須按 release 鎖定並通過 conformance。\n- 三個 design partners、十五分鐘首次部署、50% operator-time improvement 與 20% economic improvement 是建議的管理門檻，不是已觀察到的 industry baseline。\n- AX Serving 不應因為某個 runtime integration 困難，就把 runtime-specific tokenization、KV ownership 或 GPU scheduling 移進 gateway。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-15T15:00:16Z",
+    "status": "ready",
+    "datasets": {
+      "ownership_decision": [
+        {
+          "priority": 1,
+          "chart_label": "Execution runtime",
+          "layer": "Model execution、batching、KV、kernels",
+          "ownership_level": 0,
+          "ownership_label": "委派",
+          "reference": "vLLM／TensorRT-LLM／AX Engine",
+          "ax_decision": "委派",
+          "reason": "這是 runtime 主場；AX 只需 conformance、capability 與 telemetry contract。"
+        },
+        {
+          "priority": 2,
+          "chart_label": "CUDA data plane",
+          "layer": "CUDA cluster 內的 disaggregation、RDMA、KV transfer、GPU scaling",
+          "ownership_level": 1,
+          "ownership_label": "整合，不重做",
+          "reference": "NVIDIA Dynamo",
+          "ax_decision": "整合，不重做",
+          "reason": "NVIDIA 已擁有硬體、網路與 backend 深度；AX 應把整個 cluster 視為 execution domain。"
+        },
+        {
+          "priority": 3,
+          "chart_label": "Control-plane patterns",
+          "layer": "Frontend／router／worker contracts、event plane、planner patterns",
+          "ownership_level": 2,
+          "ownership_label": "學習並標準化",
+          "reference": "vLLM Production Stack／Dynamo",
+          "ax_decision": "學習並標準化",
+          "reason": "可吸收成熟的分層與觀測模式，但保持 wire-level、runtime-neutral 邊界。"
+        },
+        {
+          "priority": 4,
+          "chart_label": "Semantic identity",
+          "layer": "跨 runtime identity、equivalence、safe failover",
+          "ownership_level": 3,
+          "ownership_label": "核心自有",
+          "reference": "AX Serving 現有 PRD／source",
+          "ax_decision": "核心自有",
+          "reason": "這是 heterogeneous fleet 的 correctness boundary，且 repo 已有實作基礎。"
+        },
+        {
+          "priority": 5,
+          "chart_label": "Policy and audit",
+          "layer": "Private policy、trust、locality、tenant、audit",
+          "ownership_level": 3,
+          "ownership_label": "核心自有",
+          "reference": "AX Serving",
+          "ax_decision": "核心自有",
+          "reason": "跨站點與企業政策不應下推到單一 runtime；也是最接近 budget owner 的層。"
+        },
+        {
+          "priority": 6,
+          "chart_label": "Adaptive policy",
+          "layer": "Quality／cost／latency adaptive policy",
+          "ownership_level": 3,
+          "ownership_label": "後續核心自有，先 shadow",
+          "reference": "AX product outcome data",
+          "ax_decision": "後續自有，先 shadow",
+          "reason": "只有可靠 outcome label 與版本化 evaluation 存在時才形成真正 intelligence。"
+        }
+      ],
+      "roadmap_gates": [
+        {
+          "phase": 0,
+          "product": "競品與需求 baseline",
+          "proof": "完成 direct runtime、Dynamo 與 AX 的同工作流比較；至少 3 個 recurring design-partner use cases 與 budget owner。",
+          "stop_condition": "若需求只是單一 CUDA endpoint 或沒有付費／production owner，不做獨立平台。"
+        },
+        {
+          "phase": 1,
+          "product": "最容易的 private heterogeneous fleet",
+          "proof": "從空環境到第一個安全 request 的目標不超過 15 分鐘；Mac／AX Engine、GPU PC／Dynamo 與 Thor／Dynamo 三個獨立 pools 通過各自 conformance。",
+          "stop_condition": "若相較既有 stack 無法明顯降低 operator steps／time，就縮回薄型內部 gateway。"
+        },
+        {
+          "phase": 2,
+          "product": "Policy、identity、audit 與 safe lifecycle",
+          "proof": "Unsafe semantic failover 為零、所有 route 有 reason code、gateway goodput loss 低於 3%，rollout／rollback operator time 至少降低 50%。",
+          "stop_condition": "若客戶不把安全與營運改善視為採用或付費理由，不擴大 control-plane scope。"
+        },
+        {
+          "phase": 3,
+          "product": "Evidence-driven adaptive policy",
+          "proof": "Shadow／canary policy 在品質 guardrail 下帶來至少 20% 成本改善，或 agent loop p95 time-to-next-action 至少改善 25%。",
+          "stop_condition": "若沒有可靠 outcome label、replay 與 rollback，維持 deterministic policy，不做 online learning。"
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "strategy_source_notes",
+      "label": "AX Serving 與 Dynamo 策略：來源與方法",
+      "path": "REPORTS/ax-serving-dynamo-strategy-2026-07-15/source-notes.md",
+      "query": {
+        "engine": "ANSI SQL",
+        "language": "sql",
+        "executed_at": "2026-07-15T15:00:16Z",
+        "description": "依來源與方法筆記中的能力所有權 rubric，重現 ownership decision map 使用的六筆 reviewed rows。",
+        "sql": "SELECT priority, chart_label, layer, ownership_level, ownership_label, reference, ax_decision, reason FROM (VALUES (1, 'Execution runtime', 'Model execution、batching、KV、kernels', 0, '委派', 'vLLM／TensorRT-LLM／AX Engine', '委派', '這是 runtime 主場；AX 只需 conformance、capability 與 telemetry contract。'), (2, 'CUDA data plane', 'CUDA cluster 內的 disaggregation、RDMA、KV transfer、GPU scaling', 1, '整合，不重做', 'NVIDIA Dynamo', '整合，不重做', 'NVIDIA 已擁有硬體、網路與 backend 深度；AX 應把整個 cluster 視為 execution domain。'), (3, 'Control-plane patterns', 'Frontend／router／worker contracts、event plane、planner patterns', 2, '學習並標準化', 'vLLM Production Stack／Dynamo', '學習並標準化', '可吸收成熟的分層與觀測模式，但保持 wire-level、runtime-neutral 邊界。'), (4, 'Semantic identity', '跨 runtime identity、equivalence、safe failover', 3, '核心自有', 'AX Serving 現有 PRD／source', '核心自有', '這是 heterogeneous fleet 的 correctness boundary，且 repo 已有實作基礎。'), (5, 'Policy and audit', 'Private policy、trust、locality、tenant、audit', 3, '核心自有', 'AX Serving', '核心自有', '跨站點與企業政策不應下推到單一 runtime；也是最接近 budget owner 的層。'), (6, 'Adaptive policy', 'Quality／cost／latency adaptive policy', 3, '後續核心自有，先 shadow', 'AX product outcome data', '後續自有，先 shadow', '只有可靠 outcome label 與版本化 evaluation 存在時才形成真正 intelligence。')) AS t(priority, chart_label, layer, ownership_level, ownership_label, reference, ax_decision, reason) ORDER BY priority",
+        "filters": [
+          "Only capability layers material to the AX Serving versus Dynamo product decision",
+          "Sources reviewed through 2026-07-15"
+        ],
+        "metric_definitions": [
+          "ownership_level: 0=delegate, 1=integrate without rebuilding, 2=learn and standardize, 3=core AX ownership; a strategy classification, not a measured score"
+        ]
+      }
+    },
+    {
+      "id": "ax_serving_prd",
+      "label": "AX Serving canonical PRD",
+      "path": ".internal/prd/PRD-AX-SERVING.md"
+    },
+    {
+      "id": "implementation_status",
+      "label": "AX Serving implementation and certification status",
+      "path": ".internal/IMPLEMENTATION-STATUS.md"
+    },
+    {
+      "id": "market_positioning",
+      "label": "AX Serving market positioning",
+      "path": "docs/market-positioning.md"
+    },
+    {
+      "id": "icp_demand",
+      "label": "AX Serving ideal deployment profile",
+      "path": "docs/icp-and-demand.md"
+    },
+    {
+      "id": "agent_fabric_prd",
+      "label": "AX Serving agent-aware inference fabric PRD",
+      "path": ".internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md"
+    },
+    {
+      "id": "vllm_plugins",
+      "label": "vLLM Plugin System",
+      "href": "https://docs.vllm.ai/en/latest/design/plugin_system/"
+    },
+    {
+      "id": "vllm_production_stack",
+      "label": "vLLM Production Stack",
+      "href": "https://docs.vllm.ai/projects/production-stack/en/latest/"
+    },
+    {
+      "id": "dynamo_introduction",
+      "label": "NVIDIA Dynamo introduction and architecture",
+      "href": "https://docs.nvidia.com/dynamo/getting-started/introduction"
+    },
+    {
+      "id": "dynamo_repo",
+      "label": "Official ai-dynamo/dynamo upstream repository",
+      "href": "https://github.com/ai-dynamo/dynamo"
+    },
+    {
+      "id": "dynamo_support_matrix",
+      "label": "NVIDIA Dynamo hardware and platform support matrix",
+      "href": "https://docs.nvidia.com/dynamo/latest/resources/support-matrix"
+    },
+    {
+      "id": "thor_cuda",
+      "label": "Jetson AGX Thor CUDA container setup",
+      "href": "https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html"
+    },
+    {
+      "id": "dynamo_installation",
+      "label": "NVIDIA Dynamo local installation and requirements",
+      "href": "https://docs.nvidia.com/dynamo/latest/getting-started/local-installation"
+    },
+    {
+      "id": "dynamo_custom_backend",
+      "label": "NVIDIA Dynamo custom backend contract",
+      "href": "https://docs.nvidia.com/dynamo/latest/backends/custom-backend/writing-unified-backends"
+    },
+    {
+      "id": "dynamo_feature_matrix",
+      "label": "NVIDIA Dynamo backend feature matrix",
+      "href": "https://docs.nvidia.com/dynamo/latest/resources/feature-matrix"
+    }
+  ],
+  "package_info": {
+    "originUrl": "artifact://ax-serving-dynamo-strategy-2026-07-15",
+    "controls": {
+      "edit": false,
+      "refresh": false
+    }
+  }
+}

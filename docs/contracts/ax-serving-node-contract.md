@@ -2,22 +2,30 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Protocol v1 source contract |
+| Status | Protocol v1.1 source foundation; Dynamo adapter certification pending |
 | Wire types | `crates/ax-serving-protocol` |
-| Current version | `1.0` |
-| Last updated | 2026-07-12 |
+| Current version | `1.1` |
+| Last updated | 2026-07-15 |
 
-This contract defines how a runtime agent joins the portable AX Serving fleet.
+This contract defines how a runtime agent or domain adapter joins the portable AX Serving fleet.
 The Rust protocol crate and its JSON fixtures are authoritative when this
 document and code differ.
 
+Protocol v1.1 extends the v1.0 worker contract additively so a Dynamo deployment can register as one
+execution domain. The types, validation, gateway state propagation, fixtures, and desired-domain
+catalog are implemented; the Dynamo adapter and live certification are not.
+
 ## 1. Runtime ownership
 
-The runtime owns model loading, tokenization, templates, batching, cache,
+The runtime/domain owner owns model loading, tokenization, templates, batching, cache,
 generation, distributed execution, and hardware kernels. The agent owns
 runtime discovery, readiness normalization, credential isolation,
 cancellation, and byte-preserving HTTP/SSE proxying. The gateway owns fleet
-leases, admission, endpoint selection, equivalence, retry, and operations.
+leases, cross-domain admission/selection, equivalence, retry, and operations.
+
+For NVIDIA target deployments, Dynamo owns worker routing, KV-aware placement, disaggregation,
+planner/scaling, and backend execution. The AX Dynamo adapter represents the whole deployment and
+must not expose internal workers as AX candidates.
 
 An agent must not parse model files or invent model identity from a filename.
 Unknown runtime facts remain unknown.
@@ -58,7 +66,7 @@ Registration carries:
 ```json
 {
   "protocol": {
-    "version": {"major": 1, "minor": 0},
+    "version": {"major": 1, "minor": 1},
     "capabilities": ["control.drain", "dispatch.typed-admission"]
   }
 }
@@ -79,17 +87,19 @@ Known protocol capabilities include:
 ```text
 control.drain
 control.deployment-jobs
+control.execution-domain.v1
 control.inventory-delta
 dispatch.cancel
 dispatch.typed-admission
 telemetry.capacity
+telemetry.domain-capacity.v1
 telemetry.kv-cache
 telemetry.prefix-cache
 ```
 
 ## 4. Registration
 
-`RegisterWorkerRequest` contains six descriptors:
+`RegisterWorkerRequest` contains six base descriptors plus optional v1.1 domain fields:
 
 | Object | Required content |
 | --- | --- |
@@ -98,6 +108,8 @@ telemetry.prefix-cache
 | `worker` | Stable worker ID, process instance ID, advertised URL, pool, trust domain, bounded labels |
 | `runtime` | Runtime kind, version, and API family |
 | `hardware` | Platform, accelerator, device count, optional memory and hardware class |
+| `domain` | Optional stable execution-domain descriptor; requires `control.execution-domain.v1` |
+| `domain_observation` | Optional aggregate domain state, inventory, manifest, and capacity |
 | `observation` | Runtime-authoritative status, inventory generation, model descriptors, optional capacity |
 
 Worker identity has two levels:
@@ -167,10 +179,17 @@ non-negative; active/batch use cannot exceed an advertised maximum. Unknown
 signals remain absent. The gateway penalizes absent or stale telemetry instead
 of treating it as idle.
 
-The generic agent can translate selected stable AX/vLLM/SGLang Prometheus and
-JSON aliases. Those translations are best-effort adapter behavior, not a
+The current generic agent can translate selected stable AX/vLLM/SGLang Prometheus and
+JSON aliases. Direct CUDA use is a migration/testing compatibility path in the final architecture.
+Those translations are best-effort adapter behavior, not a
 guarantee that every runtime version exports every signal. Pin and test each
 certified runtime image.
+
+The future Dynamo adapter reports only documented aggregate domain telemetry. Dynamo worker costs,
+KV indexes, KVBM ownership, and NIXL transfer metadata do not enter AX state.
+When `domain_observation.aggregate_capacity` is present, it is authoritative for gateway admission
+and scoring; the generic runtime capacity field is only a fallback. This prevents a domain from
+appearing idle when its aggregate view reports pressure.
 
 ## 7. Heartbeat and fencing
 
@@ -182,6 +201,10 @@ Each heartbeat contains:
 - inventory generation;
 - optional full model inventory and capacity;
 - optional deployment-job observations.
+
+For a registration that declared `control.execution-domain.v1`, `domain_observation` is mandatory
+on every new heartbeat sequence. Omitting it rejects that heartbeat; the gateway never refreshes a
+domain lease using runtime-only state. This requirement does not apply to v1.0 migration workers.
 
 It carries `X-Ax-Lease-Token`. The gateway rejects:
 
@@ -231,7 +254,7 @@ checks runtime readiness, lease freshness, drain, pool/trust policy, operation,
 capabilities, context/output limits, identity, equivalence, and shared capacity
 before scoring.
 
-Cross-pool retry additionally requires:
+Cross-pool/domain retry additionally requires:
 
 - source and target in the same operator-certified equivalence class;
 - both deployment IDs listed in the certification artifact;
@@ -277,4 +300,47 @@ deployment identity, and negotiated capabilities. They are accepted only in
 failover.
 
 New integrations must use the protocol crate rather than adding runtime-name
-conditionals or more fields to the legacy DTOs.
+conditionals or more fields to the legacy DTOs. Direct vLLM/SGLang agents become
+`compatibility_runtime_endpoint` targets after the Dynamo adapter is certified.
+
+## 13. Execution-domain v1.1 extension
+
+Protocol minor 1 adds optional:
+
+```text
+control.execution-domain.v1
+telemetry.domain-capacity.v1
+ExecutionDomainDescriptor
+DomainObservation
+```
+
+The descriptor includes a stable domain ID, kind, endpoint scope, execution owner, qualification,
+pool, trust domain, hardware class, architecture, and compatibility-manifest digest.
+Desired `DomainSpec.selector` may pin that digest with `compatibility_manifest` (or
+`compatibility_manifest_digest`); a missing or different observed digest then fails eligibility.
+
+Required mappings:
+
+| Domain kind | Scope | Meaning |
+| --- | --- | --- |
+| `mac_ax_engine` | `node` | One Mac AX Engine endpoint |
+| `nvidia_dynamo_pc` | `domain` | One complete NVIDIA PC Dynamo deployment |
+| `nvidia_dynamo_thor` | `domain` | One separately qualified Thor Dynamo deployment |
+| `compatibility_runtime_endpoint` | `node` | Time-bounded direct runtime migration path |
+
+PC and Thor cannot share a domain/pool by default. Dynamo domain observations are aggregate and must
+not contain internal worker IDs or KV state. A Dynamo adapter returns typed non-admission only when
+it rejects locally before upstream dispatch or a pinned Dynamo contract proves that execution did
+not start.
+
+Current `ax-runtime-agent` registrations advertise the domain capability only when
+`AXS_NODE_DOMAIN_ID` is configured. The agent derives a safe kind: AX Engine becomes
+`mac_ax_engine`, while every other direct runtime becomes `compatibility_runtime_endpoint`; it
+cannot claim a Dynamo domain. `AXS_NODE_DOMAIN_QUALIFICATION` defaults to `unverified`, and an
+optional `AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST` carries the retained manifest digest. Without a
+domain ID, operators can use the explicit Mac/compatibility migration mapping. NVIDIA production
+domains still require the separate adapter, a valid v1.1 descriptor, and a ready aggregate
+observation.
+
+The normative v1.1 types, migration rules, and conformance matrix are in the
+[technical specification](../../.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md).

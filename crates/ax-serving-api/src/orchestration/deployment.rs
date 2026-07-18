@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use ax_serving_protocol::{
     DeploymentControlRecord, DeploymentDesiredState, DeploymentId, DeploymentIdentity,
-    DeploymentSpec, Digest, EquivalenceClassId, EquivalencePolicy, LogicalModelId, PoolId,
-    PoolSpec,
+    DeploymentSpec, Digest, DomainId, DomainSpec, EquivalenceClassId, EquivalencePolicy,
+    ExecutionDomainKind, LogicalModelId, PoolId, PoolSpec,
 };
 use serde::Serialize;
 
@@ -60,6 +60,7 @@ pub struct RouteCandidate {
     pub endpoint: WorkerModelEndpoint,
     pub deployment: DeploymentSpec,
     pub pool: PoolSpec,
+    pub domain: Option<DomainSpec>,
     pub observed_identity: DeploymentIdentity,
 }
 
@@ -67,7 +68,9 @@ pub struct RouteCandidate {
 pub struct DeploymentCatalog {
     mode: DeploymentMode,
     pools: BTreeMap<PoolId, PoolSpec>,
+    domains: BTreeMap<DomainId, DomainSpec>,
     deployments: BTreeMap<DeploymentId, DeploymentSpec>,
+    deployment_domains: BTreeMap<DeploymentId, DomainId>,
     deployments_by_model: BTreeMap<LogicalModelId, Vec<DeploymentId>>,
     equivalence_classes: BTreeMap<EquivalenceClassId, EquivalencePolicy>,
 }
@@ -119,9 +122,10 @@ impl DeploymentCatalogStore {
 
 impl DeploymentCatalog {
     pub fn from_config(config: &OrchestratorConfig) -> anyhow::Result<Self> {
-        Self::new(
+        Self::new_with_domains(
             DeploymentMode::parse(&config.deployment_mode)?,
             config.pools.clone(),
+            config.domains.clone(),
             config.deployments.clone(),
             config.equivalence_classes.clone(),
         )
@@ -133,14 +137,26 @@ impl DeploymentCatalog {
         deployments: Vec<DeploymentSpec>,
         equivalence_classes: Vec<EquivalencePolicy>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_domains(mode, pools, Vec::new(), deployments, equivalence_classes)
+    }
+
+    pub fn new_with_domains(
+        mode: DeploymentMode,
+        pools: Vec<PoolSpec>,
+        domains: Vec<DomainSpec>,
+        deployments: Vec<DeploymentSpec>,
+        equivalence_classes: Vec<EquivalencePolicy>,
+    ) -> anyhow::Result<Self> {
         if mode == DeploymentMode::LegacyCompat
-            && (!pools.is_empty() || !deployments.is_empty() || !equivalence_classes.is_empty())
+            && (!pools.is_empty()
+                || !domains.is_empty()
+                || !deployments.is_empty()
+                || !equivalence_classes.is_empty())
         {
             anyhow::bail!("deployment declarations require orchestrator.deployment_mode=explicit");
         }
         // Explicit mode may start empty so a gateway can install and become
         // ready before operators create deployments via admin APIs or config.
-
 
         let mut pool_map = BTreeMap::new();
         for mut pool in pools {
@@ -151,7 +167,18 @@ impl DeploymentCatalog {
             }
         }
 
+        let mut domain_map = BTreeMap::new();
+        for domain in domains {
+            validate_domain(&domain, &pool_map)?;
+            let id = domain.id.clone();
+            if domain_map.insert(id.clone(), domain).is_some() {
+                anyhow::bail!("duplicate execution domain id '{id}'");
+            }
+        }
+        validate_domain_pool_separation(&domain_map)?;
+
         let mut deployment_map = BTreeMap::new();
+        let mut deployment_domains = BTreeMap::new();
         let mut deployments_by_model = BTreeMap::<LogicalModelId, Vec<DeploymentId>>::new();
         for deployment in deployments {
             let pool = pool_map.get(&deployment.pool).ok_or_else(|| {
@@ -162,6 +189,9 @@ impl DeploymentCatalog {
                 )
             })?;
             validate_deployment(&deployment, pool)?;
+            if let Some(domain) = resolve_deployment_domain(&deployment, &domain_map)? {
+                deployment_domains.insert(deployment.id.clone(), domain.id.clone());
+            }
             let id = deployment.id.clone();
             if deployment_map
                 .insert(id.clone(), deployment.clone())
@@ -193,7 +223,9 @@ impl DeploymentCatalog {
         Ok(Self {
             mode,
             pools: pool_map,
+            domains: domain_map,
             deployments: deployment_map,
+            deployment_domains,
             deployments_by_model,
             equivalence_classes: equivalence_map,
         })
@@ -221,7 +253,9 @@ impl DeploymentCatalog {
             return Ok(Self {
                 mode: base.mode,
                 pools: base.pools.clone(),
+                domains: base.domains.clone(),
                 deployments: BTreeMap::new(),
+                deployment_domains: BTreeMap::new(),
                 deployments_by_model: BTreeMap::new(),
                 equivalence_classes: BTreeMap::new(),
             });
@@ -237,9 +271,10 @@ impl DeploymentCatalog {
                 (!policy.certified_deployments.is_empty()).then_some(policy)
             })
             .collect();
-        Self::new(
+        Self::new_with_domains(
             base.mode,
             base.pools.values().cloned().collect(),
+            base.domains.values().cloned().collect(),
             deployments,
             equivalence_classes,
         )
@@ -280,6 +315,16 @@ impl DeploymentCatalog {
         self.pools.get(id)
     }
 
+    pub fn domain(&self, id: &DomainId) -> Option<&DomainSpec> {
+        self.domains.get(id)
+    }
+
+    pub fn domain_for_deployment(&self, deployment: &DeploymentSpec) -> Option<&DomainSpec> {
+        self.deployment_domains
+            .get(&deployment.id)
+            .and_then(|id| self.domains.get(id))
+    }
+
     pub fn deployment(&self, id: &DeploymentId) -> Option<&DeploymentSpec> {
         self.deployments.get(id)
     }
@@ -292,6 +337,7 @@ impl DeploymentCatalog {
         let Some(pool) = self.pool(&deployment.pool) else {
             return (0, 0);
         };
+        let domain = self.domain_for_deployment(deployment);
         let mut endpoints = std::collections::HashMap::<WorkerId, WorkerModelEndpoint>::new();
         for request_kind in [
             super::registry::RequestKind::Llm,
@@ -309,6 +355,9 @@ impl DeploymentCatalog {
                 None,
             ) {
                 if !endpoint_matches_pool(&endpoint, pool) {
+                    continue;
+                }
+                if domain.is_some_and(|domain| !endpoint_matches_domain(&endpoint, domain)) {
                     continue;
                 }
                 let Ok(identity) = observed_identity(&endpoint) else {
@@ -382,6 +431,18 @@ impl DeploymentCatalog {
             let Some(pool) = self.pool(&deployment.pool) else {
                 continue;
             };
+            let domain = self.domain_for_deployment(deployment);
+            if domain.is_some_and(|domain| !domain.enabled) {
+                continue;
+            }
+            if profile
+                .decision
+                .required_domain
+                .as_ref()
+                .is_some_and(|required| domain.map(|domain| &domain.id) != Some(required))
+            {
+                continue;
+            }
             let mut required_capabilities = profile.required_capabilities.clone();
             required_capabilities.extend(deployment.required_capabilities.iter().cloned());
             for endpoint in registry.eligible_model_endpoints(
@@ -406,6 +467,9 @@ impl DeploymentCatalog {
                 if !endpoint_matches_pool(&endpoint, pool) {
                     continue;
                 }
+                if domain.is_some_and(|domain| !endpoint_matches_domain(&endpoint, domain)) {
+                    continue;
+                }
                 let Ok(observed_identity) = observed_identity(&endpoint) else {
                     continue;
                 };
@@ -416,6 +480,7 @@ impl DeploymentCatalog {
                     endpoint,
                     deployment: deployment.clone(),
                     pool: pool.clone(),
+                    domain: domain.cloned(),
                     observed_identity,
                 });
             }
@@ -427,6 +492,15 @@ impl DeploymentCatalog {
                 .any(|candidate| &candidate.deployment.pool == preferred_pool)
         {
             candidates.retain(|candidate| &candidate.deployment.pool == preferred_pool);
+        }
+        if let Some(preferred_domain) = profile.decision.preferred_domain.as_ref()
+            && candidates.iter().any(|candidate| {
+                candidate.domain.as_ref().map(|domain| &domain.id) == Some(preferred_domain)
+            })
+        {
+            candidates.retain(|candidate| {
+                candidate.domain.as_ref().map(|domain| &domain.id) == Some(preferred_domain)
+            });
         }
         Ok(candidates)
     }
@@ -452,12 +526,141 @@ impl DeploymentCatalog {
         self.pools.values()
     }
 
+    pub fn domains(&self) -> impl Iterator<Item = &DomainSpec> {
+        self.domains.values()
+    }
+
     pub fn deployments(&self) -> impl Iterator<Item = &DeploymentSpec> {
         self.deployments.values()
     }
 
     pub fn equivalence_classes(&self) -> impl Iterator<Item = &EquivalencePolicy> {
         self.equivalence_classes.values()
+    }
+}
+
+fn validate_domain(domain: &DomainSpec, pools: &BTreeMap<PoolId, PoolSpec>) -> anyhow::Result<()> {
+    domain
+        .validate()
+        .map_err(|error| anyhow::anyhow!("execution domain '{}': {error}", domain.id))?;
+    let pool = pools.get(&domain.pool).ok_or_else(|| {
+        anyhow::anyhow!(
+            "execution domain '{}' references unknown pool '{}'",
+            domain.id,
+            domain.pool
+        )
+    })?;
+    if pool.trust_domain != domain.trust_domain {
+        anyhow::bail!(
+            "execution domain '{}' trust domain does not match pool '{}'",
+            domain.id,
+            pool.id
+        );
+    }
+    if pool.hardware_class.as_deref() != Some(domain.hardware_class.as_str()) {
+        anyhow::bail!(
+            "execution domain '{}' hardware class does not match pool '{}'",
+            domain.id,
+            pool.id
+        );
+    }
+    let expected_runtime = match domain.kind {
+        ExecutionDomainKind::MacAxEngine => Some("ax_engine"),
+        ExecutionDomainKind::NvidiaDynamoPc | ExecutionDomainKind::NvidiaDynamoThor => {
+            Some("dynamo")
+        }
+        ExecutionDomainKind::CompatibilityRuntimeEndpoint => None,
+        ExecutionDomainKind::Unknown => unreachable!("DomainSpec::validate rejected unknown kind"),
+    };
+    if expected_runtime.is_some_and(|expected| pool.runtime_kind != expected) {
+        anyhow::bail!(
+            "execution domain '{}' kind '{}' requires pool runtime '{}', found '{}'",
+            domain.id,
+            domain.kind.as_str(),
+            expected_runtime.expect("checked Some"),
+            pool.runtime_kind
+        );
+    }
+    if domain
+        .selector
+        .get("domain_id")
+        .is_some_and(|configured| configured != domain.id.as_str())
+    {
+        anyhow::bail!(
+            "execution domain '{}' selector domain_id must equal its stable id",
+            domain.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_domain_pool_separation(domains: &BTreeMap<DomainId, DomainSpec>) -> anyhow::Result<()> {
+    let mut kinds_by_pool =
+        BTreeMap::<PoolId, std::collections::BTreeSet<ExecutionDomainKind>>::new();
+    for domain in domains.values() {
+        kinds_by_pool
+            .entry(domain.pool.clone())
+            .or_default()
+            .insert(domain.kind);
+    }
+    for (pool, kinds) in kinds_by_pool {
+        if kinds.contains(&ExecutionDomainKind::NvidiaDynamoPc)
+            && kinds.contains(&ExecutionDomainKind::NvidiaDynamoThor)
+        {
+            anyhow::bail!(
+                "pool '{pool}' cannot contain both NVIDIA PC and NVIDIA Thor execution domains"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_deployment_domain<'a>(
+    deployment: &DeploymentSpec,
+    domains: &'a BTreeMap<DomainId, DomainSpec>,
+) -> anyhow::Result<Option<&'a DomainSpec>> {
+    if let Some(domain_id) = &deployment.domain {
+        let domain = domains.get(domain_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "deployment '{}' references unknown execution domain '{}'",
+                deployment.id,
+                domain_id
+            )
+        })?;
+        if domain.pool != deployment.pool {
+            anyhow::bail!(
+                "deployment '{}' pool '{}' does not match execution domain '{}' pool '{}'",
+                deployment.id,
+                deployment.pool,
+                domain.id,
+                domain.pool
+            );
+        }
+        return Ok(Some(domain));
+    }
+
+    // Preserve existing explicit catalogs until an operator starts the v1.1
+    // migration. Once any domains are declared, implicit resolution is allowed
+    // only for exactly one enabled domain in the deployment's pool.
+    if domains.is_empty() {
+        return Ok(None);
+    }
+    let matches = domains
+        .values()
+        .filter(|domain| domain.enabled && domain.pool == deployment.pool)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [domain] => Ok(Some(*domain)),
+        [] => anyhow::bail!(
+            "deployment '{}' omits domain and pool '{}' has no enabled execution domain",
+            deployment.id,
+            deployment.pool
+        ),
+        _ => anyhow::bail!(
+            "deployment '{}' omits domain and pool '{}' maps to multiple enabled execution domains",
+            deployment.id,
+            deployment.pool
+        ),
     }
 }
 
@@ -490,6 +693,51 @@ fn endpoint_matches_pool(endpoint: &WorkerModelEndpoint, pool: &PoolSpec) -> boo
 
     pool.selector.contains_key("worker_pool")
         || endpoint.worker_pool.as_deref() == Some(pool.id.as_str())
+}
+
+fn endpoint_matches_domain(endpoint: &WorkerModelEndpoint, desired: &DomainSpec) -> bool {
+    let Some(observed) = endpoint.domain.as_ref() else {
+        // A v1.0 endpoint can enter the domain model only through an explicit
+        // compatibility or Mac migration declaration. NVIDIA production
+        // domains always require a v1.1 descriptor.
+        let kind_matches = match desired.kind {
+            ExecutionDomainKind::MacAxEngine => {
+                endpoint.runtime_kind.eq_ignore_ascii_case("ax_engine")
+                    && endpoint.hardware_class.as_deref() == Some(desired.hardware_class.as_str())
+            }
+            ExecutionDomainKind::CompatibilityRuntimeEndpoint => true,
+            ExecutionDomainKind::NvidiaDynamoPc
+            | ExecutionDomainKind::NvidiaDynamoThor
+            | ExecutionDomainKind::Unknown => false,
+        };
+        return kind_matches
+            && desired.selector.iter().all(|(key, expected)| {
+                let observed = match key.as_str() {
+                    "domain_id" => Some(desired.id.as_str()),
+                    "worker_pool" | "pool_id" => endpoint.worker_pool.as_deref(),
+                    "node_class" => endpoint.node_class.as_deref(),
+                    "hardware_class" => endpoint.hardware_class.as_deref(),
+                    "runtime_kind" => Some(endpoint.runtime_kind.as_str()),
+                    "trust_domain" => endpoint.trust_domain.as_deref(),
+                    _ => None,
+                };
+                observed == Some(expected.as_str())
+            });
+    };
+    if !desired.matches_descriptor(observed) {
+        return false;
+    }
+
+    let Some(observation) = endpoint.domain_observation.as_ref() else {
+        return false;
+    };
+    observation.ready
+        && observed.compatibility_manifest == observation.manifest_digest
+        && (observation.models.is_empty()
+            || observation
+                .models
+                .iter()
+                .any(|model| model.runtime_model_id.as_str() == endpoint.model.id))
 }
 
 fn observed_identity(endpoint: &WorkerModelEndpoint) -> anyhow::Result<DeploymentIdentity> {
@@ -713,12 +961,17 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use ax_serving_protocol::{
-        DeploymentIdentity, DeploymentSpec, Digest, EquivalenceClassId, EquivalencePolicy,
-        IdentityField, IdentityPolicy, LogicalModelId, PoolId, PoolSpec, RuntimeModelId,
-        TrustDomainId,
+        DeploymentIdentity, DeploymentSpec, Digest, DomainId, DomainObservation, DomainSpec,
+        EndpointScope, EquivalenceClassId, EquivalencePolicy, ExecutionDomainDescriptor,
+        ExecutionDomainKind, IdentityField, IdentityPolicy, LogicalModelId, PoolId, PoolSpec,
+        QualificationState, RuntimeModelId, RuntimeState, TrustDomainId,
     };
 
-    use super::{DeploymentCatalog, DeploymentMode, ModelResolution};
+    use super::super::registry::{
+        ModelInventoryEntry, WorkerId, WorkerModelEndpoint, WorkerStatus,
+    };
+    use super::super::worker_endpoint::WorkerEndpoint;
+    use super::{DeploymentCatalog, DeploymentMode, ModelResolution, endpoint_matches_domain};
 
     fn digest(value: char) -> Digest {
         Digest::new(format!("sha256:{}", value.to_string().repeat(64))).unwrap()
@@ -731,6 +984,82 @@ mod tests {
             hardware_class: None,
             trust_domain: TrustDomainId::new("private").unwrap(),
             selector: BTreeMap::new(),
+        }
+    }
+
+    fn domain_pool(id: &str, runtime: &str, hardware: &str) -> PoolSpec {
+        let mut value = pool(id, runtime);
+        value.hardware_class = Some(hardware.into());
+        value
+    }
+
+    fn domain(id: &str, pool: &str, kind: ExecutionDomainKind, hardware: &str) -> DomainSpec {
+        DomainSpec {
+            id: DomainId::new(id).unwrap(),
+            kind,
+            pool: PoolId::new(pool).unwrap(),
+            trust_domain: TrustDomainId::new("private").unwrap(),
+            hardware_class: hardware.into(),
+            required_qualification: QualificationState::Certified,
+            selector: BTreeMap::new(),
+            enabled: true,
+        }
+    }
+
+    fn dynamo_endpoint(desired: &DomainSpec) -> WorkerModelEndpoint {
+        let descriptor = ExecutionDomainDescriptor {
+            id: desired.id.clone(),
+            kind: desired.kind,
+            endpoint_scope: EndpointScope::Domain,
+            execution_owner: "dynamo".into(),
+            qualification: QualificationState::Certified,
+            pool_id: desired.pool.clone(),
+            trust_domain: desired.trust_domain.clone(),
+            hardware_class: desired.hardware_class.clone(),
+            architecture: "x86_64".into(),
+            compatibility_manifest: None,
+            labels: BTreeMap::new(),
+        };
+        WorkerModelEndpoint {
+            worker: WorkerStatus {
+                id: WorkerId::new(),
+                addr: WorkerEndpoint::parse("http://127.0.0.1:18081").unwrap(),
+                inflight: 0,
+                max_inflight: 8,
+                active_sequences: 0,
+                ttft_p95_ms: 0,
+                kv_utilization: None,
+                batch_headroom: None,
+                queue_depth: None,
+                error_rate: None,
+                decode_tok_per_sec: None,
+                telemetry_age_ms: Some(0),
+            },
+            worker_pool: Some(desired.pool.to_string()),
+            node_class: None,
+            hardware_class: Some(desired.hardware_class.clone()),
+            runtime_kind: "dynamo".into(),
+            runtime_version: Some("1.2.1".into()),
+            trust_domain: Some(desired.trust_domain.to_string()),
+            protocol_worker_id: Some("adapter-1".into()),
+            worker_instance_id: Some("instance-1".into()),
+            registration_id: Some("registration-1".into()),
+            domain: Some(descriptor),
+            domain_observation: Some(DomainObservation {
+                observed_at: time::OffsetDateTime::UNIX_EPOCH,
+                generation: 1,
+                ready: true,
+                state: RuntimeState::Ready,
+                reason_code: None,
+                frontend_instances_ready: Some(1),
+                aggregate_capacity: None,
+                manifest_digest: None,
+                models: Vec::new(),
+            }),
+            model: ModelInventoryEntry {
+                id: "dynamo/qwen".into(),
+                ..Default::default()
+            },
         }
     }
 
@@ -751,6 +1080,7 @@ mod tests {
             id: ax_serving_protocol::DeploymentId::new(id).unwrap(),
             logical_model: LogicalModelId::new("qwen/code").unwrap(),
             pool: PoolId::new(pool).unwrap(),
+            domain: None,
             runtime_model_id: RuntimeModelId::new(format!("{runtime}/qwen-code")).unwrap(),
             equivalence_class: Some(EquivalenceClassId::new("qwen-certified").unwrap()),
             expected_identity: Some(identity(runtime)),
@@ -826,5 +1156,164 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("deployment declarations require"));
+    }
+
+    #[test]
+    fn deployment_domain_resolves_explicitly() {
+        let desired_domain = domain(
+            "nvidia-pc-main",
+            "nvidia-pc",
+            ExecutionDomainKind::NvidiaDynamoPc,
+            "nvidia-pc-cuda",
+        );
+        let mut desired_deployment = deployment("qwen-dynamo", "nvidia-pc", "dynamo");
+        desired_deployment.domain = Some(desired_domain.id.clone());
+        let catalog = DeploymentCatalog::new_with_domains(
+            DeploymentMode::Explicit,
+            vec![domain_pool("nvidia-pc", "dynamo", "nvidia-pc-cuda")],
+            vec![desired_domain.clone()],
+            vec![desired_deployment.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog.domain_for_deployment(&desired_deployment),
+            Some(&desired_domain)
+        );
+    }
+
+    #[test]
+    fn ambiguous_implicit_domain_mapping_fails_startup() {
+        let desired_deployment = deployment("qwen-mac", "mac", "ax_engine");
+        let error = DeploymentCatalog::new_with_domains(
+            DeploymentMode::Explicit,
+            vec![domain_pool("mac", "ax_engine", "apple-silicon")],
+            vec![
+                domain(
+                    "mac-a",
+                    "mac",
+                    ExecutionDomainKind::MacAxEngine,
+                    "apple-silicon",
+                ),
+                domain(
+                    "mac-b",
+                    "mac",
+                    ExecutionDomainKind::MacAxEngine,
+                    "apple-silicon",
+                ),
+            ],
+            vec![desired_deployment],
+            Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("maps to multiple enabled execution domains"));
+    }
+
+    #[test]
+    fn pc_and_thor_domains_cannot_share_a_pool() {
+        let error = DeploymentCatalog::new_with_domains(
+            DeploymentMode::Explicit,
+            vec![domain_pool("nvidia", "dynamo", "nvidia-unified")],
+            vec![
+                domain(
+                    "pc",
+                    "nvidia",
+                    ExecutionDomainKind::NvidiaDynamoPc,
+                    "nvidia-unified",
+                ),
+                domain(
+                    "thor",
+                    "nvidia",
+                    ExecutionDomainKind::NvidiaDynamoThor,
+                    "nvidia-unified",
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("cannot contain both NVIDIA PC and NVIDIA Thor"));
+    }
+
+    #[test]
+    fn dynamo_domain_routing_requires_matching_ready_domain_observation() {
+        let desired = domain(
+            "nvidia-pc-main",
+            "nvidia-pc",
+            ExecutionDomainKind::NvidiaDynamoPc,
+            "nvidia-pc-cuda",
+        );
+        let mut endpoint = dynamo_endpoint(&desired);
+        assert!(endpoint_matches_domain(&endpoint, &desired));
+
+        endpoint.domain_observation = None;
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+        endpoint.domain = None;
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+    }
+
+    #[test]
+    fn explicit_mac_migration_accepts_v1_0_ax_engine_endpoint_only() {
+        let mut desired = domain(
+            "mac-local",
+            "mac",
+            ExecutionDomainKind::MacAxEngine,
+            "apple-silicon",
+        );
+        let mut endpoint = dynamo_endpoint(&desired);
+        endpoint.domain = None;
+        endpoint.domain_observation = None;
+        endpoint.runtime_kind = "ax_engine".into();
+        assert!(endpoint_matches_domain(&endpoint, &desired));
+
+        endpoint.runtime_kind = "vllm".into();
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+
+        endpoint.runtime_kind = "ax_engine".into();
+        desired
+            .selector
+            .insert("node_class".into(), "m3-ultra".into());
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+        endpoint.node_class = Some("m3-ultra".into());
+        assert!(endpoint_matches_domain(&endpoint, &desired));
+    }
+
+    #[test]
+    fn explicit_mac_domain_accepts_matching_v1_1_agent_descriptor() {
+        let desired = domain(
+            "mac-local",
+            "mac",
+            ExecutionDomainKind::MacAxEngine,
+            "apple-silicon",
+        );
+        let mut endpoint = dynamo_endpoint(&desired);
+        endpoint.runtime_kind = "ax_engine".into();
+        let descriptor = endpoint.domain.as_mut().unwrap();
+        descriptor.endpoint_scope = EndpointScope::Node;
+        descriptor.execution_owner = "ax_engine".into();
+        descriptor.architecture = "arm64".into();
+        descriptor.validate().unwrap();
+
+        assert!(endpoint_matches_domain(&endpoint, &desired));
+        endpoint.domain_observation = None;
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+        endpoint.domain_observation = Some(DomainObservation {
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            generation: 2,
+            ready: true,
+            state: RuntimeState::Ready,
+            reason_code: None,
+            frontend_instances_ready: Some(1),
+            aggregate_capacity: None,
+            manifest_digest: None,
+            models: Vec::new(),
+        });
+        endpoint.domain.as_mut().unwrap().id = DomainId::new("other-mac").unwrap();
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
     }
 }

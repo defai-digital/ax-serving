@@ -83,9 +83,9 @@ with GrpcClient(socket="/tmp/ax-serving.sock") as client:
     )
 ```
 
-Do not use gRPC v1 as a hybrid gateway protocol. It carries local model paths,
+Do not use gRPC v1 as a federation gateway protocol. It carries local model paths,
 backend-specific controls, and token-ID semantics that cannot be mapped
-losslessly across AX Engine and CUDA runtimes.
+losslessly across AX Engine and NVIDIA Dynamo domains.
 
 ## Errors and timeouts
 

@@ -103,7 +103,8 @@ orchestrator:
   dispatch_policy: "inference_aware"  # env: AXS_DISPATCH_POLICY
                                # production: inference_aware; compatibility policies remain available
   deployment_mode: "legacy_compat" # env: AXS_DEPLOYMENT_MODE
-                               # use explicit for certified logical-model routing across MLX/CUDA pools
+                               # use explicit plus domains/pools/deployments for domain-aware routing;
+                               # this default intentionally keeps endpoint compatibility mode
   telemetry_stale_ms: 10000    # env: AXS_TELEMETRY_STALE_MS
   max_dispatch_attempts: 2     # env: AXS_MAX_DISPATCH_ATTEMPTS (hard maximum: 2)
   tls_profile: "loopback_dev" # env: AXS_TLS_PROFILE (remote: trusted_mesh)

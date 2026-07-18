@@ -1,0 +1,117 @@
+{
+  "protocol": {
+    "version": {
+      "major": 1,
+      "minor": 1
+    },
+    "capabilities": [
+      "control.drain",
+      "control.execution-domain.v1",
+      "dispatch.cancel",
+      "dispatch.typed-admission",
+      "telemetry.capacity",
+      "telemetry.domain-capacity.v1"
+    ]
+  },
+  "agent": {
+    "name": "ax-dynamo-adapter",
+    "version": "0.1.0"
+  },
+  "worker": {
+    "id": "dynamo-pc-adapter-1",
+    "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17eb",
+    "advertise_url": "https://10.0.8.20:18080",
+    "pool_id": "nvidia-pc",
+    "trust_domain": "private-dc",
+    "labels": {
+      "zone": "dc-a"
+    }
+  },
+  "runtime": {
+    "kind": "dynamo",
+    "version": "1.2.1",
+    "api": "openai-v1"
+  },
+  "hardware": {
+    "platform": "linux",
+    "accelerator": "nvidia-cuda",
+    "device_count": 8,
+    "hardware_class": "nvidia-pc-cuda"
+  },
+  "domain": {
+    "id": "nvidia-pc-main",
+    "kind": "nvidia_dynamo_pc",
+    "endpoint_scope": "domain",
+    "execution_owner": "dynamo",
+    "qualification": "certified",
+    "pool_id": "nvidia-pc",
+    "trust_domain": "private-dc",
+    "hardware_class": "nvidia-pc-cuda",
+    "architecture": "x86_64",
+    "compatibility_manifest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "labels": {
+      "zone": "dc-a"
+    }
+  },
+  "domain_observation": {
+    "observed_at": "2026-07-15T12:00:00Z",
+    "generation": 12,
+    "ready": true,
+    "state": "ready",
+    "frontend_instances_ready": 2,
+    "aggregate_capacity": {
+      "active_requests": 7,
+      "max_concurrent_requests": 64,
+      "waiting_requests": 1,
+      "recent_error_rate": 0.001
+    },
+    "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "models": [
+      {
+        "runtime_model_id": "qwen3.5-32b",
+        "identity": {
+          "runtime_kind": "dynamo",
+          "runtime_version": "1.2.1",
+          "revision": "qwen3.5-32b-rev1",
+          "quantization": "fp8"
+        },
+        "operations": [
+          "chat_completions"
+        ],
+        "capabilities": [],
+        "max_context_tokens": 131072,
+        "max_output_tokens": 32768
+      }
+    ]
+  },
+  "observation": {
+    "observed_at": "2026-07-15T12:00:00Z",
+    "runtime": {
+      "ready": true,
+      "state": "ready"
+    },
+    "inventory_generation": 12,
+    "models": [
+      {
+        "runtime_model_id": "qwen3.5-32b",
+        "identity": {
+          "runtime_kind": "dynamo",
+          "runtime_version": "1.2.1",
+          "revision": "qwen3.5-32b-rev1",
+          "quantization": "fp8"
+        },
+        "operations": [
+          "chat_completions"
+        ],
+        "capabilities": [],
+        "max_context_tokens": 131072,
+        "max_output_tokens": 32768
+      }
+    ],
+    "capacity": {
+      "active_requests": 7,
+      "max_concurrent_requests": 64,
+      "waiting_requests": 1
+    }
+  }
+}

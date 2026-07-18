@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    DeploymentCommand, DeploymentJobObservation, PoolId, ProtocolDescriptor, RegistrationId,
-    RuntimeModelDescriptor, TrustDomainId, WorkerId, WorkerInstanceId,
+    DeploymentCommand, DeploymentJobObservation, DomainObservation, ExecutionDomainDescriptor,
+    PoolId, ProtocolCapability, ProtocolDescriptor, RegistrationId, RuntimeModelDescriptor,
+    TrustDomainId, WorkerId, WorkerInstanceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,7 +230,106 @@ pub struct RegisterWorkerRequest {
     pub worker: WorkerDescriptor,
     pub runtime: RuntimeDescriptor,
     pub hardware: HardwareDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<ExecutionDomainDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_observation: Option<DomainObservation>,
     pub observation: RuntimeObservation,
+}
+
+impl RegisterWorkerRequest {
+    /// Validate additive protocol-v1.1 execution-domain semantics.
+    ///
+    /// Runtime-observation validation remains available separately so v1.0
+    /// callers do not need to adopt domain fields.
+    pub fn validate_domain_contract(&self) -> Result<(), DomainContractError> {
+        let declares_control =
+            self.protocol.capabilities.iter().any(|capability| {
+                capability.as_str() == ProtocolCapability::CONTROL_EXECUTION_DOMAIN
+            });
+        let declares_domain_capacity =
+            self.protocol.capabilities.iter().any(|capability| {
+                capability.as_str() == ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY
+            });
+
+        if (self.domain.is_some() || self.domain_observation.is_some() || declares_control)
+            && (self.protocol.version.major != 1 || self.protocol.version.minor < 1)
+        {
+            return Err(DomainContractError::ProtocolMinorTooOld);
+        }
+        if declares_control != self.domain.is_some() {
+            return Err(if declares_control {
+                DomainContractError::CapabilityWithoutDescriptor
+            } else {
+                DomainContractError::DescriptorWithoutCapability
+            });
+        }
+        if declares_domain_capacity && !declares_control {
+            return Err(DomainContractError::CapacityCapabilityWithoutDomain);
+        }
+
+        let Some(descriptor) = &self.domain else {
+            if self.domain_observation.is_some() {
+                return Err(DomainContractError::ObservationWithoutDescriptor);
+            }
+            return Ok(());
+        };
+        descriptor
+            .validate()
+            .map_err(|error| DomainContractError::InvalidDescriptor(error.to_string()))?;
+        if descriptor.pool_id != self.worker.pool_id {
+            return Err(DomainContractError::PoolMismatch);
+        }
+        if descriptor.trust_domain != self.worker.trust_domain {
+            return Err(DomainContractError::TrustDomainMismatch);
+        }
+        if let Some(hardware_class) = &self.hardware.hardware_class
+            && hardware_class != &descriptor.hardware_class
+        {
+            return Err(DomainContractError::HardwareClassMismatch);
+        }
+
+        if let Some(observation) = &self.domain_observation {
+            observation
+                .validate()
+                .map_err(|error| DomainContractError::InvalidObservation(error.to_string()))?;
+            if observation.aggregate_capacity.is_some() && !declares_domain_capacity {
+                return Err(DomainContractError::CapacityWithoutCapability);
+            }
+            if descriptor.compatibility_manifest != observation.manifest_digest {
+                return Err(DomainContractError::ManifestMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DomainContractError {
+    #[error("execution-domain fields require protocol major 1 minor 1 or newer")]
+    ProtocolMinorTooOld,
+    #[error("control.execution-domain.v1 requires an execution-domain descriptor")]
+    CapabilityWithoutDescriptor,
+    #[error("an execution-domain descriptor requires control.execution-domain.v1")]
+    DescriptorWithoutCapability,
+    #[error("telemetry.domain-capacity.v1 requires control.execution-domain.v1")]
+    CapacityCapabilityWithoutDomain,
+    #[error("a domain observation requires an execution-domain descriptor")]
+    ObservationWithoutDescriptor,
+    #[error("domain aggregate capacity requires telemetry.domain-capacity.v1")]
+    CapacityWithoutCapability,
+    #[error("invalid execution-domain descriptor: {0}")]
+    InvalidDescriptor(String),
+    #[error("invalid execution-domain observation: {0}")]
+    InvalidObservation(String),
+    #[error("execution-domain pool does not match worker pool")]
+    PoolMismatch,
+    #[error("execution-domain trust boundary does not match worker trust boundary")]
+    TrustDomainMismatch,
+    #[error("execution-domain hardware class does not match worker hardware class")]
+    HardwareClassMismatch,
+    #[error("execution-domain observation manifest does not match its descriptor")]
+    ManifestMismatch,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +396,8 @@ pub struct HeartbeatRequest {
     pub models: Option<Vec<RuntimeModelDescriptor>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<CapacityObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_observation: Option<DomainObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployment_jobs: Vec<DeploymentJobObservation>,
 }

@@ -107,10 +107,12 @@ impl Operation {
 impl ProtocolCapability {
     pub const CONTROL_DRAIN: &'static str = "control.drain";
     pub const CONTROL_DEPLOYMENT_JOBS: &'static str = "control.deployment-jobs";
+    pub const CONTROL_EXECUTION_DOMAIN: &'static str = "control.execution-domain.v1";
     pub const CONTROL_INVENTORY_DELTA: &'static str = "control.inventory-delta";
     pub const DISPATCH_CANCEL: &'static str = "dispatch.cancel";
     pub const DISPATCH_TYPED_ADMISSION: &'static str = "dispatch.typed-admission";
     pub const TELEMETRY_CAPACITY: &'static str = "telemetry.capacity";
+    pub const TELEMETRY_DOMAIN_CAPACITY: &'static str = "telemetry.domain-capacity.v1";
     pub const TELEMETRY_KV_CACHE: &'static str = "telemetry.kv-cache";
     pub const TELEMETRY_PREFIX_CACHE: &'static str = "telemetry.prefix-cache";
 }

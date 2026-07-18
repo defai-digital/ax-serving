@@ -1,61 +1,56 @@
-# AX Serving use cases and tradeoffs
+# AX Serving use cases and trade-offs
 
-AX Serving is useful when one client endpoint must operate multiple inference
-runtimes without moving runtime-specific scheduling into the gateway.
+AX Serving is useful when one client/API policy must govern more than one independently operated
+inference domain.
 
 ## Strong fits
 
-- A private fleet containing AX Engine/MLX and vLLM or SGLang/CUDA pools.
-- Multiple immutable runtime deployments published behind logical model names.
-- Central authentication, tenant admission, drain, rollout, and diagnostics.
-- Active-active gateways with Redis/Valkey-backed worker leases and capacity.
-- Applications that need OpenAI-compatible chat, completion, embedding, and
-  incremental SSE while runtimes remain independently deployable.
-- Operators who need failover to stop at model/tokenizer/template/quantization
-  equivalence boundaries.
+- A private fleet containing Mac AX Engine and NVIDIA Dynamo capacity.
+- NVIDIA PC and Thor devices that must remain separate performance/failure domains.
+- Tenant, privacy, residency, locality, budget, or SLO policy that no one runtime can enforce
+  globally.
+- Logical models backed by multiple explicitly certified deployments.
+- Central admission, audit, drain, rollout, diagnostics, and HA across domains.
+- A need to use installed Mac/edge capacity without exposing runtime addresses to applications.
 
 ## Poor fits
 
-- One local model with no fleet operations: use AX Engine, llama.cpp, or the
-  selected runtime server directly.
-- A requirement to split one model or KV cache across MLX and CUDA: AX Serving
-  routes whole attempts and does not implement distributed tensor execution.
-- A need for CUDA token scheduling itself: use vLLM or SGLang; AX Serving can
-  manage those endpoints but does not replace them.
-- Hyperscale or feature claims that have not passed this project's published
-  validation envelope.
+- One model on one NVIDIA deployment: use Dynamo directly.
+- One model on one Mac: use AX Engine directly.
+- A need for CUDA token scheduling or KV-aware NVIDIA worker routing: use Dynamo and its backend.
+- A need to split a graph, KV cache, or prefill/decode phase across Mac, PC, and Thor.
+- An agent application framework with tools, MCP, memory, sandboxes, and workflow state.
+- A business case that cannot pass a cost/load, availability, privacy/locality, or operator-workflow
+  value gate.
 
 ## Architectural advantages
 
-- The portable gateway does not link AX Engine, MLX, CUDA, or llama.cpp.
-- Runtime adapters use a versioned protocol and runtime-authoritative
-  readiness/inventory rather than gateway-side model parsing.
-- Hard eligibility and explicit equivalence prevent best-effort routing from
-  becoming silent semantic failover.
-- Retry is conservative: one pre-commit retry only for connect failure or
-  authenticated typed non-admission.
-- Public, admin, control-plane, dispatch, and runtime credentials are distinct.
-- Small deployments retain an in-memory profile; HA deployments add shared
-  state without changing the public API.
+- The gateway links no AX Engine, Dynamo, MLX, Metal, CUDA, or backend runtime SDK.
+- AX chooses a domain while Dynamo retains NVIDIA-local optimization.
+- PC and Thor have separate identities, artifacts, calibration, qualification, and rollout.
+- Hard eligibility and explicit equivalence prevent semantic failover by model name alone.
+- Retry is conservative and has one owner at each layer.
+- Decisions are versioned, bounded, auditable, and replayable without retaining prompts.
+- Small evaluation and active-active HA profiles share one public API.
 
-## Tradeoffs
+## Trade-offs
 
-- An agent adds one network hop and an adapter certification obligation.
-- Explicit identity and equivalence require operational discipline.
-- Redis/Valkey becomes a production dependency for active-active gateways.
-- AX Serving cannot optimize inside a runtime as deeply as that runtime's own
-  scheduler, so telemetry must remain conservative.
-- A passing source test suite is not live runtime or performance certification.
+- Federation adds a hop, an adapter, and another operational control plane.
+- Coarse domain telemetry cannot optimize NVIDIA workers as well as Dynamo can; it should not try.
+- Explicit identity/equivalence and upstream compatibility manifests require operational discipline.
+- Cross-domain quality labels and value evidence are workload-specific.
+- Thor requires separate live qualification despite generic ARM64/Blackwell prerequisites.
+- If the fleet stays homogeneous, the added complexity has little value.
 
-## Positioning
+## Correct comparisons
 
-| Question | Correct comparison |
+| Question | Comparison |
 | --- | --- |
-| Is MLX execution competitive with a local runtime? | Benchmark AX Engine versus llama.cpp under a matched artifact contract. |
-| What is the cost of the gateway? | Compare the same runtime directly and through AX Serving. |
-| Does a mixed fleet improve availability or cost? | Compare homogeneous and mixed fleets under drain/failure/overload scenarios. |
-| Does AX Serving replace vLLM? | No. vLLM remains the CUDA execution and token-scheduling runtime. |
+| Is Mac execution competitive? | AX Engine direct versus the relevant local/runtime baseline under matched artifacts. |
+| Is NVIDIA execution efficient? | Tune and benchmark the chosen Dynamo/backend graph directly. |
+| What does AX cost? | The same Mac or Dynamo domain directly versus through AX Serving. |
+| Does federation help? | Single-domain policy versus mixed-domain policy under normal, saturated, drain, outage, privacy, and budget scenarios. |
+| Does AX replace Dynamo/vLLM? | No. Dynamo and its backend remain the NVIDIA execution system. |
 
-See the [quick start](../QUICKSTART.md),
-[operations runbook](runbooks/multi-worker.md), and
-[performance evidence guide](perf/service-tuning.md).
+See the [canonical design](../.internal/README.md) and
+[implementation status](../.internal/IMPLEMENTATION-STATUS.md).

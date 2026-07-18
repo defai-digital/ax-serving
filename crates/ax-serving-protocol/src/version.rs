@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ProtocolCapability;
 
-pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProtocolVersion {

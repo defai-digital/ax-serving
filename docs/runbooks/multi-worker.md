@@ -1,54 +1,53 @@
-# Hybrid fleet operations runbook
+# Federated fleet operations runbook
 
 | Field | Value |
 | --- | --- |
-| Applies to | Portable `ax-serving-api` gateway and `ax-runtime-agent` |
-| Architecture | Runtime-neutral REST/SSE data path, protocol-v1 control plane |
-| Last updated | 2026-07-12 |
+| Current scope | Portable `ax-serving-api`, protocol v1.1 foundation, and `ax-runtime-agent` |
+| Target scope | Mac AX Engine pools plus separate NVIDIA PC/Thor Dynamo domains |
+| Last updated | 2026-07-15 |
+| Status | Current Mac/compatibility procedures are runnable; Dynamo/Thor procedures are qualification targets |
 
-This runbook operates AX Engine/MLX and vLLM or SGLang/CUDA endpoints as one
-fleet. It does not apply to the embedded macOS compatibility server except
-where explicitly noted.
+This runbook separates current source behavior from the final architecture. Execution-domain
+types/config/diagnostics ship in source, but the Dynamo Domain Adapter and live federation
+certification do not. Do not use target examples as support evidence; consult the
+[status ledger](../../.internal/IMPLEMENTATION-STATUS.md).
 
 ## 1. Ownership boundary
 
-AX Serving owns public authentication, admission, logical-model resolution,
-endpoint selection, safe retry, fleet leases, shared capacity reservations,
-drain, desired deployment state, and diagnostics.
+AX Serving owns public auth, tenant/trust policy, logical models, identity/equivalence,
+cross-domain admission/selection, one safe pre-commit retry, audit, and global lifecycle intent.
 
-The runtime owns tokenization, chat templates, model loading, batching, KV
-cache, token scheduling, distributed execution, and kernels. The runtime agent
-normalizes discovery/readiness/metrics and proxies bytes; it must remain thin.
+NVIDIA Dynamo owns worker routing, KV-aware placement, prefill/decode, KVBM/NIXL, planner, scaling,
+backend execution, and in-domain retry/migration. AX Engine owns token execution on Mac.
 
-One request attempt runs on one endpoint. “Hybrid” means mixed endpoint pools,
-not a graph or KV cache split between MLX and CUDA.
+One request attempt runs wholly inside one domain. PC and Thor are separate domains.
 
 ## 2. Deployment profiles
 
-### Loopback development
+### Loopback evaluation
 
-- one gateway;
+- one AX gateway;
 - `fleet_store: memory`;
-- `deployment_mode: legacy_compat` or explicit test declarations;
+- current `legacy_compat` or explicit test catalog;
+- loopback Mac agent/runtime;
 - `AXS_TLS_PROFILE=loopback_dev`;
 - `AXS_ALLOW_NO_AUTH=true` only by explicit operator choice.
 
-### Remote production candidate
+### Federation production candidate
 
-- two or more gateways with unique `AXS_GATEWAY_ID` values;
-- durable Redis/Valkey shared state;
+- two or more AX gateways with unique `AXS_GATEWAY_ID` values;
+- Redis/Valkey AX fleet state;
 - `deployment_mode: explicit`;
-- authenticated public, admin, worker-control, dispatch, and runtime hops;
-- TLS at ingress and mTLS or an equivalent trusted private mesh internally;
-- immutable runtime images and complete deployment identities;
-- retained conformance, performance, failure, and soak evidence.
+- one pinned/certified Mac AX Engine path;
+- one pinned/certified NVIDIA PC Dynamo domain and adapter;
+- Thor disabled or a separate experimental/certified domain;
+- authenticated public, admin, control, dispatch, Dynamo, runtime, and Redis hops;
+- TLS/mTLS through an operator-provided trusted private network;
+- immutable identity, compatibility manifests, equivalence, and retained release evidence.
 
-The source tree is not a production certification. Complete every PRD release
-gate before applying that label to a deployment.
+The source tree is not a production certification.
 
-## 3. Start the gateway
-
-Build only the portable target:
+## 3. Start the current gateway
 
 ```bash
 cargo build --locked --release -p ax-serving-cli --bin ax-serving-api
@@ -60,7 +59,7 @@ Development:
 AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
 ```
 
-Remote active-active example:
+Active-active candidate:
 
 ```bash
 AXS_CONFIG=/etc/ax-serving/serving.yaml \
@@ -70,101 +69,49 @@ AXS_GATEWAY_ID='gateway-a' \
 AXS_TLS_PROFILE=trusted_mesh \
 AXS_API_KEY='public-client-key' \
 AXS_ADMIN_API_KEY='admin-key' \
-AXS_INTERNAL_API_TOKEN='worker-control-key' \
-AXS_DISPATCH_TOKEN='gateway-agent-key' \
+AXS_INTERNAL_API_TOKEN='adapter-control-key' \
+AXS_DISPATCH_TOKEN='gateway-adapter-key' \
 target/release/ax-serving-api
 ```
 
-Start another replica as `gateway-b` with the same configuration and fleet
-key prefix. Never duplicate a gateway ID.
+Start a second replica as `gateway-b` with the same catalog/key prefix and a different gateway ID.
+Never duplicate a gateway ID.
 
-The default endpoint policy is `inference_aware`. It applies hard eligibility
-filters first, then conservatively scores fresh runtime capacity, queue, KV,
-batch, TTFT, error, and cache signals. Unknown and stale signals are penalized.
-Compatibility policies remain available for rollback:
+## 4. Attach a current Mac AX Engine node
 
-- `least_inflight`;
-- `weighted_round_robin`;
-- `model_affinity`;
-- `token_cost`;
-- `cache_affinity`.
-
-## 4. Start runtime agents
-
-Build:
+Build the agent:
 
 ```bash
 cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent
 ```
 
-AX Engine example:
-
-Start the current AX Engine server as the runtime owner. Keep it on loopback
-when the agent is colocated:
-
-```bash
-AX_ENGINE_API_KEY='runtime-only-key' \
-/Users/akiralam/code/ax-engine/target/release/ax-engine-server \
-  --host 127.0.0.1 --port 8000 \
-  --model-id 'replace-with-runtime-model-id' \
-  --mlx \
-  --mlx-model-artifacts-dir '/replace/with/model-artifacts'
-```
-
-Then attach the portable agent:
+Start the pinned AX Engine server on the Mac, then attach the agent:
 
 ```bash
 AXS_CONTROL_PLANE_URL=https://ax-serving-control.example \
 AXS_NODE_RUNTIME=ax_engine \
-AXS_RUNTIME_VERSION='6.8.2' \
+AXS_RUNTIME_VERSION='replace-with-pinned-version' \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
 AXS_NODE_ADVERTISED_ADDR=10.20.1.10:18081 \
 AXS_NODE_ID=mac-mlx-01 \
 AXS_NODE_WORKER_POOL=mac-mlx \
-AXS_NODE_HARDWARE_CLASS=mac \
-AXS_TRUST_DOMAIN=private \
+AXS_NODE_HARDWARE_CLASS=apple-silicon \
+AXS_NODE_DOMAIN_ID=mac-local \
+AXS_NODE_DOMAIN_QUALIFICATION=certified \
+AXS_TRUST_DOMAIN=private-local \
 AXS_TLS_PROFILE=trusted_mesh \
-AXS_WORKER_TOKEN='worker-control-key' \
-AXS_DISPATCH_TOKEN='gateway-agent-key' \
+AXS_WORKER_TOKEN='adapter-control-key' \
+AXS_DISPATCH_TOKEN='gateway-adapter-key' \
 AXS_RUNTIME_API_KEY='runtime-only-key' \
 target/release/ax-runtime-agent
 ```
 
-AX Engine 6.8.2 exposes generation and multimodal capability metadata from
-`/v1/models`; the agent consumes that metadata directly. The current AX Engine
-model card does not distinguish an embedding-only deployment, so set
-`AXS_NODE_EMBEDDING=true` for a certified embedding deployment and
-`AXS_NODE_EMBEDDING=false` when an explicit fail-closed override is required.
-Do not infer embedding equivalence from a model name.
+Set `AXS_NODE_DOMAIN_QUALIFICATION=certified` only when the exact AX Engine/runtime/model identity
+has retained qualification evidence. Otherwise use `experimental` or the default `unverified`.
+`AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST=sha256:<digest>` is optional for a manifest-backed node.
 
-The current server exposes authoritative readiness at `/health`, inventory at
-`/v1/models`, inference through OpenAI-compatible REST/SSE, and aggregate
-telemetry at `/metrics`. AX Serving maps only the metrics whose semantics are
-defined by AX Engine 6.8.2; unavailable TTFT or throughput observations remain
-unknown and therefore cannot improve an endpoint's routing score.
-
-vLLM example:
-
-```bash
-AXS_CONTROL_PLANE_URL=https://ax-serving-control.example \
-AXS_NODE_RUNTIME=vllm \
-AXS_RUNTIME_VERSION='replace-with-certified-version' \
-AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
-AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=10.20.2.10:18081 \
-AXS_NODE_ID=cuda-vllm-01 \
-AXS_NODE_WORKER_POOL=cuda-vllm \
-AXS_NODE_HARDWARE_CLASS=pc-cuda \
-AXS_TRUST_DOMAIN=private \
-AXS_TLS_PROFILE=trusted_mesh \
-AXS_WORKER_TOKEN='worker-control-key' \
-AXS_DISPATCH_TOKEN='gateway-agent-key' \
-AXS_RUNTIME_API_KEY='runtime-only-key' \
-target/release/ax-runtime-agent
-```
-
-For every deployment, set the observed identity fields used by its policy:
+Set every required identity variable from retained artifacts:
 
 ```text
 AXS_MODEL_REVISION
@@ -176,84 +123,114 @@ AXS_MODEL_MAX_OUTPUT_TOKENS
 AXS_MODEL_CAPABILITIES
 ```
 
-The agent becomes ready only when the upstream runtime is ready and inventory
-has been observed. Agent process health alone is not routing readiness. A
-runtime failure, stale observation, protocol mismatch, drain state, or expired
-lease removes the endpoint from eligibility.
+The agent is eligible only after AX Engine readiness and inventory are authoritative. The agent
+process being alive is insufficient.
 
-## 5. Configure deployment identity
+## 5. NVIDIA domains
 
-Use [`../../config/serving.hybrid.example.yaml`](../../config/serving.hybrid.example.yaml)
-as a schema example only. Replace all placeholder digests and certification
-paths.
+### Current compatibility path
 
-An explicit deployment declares:
+The current `ax-runtime-agent` can point directly at vLLM/SGLang for migration and testing. This is
+not the final production NVIDIA architecture and must not be used as Dynamo federation evidence.
 
-- logical client model alias;
-- runtime model ID;
-- pool, runtime kind, hardware class, and trust domain;
-- runtime/version, model revision or artifact digest;
-- tokenizer and template digests;
-- quantization, operations, context/output limits, modalities, and capabilities;
-- required matching fields;
-- optional equivalence class.
+### Target PC Dynamo path
 
-Cross-pool failover is permitted only when source and target are both listed
-in the same equivalence policy and match every required identity field. A
-shared model name is not equivalence. Different quantizers or formats must be
-recorded and tested; do not call them exact when they are not.
+The approved target is:
 
-## 6. Validate startup
+```text
+AX gateway -> ax-dynamo-adapter -> pinned Dynamo frontend -> Dynamo-selected backend worker
+```
 
-Public probes:
+Before enabling dispatch, the operator must have:
+
+- a released upstream `ai-dynamo/dynamo` tag/commit;
+- immutable frontend/planner/operator/runtime image digests;
+- pinned backend, CUDA, OS/architecture, graph config, and model identities;
+- a validated AX Dynamo compatibility manifest;
+- adapter readiness/inventory/metrics mapping conformance;
+- direct Dynamo versus through-AX overhead and fault evidence.
+
+No runnable adapter command is documented until the binary exists and these contracts pass.
+
+### Target Thor path
+
+Thor uses a different domain ID, pool, manifest, qualification, and rollout. Keep it disabled or
+`experimental` until live ARM64/CUDA/backend, memory/thermal, restart, stream/cancel, performance,
+and soak evidence passes. Do not reuse PC TensorRT engines, quantization artifacts, capacity curves,
+or planner calibration.
+
+## 6. Validate gateway and capacity
 
 ```bash
 curl -fsS http://gateway:18080/livez
 curl -fsS http://gateway:18080/readyz
+curl -i http://gateway:18080/routablez
 curl -sS http://gateway:18080/health | jq .
 curl -sS http://gateway:18080/v1/models \
   -H 'Authorization: Bearer public-client-key' | jq .
 ```
 
-Admin and control detail:
+Expected semantics:
+
+- `/livez` 200: process is alive;
+- `/readyz` 200 in default `control_plane` mode: listeners/config/fleet store can operate, even with
+  no execution capacity;
+- `/routablez` 200: at least one deployment is eligible; 503 before a node/domain is routable;
+- `/health`: separates control-plane health from worker/domain capacity.
+
+Legacy `readyz_mode=eligible_workers` is migration-only. Monitoring that pages on serving capacity
+uses `/routablez`, not `/readyz`.
+
+Admin/control detail:
 
 ```bash
 curl -sS http://gateway:18080/v1/admin/fleet \
   -H 'Authorization: Bearer admin-key' | jq .
 curl -sS http://gateway:18080/admin/v1/deployments \
   -H 'Authorization: Bearer admin-key' | jq .
+curl -sS 'http://gateway:18080/v1/admin/decisions?limit=50' \
+  -H 'Authorization: Bearer admin-key' | jq .
 curl -sS http://gateway:19090/internal/workers \
-  -H 'X-Internal-Token: worker-control-key' | jq .
+  -H 'X-Internal-Token: adapter-control-key' | jq .
 ```
 
-Expected before traffic:
+Domain descriptors/observations appear when a v1.1 adapter reports them. The decision endpoint is a
+bounded in-process diagnostic journal; it is not durable replay evidence across gateway restarts.
 
-- `/livez` is `200` on every process;
-- `/readyz` is `200` only on gateways with at least one eligible endpoint;
-- every worker has a current protocol lease and ready runtime observation;
-- explicit deployment identity matches the catalog;
-- no unexpected legacy registration participates in certified routing.
+## 7. Identity and equivalence
 
-## 7. Request and retry contract
+Every explicit deployment declares logical model, runtime model, pool/domain, runtime/backend,
+model revision/artifact, tokenizer/template, quantization, operations, limits, trust class, and
+required matching fields.
 
-The gateway creates one request ID and a unique attempt ID per dispatch. It
-may perform at most two attempts.
+Cross-domain retry/failover requires:
 
-A second attempt is allowed only when all conditions hold:
+1. both deployment IDs in one operator-certified equivalence class;
+2. every required identity field present and matching;
+3. a non-empty immutable workload certification artifact;
+4. operation/capability/quality and trust/residency compatibility.
 
-1. no response headers or body bytes were committed to the client;
-2. the first attempt failed to connect, or the authenticated agent returned a
-   typed `not-admitted` result;
-3. another deployment is eligible and retry-compatible, including explicit
-   equivalence for cross-pool routing;
-4. the absolute request deadline has not expired.
+A shared model string is not equivalence. Different formats/quantizers must be disclosed and tested.
 
-AX Serving never retries an arbitrary runtime `5xx`, an ambiguous transport
-failure after admission, or a stream after its first committed byte. A rising
-retry counter therefore indicates connect failures or trusted pre-admission
-capacity rejection—not generic runtime errors.
+## 8. Retry and cancellation
 
-## 8. Admission and tenant controls
+AX creates one request ID and a unique attempt ID per selected domain. It may perform at most two
+domain attempts.
+
+A second AX attempt is allowed only when:
+
+- no response header/body byte was committed;
+- connection failed before admission or the authenticated adapter returned typed `not-admitted`;
+- the next deployment is equivalent and policy-eligible;
+- the absolute deadline remains.
+
+Generic runtime/Dynamo/backend `5xx`, post-write disconnect, timeout after ambiguous admission, and
+committed streams are never retried by AX. Dynamo owns internal worker retry/migration as part of
+the same AX attempt.
+
+Client disconnect and deadlines propagate to the adapter and runtime/domain owner.
+
+## 9. Admission controls
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
@@ -263,199 +240,108 @@ capacity rejection—not generic runtime errors.
 | `AXS_GLOBAL_QUEUE_POLICY` | `queue` | `queue`, `reject`, or `shed_oldest` |
 | `AXS_TENANT_MAX_CONCURRENT` | `0` | Per-tenant active cap; zero disables |
 
-Priority is `low`, `normal`, or `high` through `x-ax-priority`. Priority aging
-and cross-client handoff prevent indefinite starvation. The gateway does not
-perform token-level scheduling.
+Priority is `low`, `normal`, or `high`. AX does not perform token-level scheduling.
 
-If cache affinity is needed, configure a 32-byte-or-longer random
-`AXS_CACHE_AFFINITY_SECRET` and send an opaque `x-ax-cache-affinity` value.
-The derived key is tenant-scoped; raw hints and prompt text are neither stored
-nor forwarded.
+Optional cache/session affinity is tenant-scoped, bounded, and soft. It never overrides readiness,
+capacity, policy, identity, or equivalence. Raw hints and prompts are not stored or forwarded.
 
-## 9. Drain a worker
+## 10. Drain and roll
 
-Preferred agent-controlled shutdown:
+### Mac endpoint drain
 
-1. stop renewing ready heartbeats;
-2. send drain;
-3. reject new dispatch with typed `not-admitted`;
-4. wait for inflight streams to reach zero or the hard timeout;
-5. send drain-complete and terminate.
+1. Agent marks itself draining and stops local admission.
+2. It sends an authoritative draining observation.
+3. New requests select another eligible endpoint/domain or receive unavailable.
+4. Existing streams finish until the deadline.
+5. Agent reports drain complete and terminates/fences its registration.
 
-Manual emergency drain:
+Emergency admin drain:
 
 ```bash
 curl -sS -X POST http://gateway:18080/v1/workers/WORKER_ID/drain \
   -H 'Authorization: Bearer admin-key'
 ```
 
-Watch `inflight` and drain state. Do not delete a worker merely to accelerate a
-normal drain; force removal can terminate active work and is an incident action.
+### Dynamo domain drain target
 
-## 10. Roll a deployment
+The Dynamo adapter stops AX admission first. Dynamo's documented drain/rollout mechanism then owns
+internal workers. AX does not remove individual Dynamo workers. Domain drain completes only when no
+AX-visible admitted requests remain or the hard deadline expires.
 
-In explicit mode, create or update the replacement identity first. Then submit
-a roll action naming the replacement deployment. The lifecycle state machine:
+### Deployment roll
 
-1. enables the replacement desired state;
-2. waits until at least one replacement endpoint is ready;
-3. disables the source deployment;
-4. rolls desired state back if readiness does not arrive before the timeout.
+AX async jobs represent desired state:
 
-All mutations return a job. Poll it until `succeeded` or `failed`:
+1. enable immutable replacement identity/manifest;
+2. wait for a compatible replacement domain/endpoint to be ready;
+3. stop new admission to the source;
+4. drain source;
+5. rollback desired state if readiness/health gates fail.
 
-```bash
-curl -sS http://gateway:18080/admin/v1/jobs/JOB_ID \
-  -H 'Authorization: Bearer admin-key' | jq .
-```
-
-These jobs coordinate AX Serving desired state. The external orchestrator or
-runtime adapter still owns image rollout, model download, GPU allocation, and
-process lifecycle.
+External runtime/Dynamo controllers perform actual process/graph/image changes.
 
 ## 11. Gateway upgrade and rollback
 
-Preconditions:
+1. Verify protocol fixture compatibility and retain prior image/config/policy.
+2. Add one new gateway with a unique ID.
+3. Verify `/readyz`, `/routablez`, shared fleet/catalog/reservations, and metrics.
+4. Send canary traffic and compare commitment/error/retry/latency signals.
+5. Replace remaining gateways one at a time and drain streams.
+6. Roll back to the prior immutable image/policy on guardrail failure.
 
-- CI, protocol fixtures, Redis conformance, and dependency-boundary checks pass;
-- protocol major version is compatible with active agents;
-- database/key-prefix migration is backward compatible;
-- the prior immutable image and configuration are retained.
+Never clear Redis as a routine rollback. Incompatible state/protocol requires the release-specific
+migration procedure.
 
-Procedure:
+## 12. Credentials and transport
 
-1. add one new gateway replica with a unique ID;
-2. verify `/livez`, `/readyz`, shared workers, deployments, reservations, and
-   metrics;
-3. send canary traffic and compare error/retry/latency signals;
-4. replace remaining replicas one at a time with `maxUnavailable=0`;
-5. retain the previous replicas until streams drain.
+Rotate independently:
 
-Rollback by restoring the previous immutable image while keeping the same
-compatible shared-state key prefix. If the new version wrote an incompatible
-protocol or state schema, stop and follow the release-specific migration plan;
-never clear Redis as a routine rollback.
+1. public client identity;
+2. admin/monitoring identity;
+3. AX adapter control and lease identity;
+4. gateway-to-adapter dispatch identity;
+5. Mac runtime identity;
+6. Dynamo adapter-to-frontend identity;
+7. Dynamo lifecycle controller/RBAC identity;
+8. Redis/Valkey identity;
+9. affinity derivation secret, accepting cache-locality loss.
 
-## 12. Credential rotation
+Never store secrets in checked-in YAML, images, URLs, metrics labels, or retained CI command output.
 
-Rotate one trust boundary at a time. Use overlap only where comma-separated
-key sets are supported.
+## 13. Observability and incidents
 
-1. add the new public/admin key, deploy gateways, update clients, remove old;
-2. add the new worker-control key, deploy gateways and agents in a coordinated
-   window, then remove old;
-3. rotate dispatch credentials by updating gateways and agents together;
-4. rotate runtime credentials only on agents and runtimes;
-5. rotate Redis credentials through a new URL, verify replica reconciliation,
-   then revoke old access;
-6. rotate affinity secret only when losing old cache locality is acceptable.
+Baseline alerts cover:
 
-Never place secrets in YAML, logs, command output retained by CI, images, or
-Prometheus labels.
+- control-plane not ready;
+- no routable deployment/domain;
+- stale leases/observations or manifest mismatch;
+- queue rejection/shed/timeout;
+- retry increase by owner/reason;
+- admission ambiguity or commitment failure;
+- adapter/Dynamo/Mac error and cancellation rates;
+- Redis fencing/reconciliation failure;
+- rollout/drain deadline and policy rollback guard.
 
-## 13. Observability and alerts
+Incident order:
 
-Scrape `GET /metrics` with the admin bearer credential; use authenticated
-`GET /v1/metrics` for JSON diagnostics. Required baseline signals include:
+1. stop unsafe admission or disable the affected domain/deployment;
+2. preserve existing streams when safe;
+3. confirm retry/commitment state before manually replaying work;
+4. inspect bounded decision/audit evidence and pinned manifests;
+5. restore an immutable prior policy/domain version;
+6. retain timeline, config, traces, and raw evidence without prompts/secrets.
 
-- `axs_gateway_requests_total`;
-- `axs_gateway_dispatch_attempts_total`;
-- completed, failed, cancelled, and retry counters;
-- admitted/rejected counters and queue state;
-- healthy, unhealthy, draining, and eligible worker gauges;
-- aggregate worker inflight;
-- endpoint-selection and upstream-response-header latency histograms;
-- bounded endpoint-selection outcome counters.
+Loss of Thor must not affect PC/Mac control paths; loss of PC must not cause unsafe Thor/Mac failover.
 
-Worker IDs, request IDs, prompts, model paths, and credentials are not metric
-labels. Use bounded audit/log records with request IDs for individual cases.
+## 14. Release checklist
 
-Recommended alerts:
-
-- no eligible worker for a published logical model;
-- readiness failures on enough gateways to violate redundancy;
-- heartbeat/observation age approaching TTL;
-- sustained queue depth, rejection, or tenant quota pressure;
-- safe retries above the established baseline;
-- failed or timed-out lifecycle jobs;
-- Redis connectivity or latency failure;
-- gateway RSS growth during the validated soak window.
-
-Alert thresholds must come from retained workload evidence, not generic
-defaults.
-
-For distributed traces, configure `OTEL_EXPORTER_OTLP_ENDPOINT` or
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` on each gateway and runtime agent. The
-portable exporter supports `http/json`; optional collector credentials use
-`OTEL_EXPORTER_OTLP_HEADERS` and are redacted from diagnostics. W3C
-`traceparent`/`tracestate` continuity remains enabled when export is disabled.
-Built-in spans exclude prompt/output content, tools, images, paths, and
-credentials.
-
-## 14. Incident response
-
-### `/readyz` is `503`
-
-Check, in order:
-
-1. runtime process readiness and `/v1/models`;
-2. agent heartbeat and observation timestamp;
-3. protocol major compatibility and required capabilities;
-4. worker drain/lease state;
-5. deployment identity/equivalence mismatch;
-6. capacity reservations and tenant/global admission;
-7. Redis connectivity and clock-independent TTL behavior.
-
-Do not bypass identity or readiness filters to restore traffic. Pin a known
-safe deployment or roll back the runtime artifact.
-
-### Retry counter rises
-
-Inspect gateway route diagnostics and agent admission state. Valid causes are
-connection failures and typed pre-admission rejection. Runtime `5xx` should be
-returned on the original attempt and must not increment safe retries. If they
-do, treat it as a correctness regression.
-
-### Redis/Valkey is unavailable
-
-Existing streams may continue locally. New explicit admissions fail closed
-when shared reservation or fleet state cannot be proven. Restore the durable
-store; do not switch live active-active replicas to unrelated in-memory state.
-
-### Runtime returns errors after admission
-
-Do not reroute. Drain or disable the deployment, inspect runtime logs using the
-request/attempt IDs, and roll back the runtime/model artifact. A duplicate
-attempt could create double cost or divergent output.
-
-### Queue overload
-
-Determine whether pressure is gateway admission, worker capacity, or runtime
-queue/KV saturation. Add compatible endpoints or reduce admission only after
-checking runtime goodput. Increasing gateway concurrency can worsen runtime
-tail latency.
-
-## 15. Shutdown
-
-Remove a gateway from the load balancer before termination. It stops new
-admission, allows accepted streams to complete, and exits at its hard deadline.
-Worker agents stop ready heartbeats, drain, and report drain-complete.
-
-After planned maintenance verify:
-
-- no leaked local or shared reservations;
-- no stale worker lease remains eligible;
-- deployment desired and observed state agree;
-- retry/cancellation counters match the event;
-- public credentials were not observed at runtimes.
-
-## 16. Compatibility transports
-
-Direct HTTP/SSE is the production data-path target. NATS remains a
-compatibility transport and is configured with `max_deliver=1`; ambiguous
-token-stream redelivery is not safe retry. Do not use durable broker replay as
-an inference failover mechanism.
-
-The embedded gRPC v1 API is macOS compatibility-only. It carries local model
-paths, backend enums, and token-ID semantics that cannot be translated
-losslessly by the portable hybrid gateway.
+- Mac AX Engine live conformance passed.
+- NVIDIA PC Dynamo compatibility manifest and live conformance passed.
+- Thor disabled/experimental or independently certified.
+- Every cross-domain equivalence transition has retained evidence.
+- Direct-versus-AX overhead and 256-candidate selection gates passed.
+- Two-gateway Redis restart/partition/fencing/reservation tests passed.
+- 60-minute mixed-domain soak passed.
+- Credential rotation, security, monitoring, upgrade, and rollback drills passed.
+- At least one PRD value gate passed.
+- Public documentation matches implemented/certified status.

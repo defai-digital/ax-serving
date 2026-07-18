@@ -1,0 +1,452 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "AX Inference Intelligence 深度研究：從 Cognitive Runtime 願景到可驗證的控制平面",
+    "description": "截至 2026-07-15，對 AX Serving、AX Engine、開源競品、產品價值與相關研究的技術策略 review。",
+    "generatedAt": "2026-07-15T06:12:30Z",
+    "charts": [
+      {
+        "id": "oss_capability_evidence",
+        "title": "受評開源專案的控制平面能力證據",
+        "subtitle": "截至 2026-07-15；2＝官方文件顯示目前支援，1＝部分、有限、beta 或需客製，0＝本次主來源未找到。這不是成熟度或效能排名。",
+        "showDescription": true,
+        "intent": "relationship",
+        "question": "原文所稱的 Runtime Intelligence 能力是否仍是開源空白？",
+        "rationale": "能力矩陣比總分排名更誠實：它保留不同專案在語意決策、硬體遙測、session、feedback 與政策治理上的分工。",
+        "comparisonContext": {
+          "denominator": "每格為 0、1、2 的文件證據編碼",
+          "grain": "專案 × 能力",
+          "normalization": "未依成熟度、效能、採用量或獨立驗證加權",
+          "unit": "evidence code"
+        },
+        "type": "heatmap",
+        "dataset": "oss_capability_matrix",
+        "sourceId": "capability_matrix_method",
+        "encodings": {
+          "x": {
+            "field": "project",
+            "type": "nominal",
+            "label": "Project"
+          },
+          "y": {
+            "fields": [
+              "semantic_selection",
+              "runtime_state",
+              "agent_session",
+              "feedback_evaluation",
+              "policy_lifecycle",
+              "context_safety",
+              "heterogeneous_control"
+            ],
+            "type": "quantitative",
+            "format": "number",
+            "label": "Documented support"
+          },
+          "tooltip": [
+            { "field": "evidence_note", "type": "text", "label": "Evidence note" },
+            { "field": "reviewed_on", "type": "temporal", "label": "Reviewed on" }
+          ]
+        },
+        "valueFormat": "number",
+        "layout": "full",
+        "maxRows": 12
+      }
+    ],
+    "sources": [
+      {
+        "id": "capability_matrix_method",
+        "label": "官方文件能力矩陣（手動證據編碼）",
+        "query": {
+          "engine": "ANSI SQL VALUES",
+          "language": "sql",
+          "executed_at": "2026-07-15T05:02:02Z",
+          "description": "將本報告列出的官方專案文件手動編碼為 0／1／2。0 僅表示本次主來源未找到；1 表示部分、有限、beta 或需客製；2 表示文件描述為目前功能。",
+          "filters": [
+            "只使用專案官方文件、官方 repository 或原始論文",
+            "觀察截止日為 2026-07-15",
+            "不把 roadmap 當作目前功能",
+            "不把文件宣稱當作獨立效能驗證"
+          ],
+          "metric_definitions": [
+            "semantic_selection：依 request 內容或難度在模型／tier／策略間選擇",
+            "runtime_state：使用 KV locality、queue、load、TTFT 或硬體狀態做 placement",
+            "agent_session：具 session continuity、agent hints、trajectory 或 agent-aware controls",
+            "feedback_evaluation：可接收 outcome feedback、評估或 learning signal",
+            "policy_lifecycle：具有 replay、shadow、activation、版本或 rollback 類政策治理",
+            "context_safety：具 context、compression、PII、guardrail、history 或安全處理",
+            "heterogeneous_control：可控制多模型、provider、runtime 或硬體 fleet"
+          ],
+          "tables_used": [
+            "vLLM Semantic Router v0.3 Themis release documentation",
+            "NVIDIA Dynamo 1.2 agent and KV router documentation",
+            "SGLang Model Gateway documentation",
+            "LiteLLM Auto Routing and Adaptive Router documentation",
+            "TensorZero feedback and experimentation documentation",
+            "AIBrix Router documentation",
+            "RouteLLM repository and paper",
+            "AX Serving commit 318f43d source and status documents"
+          ],
+          "sql": "SELECT * FROM (VALUES\n  ('vLLM Semantic Router', 2, 1, 2, 1, 2, 2, 2, 'current docs; feedback learning remains incomplete'),\n  ('NVIDIA Dynamo', 1, 2, 2, 1, 1, 0, 2, 'semantic selection is custom; agent and KV controls are documented'),\n  ('SGLang Model Gateway', 0, 2, 2, 0, 0, 2, 1, 'broad gateway boundary; no quality-constrained semantic selector found'),\n  ('LiteLLM Auto/Adaptive', 2, 1, 1, 1, 0, 1, 2, 'auto routing released in dev on 2026-07-14; adaptive components are beta'),\n  ('TensorZero', 0, 0, 1, 2, 2, 0, 2, 'strong feedback, evaluation and experimentation; not a KV-aware fleet router'),\n  ('AIBrix', 0, 2, 1, 0, 0, 0, 1, 'Kubernetes and vLLM-centric; heterogeneous GPU support is experimental'),\n  ('RouteLLM', 2, 0, 0, 2, 0, 0, 1, 'two-model research router with preference-data evaluation'),\n  ('AX Serving current', 0, 2, 0, 0, 0, 0, 2, 'runtime-neutral endpoint placement exists; agent-aware product work not started')\n) AS evidence(project, semantic_selection, runtime_state, agent_session, feedback_evaluation, policy_lifecycle, context_safety, heterogeneous_control, evidence_note)"
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# AX Inference Intelligence 深度研究：從 Cognitive Runtime 願景到可驗證的控制平面"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## Technical summary\n\n**總判斷：值得做窄版、可停損的驗證，但不值得在沒有真實 workload 證據前全面下注。**「端到端推論不能只最佳化 matrix multiply」是正確洞見；「幾乎沒有人做」、「Decision 比 Inference 更 expensive」、「World’s First Cognitive Runtime」則不成立或不可驗證。到 2026 年，語意模型路由、session-aware routing、KV-aware placement、feedback、policy replay、context compression 與 agent hints 已分別出現在 [vLLM Semantic Router](https://vllm.ai/blog/2026-06-05-v0.3-vllm-sr-themis-release)、[NVIDIA Dynamo](https://docs.nvidia.com/dynamo/user-guides/agents)、[SGLang Model Gateway](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/sgl_model_gateway.md)、[LiteLLM](https://docs.litellm.ai/docs/proxy/auto_routing)、[TensorZero](https://www.tensorzero.com/docs/gateway/guides/metrics-feedback/) 等專案。\n\n**AX 正確的工程位置是 AX Serving，而不是把 AX Engine 變成萬能大腦。** AX Serving 現在已是 runtime-neutral control plane，能依 queue、KV、batch、TTFT、error 與 cache affinity 選 endpoint；AX Engine 則維持可重播、確定性的 execution runtime。語意任務、context、tools、permissions 與結果 verifier 應由 application／agent harness 擁有；Serving 接收 typed intent 與硬性約束，選 logical model、deployment class 與 endpoint；runtime agent 轉譯有版本的 hints；Engine 驗證並執行。\n\n**第一個可防守成果不應是通用 semantic router。** 先完成並驗證既有的 agent-aware session／cache placement 設計，再做一個兩級 deployment 的 quality-constrained router，把 model residency、cold-load、KV continuity、Apple unified memory、CUDA load、privacy 與 SLO 納入同一個可重播決策。這比複製 RouteLLM 或 vLLM Semantic Router 更貼近 AX 的資產。\n\n**建議對外名稱：** `Adaptive Inference Control Plane`、`Evidence-Driven Inference Optimization` 或 repo 已採用的 `Agent-Aware Inference Fabric`。`AX Inference OS` 可保留為長期品牌願景，但不宜當作已完成的工程能力。"
+      },
+      {
+        "id": "investment_decision",
+        "type": "markdown",
+        "body": "## 投資判斷：問題有價值，但只有一部分使用者真的需要\n\n**直接答案：這不是目前應全面投入的旗艦功能；它是一個值得用小成本驗證、達標後才擴大的高潛力能力。** AWS Bedrock 與 Microsoft Foundry 都已把 cost／quality model routing 產品化，vLLM、LiteLLM 與 Dynamo 也正在快速擴張相近能力。這證明主要供應商認為問題值得產品化，但不能證明 AX 使用者願意付費；它同時也表示通用 Router 正快速商品化，單純實作 `model: auto` 不會形成 AX 的護城河。[AWS Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-routing.html) · [Microsoft Foundry](https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-router)\n\n### 哪些使用者會得到高價值\n\n- 同一 workload 至少有兩個品質／成本／硬體特性不同、而且實際可替換的 deployment。\n- 私有或 hybrid fleet 同時包含 Apple Silicon、CUDA、local／cloud，存在 model residency、cold load、KV continuity 或資料邊界問題。\n- Agent session 很長、system prompt／tools 很大、重複 prefill 或錯誤 placement 明顯影響下一步延遲。\n- 推論成本或 GPU capacity 已是可量測的營運瓶頸，且有可靠 evaluator 能守住品質。\n\n### 哪些使用者幾乎不需要\n\n- 單機、單使用者、單模型，或流量低到固定設定已足夠。\n- Privacy／capability 規則使大多數 request 只能使用一個模型。\n- 模型切換比一次推論更昂貴，且沒有穩定的多 endpoint 常駐部署。\n- 沒有 task outcome、測試、ground truth 或人工抽查，因此無法判斷 Router 是否省錢卻降低品質。\n\nMicrosoft 的架構指引也明確指出：只有 request complexity 或 volume 的變異足以抵銷額外架構複雜度時，model router 才最有效。[Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/choose-ai-model)\n\n### 用可服務比例判斷，而不是用願景判斷\n\n可先使用一個簡單的投資近似式：\n\n> **整體毛改善 ≈ 可由 Router 真正選擇的 request 比例 × 該可選流量的平均改善**\n\n- **窄需求：** 20% 可選流量 × 20% 改善＝4% 整體毛改善，通常不足以支付新控制平面的複雜度。\n- **臨界：** 50% 可選流量 × 20% 改善＝10%，只有工程與營運成本很低時值得。\n- **強需求：** 70% 可選流量 × 25% 改善＝17.5%，才有機會形成明確產品價值。\n\n這些數字是 **go／no-go 情境門檻，不是 AX 的收益預測**。真正分母應使用 `cost per successful task` 或 `p95 time-to-next-action`，不能只看每次 request 的 token 成本。RouteLLM 在部分 benchmark 報告超過 2× 成本降低，Dynamo 整合案例也報告顯著 TTFT 改善；兩者都只能證明技術上可能有大收益，不能代替 AX 自己的 workload replay。[RouteLLM](https://arxiv.org/abs/2406.18665) · [Dynamo agentic inference](https://docs.nvidia.com/dynamo/dev/digest/agentic-inference)\n\n### 建議的投資閘門\n\n只批准一個 time-boxed、shadow-only 的驗證里程碑，不先承諾完整 Cognitive Runtime。繼續投資必須同時滿足：\n\n1. 至少兩個真實 AX workload，或三個願意提供代表性 traffic／labels 的 design partners。\n2. 至少約 50% 目標流量具有兩個以上合法且有意義的 action；否則 Router 沒有足夠決策空間。\n3. 品質達到預先定義的 non-inferiority gate，privacy／capability／identity violation 為 0。\n4. `cost per successful task` 改善至少約 10–15%，或 agent workload 的 p95 time-to-next-action 改善至少約 20–25%。\n5. Routing decision 可解釋、可重播、可回滾，且營運複雜度沒有抵銷收益。\n\n若可選流量低於約 30%、總改善低於約 10%、找不到可靠 evaluator，或沒有 design partner 願意提供 workload，應停止擴張，只保留既有 inference-aware endpoint placement。**目前最高價值、最低偏離的工作仍是 agent-aware session／cache placement；通用 semantic Router 是條件式投資；完整 Cognitive Runtime 則應暫緩。**"
+      },
+      {
+        "id": "thesis_review",
+        "type": "markdown",
+        "body": "## 核心 thesis：方向正確，但「Runtime 會思考」會模糊真正的系統問題\n\n原文最有價值的洞見不是讓 runtime 擁有人格化的 brain，而是：**一個 request 的端到端結果由一串可最佳化的決策共同決定**。錯誤的 model、context、tool、placement 或 retry 決策會放大 token 數、network round trips、模型載入、KV 重算與失敗重試。\n\n因此，這句話：\n\n> Decision 比 Inference expensive.\n\n應改成：\n\n> **Decision 本身通常不是主要 FLOPs；錯誤的 decision 會觸發不必要的 context、tool calls、network round trips、model execution、cache misses 與 retries，所以端到端最佳化不能只看 kernel throughput。**\n\n同樣地，`Inference-time Intelligence` 容易和研究界的 test-time／inference-time compute 混淆。ICLR 2025 的代表工作指的是依題目難度配置 sampling、search、process reward model 或 verifier compute，而不是整個 gateway／fleet control plane。原文研究方向最好另行命名；test-time compute 可以成為其下游的一種 execution strategy，而不是同義詞。[ICLR 2025 paper](https://proceedings.iclr.cc/paper_files/paper/2025/hash/1b623663fd9b874366f3ce019fdfdd44-Abstract-Conference.html)\n\n**建議重寫中心句：**\n\n> AX 應建立一個 evidence-driven adaptive inference control plane：它根據 application-declared intent、hard policy、fleet telemetry 與 measured outcomes，選擇並約束可重播的推論計畫；runtime 仍以確定性方式驗證與執行該計畫。"
+      },
+      {
+        "id": "market_evidence_intro",
+        "type": "markdown",
+        "body": "## 市場證據：這已是快速形成中的產品類別，不是 5–10 年後才開始的空白\n\n下圖把七種能力逐項編碼。它只回答「官方文件是否顯示某種能力」，不回答程式品質、production readiness、效能或採用量；0 也不證明功能絕對不存在。即使採取這個保守口徑，原文列出的能力仍已廣泛分散在現有專案中。"
+      },
+      {
+        "id": "market_evidence_chart",
+        "type": "chart",
+        "chartId": "oss_capability_evidence"
+      },
+      {
+        "id": "market_evidence_detail",
+        "type": "markdown",
+        "body": "## 真正的缺口不是單一 feature，而是可信的跨層閉環\n\n- **vLLM Semantic Router v0.3** 已明確提出 `signal → projection → decision → algorithm → model`，包含 complexity、context、PII、feedback、session continuity、switch economics、replay，以及 shadow／activate／revert 政策生命週期。這已直接涵蓋原文多數「Runtime Brain」概念；但它仍是 pre-1.0 專案，`production-ready` 是專案方自述，不等同獨立認證。[官方 release note](https://vllm.ai/blog/2026-06-05-v0.3-vllm-sr-themis-release)\n\n- **NVIDIA Dynamo 1.2** 讓 harness 傳入 session／trajectory、priority、expected output length 與 speculative prefill；router 使用 KV overlap、prefill／decode load 與 backend priority 做 placement。官方 agent 文件還明確說 semantic trajectory 仍由 harness 負責，與 AX 的既有邊界高度相似。[Agents](https://docs.nvidia.com/dynamo/user-guides/agents) · [KV router](https://docs.nvidia.com/dynamo/latest/user-guides/kv-cache-aware-routing)\n\n- **SGLang Model Gateway** 已是多模型 control plane，包含 worker lifecycle、cache-aware load balancing、conversation/history、MCP、privacy、tokenizer 與 40+ metrics；但目前文件列出的核心 policies 仍是 random、round robin、power-of-two、cache-aware 與 bucket，不能把 worker 的 `cost` metadata 誤寫成已完成的 quality-constrained semantic routing。[官方文件](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/sgl_model_gateway.md)\n\n- **LiteLLM Auto Routing** 在 2026-07-14 才出現最早 dev release，已支援 heuristic／LLM／keyword classification、tier pools、session affinity、Thompson-sampled adaptive pools 與 decision causes；另一個 Adaptive Router 仍標示 beta。這個時間點本身說明競爭正在加速，也說明成熟度仍不均一。[Auto Routing](https://docs.litellm.ai/docs/proxy/auto_routing) · [Adaptive Router](https://docs.litellm.ai/docs/adaptive_router)\n\n- **RouteLLM** 已用 preference data 在 strong／weak model 間學習成本—品質 routing，論文在部分設定報告超過 2× 的成本降低而不犧牲品質；它也明確要求 router threshold 應以接近真實 workload 的資料校準。它是 routing 可行性的證據，不是 production fleet control plane。[paper](https://arxiv.org/abs/2406.18665) · [repository](https://github.com/lm-sys/RouteLLM)\n\n- **TensorZero** 已把 inference／episode feedback、experimentation、variants 與 offline optimization 串起來；**AIBrix** 則有 high-frequency pod metrics、prefix-cache、SLO 與 session-affinity routing。兩者分別否定「沒有 feedback loop」與「infra router 只會 round robin」的泛化說法。[TensorZero](https://www.tensorzero.com/docs/gateway/guides/metrics-feedback/) · [AIBrix](https://aibrix.readthedocs.io/latest/designs/aibrix-router.html)\n\n因此可以保留的 novelty claim 只能是：\n\n> **尚未成熟的是把任務意圖、品質約束、隱私、成本、model residency、runtime telemetry、session／KV continuity 與 outcome feedback，統一成可審計、可重播、可回滾的 closed-loop optimization system，並在私有異質 fleet 上證明收益。**"
+      },
+      {
+        "id": "ax_current_state",
+        "type": "markdown",
+        "body": "## AX 現況：已具備 placement control plane，但尚未具備 semantic decision plane\n\n本地 code review 以 AX Serving commit [`318f43d`](https://github.com/defai-digital/ax-serving/tree/318f43d9d5ddc44c2856b81a53a9504180ee2d68) 與 AX Engine commit [`d1f2598`](https://github.com/defai-digital/ax-engine/tree/d1f2598970f5599b34a8e74ba9356b97630d9d2d) 為準。\n\n| 已確認事實 | 工程含義 |\n|---|---|\n| AX Serving 明確定位為 runtime-neutral gateway／fleet control plane；runtime 擁有 tokenization、batching、KV、speculation 與 kernel | 語意決策可加入 Serving，但不可把 execution 內部搬上來。[README](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/README.md) |\n| `RequestProfile` 是有界的 routing metadata；`logical_model` 為必填，目前只從 request 結構推導 vision、tools、structured output 等 capability | 現況不是 task classifier，也沒有 `model: auto` 的 semantic resolution。[request_profile.rs](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/crates/ax-serving-api/src/orchestration/request_profile.rs) · [proxy_handlers.rs](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/crates/ax-serving-api/src/proxy_handlers.rs) |\n| `InferenceAwarePolicy` 在 hard eligibility 後，依 active requests、queue、KV、batch、TTFT、error、missing telemetry 與 jitter 評分 endpoint | 這是 runtime-state-aware placement，不是不同 logical models 間的品質路由。[policy.rs](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/crates/ax-serving-api/src/orchestration/policy.rs) |\n| Agent-aware fabric 的 ADR／PRD 已 accepted，但 status 明列 product implementation not started，S0–S5 全部未開始 | 不可把 approved design 寫成現有能力。[status](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/AGENTIC-INFERENCE-STATUS.md) · [ADR-015](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/adr/ADR-015-AGENT-AWARE-INFERENCE-FABRIC.md) |\n| 整體 architecture 已實作，但 live AX Engine＋CUDA 的 production certification、長時間 soak、goodput 與 tail-latency evidence 仍未完成 | 先證明 control plane 穩定，再疊加 learned policy。[implementation status](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/IMPLEMENTATION-STATUS.md) |\n| AX Engine scheduler 是 pure、deterministic plan；batch 以第一個 request 的 model 為 model，其他 model defer；server 要求 requested model 等於 loaded model | Engine 現在是單一 loaded-model execution runtime，不是 fleet semantic router。[scheduler docs](https://github.com/defai-digital/ax-engine/blob/d1f2598970f5599b34a8e74ba9356b97630d9d2d/docs/SCHEDULER.md) · [validation.rs](https://github.com/defai-digital/ax-engine/blob/d1f2598970f5599b34a8e74ba9356b97630d9d2d/crates/ax-engine-server/src/openai/validation.rs) |\n\n所以「在 existing endpoint picker 前加一層」只對了一半。需要的是一個**獨立、可關閉的 model／strategy resolution stage**：它先把 `auto` 或 typed profile 解成既有的 `logical_model`／pool，然後才交給目前 endpoint picker。它不能偷偷把 `RequestProfile` 變成 prompt parser，也不能跳過原本的 hard eligibility。"
+      },
+      {
+        "id": "architecture_boundary",
+        "type": "markdown",
+        "body": "## 正確分層：Intelligence 提議 typed policy，runtime 驗證並執行\n\n```text\nAX Studio / AX Code / AX BI / Agent Harness\n  ├─ task intent、context selection、tools、permissions、workflow\n  ├─ outcome verifier 與 domain ground truth\n  └─ 送出 typed DecisionProfile（不必暴露完整 prompt）\n                         │\n                         ▼\nAX Serving — Adaptive Inference Control Plane\n  ├─ auth、tenant、privacy、budget、capability、SLO hard filters\n  ├─ logical model / deployment-class selection\n  ├─ session affinity、model residency、endpoint placement、failover\n  └─ versioned DecisionRecord、shadow、canary、rollback\n                         │\n                         ▼\nRuntime Agent / Capability Contract\n  ├─ 驗證 capability version\n  ├─ 將 bounded hints 轉成 runtime-native options\n  └─ 回傳 bounded telemetry；不回傳內部可變狀態\n                         │\n                         ▼\nAX Engine / vLLM / SGLang\n  └─ tokenizer、batch、KV、prefix、MTP、n-gram、precision、kernels\n                         │\n                         ▼\nOffline Evaluation Plane\n  └─ join outcomes、replay、calibration、policy training、promotion gates\n```\n\n這個分層有三個重要修正：\n\n1. **AX Serving 選 model／deployment 與 fleet placement；AX Engine 選 Direct／MTP／n-gram 等 execution route。** Serving 可以傳 `workload_class`、latency target 或 expected output size 等有版本 hint，但不能直接控制未經 runtime 驗證的底層 mode。\n2. **Context optimizer、tool scheduler 與 domain verifier 留在 harness。** Dynamo 也採取「harness owns semantic trajectory、serving owns lightweight metadata」的邊界。[NVIDIA Agents](https://docs.nvidia.com/dynamo/user-guides/agents)\n3. **Learning plane 不在 request hot path 自我改寫 production policy。** 它產出固定版本 artifact；Serving 只載入已通過 replay、shadow 與 canary gate 的版本。"
+      },
+      {
+        "id": "seven_directions",
+        "type": "markdown",
+        "body": "## 七個研究方向逐項 review\n\n| 原方向 | 判斷 | 正確 owner | 建議 v1 |\n|---|---|---|---|\n| Intelligent Model Routing | **做，但不是新領域** | AX Serving＋offline eval | 兩級 deployment、hard constraints、quality lower bound、shadow first |\n| Intelligent Context Optimizer | **做成 explicit harness plugin** | Application／agent harness | ranking／dedup／compression 必須保留 evidence IDs，不能在 gateway 靜默改 prompt |\n| Dynamic Precision Planning | **近程降級為 deployment-variant routing** | AX Engine＋model build pipeline | 在已認證的 INT4／FP8／BF16 variants 間選擇；逐 request、逐 layer precision 留作 engine research |\n| Runtime Verification | **拆成 structural 與 semantic** | Runtime 做 schema／parser；harness 做 compile／tests／domain outcome；eval plane 做 judge calibration | 不把「另一個 LLM 說 OK」當真值 |\n| Runtime Memory Intelligence | **做，但只對 exact-compatible state** | Engine 擁有 KV；Serving 做 affinity／placement | exact rendered token prefix、model／adapter／template identity、tenant salt、命中率與隔離證據 |\n| Agent Scheduler | **不要變成通用 planner** | Harness 做 DAG／tool dependencies；Serving 做 priority／admission／placement | 只平行化獨立、無共享狀態的 branches |\n| Cost Intelligence | **最適合 AX Serving** | Serving＋eval plane | hard budget 與 privacy 先 filter，再在可行集合內最佳化品質、延遲、energy、switch cost |\n\n### 三個必須降溫的例子\n\n- **Agent 並非普遍 serial。** AutoGen 預設可並行執行同一輪的多個 tool calls，但官方也要求在 tools 有互相干擾的 side effects，或 agent／team 維護內部狀態時停用並行。[AutoGen docs](https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/agents.html#parallel-tool-calls)\n\n- **相似主題不等於可共享 KV。** vLLM prefix cache 以實際 prompt token blocks 的 hash 查找，並用 per-request `cache_salt` 隔離 trust group。「十個人都問 Linux」不足以安全或正確重用 KV。[vLLM design](https://docs.vllm.ai/en/latest/design/prefix_caching/)\n\n- **Context compression 不能只看 answer accuracy。** 2026 ACL workshop 的受控 ASQA 實驗中，壓縮後 answer correctness 只降 2–4%，但 citation grounding 降 40–50%。這不是所有 workload 的普遍比例，卻足以證明只驗答案會低估 evidence loss。[ACL Anthology](https://aclanthology.org/2026.customnlp4u-1.19/)\n\nDynamic layer-wise precision 確實已有研究，例如 [Any-Precision LLM](https://arxiv.org/abs/2402.10517) 與 [DP-LLM](https://arxiv.org/abs/2508.06041)；但一般 serving 的 online quantization 仍多是在 load time 轉換 weights，且受 scheme、kernel 與 hardware compatibility 約束。[vLLM online quantization](https://docs.vllm.ai/en/stable/features/quantization/online/) 這使它成為 engine／model co-design 題目，而不是 Serving 增加一個 flag 就能完成的功能。"
+      },
+      {
+        "id": "research_wedge",
+        "type": "markdown",
+        "body": "## 建議研究楔子：先做 session／cache placement，再做 hardware-state-aware quality routing\n\n**Milestone A — Agent-aware placement（第一個交付）**\n\n先實作 repo 已接受但尚未開始的 session contract、tenant-scoped session key、soft binding、exact KV events、workload priority 與 benchmark harness。這個題目雖有 Dynamo／AIBrix 競爭，但最靠近 AX 現有 code，且既有 PRD 已提出 100 sessions × 10 turns、p95 next-action latency 至少改善 25% 的 release gate。第一階段的貢獻不是「世界第一」，而是證明這套 contract 能在 Apple Silicon／CUDA 的私有 fleet 上保持 semantic identity、tenant isolation 與 runtime neutrality。[AX agent-aware PRD](https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md)\n\n**Milestone B — Quality-Constrained, Residency-Aware Router（研究主題）**\n\n在 Milestone A 與 production telemetry 穩定後，再加入一個 two-deployment router。它不是只問「3B 還是 27B」，而是把本地部署真正昂貴的 state transition 納入決策：\n\n```text\nstate x = declared task / quality floor / SLO / budget / privacy\n          + required capabilities / session locality\n          + model residency / cold-load time / unified-memory pressure\n          + queue / KV overlap / expected output / recent calibrated outcomes\n\nfeasible actions A(x) = 通過 identity、capability、privacy、budget 的部署 variants\n\na* = argmin_a [ expected monetary cost\n                 + λ1 · expected end-to-end latency\n                 + λ2 · energy / memory pressure\n                 + λ3 · model-load and KV-loss penalty ]\n\nsubject to: lower-confidence-bound(quality | x, a) ≥ quality_floor\n```\n\n這比一般 prompt classifier 更有研究價值，因為 local／hybrid fleet 的 model switch 可能需要卸載 weights、破壞 KV、warm up graph，節省一次便宜 inference 反而讓整個 session 更慢。**AX 的可防守假設應是：把 semantic quality constraint 與 physical residency／continuity cost 聯合建模，能比 semantic-only router 或 load-only picker得到更好的 quality-constrained Pareto frontier。**\n\n這仍是待驗證假設，不是目前已存在的 moat。"
+      },
+      {
+        "id": "contracts",
+        "type": "markdown",
+        "body": "## 最小資料契約：讓決策可解釋、可重播、可回滾\n\n### DecisionProfile v1（caller 提供，Serving 驗證）\n\n- `task_class`：可選、typed、由 trusted harness 宣告；未知時可 abstain。\n- `quality_floor`：對應明確 evaluator／workload，不能是無定義的 `high`。\n- `latency_slo_ms`、`max_cost_microunits`、priority。\n- privacy／data locality／allowed providers／tenant trust domain。\n- required capabilities、minimum context、modalities。\n- opaque session key、expected output band、workload class。\n- explicit model override；既有指定 model 的 API 行為保持不變。\n\n### DecisionPlan v1（Serving 產生）\n\n- selected logical model、deployment class、pool 與 endpoint-selection policy。\n- candidate set 與 hard-filter reason codes。\n- predicted quality／latency／cost、uncertainty 與 abstain／fallback。\n- bounded runtime hints envelope 與 capability version。\n- policy version、feature version、decision timestamp。\n\n### DecisionRecord v1（append-only evidence）\n\n- request／session 的 salted identifiers；預設不記 raw prompt。\n- 所有候選、hard rejection、predictions、chosen action、override 與 failover。\n- observed TTFT、end-to-end time、tokens、queue、KV／prefix、model load、memory、errors。\n- outcome label reference、evaluator version、delayed feedback attribution。\n- replay inputs、policy hash、deployment inventory snapshot。\n\n**重要：hard constraints 與 soft score 必須分開。** Privacy、capability、model identity 與 tenant isolation 不能被較低 cost 抵銷；只有通過 hard filter 的候選才能進入最佳化。"
+      },
+      {
+        "id": "evaluation_design",
+        "type": "markdown",
+        "body": "## Benchmark：先證明 non-inferiority，再談 savings\n\n### 實驗單位與 baselines\n\n第一個 workload 應只選一種可自動驗證的場景，例如 AX Code 的 bounded coding tasks。實驗單位是完整 session／task outcome，不是單一 prompt。候選先限制為一個 small local deployment、一個 large local 或 approved remote escalation deployment。\n\nBaselines 至少包含：\n\n1. caller 固定指定強模型；\n2. caller 固定指定小模型；\n3. 現有 AX endpoint picker（相同 logical model）；\n4. cost-only router；\n5. semantic-only router；\n6. proposed semantic＋residency＋session router；\n7. offline oracle（知道各候選實際 outcome 後的最低成本可行選擇）。\n\n### Primary gates\n\n- **Quality non-inferiority：** 以 execution-verified outcome 為主，報告 lower confidence bound；compile 成功只能算子指標，不能取代 hidden tests／task outcome。\n- **Hard violations：** privacy、capability、identity、tenant isolation 必須為 0；SLO 則報 violation rate 與尾端分布。\n- **Efficiency：** cost per successful task、p50／p95 time-to-next-action、TTFT、total latency、energy 或 memory-hours。\n- **State transition cost：** cold-load rate、model-switch rate、KV-loss tokens、session-affinity hit、prefix reused tokens。\n- **Router quality：** regret against oracle、quality-prediction calibration、coverage／abstain rate、routing overhead。\n- **Operations：** replay success、policy rollback、failover correctness、non-agent regression 與 per-language／task segment drift。\n\n### 推薦 rollout\n\n```text\nobserve only\n  → offline replay\n  → shadow recommendation\n  → canary with fixed policy version\n  → staged promotion\n  → rollback on predeclared gates\n```\n\n不要直接做 production online self-learning。Feedback 可能 delayed、錯配、被 poisoning，且新 policy 會改變資料分布。即使 LiteLLM 與 Dynamo examples 已採 bandit／online learning，也不代表 AX 應跳過 offline evaluation 與 versioned promotion。"
+      },
+      {
+        "id": "verification_limits",
+        "type": "markdown",
+        "body": "## Verification 與 feedback 是最難的科學問題，不是多呼叫一次 LLM\n\nRuntime 很容易量到 latency、queue、memory、KV hit 與 cost；它很難知道回答是否真正正確。Coding 的 compile success、SQL parser success 或 JSON schema validation 是可靠但狹窄的 verifier；一般問答與長期 agent outcome 則需要 domain ground truth、tests、human feedback 或經校準的 judges。\n\n研究也不支持「模型自然知道自己答對沒有」的簡化。2025 年的 *Sample, Scrutinize and Scale* 發現 frontier models 的 out-of-box verification 仍很弱，而跨候選比較能提供更好的 error signal。[paper](https://arxiv.org/abs/2502.01839) NeurIPS 2025 的 Weaver 工作則把 general LM judges 描述為與 oracle verifier 仍有顯著差距，需要組合多個弱 verifier 並校準其可靠性。[paper](https://arxiv.org/abs/2506.18203)\n\n因此 DecisionRecord 必須保存 evaluator version 與 label provenance；quality model 要做 calibration、coverage 與 drift 檢查；無可靠 evaluator 的 task 應 abstain 或維持 caller-selected model。`user retry`、`thumbs up` 與 `compile pass` 都只能是不同強度的 signals，不能混成一個神秘的 confidence 分數。"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## 研究範圍、方法與定義\n\n**截止時間：** 2026-07-15。\n\n**本地範圍：** 靜態檢查 AX Serving commit `318f43d` 與 AX Engine commit `d1f2598` 的 source、README、scheduler／server 文件、canonical PRD、implementation status 與 agent-aware ADR／PRD。沒有修改 production code，也沒有執行 live model benchmark。\n\n**外部範圍：** 優先使用專案官方 documentation／repository 與原始論文；技術能力以主來源交叉核對。競品 heatmap 的 2／1／0 是手動 evidence code：2 表示官方文件將其描述為 current feature；1 表示 partial、limited、beta、experimental 或需 custom integration；0 只表示本次選定主來源未找到。它不衡量 code quality、production maturity、adoption、security 或效能。\n\n**關鍵定義：**\n\n- `semantic model selection`：依 request／session 的內容、難度或 policy 在不同 model／tier／strategy 間選擇，不包含同一 model pool 內純 load balancing。\n- `endpoint placement`：logical model 已決定後，在 eligible workers／endpoints 間依 load、KV、SLO 或 locality 選擇。\n- `execution policy`：runtime 內的 batching、KV、speculation、precision、kernel 等策略。\n- `closed loop`：decision、observation、outcome label、offline evaluation、versioned policy、shadow／canary、promotion／rollback 的完整生命週期；只收 telemetry 不算 closed loop。\n- `production-certified`：有 retained、可重現的 live evidence 與 release gates；code implemented 或 vendor documentation claim 均不等同 certification。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 限制、不確定性與 robustness checks\n\n- **市場變化極快。** LiteLLM Auto Routing 的最早 dev release 就在本報告前一天；任何「沒有人做」的敘述都可能在數週內失效。\n- **官方文件不是獨立驗證。** vLLM Semantic Router 的 production-ready、Dynamo integration 的 4× p50 TTFT improvement 等數字都屬專案方或整合方報告；本報告用它們證明 capability／競爭存在，不把它們當 AX 可直接複製的效能基準。[Dynamo digest](https://docs.nvidia.com/dynamo/dev/digest/agentic-inference)\n- **文件缺席不等於能力不存在。** Heatmap 的 0 僅代表本次 primary-source review 未找到；它刻意不是排名。\n- **AX 設計狀態與 implementation 分離。** Agent-aware ADR 已接受，但 status 明確顯示尚未開始；AX Serving architecture 已實作，但 production certification 未完成。\n- **沒有真實 workload，無法估 savings。** 「一年省 50% GPU」沒有 workload mix、quality floor、model price、switch cost、cache behavior 或 confidence interval，應刪除。\n- **跨產品 telemetry 可能受 privacy 限制。** 只要 Serving 開始看 raw prompt，就會改變目前 bounded metadata、runtime-neutral 與 privacy boundary；應先做 threat model 與 explicit opt-in。\n- **LLM judge 可能造成共同偏誤。** Router 與 verifier 若使用相同 model family，可能一起偏向某些語言、風格或模型；應用 execution ground truth、human audits 與跨 judge sensitivity checks。"
+      },
+      {
+        "id": "roadmap",
+        "type": "markdown",
+        "body": "## 建議路線：四個 gated milestones，而不是一次做 Inference OS\n\n| Milestone | 交付 | 進入下一階段的 gate |\n|---|---|---|\n| 0. Certify the base | 完成 live AX Engine＋CUDA、soak、tail latency、goodput 與 failure evidence | 現有 architecture 達到可重現 production gate |\n| 1. Agent-aware placement | session contract、tenant-scoped affinity、runtime events、priority、benchmark replay | 既有 PRD 的 p95 next-action 改善目標；0 privacy／identity violations；non-agent regression 通過 |\n| 2. Shadow quality router | `model: auto` 或 typed profile、兩級 deployment、DecisionRecord、offline replay | quality non-inferiority；cost／latency Pareto 改善；calibration 與 abstain 可接受 |\n| 3. Canary adaptive policy | fixed version policy、canary、rollback、delayed feedback join | 預先定義的 segment gates 全部通過，無 silent drift |\n| 4. Selective expansion | evidence-preserving context plugin、test-time compute budget、更多 certified variants | 每個新 action 都有 evaluator、capability contract 與獨立 benchmark |\n\n**明確暫緩：** 十多模型全自動 router、online self-modifying production scheduler、逐 layer per-request precision、讓 LLM 直接操作 KV allocator，以及把 tool／MCP／memory／planner 塞入 AX Serving core。\n\n### 對外定位\n\n長期品牌可說：\n\n> **AX Inference OS** — a long-term vision for adaptive private inference.\n\n目前最可信的產品描述是：\n\n> **AX Serving is a privacy-preserving, evidence-driven, agent-aware inference control plane for heterogeneous private AI fleets.**\n\n這個說法有清楚的 owner boundary、可量測的 release gates，也能和 vLLM Semantic Router 的 semantic layer、Dynamo 的 NVIDIA-centric systems layer，以及 SGLang 的 broad gateway layer做出差異。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 下一個決策前必須回答的問題\n\n1. **第一個 workload 是什麼？** 建議只選 AX Code 的 execution-verifiable bounded tasks；如果選一般聊天，quality label 會立刻成為主風險。\n2. **第一個 action set 是什麼？** small local＋large local，還是 local＋cloud？兩者的 privacy、cost 與 residency model 完全不同。\n3. **誰可以宣告 task／quality metadata？** 只信任 AX apps，還是允許任意 OpenAI-compatible client？需要 schema、authz 與 anti-gaming policy。\n4. **Serving 是否允許讀 raw prompt？** 若答案是否定，第一版 router 應完全依 typed caller metadata；若答案肯定，必須先更新 privacy boundary 與 threat model。\n5. **quality floor 如何定義？** 每個 task class 要有 evaluator、label latency、confidence interval 與 abstain policy。\n6. **model switch 的真實成本是多少？** 必須量 model load、graph warm-up、KV loss、unified-memory pressure 與 session migration，不能用 parameter count 代替。\n7. **哪一項是論文貢獻，哪一項是產品工程？** 最有希望的研究主張是 semantic quality constraint 與 physical residency／continuity cost 的聯合最佳化；API gateway feature list 本身不構成 moat。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-15T06:12:30Z",
+    "status": "ready",
+    "datasets": {
+      "oss_capability_matrix": [
+        {
+          "project": "vLLM Semantic Router",
+          "semantic_selection": 2,
+          "runtime_state": 1,
+          "agent_session": 2,
+          "feedback_evaluation": 1,
+          "policy_lifecycle": 2,
+          "context_safety": 2,
+          "heterogeneous_control": 2,
+          "evidence_note": "current docs; feedback learning remains incomplete",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "NVIDIA Dynamo",
+          "semantic_selection": 1,
+          "runtime_state": 2,
+          "agent_session": 2,
+          "feedback_evaluation": 1,
+          "policy_lifecycle": 1,
+          "context_safety": 0,
+          "heterogeneous_control": 2,
+          "evidence_note": "semantic selection is custom; agent and KV controls are documented",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "SGLang Model Gateway",
+          "semantic_selection": 0,
+          "runtime_state": 2,
+          "agent_session": 2,
+          "feedback_evaluation": 0,
+          "policy_lifecycle": 0,
+          "context_safety": 2,
+          "heterogeneous_control": 1,
+          "evidence_note": "broad gateway boundary; no quality-constrained semantic selector found",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "LiteLLM Auto/Adaptive",
+          "semantic_selection": 2,
+          "runtime_state": 1,
+          "agent_session": 1,
+          "feedback_evaluation": 1,
+          "policy_lifecycle": 0,
+          "context_safety": 1,
+          "heterogeneous_control": 2,
+          "evidence_note": "auto routing released in dev on 2026-07-14; adaptive components are beta",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "TensorZero",
+          "semantic_selection": 0,
+          "runtime_state": 0,
+          "agent_session": 1,
+          "feedback_evaluation": 2,
+          "policy_lifecycle": 2,
+          "context_safety": 0,
+          "heterogeneous_control": 2,
+          "evidence_note": "strong feedback, evaluation and experimentation; not a KV-aware fleet router",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "AIBrix",
+          "semantic_selection": 0,
+          "runtime_state": 2,
+          "agent_session": 1,
+          "feedback_evaluation": 0,
+          "policy_lifecycle": 0,
+          "context_safety": 0,
+          "heterogeneous_control": 1,
+          "evidence_note": "Kubernetes and vLLM-centric; heterogeneous GPU support is experimental",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "RouteLLM",
+          "semantic_selection": 2,
+          "runtime_state": 0,
+          "agent_session": 0,
+          "feedback_evaluation": 2,
+          "policy_lifecycle": 0,
+          "context_safety": 0,
+          "heterogeneous_control": 1,
+          "evidence_note": "two-model research router with preference-data evaluation",
+          "reviewed_on": "2026-07-15"
+        },
+        {
+          "project": "AX Serving current",
+          "semantic_selection": 0,
+          "runtime_state": 2,
+          "agent_session": 0,
+          "feedback_evaluation": 0,
+          "policy_lifecycle": 0,
+          "context_safety": 0,
+          "heterogeneous_control": 2,
+          "evidence_note": "runtime-neutral endpoint placement exists; agent-aware product work not started",
+          "reviewed_on": "2026-07-15"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "capability_matrix_method",
+      "label": "官方文件能力矩陣（手動證據編碼）",
+      "query": {
+        "engine": "ANSI SQL VALUES",
+        "language": "sql",
+        "executed_at": "2026-07-15T05:02:02Z",
+        "description": "將本報告列出的官方專案文件手動編碼為 0／1／2；用途是證明能力已分散存在，不是成熟度排名。",
+        "filters": [
+          "只使用專案官方文件、官方 repository 或原始論文",
+          "觀察截止日為 2026-07-15",
+          "不把 roadmap 當作目前功能",
+          "不把文件宣稱當作獨立效能驗證"
+        ],
+        "metric_definitions": [
+          "2＝官方文件描述為目前功能",
+          "1＝部分、有限、beta、experimental 或需客製",
+          "0＝本次選定主來源未找到；不代表絕對不存在"
+        ],
+        "tables_used": [
+          "vLLM Semantic Router v0.3 Themis release documentation",
+          "NVIDIA Dynamo 1.2 agent and KV router documentation",
+          "SGLang Model Gateway documentation",
+          "LiteLLM Auto Routing and Adaptive Router documentation",
+          "TensorZero feedback and experimentation documentation",
+          "AIBrix Router documentation",
+          "RouteLLM repository and paper",
+          "AX Serving commit 318f43d source and status documents"
+        ],
+        "sql": "SELECT * FROM (VALUES\n  ('vLLM Semantic Router', 2, 1, 2, 1, 2, 2, 2, 'current docs; feedback learning remains incomplete'),\n  ('NVIDIA Dynamo', 1, 2, 2, 1, 1, 0, 2, 'semantic selection is custom; agent and KV controls are documented'),\n  ('SGLang Model Gateway', 0, 2, 2, 0, 0, 2, 1, 'broad gateway boundary; no quality-constrained semantic selector found'),\n  ('LiteLLM Auto/Adaptive', 2, 1, 1, 1, 0, 1, 2, 'auto routing released in dev on 2026-07-14; adaptive components are beta'),\n  ('TensorZero', 0, 0, 1, 2, 2, 0, 2, 'strong feedback, evaluation and experimentation; not a KV-aware fleet router'),\n  ('AIBrix', 0, 2, 1, 0, 0, 0, 1, 'Kubernetes and vLLM-centric; heterogeneous GPU support is experimental'),\n  ('RouteLLM', 2, 0, 0, 2, 0, 0, 1, 'two-model research router with preference-data evaluation'),\n  ('AX Serving current', 0, 2, 0, 0, 0, 0, 2, 'runtime-neutral endpoint placement exists; agent-aware product work not started')\n) AS evidence(project, semantic_selection, runtime_state, agent_session, feedback_evaluation, policy_lifecycle, context_safety, heterogeneous_control, evidence_note)"
+      }
+    },
+    {
+      "id": "ax_serving_boundary",
+      "label": "AX Serving README at commit 318f43d",
+      "href": "https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/README.md"
+    },
+    {
+      "id": "ax_serving_status",
+      "label": "AX Serving implementation status at commit 318f43d",
+      "href": "https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/IMPLEMENTATION-STATUS.md"
+    },
+    {
+      "id": "ax_serving_profile",
+      "label": "AX Serving RequestProfile source",
+      "href": "https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/crates/ax-serving-api/src/orchestration/request_profile.rs"
+    },
+    {
+      "id": "ax_serving_policy",
+      "label": "AX Serving endpoint policy source",
+      "href": "https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/crates/ax-serving-api/src/orchestration/policy.rs"
+    },
+    {
+      "id": "ax_agent_design",
+      "label": "AX Serving agent-aware status and ADR",
+      "href": "https://github.com/defai-digital/ax-serving/blob/318f43d9d5ddc44c2856b81a53a9504180ee2d68/.internal/AGENTIC-INFERENCE-STATUS.md"
+    },
+    {
+      "id": "ax_engine_scheduler",
+      "label": "AX Engine scheduler documentation at commit d1f2598",
+      "href": "https://github.com/defai-digital/ax-engine/blob/d1f2598970f5599b34a8e74ba9356b97630d9d2d/docs/SCHEDULER.md"
+    },
+    {
+      "id": "ax_engine_server",
+      "label": "AX Engine server model validation",
+      "href": "https://github.com/defai-digital/ax-engine/blob/d1f2598970f5599b34a8e74ba9356b97630d9d2d/crates/ax-engine-server/src/openai/validation.rs"
+    },
+    {
+      "id": "vllm_semantic_router",
+      "label": "vLLM Semantic Router v0.3 Themis",
+      "href": "https://vllm.ai/blog/2026-06-05-v0.3-vllm-sr-themis-release"
+    },
+    {
+      "id": "nvidia_dynamo_agents",
+      "label": "NVIDIA Dynamo Agents documentation",
+      "href": "https://docs.nvidia.com/dynamo/user-guides/agents"
+    },
+    {
+      "id": "nvidia_dynamo_router",
+      "label": "NVIDIA Dynamo KV Router documentation",
+      "href": "https://docs.nvidia.com/dynamo/latest/user-guides/kv-cache-aware-routing"
+    },
+    {
+      "id": "sglang_gateway",
+      "label": "SGLang Model Gateway documentation",
+      "href": "https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/sgl_model_gateway.md"
+    },
+    {
+      "id": "litellm_auto",
+      "label": "LiteLLM Auto Routing documentation",
+      "href": "https://docs.litellm.ai/docs/proxy/auto_routing"
+    },
+    {
+      "id": "routellm",
+      "label": "RouteLLM paper",
+      "href": "https://arxiv.org/abs/2406.18665"
+    },
+    {
+      "id": "tensorzero_feedback",
+      "label": "TensorZero metrics and feedback documentation",
+      "href": "https://www.tensorzero.com/docs/gateway/guides/metrics-feedback/"
+    },
+    {
+      "id": "aibrix_router",
+      "label": "AIBrix Router documentation",
+      "href": "https://aibrix.readthedocs.io/latest/designs/aibrix-router.html"
+    },
+    {
+      "id": "test_time_compute",
+      "label": "ICLR 2025 test-time compute paper",
+      "href": "https://proceedings.iclr.cc/paper_files/paper/2025/hash/1b623663fd9b874366f3ce019fdfdd44-Abstract-Conference.html"
+    },
+    {
+      "id": "vllm_prefix_cache",
+      "label": "vLLM prefix caching design",
+      "href": "https://docs.vllm.ai/en/latest/design/prefix_caching/"
+    },
+    {
+      "id": "compression_grounding",
+      "label": "ACL 2026 evidence-aware prompt compression study",
+      "href": "https://aclanthology.org/2026.customnlp4u-1.19/"
+    },
+    {
+      "id": "verification_search",
+      "label": "Sample, Scrutinize and Scale",
+      "href": "https://arxiv.org/abs/2502.01839"
+    },
+    {
+      "id": "autogen_parallel",
+      "label": "AutoGen parallel tool call documentation",
+      "href": "https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/agents.html#parallel-tool-calls"
+    },
+    {
+      "id": "dynamic_precision",
+      "label": "DP-LLM dynamic layer-wise precision research",
+      "href": "https://arxiv.org/abs/2508.06041"
+    },
+    {
+      "id": "aws_bedrock_prompt_routing",
+      "label": "Amazon Bedrock intelligent prompt routing documentation",
+      "href": "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-routing.html"
+    },
+    {
+      "id": "microsoft_foundry_model_router",
+      "label": "Microsoft Foundry model router documentation",
+      "href": "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-router"
+    },
+    {
+      "id": "microsoft_model_routing_guidance",
+      "label": "Azure Architecture Center model routing guidance",
+      "href": "https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/choose-ai-model"
+    },
+    {
+      "id": "nvidia_dynamo_agentic_digest",
+      "label": "NVIDIA Dynamo full-stack agentic inference digest",
+      "href": "https://docs.nvidia.com/dynamo/dev/digest/agentic-inference"
+    }
+  ]
+}

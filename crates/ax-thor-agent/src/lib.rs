@@ -210,6 +210,7 @@ mod tests {
             worker_pool: None,
             node_class: "thor".into(),
             hardware_class: "thor".into(),
+            execution_domain: None,
             friendly_name: None,
             chip_model: None,
             shutdown_timeout_secs: None,

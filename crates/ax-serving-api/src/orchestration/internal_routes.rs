@@ -174,10 +174,12 @@ fn parse_worker_id(registry: &WorkerRegistry, id_str: &str) -> Result<WorkerId, 
 fn gateway_protocol_capabilities() -> BTreeSet<ProtocolCapability> {
     [
         ProtocolCapability::CONTROL_DRAIN,
+        ProtocolCapability::CONTROL_EXECUTION_DOMAIN,
         ProtocolCapability::CONTROL_INVENTORY_DELTA,
         ProtocolCapability::DISPATCH_CANCEL,
         ProtocolCapability::DISPATCH_TYPED_ADMISSION,
         ProtocolCapability::TELEMETRY_CAPACITY,
+        ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY,
         ProtocolCapability::TELEMETRY_KV_CACHE,
         ProtocolCapability::TELEMETRY_PREFIX_CACHE,
     ]
@@ -422,6 +424,11 @@ async fn handle_protocol_register(
     if let Err(error) = validate_observation_age(request.observation.observed_at) {
         return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
     }
+    if let Some(observation) = &request.domain_observation
+        && let Err(error) = validate_observation_age(observation.observed_at)
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
+    }
     let capabilities = gateway_protocol_capabilities();
     let negotiated = match negotiate_protocol(
         &request.protocol,
@@ -507,6 +514,11 @@ async fn handle_heartbeat(
             }
         };
         if let Err(error) = validate_observation_age(request.observed_at) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
+        }
+        if let Some(observation) = &request.domain_observation
+            && let Err(error) = validate_observation_age(observation.observed_at)
+        {
             return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
         }
         let lease_token = headers
@@ -877,6 +889,186 @@ mod tests {
                 "capacity": {"active_requests": 0, "max_concurrent_requests": 8}
             }
         })
+    }
+
+    fn protocol_domain_registration() -> serde_json::Value {
+        let mut value = protocol_registration();
+        value["protocol"]["version"]["minor"] = serde_json::json!(1);
+        value["protocol"]["capabilities"] = serde_json::json!([
+            "control.drain",
+            "control.execution-domain.v1",
+            "dispatch.typed-admission",
+            "telemetry.capacity",
+            "telemetry.domain-capacity.v1"
+        ]);
+        value["agent"]["name"] = serde_json::json!("ax-dynamo-adapter");
+        value["worker"]["id"] = serde_json::json!("dynamo-pc-adapter-1");
+        value["worker"]["pool_id"] = serde_json::json!("nvidia-pc");
+        value["worker"]["trust_domain"] = serde_json::json!("private-dc");
+        value["runtime"]["kind"] = serde_json::json!("dynamo");
+        value["runtime"]["version"] = serde_json::json!("1.2.1");
+        value["hardware"]["platform"] = serde_json::json!("linux");
+        value["hardware"]["accelerator"] = serde_json::json!("nvidia-cuda");
+        value["hardware"]["hardware_class"] = serde_json::json!("nvidia-pc-cuda");
+        value["observation"]["models"][0]["identity"]["runtime_kind"] = serde_json::json!("dynamo");
+        value["observation"]["models"][0]["identity"]["runtime_version"] =
+            serde_json::json!("1.2.1");
+        value["domain"] = serde_json::json!({
+            "id": "nvidia-pc-main",
+            "kind": "nvidia_dynamo_pc",
+            "endpoint_scope": "domain",
+            "execution_owner": "dynamo",
+            "qualification": "certified",
+            "pool_id": "nvidia-pc",
+            "trust_domain": "private-dc",
+            "hardware_class": "nvidia-pc-cuda",
+            "architecture": "x86_64",
+            "compatibility_manifest": format!("sha256:{}", "a".repeat(64)),
+            "labels": {"zone": "dc-a"}
+        });
+        value["domain_observation"] = serde_json::json!({
+            "observed_at": current_rfc3339(),
+            "generation": 1,
+            "ready": true,
+            "state": "ready",
+            "frontend_instances_ready": 2,
+            "aggregate_capacity": {
+                "active_requests": 0,
+                "max_concurrent_requests": 8
+            },
+            "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+            "models": value["observation"]["models"].clone()
+        });
+        value
+    }
+
+    #[tokio::test]
+    async fn protocol_v1_1_domain_registration_and_observation_are_visible() {
+        let state = test_state();
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        protocol_domain_registration().to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registration: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let heartbeat = serde_json::json!({
+            "registration_id": registration["registration_id"],
+            "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+            "sequence": 1,
+            "observed_at": current_rfc3339(),
+            "runtime": {"ready": true, "state": "ready"},
+            "inventory_generation": 1,
+            "domain_observation": {
+                "observed_at": current_rfc3339(),
+                "generation": 2,
+                "ready": true,
+                "state": "degraded",
+                "reason_code": "capacity_reduced",
+                "frontend_instances_ready": 1,
+                "aggregate_capacity": {
+                    "active_requests": 3,
+                    "max_concurrent_requests": 8
+                },
+                "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+                "models": protocol_domain_registration()["observation"]["models"].clone()
+            }
+        });
+        let heartbeat_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/dynamo-pc-adapter-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(
+                        LEASE_TOKEN_HEADER,
+                        registration["lease_token"].as_str().unwrap(),
+                    )
+                    .body(axum::body::Body::from(heartbeat.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+
+        let missing_domain_observation = serde_json::json!({
+            "registration_id": registration["registration_id"],
+            "instance_id": "627f7e26-348f-4fe6-b9b4-cce6785d17ea",
+            "sequence": 2,
+            "observed_at": current_rfc3339(),
+            "runtime": {"ready": true, "state": "ready"},
+            "inventory_generation": 1
+        });
+        let missing_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/dynamo-pc-adapter-1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header(
+                        LEASE_TOKEN_HEADER,
+                        registration["lease_token"].as_str().unwrap(),
+                    )
+                    .body(axum::body::Body::from(
+                        missing_domain_observation.to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let id = state
+            .registry
+            .resolve_worker_id("dynamo-pc-adapter-1")
+            .unwrap();
+        let snapshot = state.registry.get_snapshot(id).unwrap();
+        assert_eq!(
+            snapshot.domain.as_ref().map(|domain| domain.id.as_str()),
+            Some("nvidia-pc-main")
+        );
+        assert_eq!(
+            snapshot
+                .domain_observation
+                .as_ref()
+                .map(|observation| observation.generation),
+            Some(2)
+        );
+        assert_eq!(snapshot.active_sequences, 3);
+    }
+
+    #[tokio::test]
+    async fn domain_descriptor_without_v1_1_capability_is_rejected() {
+        let mut registration = protocol_domain_registration();
+        registration["protocol"]["capabilities"] = serde_json::json!(["telemetry.capacity"]);
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(registration.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

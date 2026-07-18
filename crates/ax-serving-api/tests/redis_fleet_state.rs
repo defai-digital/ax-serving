@@ -14,6 +14,7 @@ fn deployment() -> DeploymentSpec {
         id: DeploymentId::new("redis-deployment").unwrap(),
         logical_model: LogicalModelId::new("public/redis").unwrap(),
         pool: PoolId::new("redis-pool").unwrap(),
+        domain: None,
         runtime_model_id: RuntimeModelId::new("runtime/redis").unwrap(),
         equivalence_class: None,
         expected_identity: None,

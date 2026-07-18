@@ -134,9 +134,10 @@ effective precision whenever they differ.
 
 For AX Serving, report separately:
 
-1. direct runtime baseline;
-2. the same endpoint through gateway and agent;
-3. a mixed AX Engine/CUDA fleet under normal and fault conditions.
+1. direct AX Engine or Dynamo-domain baseline;
+2. the same Mac endpoint or Dynamo frontend through its adapter and AX gateway;
+3. a mixed Mac/PC/Thor domain fleet under normal, saturation, drain, and fault conditions;
+4. domain-policy value and correctness against an explicit/single-domain baseline.
 
-Do not compare AX Serving's routing layer with vLLM's token engine as though
-they perform the same work.
+Do not compare AX Serving's federation layer with Dynamo's worker router or a backend token engine
+as though they perform the same work. PC and Thor results require separate manifests and reports.

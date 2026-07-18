@@ -314,6 +314,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/v1/admin/startup-report", get(proxy_admin_startup_report))
         .route("/v1/admin/diagnostics", get(proxy_admin_diagnostics))
         .route("/v1/admin/audit", get(proxy_admin_audit))
+        .route("/v1/admin/decisions", get(proxy_admin_decisions))
         .route("/v1/admin/policy", get(proxy_admin_policy))
         .route("/v1/admin/fleet", get(proxy_admin_fleet))
         .route("/v1/admin/deployments", get(proxy_admin_deployments))
@@ -709,11 +710,10 @@ pub async fn start_orchestrator(
                             ops.shutdown.propagation_ms,
                         ))
                         .await;
-                        let drain_budget =
-                            std::time::Duration::from_secs(ops.shutdown.drain_secs);
-                        let hard_remaining =
-                            ops.shutdown
-                                .remaining_until_hard(shutdown_started, std::time::Instant::now());
+                        let drain_budget = std::time::Duration::from_secs(ops.shutdown.drain_secs);
+                        let hard_remaining = ops
+                            .shutdown
+                            .remaining_until_hard(shutdown_started, std::time::Instant::now());
                         let drain_cap = drain_budget.min(hard_remaining);
                         let drain_deadline = std::time::Instant::now() + drain_cap;
                         while ops.inflight() > 0 && std::time::Instant::now() < drain_deadline {

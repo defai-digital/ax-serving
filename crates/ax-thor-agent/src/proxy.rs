@@ -240,6 +240,9 @@ fn should_forward_runtime_header(name: &HeaderName, include_content_length: bool
             | "x-ax-admission-state"
             | "x-ax-attempt-id"
             | "x-ax-dispatch-token"
+            | "x-ax-deployment-id"
+            | "x-ax-domain-id"
+            | "x-ax-pool-id"
     ) && (include_content_length || name != header::CONTENT_LENGTH.as_str())
 }
 
@@ -718,9 +721,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_cannot_forge_internal_admission_header() {
-        let name = axum::http::HeaderName::from_static("x-ax-admission-state");
-        assert!(!should_forward_runtime_header(&name, true));
+    fn runtime_cannot_forge_internal_control_headers() {
+        for header in [
+            "x-ax-admission-state",
+            "x-ax-attempt-id",
+            "x-ax-deployment-id",
+            "x-ax-domain-id",
+            "x-ax-pool-id",
+        ] {
+            let name = axum::http::HeaderName::from_static(header);
+            assert!(!should_forward_runtime_header(&name, true));
+        }
     }
 
     #[test]

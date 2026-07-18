@@ -5,7 +5,8 @@ use std::sync::{
 
 use anyhow::{Context, Result};
 use ax_serving_protocol::{
-    AgentDescriptor, CapacityObservation, DeploymentIdentity, HardwareDescriptor,
+    AgentDescriptor, CapacityObservation, DeploymentIdentity, DomainObservation, EndpointScope,
+    ExecutionDomainDescriptor, ExecutionDomainKind, HardwareDescriptor,
     HeartbeatRequest as ProtocolHeartbeatRequest, HeartbeatResponse as ProtocolHeartbeatResponse,
     LeaseToken, Operation, PoolId, ProtocolCapability, ProtocolDescriptor, RegisterWorkerRequest,
     RegisterWorkerResponse, RegistrationId, RuntimeDescriptor, RuntimeModelDescriptor,
@@ -188,8 +189,28 @@ fn registration_body(
         labels.insert("chip_model".into(), chip_model.clone());
     }
 
+    let observed_at = time::OffsetDateTime::now_utc();
+    let runtime_status = RuntimeStatus::ready();
+    let capacity = CapacityObservation {
+        active_requests: Some(0),
+        max_concurrent_requests: Some(config.max_inflight as u64),
+        ..Default::default()
+    };
+    let domain = execution_domain_descriptor(config, &pool, &trust_domain)?;
+    let domain_observation = domain.as_ref().map(|descriptor| DomainObservation {
+        observed_at,
+        generation: 1,
+        ready: runtime_status.ready,
+        state: runtime_status.state,
+        reason_code: runtime_status.reason_code.clone(),
+        frontend_instances_ready: Some(1),
+        aggregate_capacity: Some(capacity.clone()),
+        manifest_digest: descriptor.compatibility_manifest.clone(),
+        models: runtime_models.clone(),
+    });
+
     Ok(RegisterWorkerRequest {
-        protocol: ProtocolDescriptor::current(protocol_capabilities()),
+        protocol: ProtocolDescriptor::current(protocol_capabilities(domain.is_some())),
         agent: AgentDescriptor {
             name: "ax-runtime-agent".into(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -215,22 +236,20 @@ fn registration_body(
             memory_bytes: None,
             hardware_class: Some(config.hardware_class.clone()),
         },
+        domain,
+        domain_observation,
         observation: RuntimeObservation {
-            observed_at: time::OffsetDateTime::now_utc(),
-            runtime: RuntimeStatus::ready(),
+            observed_at,
+            runtime: runtime_status,
             inventory_generation: 1,
             models: runtime_models,
-            capacity: Some(CapacityObservation {
-                active_requests: Some(0),
-                max_concurrent_requests: Some(config.max_inflight as u64),
-                ..Default::default()
-            }),
+            capacity: Some(capacity),
         },
     })
 }
 
-fn protocol_capabilities() -> Vec<ProtocolCapability> {
-    [
+fn protocol_capabilities(domain_enabled: bool) -> Vec<ProtocolCapability> {
+    let mut capabilities = vec![
         ProtocolCapability::CONTROL_DRAIN,
         ProtocolCapability::CONTROL_INVENTORY_DELTA,
         ProtocolCapability::DISPATCH_CANCEL,
@@ -238,10 +257,58 @@ fn protocol_capabilities() -> Vec<ProtocolCapability> {
         ProtocolCapability::TELEMETRY_CAPACITY,
         ProtocolCapability::TELEMETRY_KV_CACHE,
         ProtocolCapability::TELEMETRY_PREFIX_CACHE,
-    ]
-    .into_iter()
-    .map(|capability| ProtocolCapability::new(capability).expect("static protocol capability"))
-    .collect()
+    ];
+    if domain_enabled {
+        capabilities.push(ProtocolCapability::CONTROL_EXECUTION_DOMAIN);
+        capabilities.push(ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY);
+    }
+    capabilities
+        .into_iter()
+        .map(|capability| ProtocolCapability::new(capability).expect("static protocol capability"))
+        .collect()
+}
+
+fn execution_domain_descriptor(
+    config: &ThorConfig,
+    pool: &PoolId,
+    trust_domain: &TrustDomainId,
+) -> Result<Option<ExecutionDomainDescriptor>> {
+    let Some(domain) = config.execution_domain.as_ref() else {
+        return Ok(None);
+    };
+    let runtime_kind = normalize_runtime_kind(&config.runtime);
+    let (kind, execution_owner) = if runtime_kind == "ax_engine" {
+        (ExecutionDomainKind::MacAxEngine, "ax_engine".to_string())
+    } else {
+        (
+            ExecutionDomainKind::CompatibilityRuntimeEndpoint,
+            runtime_kind,
+        )
+    };
+    let descriptor = ExecutionDomainDescriptor {
+        id: domain.id.clone(),
+        kind,
+        endpoint_scope: EndpointScope::Node,
+        execution_owner,
+        qualification: domain.qualification,
+        pool_id: pool.clone(),
+        trust_domain: trust_domain.clone(),
+        hardware_class: config.hardware_class.clone(),
+        architecture: normalized_architecture().into(),
+        compatibility_manifest: domain.compatibility_manifest.clone(),
+        labels: Default::default(),
+    };
+    descriptor
+        .validate()
+        .context("invalid protocol-v1.1 execution-domain descriptor")?;
+    Ok(Some(descriptor))
+}
+
+fn normalized_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        architecture => architecture,
+    }
 }
 
 fn protocol_model_descriptor(
@@ -436,19 +503,36 @@ pub async fn heartbeat_loop(
             observation_window_ms: None,
         };
         let sequence = session.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let observed_at = time::OffsetDateTime::now_utc();
+        let runtime_status = if runtime_ready {
+            RuntimeStatus::ready()
+        } else {
+            RuntimeStatus::unavailable(runtime_status_reason.unwrap_or("runtime_unavailable"))
+        };
+        let domain_observation = config
+            .execution_domain
+            .as_ref()
+            .map(|domain| DomainObservation {
+                observed_at,
+                generation: sequence,
+                ready: runtime_status.ready,
+                state: runtime_status.state,
+                reason_code: runtime_status.reason_code.clone(),
+                frontend_instances_ready: Some(u32::from(runtime_status.ready)),
+                aggregate_capacity: Some(capacity.clone()),
+                manifest_digest: domain.compatibility_manifest.clone(),
+                models: runtime_models.clone(),
+            });
         let body = ProtocolHeartbeatRequest {
             registration_id: session.registration_id,
             instance_id: session.instance_id,
             sequence,
-            observed_at: time::OffsetDateTime::now_utc(),
-            runtime: if runtime_ready {
-                RuntimeStatus::ready()
-            } else {
-                RuntimeStatus::unavailable(runtime_status_reason.unwrap_or("runtime_unavailable"))
-            },
+            observed_at,
+            runtime: runtime_status,
             inventory_generation,
             models: Some(runtime_models),
             capacity: Some(capacity),
+            domain_observation,
             deployment_jobs: Vec::new(),
         };
 
@@ -638,9 +722,12 @@ mod tests {
         CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout,
         registration_body,
     };
-    use crate::config::ThorConfig;
+    use crate::config::{ExecutionDomainConfig, ThorConfig};
     use crate::sglang::ModelInfo;
-    use ax_serving_protocol::{Operation, WorkerInstanceId};
+    use ax_serving_protocol::{
+        DomainId, ExecutionDomainKind, Operation, ProtocolCapability, QualificationState,
+        WorkerInstanceId,
+    };
 
     fn test_config() -> ThorConfig {
         ThorConfig {
@@ -660,6 +747,7 @@ mod tests {
             worker_pool: None,
             node_class: "thor".into(),
             hardware_class: "thor".into(),
+            execution_domain: None,
             friendly_name: None,
             chip_model: None,
             shutdown_timeout_secs: None,
@@ -683,6 +771,49 @@ mod tests {
             std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
         );
         assert!(control_plane_request_timeout() <= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn registration_body_advertises_only_safe_node_domain_kinds() {
+        let mut config = test_config();
+        config.runtime = "ax_engine".into();
+        config.worker_pool = Some("mac-mlx".into());
+        config.hardware_class = "apple-silicon".into();
+        config.execution_domain = Some(ExecutionDomainConfig {
+            id: DomainId::new("mac-studio-1").unwrap(),
+            qualification: QualificationState::Certified,
+            compatibility_manifest: None,
+        });
+        let models = [ModelInfo {
+            id: "qwen-main".into(),
+            max_model_len: Some(8192),
+            max_output_tokens: Some(2048),
+            quantization: None,
+            artifact_format: None,
+            modalities: Vec::new(),
+            supported_operations: vec!["llm".into()],
+        }];
+
+        let mac = registration_body(&config, &models, WorkerInstanceId::new()).unwrap();
+        assert_eq!(
+            mac.domain.as_ref().map(|domain| domain.kind),
+            Some(ExecutionDomainKind::MacAxEngine)
+        );
+        assert!(
+            mac.domain_observation
+                .as_ref()
+                .is_some_and(|value| value.ready)
+        );
+        assert!(mac.protocol.capabilities.iter().any(|capability| {
+            capability.as_str() == ProtocolCapability::CONTROL_EXECUTION_DOMAIN
+        }));
+
+        config.runtime = "vllm".into();
+        let compatibility = registration_body(&config, &models, WorkerInstanceId::new()).unwrap();
+        assert_eq!(
+            compatibility.domain.as_ref().map(|domain| domain.kind),
+            Some(ExecutionDomainKind::CompatibilityRuntimeEndpoint)
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@
 //! must heartbeat at least once every 5 s or it transitions through
 //! Unhealthy within 10 s and is evicted at 15 s.
 
-use std::collections::BTreeSet;
 use super::worker_endpoint::WorkerEndpoint;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -29,9 +29,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use ax_serving_protocol::{
-    AgentDescriptor, HeartbeatRequest as ProtocolHeartbeatRequest,
-    HeartbeatResponse as ProtocolHeartbeatResponse, LeaseToken, NegotiatedProtocol,
-    ProtocolDescriptor, ProtocolVersion, RegisterWorkerRequest as ProtocolRegisterRequest,
+    AgentDescriptor, DomainObservation, ExecutionDomainDescriptor,
+    HeartbeatRequest as ProtocolHeartbeatRequest, HeartbeatResponse as ProtocolHeartbeatResponse,
+    LeaseToken, NegotiatedProtocol, ProtocolCapability, ProtocolDescriptor, ProtocolVersion,
+    RegisterWorkerRequest as ProtocolRegisterRequest,
     RegisterWorkerResponse as ProtocolRegisterResponse, RegistrationId, RuntimeModelDescriptor,
     WorkerId as ProtocolWorkerId, WorkerInstanceId,
 };
@@ -277,6 +278,10 @@ pub struct WorkerEntry {
     pub registration_id: Option<String>,
     pub trust_domain: Option<String>,
     pub agent_name: Option<String>,
+    /// Protocol-v1.1 execution-domain identity, when this endpoint declares one.
+    pub domain: Option<ExecutionDomainDescriptor>,
+    /// Latest bounded aggregate domain observation.
+    pub domain_observation: Option<DomainObservation>,
     /// Operations the worker supports, e.g. `llm`, `embedding`, `vision`.
     pub supported_operations: Vec<String>,
     supported_operations_explicit: bool,
@@ -604,6 +609,8 @@ pub struct WorkerModelEndpoint {
     pub protocol_worker_id: Option<String>,
     pub worker_instance_id: Option<String>,
     pub registration_id: Option<String>,
+    pub domain: Option<ExecutionDomainDescriptor>,
+    pub domain_observation: Option<DomainObservation>,
     pub model: ModelInventoryEntry,
 }
 
@@ -636,6 +643,10 @@ pub struct WorkerSnapshot {
     pub trust_domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<ExecutionDomainDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_observation: Option<DomainObservation>,
     pub supported_operations: Vec<String>,
     pub max_inflight: usize,
     pub inflight: usize,
@@ -883,6 +894,8 @@ impl WorkerRegistry {
                 existing.registration_id = None;
                 existing.trust_domain = None;
                 existing.agent_name = None;
+                existing.domain = None;
+                existing.domain_observation = None;
                 existing.friendly_name = friendly_name.clone();
                 existing.chip_model = chip_model.clone();
                 existing.worker_pool = worker_pool.clone();
@@ -905,6 +918,8 @@ impl WorkerRegistry {
                 registration_id: None,
                 trust_domain: None,
                 agent_name: None,
+                domain: None,
+                domain_observation: None,
                 supported_operations,
                 supported_operations_explicit: !explicit_supported_operations_empty,
                 max_inflight,
@@ -959,6 +974,9 @@ impl WorkerRegistry {
             .observation
             .validate()
             .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+        request
+            .validate_domain_contract()
+            .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
 
         let registration = request.clone();
         let stable_worker_id = request.worker.id.clone();
@@ -999,10 +1017,7 @@ impl WorkerRegistry {
             hardware_class: request.hardware.hardware_class.clone(),
             runtime_endpoint: None,
             supported_operations: operations,
-            max_inflight: request
-                .observation
-                .capacity
-                .as_ref()
+            max_inflight: effective_registration_capacity(&request)
                 .and_then(|capacity| capacity.max_concurrent_requests)
                 .unwrap_or(1)
                 .min(MAX_WORKER_INFLIGHT as u64) as usize,
@@ -1017,6 +1032,7 @@ impl WorkerRegistry {
 
         let heartbeat = legacy_heartbeat_from_observation(
             &request.observation,
+            effective_registration_capacity(&request),
             negotiated.version,
             &request.agent.version,
         );
@@ -1051,6 +1067,8 @@ impl WorkerRegistry {
             entry.registration_id = Some(registration_id.to_string());
             entry.trust_domain = Some(request.worker.trust_domain.to_string());
             entry.agent_name = Some(request.agent.name);
+            entry.domain = request.domain;
+            entry.domain_observation = request.domain_observation;
         }
 
         Ok(ProtocolRegisterResponse {
@@ -1076,6 +1094,11 @@ impl WorkerRegistry {
         }
         if let Some(capacity) = &request.capacity {
             capacity
+                .validate()
+                .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+        }
+        if let Some(observation) = &request.domain_observation {
+            observation
                 .validate()
                 .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
         }
@@ -1105,6 +1128,42 @@ impl WorkerRegistry {
         if request.sequence == session.last_sequence && session.last_sequence != 0 {
             return Ok(ProtocolHeartbeatResponse::default());
         }
+        if session.registration.domain.is_some() && request.domain_observation.is_none() {
+            return Err(ProtocolRegistryError::InvalidObservation(
+                "registered execution-domain heartbeat omitted its domain observation".into(),
+            ));
+        }
+        if let Some(observation) = &request.domain_observation {
+            let descriptor = session.registration.domain.as_ref().ok_or_else(|| {
+                ProtocolRegistryError::InvalidObservation(
+                    "domain observation has no registered descriptor".into(),
+                )
+            })?;
+            if observation.aggregate_capacity.is_some()
+                && !session.negotiated.capabilities.iter().any(|capability| {
+                    capability.as_str() == ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY
+                })
+            {
+                return Err(ProtocolRegistryError::InvalidObservation(
+                    "domain aggregate capacity was not negotiated".into(),
+                ));
+            }
+            if descriptor.compatibility_manifest != observation.manifest_digest {
+                return Err(ProtocolRegistryError::InvalidObservation(
+                    "domain manifest does not match the registered descriptor".into(),
+                ));
+            }
+            if session
+                .registration
+                .domain_observation
+                .as_ref()
+                .is_some_and(|accepted| observation.generation < accepted.generation)
+            {
+                return Err(ProtocolRegistryError::InvalidObservation(
+                    "domain observation generation moved backwards".into(),
+                ));
+            }
+        }
 
         let inventory_resync = request.models.is_none()
             && request.inventory_generation != session.inventory_generation;
@@ -1125,12 +1184,20 @@ impl WorkerRegistry {
         if !self.heartbeat(session.internal_id, heartbeat) {
             return Err(ProtocolRegistryError::NotRegistered);
         }
+        if let Some(observation) = &request.domain_observation
+            && let Some(mut entry) = self.inner.get_mut(&session.internal_id)
+        {
+            entry.domain_observation = Some(observation.clone());
+        }
 
         session.last_sequence = request.sequence;
         session.registration.observation.observed_at = request.observed_at;
         session.registration.observation.runtime = request.runtime.clone();
         session.registration.observation.capacity = request.capacity.clone();
         session.registration.observation.inventory_generation = request.inventory_generation;
+        if request.domain_observation.is_some() {
+            session.registration.domain_observation = request.domain_observation.clone();
+        }
         if request.models.is_some() {
             session.inventory_generation = request.inventory_generation;
             session.registration.observation.models = request.models.clone().unwrap_or_default();
@@ -1274,6 +1341,10 @@ impl WorkerRegistry {
             .observation
             .validate()
             .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
+        record
+            .registration
+            .validate_domain_contract()
+            .map_err(|error| ProtocolRegistryError::InvalidObservation(error.to_string()))?;
         if record.worker_id != record.registration.worker.id
             || record.instance_id != record.registration.worker.instance_id
         {
@@ -1317,10 +1388,7 @@ impl WorkerRegistry {
                 hardware_class: request.hardware.hardware_class.clone(),
                 runtime_endpoint: None,
                 supported_operations: operations,
-                max_inflight: request
-                    .observation
-                    .capacity
-                    .as_ref()
+                max_inflight: effective_registration_capacity(request)
                     .and_then(|capacity| capacity.max_concurrent_requests)
                     .unwrap_or(1)
                     .min(MAX_WORKER_INFLIGHT as u64) as usize,
@@ -1337,6 +1405,7 @@ impl WorkerRegistry {
             internal_id,
             legacy_heartbeat_from_observation(
                 &request.observation,
+                effective_registration_capacity(request),
                 record.protocol.version,
                 &record.agent.version,
             ),
@@ -1366,6 +1435,8 @@ impl WorkerRegistry {
             entry.registration_id = Some(record.registration_id.to_string());
             entry.trust_domain = Some(request.worker.trust_domain.to_string());
             entry.agent_name = Some(record.agent.name);
+            entry.domain = request.domain.clone();
+            entry.domain_observation = request.domain_observation.clone();
             entry.drain = record.draining;
             entry.last_heartbeat = Instant::now()
                 .checked_sub(shared_age)
@@ -1703,6 +1774,8 @@ impl WorkerRegistry {
                     protocol_worker_id: entry.protocol_worker_id.clone(),
                     worker_instance_id: entry.worker_instance_id.clone(),
                     registration_id: entry.registration_id.clone(),
+                    domain: entry.domain.clone(),
+                    domain_observation: entry.domain_observation.clone(),
                     model: model.clone(),
                 })
             })
@@ -1976,6 +2049,7 @@ fn protocol_supported_operations(models: &[RuntimeModelDescriptor]) -> Vec<Strin
 
 fn legacy_heartbeat_from_observation(
     observation: &ax_serving_protocol::RuntimeObservation,
+    effective_capacity: Option<&ax_serving_protocol::CapacityObservation>,
     protocol_version: ProtocolVersion,
     agent_version: &str,
 ) -> HeartbeatRequest {
@@ -1992,7 +2066,7 @@ fn legacy_heartbeat_from_observation(
         observed_at_unix_ms: offset_datetime_millis(observation.observed_at),
         protocol_version: Some(protocol_version),
         agent_version: Some(agent_version.to_string()),
-        ..legacy_capacity_heartbeat(observation.capacity.as_ref())
+        ..legacy_capacity_heartbeat(effective_capacity)
     }
 }
 
@@ -2014,8 +2088,28 @@ fn legacy_heartbeat_from_protocol(
         observed_at_unix_ms: offset_datetime_millis(request.observed_at),
         protocol_version: Some(protocol_version),
         agent_version: Some(agent_version.to_string()),
-        ..legacy_capacity_heartbeat(request.capacity.as_ref())
+        ..legacy_capacity_heartbeat(effective_heartbeat_capacity(request))
     }
+}
+
+fn effective_registration_capacity(
+    request: &ProtocolRegisterRequest,
+) -> Option<&ax_serving_protocol::CapacityObservation> {
+    request
+        .domain_observation
+        .as_ref()
+        .and_then(|observation| observation.aggregate_capacity.as_ref())
+        .or(request.observation.capacity.as_ref())
+}
+
+fn effective_heartbeat_capacity(
+    request: &ProtocolHeartbeatRequest,
+) -> Option<&ax_serving_protocol::CapacityObservation> {
+    request
+        .domain_observation
+        .as_ref()
+        .and_then(|observation| observation.aggregate_capacity.as_ref())
+        .or(request.capacity.as_ref())
 }
 
 fn legacy_capacity_heartbeat(
@@ -2094,6 +2188,8 @@ fn snapshot_of(e: &WorkerEntry) -> WorkerSnapshot {
         registration_id: e.registration_id.clone(),
         trust_domain: e.trust_domain.clone(),
         agent_name: e.agent_name.clone(),
+        domain: e.domain.clone(),
+        domain_observation: e.domain_observation.clone(),
         supported_operations: e.supported_operations.clone(),
         max_inflight: e.max_inflight,
         inflight,
@@ -2798,10 +2894,7 @@ mod tests {
         );
         let vision_workers = r.eligible_workers_for("vision-model", RequestKind::Vision);
         assert_eq!(vision_workers.len(), 1);
-        assert_eq!(
-            vision_workers[0].addr.to_string(),
-            "http://127.0.0.1:8082"
-        );
+        assert_eq!(vision_workers[0].addr.to_string(), "http://127.0.0.1:8082");
     }
 
     #[test]
