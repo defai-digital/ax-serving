@@ -25,10 +25,11 @@ and equivalence checks, bounded in-memory decision records, streaming/cancellati
 retry, HA fleet state, AX runtime agent, containers, Compose/Kubernetes, and Helm sources are
 implemented. Protocol v1.0 fixtures and endpoint migration behavior remain supported.
 
-The Dynamo Domain Adapter, durable/replayable decision storage, domain-aware HA reservations, and
-live federated certification are not yet implemented. NVIDIA Thor is a target experimental domain,
-not a current support claim. See the [status ledger](.internal/IMPLEMENTATION-STATUS.md) for exact
-evidence and blockers.
+The runtime-SDK-free Dynamo Domain Adapter and immutable compatibility-manifest validation are
+implemented with source/mock conformance tests. Durable/replayable decision storage,
+domain-aware HA reservations, and live federated certification are not yet implemented. NVIDIA
+Thor is a target experimental domain, not a current support claim. See the
+[status ledger](.internal/IMPLEMENTATION-STATUS.md) for exact evidence and blockers.
 
 ## Why AX Serving exists
 
@@ -91,7 +92,8 @@ Build the implemented portable binaries:
 ```bash
 cargo build --release \
   -p ax-serving-cli --bin ax-serving-api \
-  -p ax-thor-agent --bin ax-runtime-agent
+  -p ax-thor-agent --bin ax-runtime-agent \
+  -p ax-dynamo-adapter --bin ax-dynamo-adapter
 ```
 
 Start a development gateway on loopback:
@@ -134,7 +136,9 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
 
 The current agent can also proxy direct vLLM/SGLang endpoints for migration and testing. That path
 is compatibility-only in the final design; it is not the target NVIDIA production architecture.
-The Dynamo Domain Adapter described by the canonical specification does not yet ship.
+For the NVIDIA path, follow the
+[Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) and validate an immutable manifest before
+starting `ax-dynamo-adapter`. Source/mock conformance is not live hardware certification.
 
 For explicit deployment identity, start from
 [`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). It demonstrates explicit
@@ -190,7 +194,7 @@ Loopback development requires `AXS_TLS_PROFILE=loopback_dev` and explicit
 | `AXS_WORKER_TOKEN` | Adapter copy of the control credential |
 | `AXS_DISPATCH_TOKEN` | Gateway-to-adapter inference dispatch |
 | `AXS_RUNTIME_API_KEY` | Mac agent-to-AX Engine authentication |
-| future `AXS_DYNAMO_API_KEY` | Dynamo adapter-to-frontend authentication |
+| `AXS_DYNAMO_API_KEY` | Dynamo adapter-to-frontend authentication |
 | `AXS_REDIS_URL` | Shared AX HA state |
 | `AXS_CACHE_AFFINITY_SECRET` | Tenant-scoped opaque affinity derivation |
 
@@ -205,6 +209,8 @@ Portable checks:
 cargo check -p ax-serving-protocol
 cargo check -p ax-serving-api --no-default-features --features gateway
 cargo check -p ax-serving-cli --no-default-features --features gateway --bin ax-serving-api
+cargo check -p ax-serving-adapter-core
+cargo check -p ax-dynamo-adapter
 cargo check -p ax-thor-agent
 ```
 
@@ -225,7 +231,7 @@ environments. A skipped hardware test is not support evidence.
 - Evaluation: one gateway, in-memory state, loopback or trusted private adapters.
 - HA candidate: two or more gateways, Redis/Valkey, unique gateway IDs, trusted transport, and
   separate credentials.
-- Container targets: `gateway` and `agent` in
+- Container targets: `gateway`, `agent`, and `dynamo-adapter` in
   [packaging/container/Dockerfile](packaging/container/Dockerfile).
 - Compose: [deploy/compose](deploy/compose/README.md).
 - Kubernetes baseline: [deploy/kubernetes](deploy/kubernetes/README.md).
@@ -238,11 +244,14 @@ Dynamo remains a separately pinned and operated execution domain.
 
 - `crates/ax-serving-protocol` — portable worker/deployment/domain protocol v1.1;
 - `crates/ax-serving-api` — gateway, catalog, routing, HA state, lifecycle, REST/SSE;
+- `crates/ax-serving-adapter-core` — byte-preserving OpenAI/SSE adapter transport;
+- `crates/ax-dynamo-adapter` — one runtime-SDK-free endpoint per NVIDIA Dynamo domain;
 - `crates/ax-thor-agent` — current package for the generic `ax-runtime-agent` binary;
 - `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
 - `crates/ax-serving-engine` — embedded compatibility backends, not federation architecture;
 - `crates/ax-serving-bench` — benchmark, regression, and soak runners;
 - `deploy` — Compose, Kubernetes, Helm, monitoring, and alerting;
+- `integrations/nvidia` — optional backend profiles and immutable manifest schema;
 - `.internal` — canonical ADR, PRD, technical specification, and status ledger;
 - `docs` — public contracts, operations, and performance guidance.
 

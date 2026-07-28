@@ -13,7 +13,8 @@ COPY . .
 RUN cargo build --locked --release \
       -p ax-serving-cli --no-default-features --features gateway \
       --bin ax-serving-api --bin ax-servingctl \
-    && cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent
+    && cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent \
+    && cargo build --locked --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
 
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
@@ -35,3 +36,8 @@ FROM runtime-base AS agent
 COPY --from=builder /src/target/release/ax-runtime-agent /usr/local/bin/ax-runtime-agent
 EXPOSE 18081
 ENTRYPOINT ["/usr/local/bin/ax-runtime-agent"]
+
+FROM runtime-base AS dynamo-adapter
+COPY --from=builder /src/target/release/ax-dynamo-adapter /usr/local/bin/ax-dynamo-adapter
+EXPOSE 18082
+ENTRYPOINT ["/usr/local/bin/ax-dynamo-adapter"]

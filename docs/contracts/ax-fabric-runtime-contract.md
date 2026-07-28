@@ -79,9 +79,9 @@ The read API does not imply that every deployment behind an alias is
 equivalent. AX Serving's explicit catalog and equivalence policy enforce that
 internally.
 
-The final execution-domain and Dynamo adapter contract is approved design but not a released
-public contract. AX Fabric continues to use logical models and must not address Dynamo workers,
-PC/Thor pools, or Mac endpoints directly.
+The execution-domain contract and Dynamo adapter now exist as source-level protocol v1.1
+integration, but are not live certified. AX Fabric continues to use logical models and must not
+address Dynamo workers, PC/Thor pools, or Mac endpoints directly.
 
 ## Inference
 

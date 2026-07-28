@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active target boundary |
-| Last updated | 2026-07-15 |
+| Last updated | 2026-07-27 |
 | Authority | [ADR-016](../../.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md) |
 
 ## Product boundary
@@ -40,11 +40,11 @@ AX Serving selects a domain. Dynamo selects NVIDIA workers. AX Engine executes o
 | --- | --- | --- | --- |
 | OpenAI REST/SSE gateway | Portable API/control plane | Keep | Implemented |
 | `ax-serving-protocol` v1.1 | Worker/domain wire contract with v1.0 tolerance | Keep additive within major 1 | Domain foundation implemented; live certification pending |
-| Registry, leases, admission, catalog, equivalence | Domain-aware endpoint control plane | Add certified adapters and full domain policy | Foundation implemented / adapter pending |
+| Registry, leases, admission, catalog, equivalence | Domain-aware endpoint control plane | Add certified adapters and full domain policy | Foundation and adapter source implemented / certification pending |
 | Redis/Valkey state | Worker/deployment HA | Extend with domain/policy records | Implemented / extension pending |
 | `ax-runtime-agent` binary | Generic OpenAI runtime adapter | Mac AX Engine adapter | Implemented; live certification pending |
 | Direct vLLM/SGLang agent modes | CUDA endpoint adapter | Migration/testing compatibility only | Implemented compatibility |
-| Future `ax-dynamo-adapter` | None | One adapter per Dynamo execution domain | Designed, not implemented |
+| `ax-dynamo-adapter` | One runtime-SDK-free endpoint per pinned Dynamo deployment | One adapter per Dynamo execution domain | Source/mock conformance implemented; live certification pending |
 | Future Dynamo lifecycle controller | None | Optional async desired-state bridge | Designed, not implemented |
 | Embedded AX/MLX/llama.cpp backends | Local inference | `embedded-compat` only | Compatibility |
 | `ax.serving.v1` gRPC | Local paths/backend/token IDs | `embedded-compat` only | Compatibility |

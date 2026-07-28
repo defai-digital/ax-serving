@@ -141,7 +141,11 @@ impl ShutdownDeadlines {
     }
 
     /// Remaining time until [`Self::hard_deadline_at`], clamped to zero if already past.
-    pub fn remaining_until_hard(self, shutdown_started_at: Instant, now: Instant) -> std::time::Duration {
+    pub fn remaining_until_hard(
+        self,
+        shutdown_started_at: Instant,
+        now: Instant,
+    ) -> std::time::Duration {
         self.hard_deadline_at(shutdown_started_at)
             .saturating_duration_since(now)
     }
@@ -211,11 +215,7 @@ impl GatewayOperationalState {
         }
     }
 
-    pub fn ready_assessment(
-        &self,
-        now_unix_ms: u64,
-        eligible_workers: usize,
-    ) -> ReadyAssessment {
+    pub fn ready_assessment(&self, now_unix_ms: u64, eligible_workers: usize) -> ReadyAssessment {
         if !self.config_validated.load(Ordering::Relaxed) {
             return ReadyAssessment::not_ready("starting", 1);
         }

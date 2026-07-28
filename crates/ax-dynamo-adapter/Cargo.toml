@@ -1,0 +1,29 @@
+[package]
+name = "ax-dynamo-adapter"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ax-dynamo-adapter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ax-serving-adapter-core = { path = "../ax-serving-adapter-core" }
+ax-serving-observability = { path = "../ax-serving-observability" }
+ax-serving-protocol = { path = "../ax-serving-protocol" }
+axum.workspace = true
+clap.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tower = { version = "0.5", features = ["util"] }

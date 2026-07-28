@@ -108,10 +108,10 @@ pub fn browse_services(
         let wait = remaining.min(Duration::from_millis(200));
         match receiver.recv_timeout(wait) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                if let Some(service) = service_from_resolved(&info) {
-                    if matches_filter(&service, filter) {
-                        found.insert(service.base_url.clone(), service);
-                    }
+                if let Some(service) = service_from_resolved(&info)
+                    && matches_filter(&service, filter)
+                {
+                    found.insert(service.base_url.clone(), service);
                 }
             }
             Ok(ServiceEvent::SearchStopped(_)) => break,
@@ -280,9 +280,7 @@ pub fn prefer_private_v4(addresses: impl IntoIterator<Item = IpAddr>) -> Option<
                 && !v4.is_link_local()
                 && (v4.is_private() || is_shared_v4(*v4) || v4.is_loopback())
         }
-        IpAddr::V6(v6) => {
-            !v6.is_unspecified() && !v6.is_multicast() && !v6.is_unicast_link_local()
-        }
+        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast() && !v6.is_unicast_link_local(),
     })
 }
 
@@ -542,8 +540,18 @@ mod tests {
     #[test]
     fn resolve_base_url_lan_multi_candidate_fail_closed() {
         let candidates = [
-            sample(DiscoveredKind::AxServingGateway, "g1", "http://10.0.0.1:19090", "1"),
-            sample(DiscoveredKind::AxServingGateway, "g2", "http://10.0.0.2:19090", "2"),
+            sample(
+                DiscoveredKind::AxServingGateway,
+                "g1",
+                "http://10.0.0.1:19090",
+                "1",
+            ),
+            sample(
+                DiscoveredKind::AxServingGateway,
+                "g2",
+                "http://10.0.0.2:19090",
+                "2",
+            ),
         ];
         let err = resolve_base_url(
             None,

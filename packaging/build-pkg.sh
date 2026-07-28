@@ -32,6 +32,7 @@ echo "==> Building release binaries…"
 cd "$REPO_ROOT"
 cargo build --release -p ax-serving-cli --features embedded-compat --bins
 cargo build --release -p ax-thor-agent --bins
+cargo build --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
 
 # ── 2. Stage payload ─────────────────────────────────────────────────────────
 echo "==> Staging payload…"
@@ -42,11 +43,15 @@ cp target/release/ax-serving-api "$STAGING/usr/local/bin/"
 cp target/release/ax-servingctl  "$STAGING/usr/local/bin/"
 cp target/release/ax-runtime-agent "$STAGING/usr/local/bin/"
 cp target/release/ax-thor-agent "$STAGING/usr/local/bin/"
+cp target/release/ax-dynamo-adapter "$STAGING/usr/local/bin/"
 
 # Copy default config to /etc/ax-serving (postinstall script can do this too)
 mkdir -p "$STAGING/etc/ax-serving"
 cp config/backends.yaml "$STAGING/etc/ax-serving/"
 cp config/serving.yaml  "$STAGING/etc/ax-serving/"
+cp config/dynamo-adapter.example.env "$STAGING/etc/ax-serving/"
+cp integrations/nvidia/compatibility-manifest.schema.json "$STAGING/etc/ax-serving/"
+cp integrations/nvidia/compatibility-manifest.example.json "$STAGING/etc/ax-serving/"
 
 # Copy release docs and license notices.
 mkdir -p "$STAGING/usr/local/share/doc/ax-serving"

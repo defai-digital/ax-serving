@@ -6,10 +6,10 @@ use ax_serving_protocol::{
 };
 
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8000";
-const DEFAULT_THOR_LISTEN_ADDR: &str = "0.0.0.0:18081";
+const DEFAULT_NODE_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MAX_INFLIGHT: usize = 8;
-const DEFAULT_NODE_CLASS: &str = "thor";
-const DEFAULT_RUNTIME: &str = "vllm";
+const DEFAULT_NODE_CLASS: &str = "mac";
+const DEFAULT_RUNTIME: &str = "ax_engine";
 const DEFAULT_TRUST_DOMAIN: &str = "local";
 const DEFAULT_TLS_PROFILE: &str = "loopback_dev";
 
@@ -329,15 +329,15 @@ pub struct ThorConfig {
     pub execution_domain: Option<ExecutionDomainConfig>,
     pub friendly_name: Option<String>,
     pub chip_model: Option<String>,
-    /// env: `AXS_THOR_SHUTDOWN_TIMEOUT_SECS` (default 30)
+    /// env: `AXS_NODE_SHUTDOWN_TIMEOUT_SECS` (legacy `AXS_THOR_*` aliases remain accepted).
     pub shutdown_timeout_secs: Option<u64>,
-    /// env: `AXS_THOR_MAX_CONTEXT` — max context window advertised to control
+    /// env: `AXS_NODE_MAX_CONTEXT` — max context window advertised to control
     /// plane. If unset, the agent tries to derive it from the runtime.
     pub max_context: Option<u32>,
-    /// env: `AXS_THOR_EMBEDDING` — override embedding capability (true/false).
+    /// env: `AXS_NODE_EMBEDDING` — override embedding capability (true/false).
     /// If unset, the agent derives the capability from runtime model metadata.
     pub embedding: Option<bool>,
-    /// env: `AXS_THOR_VISION` — override vision capability (true/false).
+    /// env: `AXS_NODE_VISION` — override vision capability (true/false).
     /// If unset, the agent derives the capability from runtime model metadata.
     pub vision: Option<bool>,
     /// Operator-supplied semantic model identity. Runtime discovery remains
@@ -407,7 +407,7 @@ impl ThorConfig {
             load_optional_string_env("AXS_RUNTIME_VERSION").unwrap_or_else(|| "unknown".into());
         let listen_addr: SocketAddr =
             load_first_optional_string_env(&["AXS_NODE_LISTEN_ADDR", "AXS_THOR_LISTEN_ADDR"])
-                .unwrap_or_else(|| DEFAULT_THOR_LISTEN_ADDR.into())
+                .unwrap_or_else(|| DEFAULT_NODE_LISTEN_ADDR.into())
                 .parse()
                 .context("invalid AXS_NODE_LISTEN_ADDR or AXS_THOR_LISTEN_ADDR")?;
         let advertised_raw = load_first_optional_string_env(&[
@@ -598,8 +598,8 @@ mod tests {
         let config = ThorConfig::from_env().unwrap();
         assert_eq!(config.listen_addr.to_string(), "0.0.0.0:18081");
         assert_eq!(config.advertised_url, "http://127.0.0.1:18081");
-        assert_eq!(config.runtime, "vllm");
-        assert_eq!(config.hardware_class, "thor");
+        assert_eq!(config.runtime, "ax_engine");
+        assert_eq!(config.hardware_class, "mac");
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 | Field | Value |
 | --- | --- |
-| Snapshot | 2026-07-15 architecture/source review |
+| Snapshot | 2026-07-27 source migration review |
 | Final architecture | Accepted in [ADR-016](adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md) |
-| Product state | Portable gateway and execution-domain source foundation implemented; Dynamo adapter and live federation pending |
+| Product state | Portable gateway, execution-domain foundation, and Dynamo adapter source implemented; live federation pending |
 | Production claim | Blocked until every applicable PRD release and value gate has retained evidence |
 | Canonical requirements | [PRD](prd/PRD-AX-SERVING.md) |
 | Detailed design | [Technical specification](specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md) |
@@ -24,7 +24,7 @@ No lower state implies a higher one.
 | --- | --- | --- | --- |
 | Portable OpenAI REST/SSE gateway | Implemented | Not production qualified | Retain direct-versus-gateway and live mixed-domain evidence. |
 | Runtime-SDK-free dependency boundary | Implemented and CI-checked in prior snapshots | Release evidence pending | Re-run forbidden-dependency checks for every image/release. |
-| Protocol registration/lease/readiness/inventory/drain | Additive protocol v1.1 domain descriptors/observations and tolerant v1.0 fixtures implemented | Live AX/Dynamo federation certification pending | Implement a conforming adapter and run rolling-version/live-domain tests. |
+| Protocol registration/lease/readiness/inventory/drain | Additive protocol v1.1 domain descriptors/observations, tolerant v1.0 fixtures, and a conforming Dynamo adapter implemented | Live AX/Dynamo federation certification pending | Run rolling-version and live-domain tests. |
 | Explicit pools/domains/deployments/equivalence | `DomainSpec`, deployment mapping, PC/Thor separation, and fail-closed domain matching implemented | Cross-domain artifacts pending | Add manifest-backed qualification records and live-domain evidence. |
 | Request profile and hard admission | `DecisionProfileV1` source type and domain filters implemented; authenticated policy inputs are not wired | Production workload limits pending | Add bounded tenant/routing-profile inputs without prompt parsing. |
 | Inference-aware endpoint policy | Existing endpoint scoring plus hard desired/observed domain eligibility implemented | 256-candidate/domain evidence pending | Add a distinct domain-selection stage before Mac endpoint selection. |
@@ -41,8 +41,8 @@ No lower state implies a higher one.
 | --- | --- | --- |
 | Mac -> `ax-runtime-agent` -> AX Engine | Optional v1.1 Mac node-domain advertisement plus explicit catalog and fail-closed v1.0 migration mapping implemented | Live pinned AX Engine/domain certification pending |
 | Direct vLLM/SGLang -> `ax-runtime-agent` | Existing compatibility path implemented | Migration/testing only; not the final NVIDIA production architecture |
-| NVIDIA PC -> Dynamo Domain Adapter -> Dynamo | Designed in ADR/spec | Adapter not implemented; no AX certification |
-| NVIDIA Thor -> separate Dynamo Domain Adapter -> Dynamo | Designed in ADR/spec | Experimental design only; no Dynamo-on-Thor certification |
+| NVIDIA PC -> Dynamo Domain Adapter -> Dynamo | Adapter, manifest validation, aggregate observation, registration, proxy, and source conformance implemented | No live AX certification |
+| NVIDIA Thor -> separate Dynamo Domain Adapter -> Dynamo | Same source adapter with a distinct ARM64 manifest class | Experimental only; no Dynamo-on-Thor certification |
 | Embedded AX/MLX/llama.cpp and gRPC v1 | Existing `embedded-compat` path | Compatibility-only, outside federation product |
 
 The canonical upstream Dynamo repository is
@@ -62,8 +62,12 @@ The reviewed source includes:
 - `crates/ax-serving-api` domain-aware catalog, desired/observed filtering, worker state propagation,
   bounded decision diagnostics, fleet, dispatch, HA state, jobs, and probes;
 - `crates/ax-thor-agent` with the `ax-runtime-agent` binary and OpenAI runtime proxy;
+- `crates/ax-serving-adapter-core` with shared byte-preserving OpenAI/SSE transport;
+- `crates/ax-dynamo-adapter` with immutable-manifest validation, domain observation,
+  registration/lease/drain, and local typed pre-admission;
+- `integrations/nvidia` runtime profiles plus NVIDIA qualification scripts;
 - separate portable gateway and embedded compatibility features;
-- gateway/agent container targets;
+- gateway/agent/Dynamo-adapter container targets;
 - Compose, Kubernetes/Kustomize, first-party Helm, monitoring, and alerting files.
 
 The previous ledger recorded a full local Apple Silicon run of formatting, all-feature Rust
@@ -89,14 +93,24 @@ binary on this host because `libpython3.12.dylib` is absent. Workspace-wide form
 also expose pre-existing drift/lint in files outside this change. These environment/repository
 issues are not counted as D1 passes, and none of the local results are live runtime certification.
 
+### Dynamo adapter source validation (2026-07-27)
+
+- `cargo check -p ax-serving-adapter-core -p ax-thor-agent -p ax-dynamo-adapter`: passed.
+- `cargo test -p ax-serving-adapter-core -p ax-dynamo-adapter --lib`: 38 tests passed.
+- `cargo test -p ax-dynamo-adapter --test conformance`: five tests passed, including body/unknown
+  field preservation, domain fencing, ambiguous `5xx`, fragmented SSE, and not-ready rejection.
+- `cargo test -p ax-thor-agent --lib`: 27 tests passed after extracting the shared adapter core.
+
+These are source/mock results, not a support or hardware-certification claim.
+
 ## Canonical requirement status
 
 | Requirement group | State |
 | --- | --- |
 | API-001 through API-005, API-007 | Current REST/SSE/compatibility behavior implemented; live domain conformance pending. |
-| DOM-001 through DOM-008 | Protocol/catalog/eligibility source foundation implemented; adapter, manifest-backed qualification, HA reservation, and live certification remain. |
+| DOM-001 through DOM-008 | Protocol/catalog/eligibility and adapter source implemented; retained qualification, HA reservation, and live certification remain. |
 | MAC-001 through MAC-005 | Source path implemented; pinned live certification pending. |
-| DYN-001 through DYN-009 | Designed; compatibility manifest and adapter implementation pending. |
+| DYN-001 through DYN-009 | Adapter and compatibility-manifest source implemented; live pinned conformance, deployment graph identity, and retained evidence pending. |
 | MOD-001 through MOD-005 | Logical model/equivalence/domain mapping foundation implemented; compatibility-manifest identity and live equivalence evidence remain. |
 | REQ-001 through REQ-004 | Bounded profile and hard domain admission foundation implemented; authenticated cost/privacy/locality/quality inputs and domain scoring remain. |
 | REQ-005 through REQ-008 | `DecisionRecordV1` and bounded in-memory selected-candidate diagnostics implemented; rejected candidates, durable replay, shadow/canary, and learned-policy controls remain. |
@@ -156,13 +170,12 @@ qualifier.
 
 ## Next implementation milestone
 
-The D1 source foundation now exists. The next product milestone is **D2: NVIDIA PC Dynamo adapter**,
-with a small D1 hardening track in parallel:
+The D1 source foundation and first D2 adapter implementation now exist. The next product milestone
+is **D2 live NVIDIA PC qualification**, with a small D1 hardening track in parallel:
 
-1. Define and verify an immutable Dynamo compatibility manifest before registration becomes ready.
-2. Implement one adapter endpoint representing one pinned Dynamo deployment; never register its
-   internal GPU workers with AX Serving.
-3. Normalize aggregate readiness, inventory, capacity, cancellation, and typed pre-admission.
+1. Produce a complete immutable manifest for one pinned Dynamo deployment and retain its digest.
+2. Run live registration, readiness, inventory, cancellation, fault, and retry-owner conformance.
+3. Verify that aggregate capacity remains conservative without importing Dynamo-internal state.
 4. Begin in shadow inventory mode, then canary one PC/backend/model combination after fault and
    credential-isolation tests.
 5. Complete D1 rejected-candidate evidence, durable decision storage/replay, and domain-keyed HA

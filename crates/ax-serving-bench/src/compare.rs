@@ -259,8 +259,8 @@ fn print_comparison(a: &EndpointResult, b: &EndpointResult) {
     println!(
         "{:<22}  {:>10}  {:>10}  {:>8}  Winner",
         "Metric",
-        &format!("A ({})", a.label),
-        &format!("B ({})", b.label),
+        format!("A ({})", a.label),
+        format!("B ({})", b.label),
         "Delta"
     );
     println!("{}", "-".repeat(70));

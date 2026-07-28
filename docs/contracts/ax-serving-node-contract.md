@@ -5,7 +5,7 @@
 | Status | Protocol v1.1 source foundation; Dynamo adapter certification pending |
 | Wire types | `crates/ax-serving-protocol` |
 | Current version | `1.1` |
-| Last updated | 2026-07-15 |
+| Last updated | 2026-07-27 |
 
 This contract defines how a runtime agent or domain adapter joins the portable AX Serving fleet.
 The Rust protocol crate and its JSON fixtures are authoritative when this
@@ -13,7 +13,7 @@ document and code differ.
 
 Protocol v1.1 extends the v1.0 worker contract additively so a Dynamo deployment can register as one
 execution domain. The types, validation, gateway state propagation, fixtures, and desired-domain
-catalog are implemented; the Dynamo adapter and live certification are not.
+catalog and Dynamo adapter are implemented; live certification is not.
 
 ## 1. Runtime ownership
 
@@ -185,7 +185,7 @@ Those translations are best-effort adapter behavior, not a
 guarantee that every runtime version exports every signal. Pin and test each
 certified runtime image.
 
-The future Dynamo adapter reports only documented aggregate domain telemetry. Dynamo worker costs,
+The Dynamo adapter reports only documented aggregate domain telemetry. Dynamo worker costs,
 KV indexes, KVBM ownership, and NIXL transfer metadata do not enter AX state.
 When `domain_observation.aggregate_capacity` is present, it is authoritative for gateway admission
 and scoring; the generic runtime capacity field is only a fallback. This prevents a domain from
@@ -339,7 +339,7 @@ Current `ax-runtime-agent` registrations advertise the domain capability only wh
 cannot claim a Dynamo domain. `AXS_NODE_DOMAIN_QUALIFICATION` defaults to `unverified`, and an
 optional `AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST` carries the retained manifest digest. Without a
 domain ID, operators can use the explicit Mac/compatibility migration mapping. NVIDIA production
-domains still require the separate adapter, a valid v1.1 descriptor, and a ready aggregate
+domains require the separate adapter, a valid v1.1 descriptor, and a ready aggregate
 observation.
 
 The normative v1.1 types, migration rules, and conformance matrix are in the

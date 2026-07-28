@@ -1571,6 +1571,7 @@ fn default_config_candidates() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
@@ -2141,6 +2142,9 @@ mod tests {
 }
 
 /// Unauthenticated probe for Docker HEALTHCHECK / Compose depends_on.
+// This shared module is compiled into multiple binaries; only ax-servingctl
+// exposes probe and discovery commands.
+#[allow(dead_code)]
 pub fn run_probe(base_url: String, probe: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
@@ -2159,6 +2163,7 @@ pub fn run_probe(base_url: String, probe: &str) -> Result<()> {
 }
 
 /// Browse LAN mDNS advertisements for AX Engine / gateway services.
+#[allow(dead_code)]
 pub fn run_discover(
     role: String,
     cluster: Option<String>,

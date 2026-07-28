@@ -1,0 +1,18 @@
+[package]
+name = "ax-serving-adapter-core"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ax-serving-protocol = { path = "../ax-serving-protocol" }
+axum.workspace = true
+futures.workspace = true
+opentelemetry.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true

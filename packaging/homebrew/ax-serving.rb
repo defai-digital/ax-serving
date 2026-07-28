@@ -32,11 +32,15 @@ class AxServing < Formula
     bin.install "bin/ax-servingctl"
     bin.install "bin/ax-runtime-agent"
     bin.install "bin/ax-thor-agent"
+    bin.install "bin/ax-dynamo-adapter"
 
     # Install default configs to $(brew --prefix)/etc/ax-serving/
     (etc/"ax-serving").mkpath
     etc.install "config/backends.yaml" => "ax-serving/backends.yaml"
     etc.install "config/serving.yaml" => "ax-serving/serving.yaml"
+    etc.install "config/dynamo-adapter.example.env" => "ax-serving/dynamo-adapter.example.env"
+    etc.install "config/compatibility-manifest.schema.json" => "ax-serving/compatibility-manifest.schema.json"
+    etc.install "config/compatibility-manifest.example.json" => "ax-serving/compatibility-manifest.example.json"
 
     doc.install "README.md"
     doc.install "LICENSE"
@@ -57,16 +61,18 @@ class AxServing < Formula
 
   def caveats
     <<~EOS
-      ax-serving has been installed. Five binaries are available:
+      ax-serving has been installed. Six binaries are available:
 
         ax-serving         — macOS embedded compatibility server
         ax-serving-api     — portable runtime-neutral gateway
         ax-servingctl      — portable operator client
         ax-runtime-agent   — generic runtime-node adapter
         ax-thor-agent      — deprecated runtime-node adapter alias
+        ax-dynamo-adapter  — NVIDIA Dynamo execution-domain adapter
 
-      Hybrid candidates run ax-serving-api as the gateway and register
-      ax-runtime-agent in front of AX Engine or a certified CUDA runtime.
+      Hybrid candidates run ax-serving-api as the gateway, register
+      ax-runtime-agent in front of AX Engine, and place ax-dynamo-adapter
+      in front of each independently qualified NVIDIA Dynamo domain.
       Complete the PRD evidence gates before treating a deployment as
       production certified.
 
@@ -97,5 +103,6 @@ class AxServing < Formula
     assert_match version.to_s, shell_output("#{bin}/ax-servingctl --version")
     assert_match version.to_s, shell_output("#{bin}/ax-runtime-agent --version")
     assert_match version.to_s, shell_output("#{bin}/ax-thor-agent --version")
+    assert_match version.to_s, shell_output("#{bin}/ax-dynamo-adapter --version")
   end
 end

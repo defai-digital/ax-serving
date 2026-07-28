@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "domain_kind": "nvidia_dynamo_pc",
+  "dynamo": {
+    "repository": "https://github.com/ai-dynamo/dynamo",
+    "tag": "v0.0.0-example",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "release_url": "https://github.com/ai-dynamo/dynamo/releases/tag/v0.0.0-example"
+  },
+  "components": {
+    "frontend": "registry.example.invalid/dynamo/frontend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "runtime": "registry.example.invalid/ax-serving/vllm-runtime@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "backend": {
+    "kind": "vllm",
+    "version": "0.25.1"
+  },
+  "platform": {
+    "arch": "amd64",
+    "os": "ubuntu-24.04",
+    "cuda": "13.0"
+  },
+  "graph_config_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "model_certifications": [
+    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ],
+  "issued_at": "1970-01-01T00:00:00Z",
+  "evidence": "example:replace-with-an-immutable-qualification-artifact"
+}

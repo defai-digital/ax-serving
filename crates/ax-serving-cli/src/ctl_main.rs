@@ -322,6 +322,14 @@ fn main() -> Result<()> {
             timeout_secs,
             verify,
             json,
-        } => support::run_discover(role, cluster, instance, instance_id, timeout_secs, verify, json),
+        } => support::run_discover(
+            role,
+            cluster,
+            instance,
+            instance_id,
+            timeout_secs,
+            verify,
+            json,
+        ),
     }
 }

@@ -96,9 +96,45 @@ jobs:
       - name: Audit dependency lockfile
         run: cargo audit --file Cargo.lock
 
+  nvidia-runtime-package:
+    name: NVIDIA runtime release gate (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: integrations/nvidia/vllm-runtime/pyproject.toml
+      - name: Install package test dependencies
+        run: |
+          python -m pip install 'build>=1.2,<2' 'packaging>=24,<27' 'pytest>=8,<9' 'ruff>=0.11,<1'
+          python -m pip install --no-deps -e integrations/nvidia/vllm-runtime
+      - name: Validate NVIDIA runtime package and qualification tooling
+        run: |
+          ruff check integrations/nvidia/vllm-runtime
+          ruff format --check integrations/nvidia/vllm-runtime
+          pytest -q integrations/nvidia/vllm-runtime
+          python scripts/qualification/nvidia/test_soak_dynamo_domain.py
+      - name: Build and inspect runtime wheel
+        working-directory: integrations/nvidia/vllm-runtime
+        run: |
+          python -m build --wheel
+          python -m zipfile --list dist/ax_serving_vllm_runtime-0.1.0-py3-none-any.whl
+          python -m zipfile --test dist/ax_serving_vllm_runtime-0.1.0-py3-none-any.whl
+
   build-macos:
     name: Build and sign Apple Silicon release
-    needs: [release-gate, release-security]
+    needs: [release-gate, release-security, nvidia-runtime-package]
     runs-on: macos-15
     env:
       PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
@@ -143,6 +179,7 @@ jobs:
           cargo build --release -p ax-serving-cli --bin ax-serving-api --bin ax-servingctl
           cargo build --release -p ax-serving-cli --features embedded-compat --bin ax-serving
           cargo build --release -p ax-thor-agent --bins
+          cargo build --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
       - name: Package release archive
         id: package
         env:
@@ -156,7 +193,9 @@ jobs:
           cp target/release/ax-servingctl "$STAGE/bin/"
           cp target/release/ax-runtime-agent "$STAGE/bin/"
           cp target/release/ax-thor-agent "$STAGE/bin/"
-          cp config/backends.yaml config/serving.yaml config/serving.example.yaml config/serving.hybrid.example.yaml "$STAGE/config/"
+          cp target/release/ax-dynamo-adapter "$STAGE/bin/"
+          cp config/backends.yaml config/serving.yaml config/serving.example.yaml config/serving.hybrid.example.yaml config/dynamo-adapter.example.env "$STAGE/config/"
+          cp integrations/nvidia/compatibility-manifest.schema.json integrations/nvidia/compatibility-manifest.example.json "$STAGE/config/"
           cp README.md QUICKSTART.md LICENSE LICENSING.md LICENSE-COMMERCIAL.md "$STAGE/"
           tar -czf "$TARBALL" "$STAGE"
           shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"

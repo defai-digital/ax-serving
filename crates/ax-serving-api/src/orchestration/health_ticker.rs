@@ -216,12 +216,8 @@ mod tests {
     async fn probe_candidates_marks_closed_port_unreachable() {
         let endpoint = WorkerEndpoint::parse("127.0.0.1:1").unwrap();
         let id = WorkerId::new();
-        let results = probe_candidates(
-            vec![(id, endpoint.clone())],
-            Duration::from_secs(1),
-            4,
-        )
-        .await;
+        let results =
+            probe_candidates(vec![(id, endpoint.clone())], Duration::from_secs(1), 4).await;
         assert_eq!(results.len(), 1);
         assert!(!results[0].2);
         assert_eq!(results[0].1, endpoint);

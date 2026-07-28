@@ -89,6 +89,11 @@ fn push_stream_token_piece(
 
 /// Commands executed exclusively on the model owner thread so the MLX/Metal
 /// `EngineSession` never migrates across OS threads (engine thread-local contract).
+//
+// Generate owns its tokenizer and sampling state until the single owner thread
+// consumes the command. Keep that ownership explicit instead of adding a
+// per-request heap indirection solely to equalize enum variant sizes.
+#[allow(clippy::large_enum_variant)]
 enum OwnerCommand {
     Generate {
         request: GenerateRequest,
@@ -142,9 +147,13 @@ impl SessionOwner {
                             tokenizer,
                             tx,
                         } => {
-                            if let Err(err) =
-                                run_generate_on_session(&mut session, &tokenizer, request, params, tx.clone())
-                            {
+                            if let Err(err) = run_generate_on_session(
+                                &mut session,
+                                &tokenizer,
+                                request,
+                                params,
+                                tx.clone(),
+                            ) {
                                 let _ = tx.blocking_send(GenerateEvent::Error(err.to_string()));
                             }
                         }
@@ -154,15 +163,20 @@ impl SessionOwner {
                             normalize,
                             reply,
                         } => {
-                            let result = session
-                                .embed_batch(&batch, pooling, normalize)
-                                .map_err(|err| anyhow::anyhow!("ax-engine embedding failed: {err}"));
+                            let result =
+                                session
+                                    .embed_batch(&batch, pooling, normalize)
+                                    .map_err(|err| {
+                                        anyhow::anyhow!("ax-engine embedding failed: {err}")
+                                    });
                             let _ = reply.send(result);
                         }
                         OwnerCommand::Eval { request, reply } => {
                             let result = session
                                 .generate_with_request_id(next_request_id(), request)
-                                .map_err(|err| anyhow::anyhow!("ax-engine eval generation failed: {err}"))
+                                .map_err(|err| {
+                                    anyhow::anyhow!("ax-engine eval generation failed: {err}")
+                                })
                                 .and_then(|response| {
                                     response.output_tokens.first().copied().ok_or_else(|| {
                                         anyhow::anyhow!("ax-engine eval did not produce a token")

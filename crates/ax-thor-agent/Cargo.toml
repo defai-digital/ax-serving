@@ -16,6 +16,7 @@ path = "src/runtime_main.rs"
 ax-serving-protocol = { path = "../ax-serving-protocol" }
 ax-serving-observability = { path = "../ax-serving-observability" }
 ax-serving-discovery = { path = "../ax-serving-discovery" }
+ax-serving-adapter-core = { path = "../ax-serving-adapter-core" }
 tokio = { workspace = true, features = ["full"] }
 axum = { workspace = true }
 serde = { workspace = true }
