@@ -21,6 +21,7 @@
 //!   └── HealthTicker (tokio task)
 //! ```
 
+pub mod adaptive_policy;
 pub mod deployment;
 pub mod deployment_lifecycle;
 pub mod direct;

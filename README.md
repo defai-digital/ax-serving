@@ -7,8 +7,8 @@ AX Serving is a **federated heterogeneous inference control plane** for private 
 provides one authenticated OpenAI-compatible API and governs execution across:
 
 - Apple Silicon Macs running AX Engine through `ax-runtime-agent`;
-- future model-parallel Mac clusters represented by the experimental
-  `ax-mac-cluster-adapter`;
+- model-parallel Mac clusters coordinated by `ax-mac-cluster-adapter`
+  (in-repo control plane complete; physical multi-Mac certification external);
 - NVIDIA GPU PCs managed inside an upstream NVIDIA Dynamo domain;
 - NVIDIA Thor devices managed inside a separate, independently qualified Dynamo domain.
 
@@ -38,7 +38,7 @@ tests are not live hardware certification.
 | Portable REST/SSE gateway and protocol v1.2 | Implemented; protocol v1.0/v1.1 migration fixtures remain supported |
 | Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation implemented; full domain-selection policy and live evidence remain |
 | Mac -> `ax-runtime-agent` -> AX Engine | Implemented; pinned live AX Engine certification pending |
-| Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phase 1 coordinator, gang manifest, registration, proxy, and HA admission implemented with source/mock tests; distributed AX Engine PP is not implemented |
+| Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phases 0–5 in-repo surfaces complete (manifest, gang lifecycle, domain reservation, placement, multi-replica, micro-batch contracts, TP/hybrid validation, adaptive federation hooks); physical multi-Mac production certification and Engine-native TP kernels remain external |
 | NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy implemented with source/mock conformance; live qualification pending |
 | NVIDIA Thor -> separate Dynamo domain | Source path exists but is experimental and not a support claim |
 | Streaming, cancellation, deadlines, and safe pre-commit retry | Implemented with mock/fault tests; live mixed-domain evidence pending |
@@ -109,7 +109,7 @@ boundary.
 | Domain kind | AX-visible endpoint | Local execution owner | Qualification rule |
 | --- | --- | --- | --- |
 | `mac_ax_engine` | Each eligible Mac node in a Mac pool | `ax-runtime-agent` and AX Engine | Exact AX Engine/model identity must be certified |
-| `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | Coordinator/control-plane source exists; AX Engine distributed execution does not |
+| `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | In-repo control plane complete; physical multi-Mac + Engine PP/TP production pin required for support claims |
 | `nvidia_dynamo_pc` | One adapter for one PC Dynamo deployment | Dynamo and its selected backend | Exact Dynamo/backend/image/config manifest must be certified |
 | `nvidia_dynamo_thor` | One adapter for one separate Thor deployment | Dynamo and a Thor-qualified backend | Always separate from PC; experimental until its own gates pass |
 | `compatibility_runtime_endpoint` | One direct runtime node | Configured legacy runtime | Migration and testing only |
@@ -338,7 +338,7 @@ Dynamo remains a separately pinned and operated execution domain.
 - `crates/ax-serving-api` — gateway, catalog, routing, HA state, lifecycle, REST/SSE;
 - `crates/ax-serving-adapter-core` — byte-preserving OpenAI/SSE adapter transport;
 - `crates/ax-dynamo-adapter` — one runtime-SDK-free endpoint per NVIDIA Dynamo domain;
-- `crates/ax-mac-cluster-adapter` — experimental coordinator/adapter for one future Mac AX Engine cluster;
+- `crates/ax-mac-cluster-adapter` — Mac cluster coordinator/adapter (gang lifecycle, rank bootstrap, advisory placement, multi-replica aggregation);
 - `crates/ax-thor-agent` — current package for the generic `ax-runtime-agent` binary;
 - `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
 - `crates/ax-serving-engine` — embedded compatibility backends, not federation architecture;

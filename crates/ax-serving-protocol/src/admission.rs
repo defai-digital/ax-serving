@@ -131,4 +131,38 @@ mod tests {
             RetryDecision::DoNotRetry
         );
     }
+
+    #[test]
+    fn ambiguous_post_admission_failure_is_not_retried() {
+        let error = AdmissionError {
+            code: "AXS_CLUSTER_AMBIGUOUS".into(),
+            message: "cluster failure after admission".into(),
+            retryable: true,
+            phase: AdmissionPhase::PostAdmission,
+            admission_state: AdmissionState::Unknown,
+            request_id: RequestId::new(),
+            attempt_id: AttemptId::new(),
+        };
+        assert_eq!(
+            error.retry_decision(CommitmentState::Uncommitted, 1, 3),
+            RetryDecision::DoNotRetry
+        );
+    }
+
+    #[test]
+    fn typed_pre_admission_not_admitted_may_retry() {
+        let error = AdmissionError {
+            code: "AXS_CLUSTER_NOT_READY".into(),
+            message: "no rank admitted the request".into(),
+            retryable: true,
+            phase: AdmissionPhase::PreAdmission,
+            admission_state: AdmissionState::NotAdmitted,
+            request_id: RequestId::new(),
+            attempt_id: AttemptId::new(),
+        };
+        assert_eq!(
+            error.retry_decision(CommitmentState::Uncommitted, 1, 3),
+            RetryDecision::RetryDifferentWorker
+        );
+    }
 }

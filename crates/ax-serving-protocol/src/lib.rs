@@ -4,6 +4,7 @@
 //! semantics only. It must remain independent of async runtimes, HTTP stacks,
 //! accelerator libraries, and inference-runtime SDKs.
 
+pub mod adaptive;
 pub mod admission;
 pub mod cluster;
 pub mod decision;
@@ -12,9 +13,13 @@ pub mod domain;
 pub mod ids;
 pub mod lifecycle;
 pub mod operation;
+pub mod pipeline;
 pub mod version;
 pub mod worker;
 
+pub use adaptive::{
+    AdaptiveFederationPolicyV1, AdaptivePolicyError, AdaptiveSelection, DomainCostSignal,
+};
 pub use admission::{
     ADMISSION_STATE_HEADER, ATTEMPT_ID_HEADER, AdmissionError, AdmissionPhase, AdmissionState,
     AxErrorEnvelope, AxErrorMetadata, CommitmentState, DISPATCH_TOKEN_HEADER, ErrorBody,
@@ -28,6 +33,9 @@ pub use cluster::{
 pub use decision::{
     CandidateDecision, CandidateRejectionReason, DecisionProfileV1, DecisionReasonCode,
     DecisionRecordV1, DecisionValidationError, PolicyMode,
+};
+pub use pipeline::{
+    AsyncStageTransfer, MicroBatchCommitGate, MicroBatchContract, PipelineContractError,
 };
 pub use deployment::{
     DeploymentIdentity, DeploymentSpec, Digest, DigestError, EquivalencePolicy, IdentityField,

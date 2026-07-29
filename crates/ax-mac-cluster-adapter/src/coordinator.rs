@@ -231,10 +231,16 @@ impl ClusterCoordinator {
             .any(|observation| observation.state == ClusterLifecycleState::Failed)
         {
             ClusterLifecycleState::Failed
-        } else if ready_ranks == required_ranks {
+        } else if ready_ranks == required_ranks && ranks.len() == required_ranks {
+            // Ready only when every required rank is present, fresh, and ready.
             ClusterLifecycleState::Ready
         } else {
-            least_progress(&ranks, now, self.stale_after)
+            // Partial observation sets may include Ready ranks; never promote the
+            // incomplete gang to Ready (partial-rank admission is forbidden).
+            match least_progress(&ranks, now, self.stale_after) {
+                ClusterLifecycleState::Ready => ClusterLifecycleState::Warming,
+                other => other,
+            }
         };
         ClusterStatus {
             cluster_id: self.manifest.manifest.cluster_id.to_string(),
@@ -678,5 +684,51 @@ mod tests {
         assert_eq!(topology.ranks[1].layers.start, 63);
         assert_eq!(topology.ranks[1].layers.end, 126);
         assert!(topology.ranks[1].owns_output_head);
+    }
+
+    #[tokio::test]
+    async fn drain_stops_admission_before_ranks_shut_down() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        for rank in 0..2 {
+            for state in [
+                ClusterLifecycleState::Planned,
+                ClusterLifecycleState::Downloading,
+                ClusterLifecycleState::Connecting,
+                ClusterLifecycleState::Loading,
+                ClusterLifecycleState::Warming,
+                ClusterLifecycleState::Ready,
+            ] {
+                coordinator
+                    .update_rank(observation(&coordinator, rank, state))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(coordinator.snapshot().await.domain.ready);
+        coordinator.begin_drain();
+        let snapshot = coordinator.snapshot().await;
+        assert!(!snapshot.domain.ready);
+        assert_eq!(
+            coordinator.status().await.state,
+            ClusterLifecycleState::Draining
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_gang_never_reports_ready() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        coordinator
+            .update_rank(observation(
+                &coordinator,
+                0,
+                ClusterLifecycleState::Ready,
+            ))
+            .await
+            .unwrap();
+        let status = coordinator.status().await;
+        assert_ne!(status.state, ClusterLifecycleState::Ready);
+        assert!(!coordinator.snapshot().await.domain.ready);
+        assert_eq!(status.ready_ranks, 1);
+        assert_eq!(status.required_ranks, 2);
     }
 }

@@ -258,6 +258,16 @@ impl ParallelismManifestV1 {
             }
             _ => {}
         }
+        // Profile-driven chunking is optional for static PP, but required once
+        // tensor or hybrid parallelism is certified so stage collectives stay
+        // bound to a measured execution profile.
+        if matches!(
+            self.parallelism.kind,
+            ParallelismKind::Tensor | ParallelismKind::Hybrid
+        ) && self.parallelism.chunking_profile_digest.is_none()
+        {
+            return Err(ClusterManifestError::MissingChunkingProfile);
+        }
 
         let expected_ranks = usize::from(pp_size)
             .checked_mul(usize::from(tp_size))
@@ -496,6 +506,8 @@ pub enum ClusterManifestError {
     ObservationUnknownRank(u16),
     #[error("ready rank observation does not meet the certified topology profile")]
     ObservationTopologyInsufficient,
+    #[error("tensor and hybrid plans require a chunking_profile_digest")]
+    MissingChunkingProfile,
 }
 
 fn validate_token(field: &'static str, value: &str) -> Result<(), ClusterManifestError> {
@@ -691,6 +703,138 @@ mod tests {
         assert_eq!(
             observation.validate_for(&manifest, &manifest_digest),
             Err(ClusterManifestError::ObservationGenerationMismatch)
+        );
+    }
+
+    fn hybrid_manifest() -> ParallelismManifestV1 {
+        let mut manifest = pipeline_manifest();
+        manifest.parallelism.kind = ParallelismKind::Hybrid;
+        manifest.parallelism.pp_size = 2;
+        manifest.parallelism.tp_size = 2;
+        manifest.parallelism.chunking_profile_digest = Some(digest('c'));
+        manifest.artifacts = vec![
+            ArtifactFilePlan {
+                relative_path: "weights/r0.safetensors".into(),
+                digest: digest('1'),
+                size_bytes: 100,
+                kind: ArtifactFileKind::Weight,
+            },
+            ArtifactFilePlan {
+                relative_path: "weights/r1.safetensors".into(),
+                digest: digest('2'),
+                size_bytes: 100,
+                kind: ArtifactFileKind::Weight,
+            },
+            ArtifactFilePlan {
+                relative_path: "weights/r2.safetensors".into(),
+                digest: digest('3'),
+                size_bytes: 100,
+                kind: ArtifactFileKind::Weight,
+            },
+            ArtifactFilePlan {
+                relative_path: "weights/r3.safetensors".into(),
+                digest: digest('4'),
+                size_bytes: 100,
+                kind: ArtifactFileKind::Weight,
+            },
+        ];
+        // node digests must stay unique across ranks (hex-only chars)
+        let nodes = [digest('f'), digest('0'), digest('a'), digest('b')];
+        let weight = [digest('1'), digest('2'), digest('3'), digest('4')];
+        manifest.ranks = vec![
+            RankPlan {
+                rank: 0,
+                node_identity_digest: nodes[0].clone(),
+                stage: 0,
+                tensor_rank: 0,
+                layers: LayerRange { start: 0, end: 4 },
+                owns_embeddings: true,
+                owns_output_head: false,
+                required_weight_files: vec![weight[0].clone()],
+                memory: memory(),
+            },
+            RankPlan {
+                rank: 1,
+                node_identity_digest: nodes[1].clone(),
+                stage: 0,
+                tensor_rank: 1,
+                layers: LayerRange { start: 0, end: 4 },
+                owns_embeddings: false,
+                owns_output_head: false,
+                required_weight_files: vec![weight[1].clone()],
+                memory: memory(),
+            },
+            RankPlan {
+                rank: 2,
+                node_identity_digest: nodes[2].clone(),
+                stage: 1,
+                tensor_rank: 0,
+                layers: LayerRange { start: 4, end: 8 },
+                owns_embeddings: false,
+                owns_output_head: true,
+                required_weight_files: vec![weight[2].clone()],
+                memory: memory(),
+            },
+            RankPlan {
+                rank: 3,
+                node_identity_digest: nodes[3].clone(),
+                stage: 1,
+                tensor_rank: 1,
+                layers: LayerRange { start: 4, end: 8 },
+                owns_embeddings: false,
+                owns_output_head: false,
+                required_weight_files: vec![weight[3].clone()],
+                memory: memory(),
+            },
+        ];
+        manifest
+    }
+
+    #[test]
+    fn hybrid_plan_validates_model_native_pp_tp_grid() {
+        hybrid_manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn hybrid_and_tensor_plans_require_chunking_profile() {
+        let mut hybrid = hybrid_manifest();
+        hybrid.parallelism.chunking_profile_digest = None;
+        assert_eq!(
+            hybrid.validate(),
+            Err(ClusterManifestError::MissingChunkingProfile)
+        );
+
+        let mut tensor = hybrid_manifest();
+        tensor.parallelism.kind = ParallelismKind::Tensor;
+        tensor.parallelism.pp_size = 1;
+        tensor.parallelism.tp_size = 2;
+        tensor.parallelism.chunking_profile_digest = Some(digest('c'));
+        tensor.ranks = tensor.ranks.into_iter().take(2).collect();
+        for rank in &mut tensor.ranks {
+            rank.stage = 0;
+            rank.layers = LayerRange { start: 0, end: 8 };
+        }
+        tensor.ranks[0].tensor_rank = 0;
+        tensor.ranks[1].tensor_rank = 1;
+        tensor.ranks[0].owns_embeddings = true;
+        tensor.ranks[0].owns_output_head = true;
+        tensor.ranks[1].owns_embeddings = false;
+        tensor.ranks[1].owns_output_head = false;
+        tensor.validate().unwrap();
+        tensor.parallelism.chunking_profile_digest = None;
+        assert_eq!(
+            tensor.validate(),
+            Err(ClusterManifestError::MissingChunkingProfile)
+        );
+    }
+
+    #[test]
+    fn inconsistent_tensor_group_layer_ranges_fail_closed() {
+        let mut hybrid = hybrid_manifest();
+        hybrid.ranks[1].layers.end = 3;
+        assert_eq!(
+            hybrid.validate(),
+            Err(ClusterManifestError::InconsistentTensorGroup(0))
         );
     }
 }

@@ -2,9 +2,12 @@
 
 pub mod config;
 pub mod coordinator;
+pub mod evidence;
 pub mod manifest;
 pub mod planner;
+pub mod reconcile;
 pub mod registration;
+pub mod replicas;
 
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;

@@ -70,6 +70,8 @@ pub enum PolicyMode {
     Shadow,
     Canary,
     Active,
+    /// Explicit operator rollback to the previous active baseline.
+    Rollback,
 }
 
 /// Bounded reason for accepting or preferring a selected candidate.
