@@ -7,9 +7,9 @@
 | Date | 2026-07-14 |
 | Status | Historical draft; source observations only |
 | Scope | Portable gateway (`ax-serving-api` orchestration path), tests, ops probes, evidence harness |
-| Architecture constraint | Superseded by ADR-016 federated execution-domain architecture |
-| Deployment constraint | CPU-only/readiness rules retained in ADR-016, PRD, and consolidated specification |
-| Related status ledger | `.internal/IMPLEMENTATION-STATUS.md` |
+| Architecture constraint | Superseded by the current [runtime responsibility inventory](contracts/ax-serving-runtime-responsibility-inventory.md) |
+| Deployment constraint | CPU-only/readiness rules retained in the public contracts and runbooks |
+| Current public evidence boundary | `README.md`, public contracts, and deployment guides |
 | Revision | 2026-07-14r2 — addresses design review issues 1–14 |
 
 ---
@@ -86,7 +86,7 @@ Non-negotiables retained by the canonical ADR-016 design:
 - Public `README.md` still says `/readyz` is “200 only when at least one worker is routable” (stale).
 - `docs/contracts/ax-serving-public-contract-inventory.md` still labels `/readyz` as “routable readiness”.
 - `docs/runbooks/multi-worker.md` still states `/readyz` is `200` only with eligible endpoints (same class of bug as README; **required** fix, not optional).
-- `.internal/IMPLEMENTATION-STATUS.md` still states “Current readiness is coupled to worker eligibility” under deployment status (partially outdated for default mode).
+- The contemporaneous local certification ledger also used outdated worker-gated readiness wording.
 - Fabric contract (`docs/contracts/ax-fabric-runtime-contract.md`) is closer to truth and should be the reference for remaining doc fixes.
 - No orchestration HTTP integration test for `readyz_mode = eligible_workers` (only pure unit tests in `gateway_ops.rs`).
 - `/health` (and related admin JSON) still derives `"ok"` vs `"degraded"` from `eligible_healthy_count()`—that is a **capacity** signal, not process readiness under `control_plane`.
@@ -911,9 +911,10 @@ Avoid high-cardinality labels (no model_id on metrics).
 
 ## References
 
-- `.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md`
-- `.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md`
-- `.internal/IMPLEMENTATION-STATUS.md`
+- `README.md`
+- `docs/contracts/ax-serving-public-contract-inventory.md`
+- `docs/contracts/ax-serving-runtime-responsibility-inventory.md`
+- `docs/contracts/ax-serving-node-contract.md`
 - `docs/maintainability-refactor-plan.md` (historical)
 - `docs/perf/service-tuning.md`
 - `docs/contracts/ax-fabric-runtime-contract.md`
@@ -1017,7 +1018,7 @@ Ordered for independent reviewability. Each PR should pass `cargo fmt`, relevant
 | --- | --- |
 | **Title** | `docs(ops): align readiness contracts and finish probe residual tests` |
 | **Depends on** | None for docs; test additions can use PR-2 fixtures |
-| **Files** | **Required:** `README.md`; `docs/contracts/ax-serving-public-contract-inventory.md`; `docs/runbooks/multi-worker.md`; `.internal/IMPLEMENTATION-STATUS.md` deployment readiness row; probe tests in orchestration suite (or `tests/orchestration_probes.rs`) including **legacy `eligible_workers` mode HTTP test** |
+| **Files** | **Required:** `README.md`; `docs/contracts/ax-serving-public-contract-inventory.md`; `docs/runbooks/multi-worker.md`; probe tests in orchestration suite (or `tests/orchestration_probes.rs`) including **legacy `eligible_workers` mode HTTP test** |
 | **Description** | Document `/readyz` = control plane (default), `/routablez` = capacity, `/health` ok = capacity; legacy mode; Fabric uses routablez. No intentional probe semantic change. |
 | **Validation** | Markdown review; control_plane + legacy probe integration tests |
 

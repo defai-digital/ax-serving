@@ -25,6 +25,7 @@ AGENTS.md
 CLAUDE.md
 GEMINI.md
 opencode.json
+/.internal/
 automatosx/
 .automatosx/
 .ax-grok/

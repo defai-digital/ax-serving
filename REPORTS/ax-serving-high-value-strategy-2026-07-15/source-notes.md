@@ -53,8 +53,8 @@ The segment table is a recommendation synthesized from the repository's stated s
 
 ## Primary sources
 
-- `.internal/prd/PRD-AX-SERVING.md` — canonical product boundaries, goals, release gates and benchmark policy.
-- `.internal/IMPLEMENTATION-STATUS.md` — current implementation and certification ledger.
+- `README.md` — canonical product boundaries, goals, release gates and benchmark policy.
+- `docs/deployment-topologies.md` — current implementation and certification ledger.
 - `docs/competitive-landscape.md` — intended wedge and explicit poor fits.
 - `docs/advantages-and-use-cases.md` — strong fits, poor fits and tradeoffs.
 - vLLM Production Stack official documentation — current all-CUDA substitute capabilities.

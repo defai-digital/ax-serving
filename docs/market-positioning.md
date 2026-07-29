@@ -62,4 +62,5 @@ AX Serving is not:
 
 The repository implements the portable gateway and Mac-capable runtime-agent foundations. The
 Dynamo Domain Adapter and final domain protocol are target design work, and Thor is experimental
-until live qualification. See the [status ledger](../.internal/IMPLEMENTATION-STATUS.md).
+until live qualification. Public ownership boundaries are defined by the
+[runtime responsibility inventory](contracts/ax-serving-runtime-responsibility-inventory.md).

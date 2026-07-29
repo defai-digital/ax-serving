@@ -352,7 +352,6 @@ digest. Without a domain ID, operators can use the explicit Mac/compatibility
 migration mapping. NVIDIA production domains require the separate adapter, a
 valid v1.1 descriptor, and a ready aggregate observation.
 
-The normative v1.1 federation types and migration rules are in the
-[federated technical specification](../../.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md).
-The v1.2 Mac cluster contract is in the
-[Mac distributed execution-domain specification](../../.internal/specs/TECH-SPEC-MAC-DISTRIBUTED-EXECUTION-DOMAIN.md).
+The protocol types, fixtures, and validation rules in `crates/ax-serving-protocol` are normative.
+The public [Mac cluster integration guide](../integrations/mac/CLUSTER.md) documents the current
+v1.2 source-level setup and its limitations.

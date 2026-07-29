@@ -10,13 +10,13 @@
 
 ## 權威來源與可建立的事實
 
-1. `.internal/prd/PRD-AX-SERVING.md`
+1. `README.md`
    - AX Serving 的 canonical 邊界是 runtime-neutral control plane。
    - Runtime 負責 tokenization、batching、KV、distributed execution 與 kernels。
    - AX Serving 負責 fleet state、admission、endpoint selection、safe failover、安全邊界與 operations。
    - Production goodput loss gate 是低於 3%，並要求 live mixed-fleet evidence。
 
-2. `.internal/IMPLEMENTATION-STATUS.md`
+2. `docs/deployment-topologies.md`
    - Runtime-neutral architecture、request profiling、hard eligibility、inference-aware scoring、async deployment desired state 與 rollback 已在 source 實作或由本地測試覆蓋。
    - Live AX Engine＋CUDA certification、production benchmark、兩 gateway HA、Redis fault test 與 60-minute soak 仍未完成。
    - 因此目前能證明工程基礎，不能證明 production value 或市場需求。
@@ -25,7 +25,7 @@
    - Repo 自己已排除單 endpoint、單 runtime 與 CUDA token scheduling 作為 AX Serving 的主要適配場景。
    - Demand 必須由實際 evaluation 與 retained evidence 驗證，不能從硬體品牌或模型大小推論。
 
-4. `.internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md`
+4. `docs/market-positioning.md`
    - Agent session affinity、capability negotiation 與 private fleet placement 是已定義的鄰接方向。
    - Agent planning、tool execution、memory 與 KV ownership 明確不屬於 AX Serving。
    - 其 release gate 包含 sequential-turn p95 time-to-next-action 至少改善 25%，可作為 adaptive control plane 的 outcome gate。

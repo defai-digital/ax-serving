@@ -34,5 +34,5 @@ latency cost, deploy AX Engine or Dynamo directly and do not expand AX policy sc
 ## Current availability
 
 The current source contains the gateway and Mac-capable agent foundations. The final Dynamo domain
-adapter and Thor qualification remain roadmap work. See the
-[status ledger](../.internal/IMPLEMENTATION-STATUS.md) before planning a deployment.
+adapter and Thor qualification remain roadmap work. Review the
+[multi-worker runbook](runbooks/multi-worker.md) before planning a deployment.

@@ -6,9 +6,9 @@
 > **Scope**: Supports the public runtime-node product boundary without changing product positioning
 
 This file preserves the March 2026 refactor snapshot. It is not a current
-architecture or completion ledger. Use ADR-016, the canonical PRD, technical
-specification, and `.internal/IMPLEMENTATION-STATUS.md` for current decisions
-and status; re-measure every file-size claim before scheduling follow-up work.
+architecture or completion ledger. Use the public contract inventory, node
+contract, runtime responsibility inventory, and current README for supported
+boundaries; re-measure every file-size claim before scheduling follow-up work.
 
 ## 1. Purpose
 

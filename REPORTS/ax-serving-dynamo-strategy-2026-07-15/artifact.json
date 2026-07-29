@@ -84,13 +84,13 @@
       },
       {
         "id": "ax_serving_prd",
-        "label": "AX Serving canonical PRD",
-        "path": ".internal/prd/PRD-AX-SERVING.md"
+        "label": "AX Serving public product boundary",
+        "path": "README.md"
       },
       {
         "id": "implementation_status",
-        "label": "AX Serving implementation and certification status",
-        "path": ".internal/IMPLEMENTATION-STATUS.md"
+        "label": "AX Serving public qualification boundary",
+        "path": "docs/deployment-topologies.md"
       },
       {
         "id": "market_positioning",
@@ -104,8 +104,8 @@
       },
       {
         "id": "agent_fabric_prd",
-        "label": "AX Serving agent-aware inference fabric PRD",
-        "path": ".internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md"
+        "label": "AX Serving public scope boundary",
+        "path": "docs/market-positioning.md"
       },
       {
         "id": "vllm_plugins",
@@ -329,13 +329,13 @@
     },
     {
       "id": "ax_serving_prd",
-      "label": "AX Serving canonical PRD",
-      "path": ".internal/prd/PRD-AX-SERVING.md"
+      "label": "AX Serving public product boundary",
+      "path": "README.md"
     },
     {
       "id": "implementation_status",
-      "label": "AX Serving implementation and certification status",
-      "path": ".internal/IMPLEMENTATION-STATUS.md"
+      "label": "AX Serving public qualification boundary",
+      "path": "docs/deployment-topologies.md"
     },
     {
       "id": "market_positioning",
@@ -349,8 +349,8 @@
     },
     {
       "id": "agent_fabric_prd",
-      "label": "AX Serving agent-aware inference fabric PRD",
-      "path": ".internal/prd/PRD-AGENT-AWARE-INFERENCE-FABRIC.md"
+      "label": "AX Serving public scope boundary",
+      "path": "docs/market-positioning.md"
     },
     {
       "id": "vllm_plugins",

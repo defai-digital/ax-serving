@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Active target boundary |
 | Last updated | 2026-07-27 |
-| Authority | [ADR-016](../../.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md) |
+| Authority | [Public contract inventory](ax-serving-public-contract-inventory.md) and [node contract](ax-serving-node-contract.md) |
 
 ## Product boundary
 

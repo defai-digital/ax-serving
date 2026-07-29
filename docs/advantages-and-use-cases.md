@@ -52,5 +52,5 @@ inference domain.
 | Does federation help? | Single-domain policy versus mixed-domain policy under normal, saturated, drain, outage, privacy, and budget scenarios. |
 | Does AX replace Dynamo/vLLM? | No. Dynamo and its backend remain the NVIDIA execution system. |
 
-See the [canonical design](../.internal/README.md) and
-[implementation status](../.internal/IMPLEMENTATION-STATUS.md).
+See the [runtime responsibility inventory](contracts/ax-serving-runtime-responsibility-inventory.md)
+for the public architecture and ownership boundaries.

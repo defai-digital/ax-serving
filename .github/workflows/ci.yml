@@ -19,6 +19,14 @@ permissions:
   contents: read
 
 jobs:
+  repository-hygiene:
+    name: Repository privacy boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check local-only boundaries
+        run: bash scripts/check-local-only-boundaries.sh
+
   gateway-linux:
     name: Portable gateway (${{ matrix.arch }})
     strategy:

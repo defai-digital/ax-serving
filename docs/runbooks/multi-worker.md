@@ -9,8 +9,8 @@
 
 This runbook separates current source behavior from the final architecture. Execution-domain
 types/config/diagnostics ship in source, but the Dynamo Domain Adapter and live federation
-certification do not. Do not use target examples as support evidence; consult the
-[status ledger](../../.internal/IMPLEMENTATION-STATUS.md).
+certification do not. Do not use target examples or source/mock conformance as production support
+evidence.
 
 ## 1. Ownership boundary
 

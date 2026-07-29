@@ -28,8 +28,9 @@ implemented. Protocol v1.0 fixtures and endpoint migration behavior remain suppo
 The runtime-SDK-free Dynamo Domain Adapter and immutable compatibility-manifest validation are
 implemented with source/mock conformance tests. Durable/replayable decision storage,
 domain-aware HA reservations, and live federated certification are not yet implemented. NVIDIA
-Thor is a target experimental domain, not a current support claim. See the
-[status ledger](.internal/IMPLEMENTATION-STATUS.md) for exact evidence and blockers.
+Thor is a target experimental domain, not a current support claim. Production claims require
+retained live-runtime qualification, performance, fault, and soak artifacts; source and mock
+conformance alone are not sufficient.
 
 ## Why AX Serving exists
 
@@ -259,15 +260,10 @@ Dynamo remains a separately pinned and operated execution domain.
 - `crates/ax-serving-bench` — benchmark, regression, and soak runners;
 - `deploy` — Compose, Kubernetes, Helm, monitoring, and alerting;
 - `integrations/nvidia` — optional backend profiles and immutable manifest schema;
-- `.internal` — canonical ADR, PRD, technical specification, and status ledger;
 - `docs` — public contracts, operations, and performance guidance.
 
-## Canonical design
+## Public contracts
 
-- [ADR-016: Federated Dynamo and AX Engine control plane](.internal/adr/ADR-016-FEDERATED-DYNAMO-AND-AX-ENGINE-CONTROL-PLANE.md)
-- [Product requirements](.internal/prd/PRD-AX-SERVING.md)
-- [Technical specification](.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md)
-- [Implementation and certification status](.internal/IMPLEMENTATION-STATUS.md)
 - [Runtime responsibility inventory](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Node protocol contract](docs/contracts/ax-serving-node-contract.md)
 

@@ -136,13 +136,13 @@
       },
       {
         "id": "ax_serving_prd",
-        "label": "AX Serving canonical PRD",
-        "path": ".internal/prd/PRD-AX-SERVING.md"
+        "label": "AX Serving public product boundary",
+        "path": "README.md"
       },
       {
         "id": "implementation_status",
-        "label": "AX Serving implementation and certification status",
-        "path": ".internal/IMPLEMENTATION-STATUS.md"
+        "label": "AX Serving public qualification boundary",
+        "path": "docs/deployment-topologies.md"
       },
       {
         "id": "competitive_landscape",
@@ -368,13 +368,13 @@
     },
     {
       "id": "ax_serving_prd",
-      "label": "AX Serving canonical PRD",
-      "path": ".internal/prd/PRD-AX-SERVING.md"
+      "label": "AX Serving public product boundary",
+      "path": "README.md"
     },
     {
       "id": "implementation_status",
-      "label": "AX Serving implementation and certification status",
-      "path": ".internal/IMPLEMENTATION-STATUS.md"
+      "label": "AX Serving public qualification boundary",
+      "path": "docs/deployment-topologies.md"
     },
     {
       "id": "competitive_landscape",
