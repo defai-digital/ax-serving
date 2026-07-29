@@ -3,6 +3,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod manifest;
+pub mod planner;
 pub mod registration;
 
 use std::sync::{Arc, atomic::Ordering};

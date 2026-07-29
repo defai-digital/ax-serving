@@ -27,6 +27,7 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::manifest::ValidatedManifest;
+use crate::planner::{AdvisoryPipelinePlan, PlacementProfileV1, build_advisory_plan};
 
 #[derive(Clone, Debug)]
 pub struct ObservationSnapshot {
@@ -81,6 +82,7 @@ pub struct EnginePipelineTopology {
     pub manifest_digest: String,
     pub model_artifact_digest: String,
     pub total_layers: u32,
+    pub micro_batch_limit: u16,
     pub ranks: Vec<EnginePipelineRank>,
 }
 
@@ -282,6 +284,7 @@ impl ClusterCoordinator {
             manifest_digest: self.manifest.digest.to_string(),
             model_artifact_digest: manifest.model.artifact_digest.to_string(),
             total_layers: manifest.model.total_layers,
+            micro_batch_limit: manifest.parallelism.micro_batch_limit,
             ranks: manifest
                 .ranks
                 .iter()
@@ -297,6 +300,34 @@ impl ClusterCoordinator {
                 })
                 .collect(),
         }
+    }
+
+    /// Produce an advisory candidate for a higher generation from fresh,
+    /// measured rank topology. This never mutates the active manifest.
+    pub async fn advisory_plan(
+        &self,
+        profile: &PlacementProfileV1,
+    ) -> Result<AdvisoryPipelinePlan> {
+        let now = time::OffsetDateTime::now_utc();
+        let observations = self.observations.read().await;
+        if observations.len() != self.manifest.manifest.ranks.len() {
+            bail!("advisory placement requires a complete measured gang");
+        }
+        let mut ordered = observations.values().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|observation| observation.rank);
+        if ordered.iter().any(|observation| {
+            observation.state != ClusterLifecycleState::Ready
+                || now - observation.observed_at
+                    > time::Duration::try_from(self.stale_after).unwrap_or(time::Duration::MAX)
+        }) {
+            bail!("advisory placement requires fresh ready observations from every rank");
+        }
+        build_advisory_plan(
+            &self.manifest.manifest,
+            &self.manifest.digest,
+            &ordered,
+            profile,
+        )
     }
 
     async fn refresh_ready(&self) {
@@ -399,6 +430,7 @@ pub fn router(coordinator: ClusterCoordinator, token: String) -> Router {
             "/internal/cluster/engine-topology",
             get(engine_pipeline_topology),
         )
+        .route("/internal/cluster/advisory-plan", post(advisory_placement))
         .route("/internal/cluster/status", get(cluster_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), rank_auth))
         .with_state(state)
@@ -426,6 +458,16 @@ async fn engine_pipeline_topology(
     State(state): State<RankApiState>,
 ) -> Json<EnginePipelineTopology> {
     Json(state.coordinator.engine_topology())
+}
+
+async fn advisory_placement(
+    State(state): State<RankApiState>,
+    Json(profile): Json<PlacementProfileV1>,
+) -> Response {
+    match state.coordinator.advisory_plan(&profile).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
 }
 
 async fn rank_bootstrap_plan(State(state): State<RankApiState>, Path(rank): Path<u16>) -> Response {
@@ -627,6 +669,7 @@ mod tests {
         let topology = coordinator.engine_topology();
         assert_eq!(topology.generation, 1);
         assert_eq!(topology.total_layers, 126);
+        assert_eq!(topology.micro_batch_limit, 1);
         assert_eq!(topology.ranks.len(), 2);
         assert_eq!(topology.ranks[0].layers.start, 0);
         assert_eq!(topology.ranks[0].layers.end, 63);
