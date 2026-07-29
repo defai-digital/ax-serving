@@ -88,6 +88,7 @@ pub enum DecisionReasonCode {
     AdaptivePolicy,
     ShadowBaseline,
     CanaryAssignment,
+    ActiveAssignment,
     PolicyRollback,
 }
 

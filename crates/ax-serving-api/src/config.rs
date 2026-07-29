@@ -1186,6 +1186,7 @@ mod tests {
             "serving.yaml",
             "serving.example.yaml",
             "serving.offline-enterprise.yaml",
+            "serving.mac-cluster.example.yaml",
         ] {
             let path = config_dir.join(filename);
             let config = ServeConfig::from_file(&path)
@@ -1228,6 +1229,69 @@ mod tests {
     #[test]
     fn default_config_passes_validation() {
         assert!(valid_cfg().validate().is_ok());
+    }
+
+    fn adaptive_domain(name: &str) -> DomainSpec {
+        DomainSpec {
+            id: DomainId::new(name).unwrap(),
+            kind: ax_serving_protocol::ExecutionDomainKind::MacAxEngine,
+            pool: ax_serving_protocol::PoolId::new(format!("{name}-pool")).unwrap(),
+            trust_domain: ax_serving_protocol::TrustDomainId::new("private").unwrap(),
+            hardware_class: "apple-silicon".into(),
+            required_qualification: ax_serving_protocol::QualificationState::Experimental,
+            selector: std::collections::BTreeMap::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn adaptive_config_requires_distinct_declared_domains_and_predictions() {
+        let baseline = DomainId::new("mac-single").unwrap();
+        let target = DomainId::new("mac-cluster").unwrap();
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.domains =
+            vec![adaptive_domain(baseline.as_str()), adaptive_domain(target.as_str())];
+        cfg.orchestrator.adaptive_federation = AdaptiveFederationConfig {
+            enabled: true,
+            mode: "shadow".into(),
+            target_domain: Some(target.clone()),
+            baseline_domain: Some(baseline.clone()),
+            canary_share_ppm: 100_000,
+            max_cost_microusd: Some(1_000),
+            latency_slo_ms: Some(1_000),
+            domains: vec![
+                AdaptiveDomainPredictionConfig {
+                    domain: baseline.clone(),
+                    predicted_cost_microusd: 100,
+                    predicted_latency_ms: 100,
+                    stability_rank: 1,
+                },
+                AdaptiveDomainPredictionConfig {
+                    domain: target.clone(),
+                    predicted_cost_microusd: 200,
+                    predicted_latency_ms: 80,
+                    stability_rank: 1,
+                },
+            ],
+        };
+        cfg.validate().expect("complete adaptive policy should validate");
+
+        cfg.orchestrator.adaptive_federation.target_domain = Some(baseline);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must differ")
+        );
+
+        cfg.orchestrator.adaptive_federation.target_domain = Some(target);
+        cfg.orchestrator.adaptive_federation.domains.pop();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must include target and baseline")
+        );
     }
 
     #[test]

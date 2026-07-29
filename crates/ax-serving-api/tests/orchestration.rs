@@ -25,14 +25,18 @@ use ax_serving_api::orchestration::{
     },
     start_orchestrator,
 };
+use ax_serving_api::config::{AdaptiveDomainPredictionConfig, AdaptiveFederationConfig};
 use ax_serving_api::rest::schema::MAX_CONTENT_BYTES;
 use ax_serving_protocol::{
-    AgentDescriptor, CURRENT_PROTOCOL, CapacityObservation, DeploymentIdentity, DeploymentSpec,
-    DomainId, DomainSpec, ExecutionDomainKind, HardwareDescriptor, LogicalModelId,
-    NegotiatedProtocol, Operation, PoolId, PoolSpec, ProtocolDescriptor, QualificationState,
-    RegisterWorkerRequest as ProtocolRegisterRequest, RuntimeDescriptor, RuntimeModelDescriptor,
-    RuntimeModelId, RuntimeObservation, RuntimeStatus, TrustDomainId,
-    WorkerDescriptor as ProtocolWorkerDescriptor, WorkerId as ProtocolWorkerId, WorkerInstanceId,
+    AgentDescriptor, CURRENT_PROTOCOL, CapacityObservation, CompatibilityManifestDigest,
+    DecisionReasonCode, DeploymentIdentity, DeploymentSpec, Digest, DomainId, DomainObservation,
+    DomainSpec, EndpointScope, EquivalenceClassId, EquivalencePolicy, ExecutionDomainDescriptor,
+    ExecutionDomainKind, HardwareDescriptor, IdentityField, IdentityPolicy, LogicalModelId,
+    NegotiatedProtocol, Operation, PolicyMode, PoolId, PoolSpec, ProtocolCapability,
+    ProtocolDescriptor, QualificationState, RegisterWorkerRequest as ProtocolRegisterRequest,
+    RuntimeDescriptor, RuntimeModelDescriptor, RuntimeModelId, RuntimeObservation, RuntimeState,
+    RuntimeStatus, TrustDomainId, WorkerDescriptor as ProtocolWorkerDescriptor,
+    WorkerId as ProtocolWorkerId, WorkerInstanceId,
 };
 use axum::{Router, middleware, routing::post};
 use reqwest::Client;
@@ -199,6 +203,283 @@ fn proxy_router_with_key(layer: Arc<OrchestratorLayer>, key: &str) -> Router {
         .layer(middleware::from_fn(
             ax_serving_api::auth::request_id_and_headers_middleware,
         ))
+}
+
+fn adaptive_digest(character: char) -> Digest {
+    Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+}
+
+fn adaptive_manifest_digest() -> CompatibilityManifestDigest {
+    CompatibilityManifestDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap()
+}
+
+fn adaptive_identity() -> DeploymentIdentity {
+    DeploymentIdentity {
+        runtime_kind: "ax_engine".into(),
+        runtime_version: Some("6.12.0".into()),
+        revision: Some("adaptive-fixture-rev1".into()),
+        artifact_digest: Some(adaptive_digest('b')),
+        tokenizer_digest: Some(adaptive_digest('c')),
+        template_digest: Some(adaptive_digest('d')),
+        quantization: Some("bf16".into()),
+    }
+}
+
+fn register_adaptive_domain_worker(
+    layer: &OrchestratorLayer,
+    worker_addr: SocketAddr,
+    worker_id: &str,
+    pool_id: PoolId,
+    domain_id: DomainId,
+    kind: ExecutionDomainKind,
+    hardware_class: &str,
+    runtime_model_id: RuntimeModelId,
+) {
+    let trust_domain = TrustDomainId::new("private").unwrap();
+    let model = RuntimeModelDescriptor {
+        runtime_model_id,
+        identity: adaptive_identity(),
+        operations: BTreeSet::from([Operation::chat_completions()]),
+        capabilities: BTreeSet::new(),
+        max_context_tokens: Some(8_192),
+        max_output_tokens: Some(2_048),
+    };
+    let mut capabilities: BTreeSet<ProtocolCapability> = [
+        ProtocolCapability::CONTROL_EXECUTION_DOMAIN,
+        ProtocolCapability::DISPATCH_TYPED_ADMISSION,
+        ProtocolCapability::TELEMETRY_CAPACITY,
+        ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY,
+    ]
+    .into_iter()
+    .map(|value| ProtocolCapability::new(value).unwrap())
+    .collect();
+    if kind == ExecutionDomainKind::MacAxEngineCluster {
+        capabilities.insert(
+            ProtocolCapability::new(ProtocolCapability::CONTROL_MAC_CLUSTER).unwrap(),
+        );
+    }
+    layer
+        .registry
+        .register_protocol(
+            ProtocolRegisterRequest {
+                protocol: ProtocolDescriptor::current(capabilities.clone()),
+                agent: AgentDescriptor {
+                    name: "adaptive-fixture".into(),
+                    version: "1.0.0".into(),
+                    build_sha: None,
+                },
+                worker: ProtocolWorkerDescriptor {
+                    id: ProtocolWorkerId::new(worker_id).unwrap(),
+                    instance_id: WorkerInstanceId::new(),
+                    advertise_url: format!("http://{worker_addr}"),
+                    pool_id: pool_id.clone(),
+                    trust_domain: trust_domain.clone(),
+                    labels: BTreeMap::new(),
+                },
+                runtime: RuntimeDescriptor {
+                    kind: "ax_engine".into(),
+                    version: "6.12.0".into(),
+                    api: "openai-http".into(),
+                },
+                hardware: HardwareDescriptor {
+                    platform: "macos".into(),
+                    accelerator: hardware_class.into(),
+                    device_count: if kind == ExecutionDomainKind::MacAxEngineCluster {
+                        2
+                    } else {
+                        1
+                    },
+                    memory_bytes: Some(128 * 1024 * 1024 * 1024),
+                    hardware_class: Some(hardware_class.into()),
+                },
+                domain: Some(ExecutionDomainDescriptor {
+                    id: domain_id,
+                    kind,
+                    endpoint_scope: if kind == ExecutionDomainKind::MacAxEngineCluster {
+                        EndpointScope::Domain
+                    } else {
+                        EndpointScope::Node
+                    },
+                    execution_owner: "ax_engine".into(),
+                    qualification: QualificationState::Experimental,
+                    pool_id,
+                    trust_domain,
+                    hardware_class: hardware_class.into(),
+                    architecture: "arm64".into(),
+                    compatibility_manifest: Some(adaptive_manifest_digest()),
+                    labels: BTreeMap::new(),
+                }),
+                domain_observation: Some(DomainObservation {
+                    observed_at: time::OffsetDateTime::now_utc(),
+                    generation: 1,
+                    ready: true,
+                    state: RuntimeState::Ready,
+                    reason_code: None,
+                    frontend_instances_ready: Some(1),
+                    aggregate_capacity: Some(CapacityObservation {
+                        active_requests: Some(0),
+                        max_concurrent_requests: Some(4),
+                        waiting_requests: Some(0),
+                        ..Default::default()
+                    }),
+                    manifest_digest: Some(adaptive_manifest_digest()),
+                    models: vec![model.clone()],
+                }),
+                observation: RuntimeObservation {
+                    observed_at: time::OffsetDateTime::now_utc(),
+                    runtime: RuntimeStatus::ready(),
+                    inventory_generation: 1,
+                    models: vec![model],
+                    capacity: Some(CapacityObservation {
+                        active_requests: Some(0),
+                        max_concurrent_requests: Some(4),
+                        waiting_requests: Some(0),
+                        ..Default::default()
+                    }),
+                },
+            },
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(&format!(
+                "http://{worker_addr}"
+            ))
+            .unwrap(),
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities,
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+}
+
+fn adaptive_orchestrator_config(mode: PolicyMode) -> OrchestratorConfig {
+    let single_pool = PoolId::new("mac-single").unwrap();
+    let cluster_pool = PoolId::new("mac-cluster").unwrap();
+    let single_domain = DomainId::new("mac-single-main").unwrap();
+    let cluster_domain = DomainId::new("mac-cluster-main").unwrap();
+    let logical_model = LogicalModelId::new("fixture/adaptive").unwrap();
+    let single_deployment =
+        ax_serving_protocol::DeploymentId::new("fixture-adaptive-single").unwrap();
+    let cluster_deployment =
+        ax_serving_protocol::DeploymentId::new("fixture-adaptive-cluster").unwrap();
+    let equivalence_id = EquivalenceClassId::new("fixture-adaptive-certified").unwrap();
+    let identity_policy = IdentityPolicy {
+        required_matching_fields: BTreeSet::from([
+            IdentityField::RuntimeKind,
+            IdentityField::RuntimeVersion,
+            IdentityField::Revision,
+            IdentityField::ArtifactDigest,
+            IdentityField::TokenizerDigest,
+            IdentityField::TemplateDigest,
+            IdentityField::Quantization,
+        ]),
+    };
+    OrchestratorConfig {
+        deployment_mode: "explicit".into(),
+        request_timeout_secs: 5,
+        first_byte_timeout_ms: 5_000,
+        stream_idle_timeout_ms: 5_000,
+        pools: vec![
+            PoolSpec {
+                id: single_pool.clone(),
+                runtime_kind: "ax_engine".into(),
+                hardware_class: Some("apple-silicon".into()),
+                trust_domain: TrustDomainId::new("private").unwrap(),
+                selector: BTreeMap::new(),
+            },
+            PoolSpec {
+                id: cluster_pool.clone(),
+                runtime_kind: "ax_engine".into(),
+                hardware_class: Some("apple-silicon-cluster".into()),
+                trust_domain: TrustDomainId::new("private").unwrap(),
+                selector: BTreeMap::new(),
+            },
+        ],
+        domains: vec![
+            DomainSpec {
+                id: single_domain.clone(),
+                kind: ExecutionDomainKind::MacAxEngine,
+                pool: single_pool.clone(),
+                trust_domain: TrustDomainId::new("private").unwrap(),
+                hardware_class: "apple-silicon".into(),
+                required_qualification: QualificationState::Experimental,
+                selector: BTreeMap::new(),
+                enabled: true,
+            },
+            DomainSpec {
+                id: cluster_domain.clone(),
+                kind: ExecutionDomainKind::MacAxEngineCluster,
+                pool: cluster_pool.clone(),
+                trust_domain: TrustDomainId::new("private").unwrap(),
+                hardware_class: "apple-silicon-cluster".into(),
+                required_qualification: QualificationState::Experimental,
+                selector: BTreeMap::new(),
+                enabled: true,
+            },
+        ],
+        deployments: vec![
+            DeploymentSpec {
+                id: single_deployment.clone(),
+                logical_model: logical_model.clone(),
+                pool: single_pool,
+                domain: Some(single_domain.clone()),
+                runtime_model_id: RuntimeModelId::new("fixture/adaptive-single").unwrap(),
+                equivalence_class: Some(equivalence_id.clone()),
+                expected_identity: Some(adaptive_identity()),
+                required_identity: identity_policy.clone(),
+                required_capabilities: BTreeSet::new(),
+                enabled: true,
+            },
+            DeploymentSpec {
+                id: cluster_deployment.clone(),
+                logical_model,
+                pool: cluster_pool,
+                domain: Some(cluster_domain.clone()),
+                runtime_model_id: RuntimeModelId::new("fixture/adaptive-cluster").unwrap(),
+                equivalence_class: Some(equivalence_id.clone()),
+                expected_identity: Some(adaptive_identity()),
+                required_identity: identity_policy.clone(),
+                required_capabilities: BTreeSet::new(),
+                enabled: true,
+            },
+        ],
+        equivalence_classes: vec![EquivalencePolicy {
+            id: equivalence_id,
+            identity_policy,
+            certified_deployments: BTreeSet::from([single_deployment, cluster_deployment]),
+            certification_artifact: "cert/adaptive-fixture-v1.json".into(),
+        }],
+        adaptive_federation: AdaptiveFederationConfig {
+            enabled: true,
+            mode: match mode {
+                PolicyMode::Shadow => "shadow",
+                PolicyMode::Canary => "canary",
+                PolicyMode::Active => "active",
+                PolicyMode::Rollback => "rollback",
+            }
+            .into(),
+            target_domain: Some(cluster_domain.clone()),
+            baseline_domain: Some(single_domain.clone()),
+            canary_share_ppm: 1_000_000,
+            max_cost_microusd: Some(1_000),
+            latency_slo_ms: Some(1_000),
+            domains: vec![
+                AdaptiveDomainPredictionConfig {
+                    domain: single_domain,
+                    predicted_cost_microusd: 100,
+                    predicted_latency_ms: 120,
+                    stability_rank: 2,
+                },
+                AdaptiveDomainPredictionConfig {
+                    domain: cluster_domain,
+                    predicted_cost_microusd: 200,
+                    predicted_latency_ms: 80,
+                    stability_rank: 1,
+                },
+            ],
+        },
+        ..OrchestratorConfig::default()
+    }
 }
 
 /// Unwrap a `spawn_mock_worker` / `TcpListener::bind` result, skipping the
@@ -647,6 +928,132 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
         .unwrap();
     let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(models["data"][0]["id"], "public/qwen");
+}
+
+#[tokio::test]
+async fn test_adaptive_federation_modes_route_complete_domains_and_retain_evidence() {
+    let (single_addr, single_state) = skip_if_no_socket!(spawn_echo_model_worker().await);
+    let (cluster_addr, cluster_state) = skip_if_no_socket!(spawn_echo_model_worker().await);
+    let single_domain = DomainId::new("mac-single-main").unwrap();
+    let cluster_domain = DomainId::new("mac-cluster-main").unwrap();
+
+    for (mode, selected_domain, runtime_model, counterfactual, reason_code) in [
+        (
+            PolicyMode::Shadow,
+            single_domain.clone(),
+            "fixture/adaptive-single",
+            Some(cluster_domain.clone()),
+            DecisionReasonCode::ShadowBaseline,
+        ),
+        (
+            PolicyMode::Canary,
+            cluster_domain.clone(),
+            "fixture/adaptive-cluster",
+            Some(single_domain.clone()),
+            DecisionReasonCode::CanaryAssignment,
+        ),
+        (
+            PolicyMode::Active,
+            cluster_domain.clone(),
+            "fixture/adaptive-cluster",
+            None,
+            DecisionReasonCode::ActiveAssignment,
+        ),
+        (
+            PolicyMode::Rollback,
+            single_domain.clone(),
+            "fixture/adaptive-single",
+            Some(cluster_domain.clone()),
+            DecisionReasonCode::PolicyRollback,
+        ),
+    ] {
+        let fleet_store: Arc<dyn FleetStateStore> = MemoryFleetStateStore::shared();
+        let layer = Arc::new(
+            OrchestratorLayer::new_with_fleet_store(
+                adaptive_orchestrator_config(mode),
+                ProjectPolicyConfig::default(),
+                Arc::clone(&fleet_store),
+            )
+            .unwrap(),
+        );
+        register_adaptive_domain_worker(
+            &layer,
+            single_addr,
+            "adaptive-single-worker",
+            PoolId::new("mac-single").unwrap(),
+            single_domain.clone(),
+            ExecutionDomainKind::MacAxEngine,
+            "apple-silicon",
+            RuntimeModelId::new("fixture/adaptive-single").unwrap(),
+        );
+        register_adaptive_domain_worker(
+            &layer,
+            cluster_addr,
+            "adaptive-cluster-worker",
+            PoolId::new("mac-cluster").unwrap(),
+            cluster_domain.clone(),
+            ExecutionDomainKind::MacAxEngineCluster,
+            "apple-silicon-cluster",
+            RuntimeModelId::new("fixture/adaptive-cluster").unwrap(),
+        );
+        layer.reconcile_deployment_state().await.unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_router_with_key(Arc::clone(&layer), "adaptive-public-secret").oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer adaptive-public-secret",
+                    )
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"model":"fixture/adaptive","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("adaptive request must complete within its bounded deadline")
+        .unwrap();
+        let response_status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response_status,
+            axum::http::StatusCode::OK,
+            "mode {mode:?} returned {response}"
+        );
+        assert_eq!(response["model"], runtime_model);
+
+        let decisions = layer.dispatcher.decision_records(10);
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.selected_domain, selected_domain);
+        assert_eq!(decision.policy_mode, mode);
+        assert_eq!(decision.counterfactual_domain, counterfactual);
+        assert_eq!(decision.rolled_back, mode == PolicyMode::Rollback);
+        assert!(decision.reason_codes.contains(&DecisionReasonCode::AdaptivePolicy));
+        assert!(decision.reason_codes.contains(&reason_code));
+        assert_eq!(
+            fleet_store.list_decisions(10).await.unwrap(),
+            decisions,
+            "adaptive decision evidence must be retained in the shared store"
+        );
+    }
+
+    assert_eq!(
+        single_state.domain_ids.lock().unwrap().as_slice(),
+        ["mac-single-main", "mac-single-main"]
+    );
+    assert_eq!(
+        cluster_state.domain_ids.lock().unwrap().as_slice(),
+        ["mac-cluster-main", "mac-cluster-main"]
+    );
 }
 
 /// Dispatcher must re-check worker capacity after policy selection. Policies

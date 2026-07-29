@@ -196,3 +196,10 @@ to the adapter once weights are loaded.
 
 Until those physical and Engine gates pass, do not advertise the Mac cluster path as production
 supported.
+
+## Multi-process rehearsal
+
+A compose template for gateway + Redis + adapter (+ optional Engine rank profile) lives at
+[`deploy/compose/mac-cluster.compose.example.yaml`](../../../deploy/compose/mac-cluster.compose.example.yaml).
+Operator install, upgrade, rank-loss, credential rotation, and rollback steps are documented in
+[`docs/runbooks/mac-cluster-operations.md`](../../runbooks/mac-cluster-operations.md).

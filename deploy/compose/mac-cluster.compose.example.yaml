@@ -1,0 +1,108 @@
+# Multi-process rehearsal for one Mac AX Engine cluster domain.
+#
+# This is an operator template, not a production certificate. Replace every
+# digest, credential, and AX Engine rank image/binary with pinned values from
+# the certified manifest. Internal ranks never register with AX Serving.
+#
+# Topology:
+#   client -> gateway -> mac-cluster-adapter -> rank0 OpenAI gateway
+#                                    |-> rank0 pipeline service
+#                                    +-> rank1 pipeline service
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+
+  gateway:
+    image: ax-serving-gateway:local
+    environment:
+      AXS_CONFIG: /config/serving.mac-cluster.example.yaml
+      AXS_ALLOW_NO_AUTH: "true"
+      AXS_FLEET_STORE: redis
+      AXS_REDIS_URL: redis://redis:6379
+      AXS_FLEET_KEY_PREFIX: "axs:fleet:mac-cluster"
+      AXS_GATEWAY_ID: gateway-mac-cluster-a
+      AXS_INTERNAL_API_TOKEN: change-me-internal
+      AXS_DISPATCH_TOKEN: change-me-dispatch
+      AXS_API_KEY: change-me-public
+    volumes:
+      - ../../config/serving.mac-cluster.example.yaml:/config/serving.mac-cluster.example.yaml:ro
+    ports:
+      - "18080:18080"
+      - "19090:19090"
+    depends_on:
+      - redis
+
+  mac-cluster-adapter:
+    image: ax-mac-cluster-adapter:local
+    env_file:
+      - ../../config/mac-cluster-adapter.example.env
+    environment:
+      AXS_CONTROL_URL: http://gateway:19090
+      AXS_WORKER_TOKEN: change-me-internal
+      AXS_DISPATCH_TOKEN: change-me-dispatch
+      AXS_MAC_CLUSTER_CONTROL_TOKEN: change-me-rank-control
+      AXS_MAC_CLUSTER_RANK0_URL: http://rank0-gateway:9400
+      AXS_MAC_CLUSTER_RANK0_TOKEN: change-me-rank0
+      AXS_MAC_CLUSTER_MANIFEST: /config/mac-cluster-manifest.example.json
+      AXS_LISTEN_ADDR: 0.0.0.0:9200
+    volumes:
+      - ../../config/mac-cluster-manifest.example.json:/config/mac-cluster-manifest.example.json:ro
+    ports:
+      - "9200:9200"
+    depends_on:
+      - gateway
+
+  # AX Engine processes are external pins. These stubs document multi-host layout.
+  rank0:
+    image: ax-engine-pipeline-rank:local
+    profiles: ["engine"]
+    command:
+      - --topology
+      - /config/engine-topology.json
+      - --bootstrap-plan
+      - /config/rank-0-plan.json
+      - --model-dir
+      - /model
+      - --rank
+      - "0"
+      - --listen
+      - 0.0.0.0:9300
+    ports:
+      - "9300:9300"
+
+  rank1:
+    image: ax-engine-pipeline-rank:local
+    profiles: ["engine"]
+    command:
+      - --topology
+      - /config/engine-topology.json
+      - --bootstrap-plan
+      - /config/rank-1-plan.json
+      - --model-dir
+      - /model
+      - --rank
+      - "1"
+      - --listen
+      - 0.0.0.0:9301
+    ports:
+      - "9301:9301"
+
+  rank0-gateway:
+    image: ax-engine-pipeline-gateway:local
+    profiles: ["engine"]
+    command:
+      - --topology
+      - /config/engine-topology.json
+      - --endpoints
+      - http://rank0:9300,http://rank1:9301
+      - --listen
+      - 0.0.0.0:9400
+    ports:
+      - "9400:9400"
+    depends_on:
+      - rank0
+      - rank1

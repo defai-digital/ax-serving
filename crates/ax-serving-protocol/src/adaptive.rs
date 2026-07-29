@@ -55,6 +55,8 @@ pub enum AdaptivePolicyError {
     Profile(#[from] DecisionValidationError),
     #[error("canary share must be at most 1_000_000 ppm")]
     CanaryShareOutOfRange,
+    #[error("adaptive target and baseline domains must differ")]
+    SamePolicyDomain,
     #[error("no eligible domain candidate remains after cost/SLO filters")]
     NoEligibleCandidate,
     #[error("target or baseline domain is missing from the candidate set")]
@@ -65,6 +67,9 @@ impl AdaptiveFederationPolicyV1 {
     pub fn validate(&self) -> Result<(), AdaptivePolicyError> {
         if self.canary_share_ppm > 1_000_000 {
             return Err(AdaptivePolicyError::CanaryShareOutOfRange);
+        }
+        if self.target_domain == self.baseline_domain {
+            return Err(AdaptivePolicyError::SamePolicyDomain);
         }
         DecisionProfileV1 {
             max_cost_microusd: self.max_cost_microusd,
@@ -103,18 +108,16 @@ impl AdaptiveFederationPolicyV1 {
             return Err(AdaptivePolicyError::NoEligibleCandidate);
         }
 
-        let baseline = find_domain(&eligible, &self.baseline_domain)
-            .or_else(|| best_candidate(&eligible))
-            .ok_or(AdaptivePolicyError::NoEligibleCandidate)?;
+        let baseline = find_domain(&eligible, &self.baseline_domain);
         let target = find_domain(&eligible, &self.target_domain);
 
         match self.mode {
             PolicyMode::Shadow => {
-                let active = baseline;
-                let counterfactual = target.unwrap_or(active);
-                Ok(selection(active, Some(counterfactual), self.mode, false))
+                let active = baseline.ok_or(AdaptivePolicyError::MissingPolicyDomain)?;
+                Ok(selection(active, target, self.mode, false))
             }
             PolicyMode::Canary => {
+                let baseline = baseline.ok_or(AdaptivePolicyError::MissingPolicyDomain)?;
                 let Some(target) = target else {
                     return Ok(selection(baseline, None, self.mode, false));
                 };
@@ -126,14 +129,14 @@ impl AdaptiveFederationPolicyV1 {
                 }
             }
             PolicyMode::Active => {
-                let selected = target.unwrap_or(baseline);
+                let selected = target
+                    .or(baseline)
+                    .ok_or(AdaptivePolicyError::MissingPolicyDomain)?;
                 Ok(selection(selected, None, self.mode, false))
             }
             PolicyMode::Rollback => {
                 // Rollback always restores the baseline and records that fact.
-                let selected = find_domain(&eligible, &self.baseline_domain)
-                    .or(Some(baseline))
-                    .ok_or(AdaptivePolicyError::MissingPolicyDomain)?;
+                let selected = baseline.ok_or(AdaptivePolicyError::MissingPolicyDomain)?;
                 Ok(selection(selected, target, self.mode, true))
             }
         }
@@ -160,19 +163,6 @@ fn find_domain<'a>(
         .iter()
         .copied()
         .find(|candidate| &candidate.domain == domain)
-}
-
-fn best_candidate<'a>(candidates: &[&'a DomainCostSignal]) -> Option<&'a DomainCostSignal> {
-    candidates.iter().copied().min_by(|left, right| {
-        left.predicted_latency_ms
-            .cmp(&right.predicted_latency_ms)
-            .then(
-                left.predicted_cost_microusd
-                    .cmp(&right.predicted_cost_microusd),
-            )
-            .then(right.stability_rank.cmp(&left.stability_rank))
-            .then(left.domain.as_str().cmp(right.domain.as_str()))
-    })
 }
 
 fn selection(
@@ -271,6 +261,24 @@ mod tests {
         let decision = policy(PolicyMode::Rollback).select(&candidates, 7).unwrap();
         assert_eq!(decision.selected_domain, domain("mac-single"));
         assert!(decision.rolled_back);
+    }
+
+    #[test]
+    fn shadow_and_rollback_fail_closed_without_the_baseline() {
+        let candidates = vec![signal("mac-cluster", 80, 200, true)];
+        for mode in [PolicyMode::Shadow, PolicyMode::Rollback] {
+            assert_eq!(
+                policy(mode).select(&candidates, 1),
+                Err(AdaptivePolicyError::MissingPolicyDomain)
+            );
+        }
+    }
+
+    #[test]
+    fn target_and_baseline_must_be_distinct() {
+        let mut invalid = policy(PolicyMode::Active);
+        invalid.target_domain = invalid.baseline_domain.clone();
+        assert_eq!(invalid.validate(), Err(AdaptivePolicyError::SamePolicyDomain));
     }
 
     #[test]

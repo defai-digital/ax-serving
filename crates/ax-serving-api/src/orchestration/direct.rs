@@ -950,7 +950,7 @@ impl DirectDispatcher {
                 PolicyMode::Shadow => DecisionReasonCode::ShadowBaseline,
                 PolicyMode::Canary => DecisionReasonCode::CanaryAssignment,
                 PolicyMode::Rollback => DecisionReasonCode::PolicyRollback,
-                PolicyMode::Active => DecisionReasonCode::LowestNormalizedScore,
+                PolicyMode::Active => DecisionReasonCode::ActiveAssignment,
             });
         }
 
