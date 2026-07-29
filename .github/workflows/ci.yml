@@ -230,9 +230,11 @@ jobs:
       - name: Render Kubernetes base
         run: kubectl kustomize deploy/kubernetes/base >/tmp/ax-serving-kubernetes.yaml
       - name: Parse deployment YAML
+        # Helm templates under deploy/helm/**/templates/** are Go templates, not pure YAML.
         run: >-
           ruby -e 'require "yaml";
           Dir["deploy/**/*.yaml"].sort.each do |path|
+            next if path.include?("/templates/");
             YAML.load_stream(File.read(path));
           end'
       - name: Validate dashboard JSON
