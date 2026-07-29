@@ -14,13 +14,24 @@ export type AxClientOptions = {
   fetchImpl?: typeof fetch;
 };
 
+/** Strip trailing `/` without a quantifier regex (avoids CodeQL js/polynomial-redos). */
+function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* '/' */) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export class AxServingClient {
   private readonly baseURL: string;
   private readonly apiKey?: string;
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: AxClientOptions = {}) {
-    this.baseURL = (options.baseURL ?? "http://127.0.0.1:18080").replace(/\/+$/, "");
+    this.baseURL = stripTrailingSlashes(
+      options.baseURL ?? "http://127.0.0.1:18080",
+    );
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }

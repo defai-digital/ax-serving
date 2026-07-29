@@ -56,3 +56,20 @@ test("chatCompletionsCreate preserves assistant tool-call history", async () => 
   assert.equal(body.messages[1].tool_calls[0].id, "call_1");
   assert.equal(body.messages[2].tool_call_id, "call_1");
 });
+
+test("baseURL normalizes any number of trailing slashes without regex", async () => {
+  const seen = [];
+  const client = new AxServingClient({
+    baseURL: "http://127.0.0.1:18080////",
+    fetchImpl: async (url) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify({ object: "list", data: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.modelsList();
+  assert.deepEqual(seen, ["http://127.0.0.1:18080/v1/models"]);
+});
