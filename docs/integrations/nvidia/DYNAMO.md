@@ -47,7 +47,9 @@ Credentials must come from a secret manager or process environment. Then run:
 target/release/ax-dynamo-adapter
 ```
 
-The adapter registers with protocol v1.1 as:
+The adapter registers with the current protocol v1.2 while using the v1.1
+execution-domain capabilities (it does not advertise the Mac cluster
+capability):
 
 - kind `nvidia_dynamo_pc` or `nvidia_dynamo_thor`;
 - endpoint scope `domain`;

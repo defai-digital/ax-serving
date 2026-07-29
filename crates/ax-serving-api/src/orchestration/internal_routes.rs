@@ -175,6 +175,7 @@ fn gateway_protocol_capabilities() -> BTreeSet<ProtocolCapability> {
     [
         ProtocolCapability::CONTROL_DRAIN,
         ProtocolCapability::CONTROL_EXECUTION_DOMAIN,
+        ProtocolCapability::CONTROL_MAC_CLUSTER,
         ProtocolCapability::CONTROL_INVENTORY_DELTA,
         ProtocolCapability::DISPATCH_CANCEL,
         ProtocolCapability::DISPATCH_TYPED_ADMISSION,
@@ -942,6 +943,40 @@ mod tests {
         value
     }
 
+    fn protocol_mac_cluster_registration() -> serde_json::Value {
+        let mut value = protocol_domain_registration();
+        value["protocol"]["version"]["minor"] = serde_json::json!(2);
+        value["protocol"]["capabilities"] = serde_json::json!([
+            "control.drain",
+            "control.execution-domain.v1",
+            "control.mac-cluster.v1",
+            "dispatch.typed-admission",
+            "telemetry.capacity",
+            "telemetry.domain-capacity.v1"
+        ]);
+        value["agent"]["name"] = serde_json::json!("ax-mac-cluster-adapter");
+        value["worker"]["id"] = serde_json::json!("mac-cluster-adapter-1");
+        value["worker"]["pool_id"] = serde_json::json!("mac-cluster");
+        value["worker"]["trust_domain"] = serde_json::json!("private-lab");
+        value["runtime"]["kind"] = serde_json::json!("ax_engine");
+        value["runtime"]["version"] = serde_json::json!("4.10.0");
+        value["hardware"]["platform"] = serde_json::json!("macos");
+        value["hardware"]["accelerator"] = serde_json::json!("apple-silicon-cluster");
+        value["hardware"]["hardware_class"] = serde_json::json!("apple-silicon-cluster");
+        value["observation"]["models"][0]["identity"]["runtime_kind"] =
+            serde_json::json!("ax_engine");
+        value["observation"]["models"][0]["identity"]["runtime_version"] =
+            serde_json::json!("4.10.0");
+        value["domain"]["id"] = serde_json::json!("mac-cluster-main");
+        value["domain"]["kind"] = serde_json::json!("mac_ax_engine_cluster");
+        value["domain"]["execution_owner"] = serde_json::json!("ax_engine");
+        value["domain"]["pool_id"] = serde_json::json!("mac-cluster");
+        value["domain"]["trust_domain"] = serde_json::json!("private-lab");
+        value["domain"]["hardware_class"] = serde_json::json!("apple-silicon-cluster");
+        value["domain"]["architecture"] = serde_json::json!("arm64");
+        value
+    }
+
     #[tokio::test]
     async fn protocol_v1_1_domain_registration_and_observation_are_visible() {
         let state = test_state();
@@ -1050,6 +1085,41 @@ mod tests {
             Some(2)
         );
         assert_eq!(snapshot.active_sequences, 3);
+    }
+
+    #[tokio::test]
+    async fn protocol_v1_2_mac_cluster_registration_is_domain_scoped() {
+        let state = test_state();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workers/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        protocol_mac_cluster_registration().to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let id = state
+            .registry
+            .resolve_worker_id("mac-cluster-adapter-1")
+            .unwrap();
+        let snapshot = state.registry.get_snapshot(id).unwrap();
+        let descriptor = snapshot.domain.unwrap();
+        assert_eq!(
+            descriptor.kind,
+            ax_serving_protocol::ExecutionDomainKind::MacAxEngineCluster
+        );
+        assert_eq!(
+            descriptor.endpoint_scope,
+            ax_serving_protocol::EndpointScope::Domain
+        );
     }
 
     #[tokio::test]

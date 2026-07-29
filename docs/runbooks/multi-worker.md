@@ -2,9 +2,9 @@
 
 | Field | Value |
 | --- | --- |
-| Current scope | Portable `ax-serving-api`, protocol v1.1 foundation, and `ax-runtime-agent` |
+| Current scope | Portable `ax-serving-api`, protocol v1.2 foundation, and `ax-runtime-agent` |
 | Target scope | Mac AX Engine pools plus separate NVIDIA PC/Thor Dynamo domains |
-| Last updated | 2026-07-15 |
+| Last updated | 2026-07-28 |
 | Status | Current Mac/compatibility procedures are runnable; Dynamo/Thor procedures are qualification targets |
 
 This runbook separates current source behavior from the final architecture. Execution-domain

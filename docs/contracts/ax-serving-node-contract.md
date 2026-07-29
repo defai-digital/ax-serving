@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Protocol v1.1 source foundation; Dynamo adapter certification pending |
+| Status | Protocol v1.2 source foundation; Dynamo and Mac cluster certification pending |
 | Wire types | `crates/ax-serving-protocol` |
-| Current version | `1.1` |
-| Last updated | 2026-07-27 |
+| Current version | `1.2` |
+| Last updated | 2026-07-28 |
 
 This contract defines how a runtime agent or domain adapter joins the portable AX Serving fleet.
 The Rust protocol crate and its JSON fixtures are authoritative when this
@@ -14,6 +14,10 @@ document and code differ.
 Protocol v1.1 extends the v1.0 worker contract additively so a Dynamo deployment can register as one
 execution domain. The types, validation, gateway state propagation, fixtures, and desired-domain
 catalog and Dynamo adapter are implemented; live certification is not.
+
+Protocol v1.2 additively defines `mac_ax_engine_cluster` and
+`control.mac-cluster.v1`. A source/mock-tested runtime-neutral coordinator adapter implements this
+control contract, but there is no distributed AX Engine implementation or live support evidence.
 
 ## 1. Runtime ownership
 
@@ -303,7 +307,7 @@ New integrations must use the protocol crate rather than adding runtime-name
 conditionals or more fields to the legacy DTOs. Direct vLLM/SGLang agents become
 `compatibility_runtime_endpoint` targets after the Dynamo adapter is certified.
 
-## 13. Execution-domain v1.1 extension
+## 13. Execution-domain v1.1 and Mac cluster v1.2 extensions
 
 Protocol minor 1 adds optional:
 
@@ -313,6 +317,10 @@ telemetry.domain-capacity.v1
 ExecutionDomainDescriptor
 DomainObservation
 ```
+
+Protocol minor 2 adds `control.mac-cluster.v1` and the
+`mac_ax_engine_cluster` domain kind. A cluster descriptor requires that
+capability and cannot be advertised through the v1.0 Mac migration path.
 
 The descriptor includes a stable domain ID, kind, endpoint scope, execution owner, qualification,
 pool, trust domain, hardware class, architecture, and compatibility-manifest digest.
@@ -324,6 +332,7 @@ Required mappings:
 | Domain kind | Scope | Meaning |
 | --- | --- | --- |
 | `mac_ax_engine` | `node` | One Mac AX Engine endpoint |
+| `mac_ax_engine_cluster` | `domain` | One complete model-parallel AX Engine cluster |
 | `nvidia_dynamo_pc` | `domain` | One complete NVIDIA PC Dynamo deployment |
 | `nvidia_dynamo_thor` | `domain` | One separately qualified Thor Dynamo deployment |
 | `compatibility_runtime_endpoint` | `node` | Time-bounded direct runtime migration path |
@@ -335,12 +344,15 @@ not start.
 
 Current `ax-runtime-agent` registrations advertise the domain capability only when
 `AXS_NODE_DOMAIN_ID` is configured. The agent derives a safe kind: AX Engine becomes
-`mac_ax_engine`, while every other direct runtime becomes `compatibility_runtime_endpoint`; it
-cannot claim a Dynamo domain. `AXS_NODE_DOMAIN_QUALIFICATION` defaults to `unverified`, and an
-optional `AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST` carries the retained manifest digest. Without a
-domain ID, operators can use the explicit Mac/compatibility migration mapping. NVIDIA production
-domains require the separate adapter, a valid v1.1 descriptor, and a ready aggregate
-observation.
+`mac_ax_engine`, while every other direct runtime becomes
+`compatibility_runtime_endpoint`; it cannot claim a Dynamo or Mac cluster
+domain. `AXS_NODE_DOMAIN_QUALIFICATION` defaults to `unverified`, and an
+optional `AXS_NODE_DOMAIN_COMPATIBILITY_MANIFEST` carries the retained manifest
+digest. Without a domain ID, operators can use the explicit Mac/compatibility
+migration mapping. NVIDIA production domains require the separate adapter, a
+valid v1.1 descriptor, and a ready aggregate observation.
 
-The normative v1.1 types, migration rules, and conformance matrix are in the
-[technical specification](../../.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md).
+The normative v1.1 federation types and migration rules are in the
+[federated technical specification](../../.internal/specs/TECH-SPEC-FEDERATED-INFERENCE-CONTROL-PLANE.md).
+The v1.2 Mac cluster contract is in the
+[Mac distributed execution-domain specification](../../.internal/specs/TECH-SPEC-MAC-DISTRIBUTED-EXECUTION-DOMAIN.md).

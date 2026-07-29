@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "cluster_id": "mac-cluster-main",
+  "generation": 1,
+  "created_at": "2026-07-28T12:00:00Z",
+  "model": {
+    "runtime_model_id": "llama-405b-int4-pp2",
+    "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "revision": "llama-405b-int4-rev1",
+    "tokenizer_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "template_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "quantization": "int4",
+    "architecture": "llama",
+    "total_layers": 126,
+    "max_context_tokens": 8192,
+    "max_output_tokens": 2048
+  },
+  "runtime": {
+    "ax_engine_version": "4.10.0",
+    "build_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "mlx_version": "0.29.0",
+    "os_baseline": "macos-26.0"
+  },
+  "parallelism": {
+    "kind": "pipeline",
+    "pp_size": 2,
+    "tp_size": 1,
+    "micro_batch_limit": 1
+  },
+  "transport": {
+    "kind": "tcp",
+    "security_profile": "trusted_mesh",
+    "topology_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "minimum_bandwidth_bytes_per_second": 1000000000,
+    "maximum_latency_micros": 1000
+  },
+  "artifacts": [
+    {
+      "relative_path": "weights/rank-0.safetensors",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "size_bytes": 100000000000,
+      "kind": "weight"
+    },
+    {
+      "relative_path": "weights/rank-1.safetensors",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "size_bytes": 100000000000,
+      "kind": "weight"
+    },
+    {
+      "relative_path": "tokenizer.json",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "size_bytes": 2000000,
+      "kind": "tokenizer"
+    },
+    {
+      "relative_path": "config.json",
+      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "size_bytes": 10000,
+      "kind": "config"
+    }
+  ],
+  "ranks": [
+    {
+      "rank": 0,
+      "node_identity_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "stage": 0,
+      "tensor_rank": 0,
+      "layers": {
+        "start": 0,
+        "end": 63
+      },
+      "owns_embeddings": true,
+      "owns_output_head": false,
+      "required_weight_files": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      ],
+      "memory": {
+        "assigned_weight_bytes": 100000000000,
+        "non_layer_weight_bytes": 4000000000,
+        "quantization_metadata_bytes": 2000000000,
+        "kv_budget_bytes": 8000000000,
+        "activation_budget_bytes": 4000000000,
+        "communication_buffer_bytes": 2000000000,
+        "allocator_reserve_bytes": 4000000000,
+        "os_headroom_bytes": 12000000000,
+        "certified_usable_bytes": 136000000000
+      }
+    },
+    {
+      "rank": 1,
+      "node_identity_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "stage": 1,
+      "tensor_rank": 0,
+      "layers": {
+        "start": 63,
+        "end": 126
+      },
+      "owns_embeddings": false,
+      "owns_output_head": true,
+      "required_weight_files": [
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "memory": {
+        "assigned_weight_bytes": 100000000000,
+        "non_layer_weight_bytes": 4000000000,
+        "quantization_metadata_bytes": 2000000000,
+        "kv_budget_bytes": 8000000000,
+        "activation_budget_bytes": 4000000000,
+        "communication_buffer_bytes": 2000000000,
+        "allocator_reserve_bytes": 4000000000,
+        "os_headroom_bytes": 12000000000,
+        "certified_usable_bytes": 136000000000
+      }
+    }
+  ]
+}

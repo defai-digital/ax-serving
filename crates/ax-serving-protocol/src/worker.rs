@@ -238,7 +238,7 @@ pub struct RegisterWorkerRequest {
 }
 
 impl RegisterWorkerRequest {
-    /// Validate additive protocol-v1.1 execution-domain semantics.
+    /// Validate additive protocol-v1.1 execution-domain and v1.2 Mac-cluster semantics.
     ///
     /// Runtime-observation validation remains available separately so v1.0
     /// callers do not need to adopt domain fields.
@@ -251,6 +251,11 @@ impl RegisterWorkerRequest {
             self.protocol.capabilities.iter().any(|capability| {
                 capability.as_str() == ProtocolCapability::TELEMETRY_DOMAIN_CAPACITY
             });
+        let declares_mac_cluster = self
+            .protocol
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == ProtocolCapability::CONTROL_MAC_CLUSTER);
 
         if (self.domain.is_some() || self.domain_observation.is_some() || declares_control)
             && (self.protocol.version.major != 1 || self.protocol.version.minor < 1)
@@ -269,6 +274,9 @@ impl RegisterWorkerRequest {
         }
 
         let Some(descriptor) = &self.domain else {
+            if declares_mac_cluster {
+                return Err(DomainContractError::MacClusterCapabilityWithoutDomain);
+            }
             if self.domain_observation.is_some() {
                 return Err(DomainContractError::ObservationWithoutDescriptor);
             }
@@ -277,6 +285,17 @@ impl RegisterWorkerRequest {
         descriptor
             .validate()
             .map_err(|error| DomainContractError::InvalidDescriptor(error.to_string()))?;
+        let is_mac_cluster = descriptor.kind == crate::ExecutionDomainKind::MacAxEngineCluster;
+        if is_mac_cluster && (self.protocol.version.major != 1 || self.protocol.version.minor < 2) {
+            return Err(DomainContractError::MacClusterProtocolMinorTooOld);
+        }
+        if is_mac_cluster != declares_mac_cluster {
+            return Err(if is_mac_cluster {
+                DomainContractError::MacClusterDescriptorWithoutCapability
+            } else {
+                DomainContractError::MacClusterCapabilityForOtherDomain
+            });
+        }
         if descriptor.pool_id != self.worker.pool_id {
             return Err(DomainContractError::PoolMismatch);
         }
@@ -308,12 +327,20 @@ impl RegisterWorkerRequest {
 pub enum DomainContractError {
     #[error("execution-domain fields require protocol major 1 minor 1 or newer")]
     ProtocolMinorTooOld,
+    #[error("mac_ax_engine_cluster requires protocol major 1 minor 2 or newer")]
+    MacClusterProtocolMinorTooOld,
     #[error("control.execution-domain.v1 requires an execution-domain descriptor")]
     CapabilityWithoutDescriptor,
     #[error("an execution-domain descriptor requires control.execution-domain.v1")]
     DescriptorWithoutCapability,
     #[error("telemetry.domain-capacity.v1 requires control.execution-domain.v1")]
     CapacityCapabilityWithoutDomain,
+    #[error("control.mac-cluster.v1 requires an execution-domain descriptor")]
+    MacClusterCapabilityWithoutDomain,
+    #[error("mac_ax_engine_cluster requires control.mac-cluster.v1")]
+    MacClusterDescriptorWithoutCapability,
+    #[error("control.mac-cluster.v1 is valid only for mac_ax_engine_cluster")]
+    MacClusterCapabilityForOtherDomain,
     #[error("a domain observation requires an execution-domain descriptor")]
     ObservationWithoutDescriptor,
     #[error("domain aggregate capacity requires telemetry.domain-capacity.v1")]

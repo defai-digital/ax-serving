@@ -1505,8 +1505,16 @@ pub(super) async fn proxy_admin_decisions(
     State(layer): State<Arc<OrchestratorLayer>>,
     Query(query): Query<AuditQuery>,
 ) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 200);
+    let records = match layer.fleet_store.list_decisions(limit).await {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(%error, "durable decision lookup failed; returning local journal");
+            layer.dispatcher.decision_records(limit)
+        }
+    };
     Json(serde_json::json!({
-        "records": layer.dispatcher.decision_records(query.limit),
+        "records": records,
     }))
 }
 

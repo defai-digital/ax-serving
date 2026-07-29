@@ -93,7 +93,8 @@ Build the implemented portable binaries:
 cargo build --release \
   -p ax-serving-cli --bin ax-serving-api \
   -p ax-thor-agent --bin ax-runtime-agent \
-  -p ax-dynamo-adapter --bin ax-dynamo-adapter
+  -p ax-dynamo-adapter --bin ax-dynamo-adapter \
+  -p ax-mac-cluster-adapter --bin ax-mac-cluster-adapter
 ```
 
 Start a development gateway on loopback:
@@ -139,6 +140,11 @@ is compatibility-only in the final design; it is not the target NVIDIA productio
 For the NVIDIA path, follow the
 [Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) and validate an immutable manifest before
 starting `ax-dynamo-adapter`. Source/mock conformance is not live hardware certification.
+
+The Mac cluster coordinator has a separate
+[source-level setup guide](docs/integrations/mac/CLUSTER.md). It is useful for protocol and
+coordinator integration today, but it cannot make a model span Macs until AX Engine implements the
+manifest-bound pipeline executor and activation data plane.
 
 For explicit deployment identity, start from
 [`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). It demonstrates explicit
@@ -242,10 +248,11 @@ Dynamo remains a separately pinned and operated execution domain.
 
 ## Repository layout
 
-- `crates/ax-serving-protocol` — portable worker/deployment/domain protocol v1.1;
+- `crates/ax-serving-protocol` — portable worker/deployment/domain protocol v1.2;
 - `crates/ax-serving-api` — gateway, catalog, routing, HA state, lifecycle, REST/SSE;
 - `crates/ax-serving-adapter-core` — byte-preserving OpenAI/SSE adapter transport;
 - `crates/ax-dynamo-adapter` — one runtime-SDK-free endpoint per NVIDIA Dynamo domain;
+- `crates/ax-mac-cluster-adapter` — experimental coordinator/adapter for one future Mac AX Engine cluster;
 - `crates/ax-thor-agent` — current package for the generic `ax-runtime-agent` binary;
 - `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
 - `crates/ax-serving-engine` — embedded compatibility backends, not federation architecture;

@@ -1,12 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ax_serving_api::orchestration::fleet_state::{
-    FleetMutationResult, FleetStateStore, RedisFleetStateStore, ReservationResult,
+    DomainReservationResult, FleetMutationResult, FleetStateStore, RedisFleetStateStore,
+    ReservationResult,
 };
 use ax_serving_protocol::{
-    AttemptId, DeploymentControlRecord, DeploymentDesiredState, DeploymentId, DeploymentJobAction,
-    DeploymentJobRecord, DeploymentSpec, IdentityPolicy, LogicalModelId, PoolId, RuntimeModelId,
-    WorkerId,
+    AttemptId, CandidateDecision, DecisionReasonCode, DecisionRecordV1, DeploymentControlRecord,
+    DeploymentDesiredState, DeploymentId, DeploymentJobAction, DeploymentJobRecord, DeploymentSpec,
+    DomainId, IdentityPolicy, LogicalModelId, Operation, PolicyId, PolicyMode, PolicyVersion,
+    PoolId, RequestId, RuntimeModelId, WorkerId,
 };
 
 fn deployment() -> DeploymentSpec {
@@ -23,6 +25,34 @@ fn deployment() -> DeploymentSpec {
         },
         required_capabilities: BTreeSet::new(),
         enabled: true,
+    }
+}
+
+fn decision() -> DecisionRecordV1 {
+    let domain = DomainId::new("redis-domain").unwrap();
+    let deployment = DeploymentId::new("redis-deployment").unwrap();
+    DecisionRecordV1 {
+        request_id: RequestId::new(),
+        operation: Operation::chat_completions(),
+        logical_model: LogicalModelId::new("public/redis").unwrap(),
+        routing_profile: None,
+        policy_id: PolicyId::new("explicit-catalog").unwrap(),
+        policy_version: PolicyVersion::new("1").unwrap(),
+        policy_mode: PolicyMode::Active,
+        candidate_summary: vec![CandidateDecision {
+            domain: domain.clone(),
+            deployment: deployment.clone(),
+            eligible: true,
+            rejection_reasons: BTreeSet::new(),
+            normalized_score_microunits: None,
+        }],
+        selected_domain: domain.clone(),
+        selected_deployment: deployment,
+        reason_codes: BTreeSet::from([DecisionReasonCode::OnlyEligible]),
+        observation_generations: BTreeMap::from([(domain, 4)]),
+        predicted_cost_microusd: None,
+        predicted_latency_ms: None,
+        decided_at: time::OffsetDateTime::now_utc(),
     }
 }
 
@@ -59,6 +89,35 @@ async fn redis_store_enforces_reservations_generations_and_job_round_trips() {
             .await
             .unwrap(),
         ReservationResult::Reserved
+    );
+
+    let domain_id = DomainId::new("redis-domain").unwrap();
+    let domain_first = AttemptId::new();
+    let domain_second = AttemptId::new();
+    assert_eq!(
+        store
+            .try_reserve_domain(&domain_id, 3, domain_first, 1, 5_000)
+            .await
+            .unwrap(),
+        DomainReservationResult::Reserved
+    );
+    assert_eq!(
+        store
+            .try_reserve_domain(&domain_id, 4, domain_second, 1, 5_000)
+            .await
+            .unwrap(),
+        DomainReservationResult::GenerationFenced
+    );
+    store
+        .release_domain_reservation(&domain_id, domain_first)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .try_reserve_domain(&domain_id, 4, domain_second, 1, 5_000)
+            .await
+            .unwrap(),
+        DomainReservationResult::Reserved
     );
     assert!(
         store
@@ -119,4 +178,8 @@ async fn redis_store_enforces_reservations_generations_and_job_round_trips() {
         store.get_deployment_job(job.id).await.unwrap().unwrap(),
         job
     );
+
+    let decision = decision();
+    store.put_decision(&decision, 5_000).await.unwrap();
+    assert_eq!(store.list_decisions(10).await.unwrap(), vec![decision]);
 }

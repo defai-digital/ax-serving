@@ -629,6 +629,11 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
     let decisions = layer.dispatcher.decision_records(10);
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].selected_domain, domain_id);
+    assert_eq!(
+        fleet_store.list_decisions(10).await.unwrap(),
+        decisions,
+        "the shared fleet store must retain the same bounded decision evidence"
+    );
 
     let decision_response = app
         .clone()

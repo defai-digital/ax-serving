@@ -106,11 +106,12 @@ New runtime integrations depend on this wire contract, not `InferenceBackend`
 or other embedded Rust traits. Legacy registration is a migration contract and
 cannot certify cross-runtime failover.
 
-The current source contract is protocol v1.1 with tolerant v1.0 fixtures. Domain descriptors,
-observations, configuration/catalog resolution, worker diagnostics, and bounded in-memory decision
-records are implemented. The Dynamo Domain Adapter, durable/offline replay, domain-specific HA
-reservations, and live support certification remain unreleased. One Dynamo deployment will register
-as one domain endpoint; its internal workers are never AX public/control-plane resources.
+The current source contract is protocol v1.2 with tolerant v1.0/v1.1 fixtures. Domain descriptors,
+observations, configuration/catalog resolution, worker diagnostics, generation-fenced domain
+reservations, rejected-candidate evidence, and bounded decision persistence are implemented for
+memory and Redis/Valkey stores. Live support certification, two-gateway partition/soak evidence, and
+offline replay tooling remain unreleased. One Dynamo deployment registers as one domain endpoint;
+its internal workers are never AX public/control-plane resources.
 
 ## Configuration
 

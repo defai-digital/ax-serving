@@ -79,9 +79,12 @@ The read API does not imply that every deployment behind an alias is
 equivalent. AX Serving's explicit catalog and equivalence policy enforce that
 internally.
 
-The execution-domain contract and Dynamo adapter now exist as source-level protocol v1.1
-integration, but are not live certified. AX Fabric continues to use logical models and must not
-address Dynamo workers, PC/Thor pools, or Mac endpoints directly.
+The execution-domain contract and Dynamo adapter exist as source-level protocol
+v1.1 integration, but are not live certified. Protocol v1.2 additionally
+defines a fail-closed Mac cluster domain contract; it does not imply a
+distributed AX Engine runtime is present. AX Fabric continues to use logical
+models and must not address Dynamo workers, PC/Thor pools, or Mac endpoints
+directly.
 
 ## Inference
 

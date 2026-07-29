@@ -65,6 +65,10 @@ jobs:
             echo "portable Dynamo adapter crossed the runtime-SDK dependency boundary" >&2
             exit 1
           fi
+          if cargo tree -p ax-mac-cluster-adapter | grep -Eq "$FORBIDDEN"; then
+            echo "portable Mac cluster adapter crossed the runtime-SDK dependency boundary" >&2
+            exit 1
+          fi
       - name: Check portable crates
         run: >-
           cargo check
@@ -73,6 +77,7 @@ jobs:
           -p ax-serving-api
           -p ax-serving-adapter-core
           -p ax-dynamo-adapter
+          -p ax-mac-cluster-adapter
           -p ax-thor-agent
           -p ax-serving-cli
       - name: Clippy portable crates
@@ -83,6 +88,7 @@ jobs:
           -p ax-serving-api
           -p ax-serving-adapter-core
           -p ax-dynamo-adapter
+          -p ax-mac-cluster-adapter
           -p ax-thor-agent
           -p ax-serving-cli
           --all-targets -- -D warnings
@@ -93,6 +99,7 @@ jobs:
           cargo test -p ax-serving-api
           cargo test -p ax-serving-adapter-core
           cargo test -p ax-dynamo-adapter
+          cargo test -p ax-mac-cluster-adapter
           cargo test -p ax-thor-agent
           cargo test -p ax-serving-cli --no-default-features --features gateway --bin ax-servingctl
       - name: Redis fleet-state conformance

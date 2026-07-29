@@ -1,0 +1,85 @@
+# AX Serving profile for one model-parallel Mac AX Engine cluster.
+#
+# The cluster adapter registers one domain endpoint. Internal ranks never
+# register with AX Serving and are never independently routable.
+
+orchestrator:
+  host: "127.0.0.1"
+  port: 18080
+  internal_bind_addr: "127.0.0.1"
+  internal_port: 19090
+  worker_heartbeat_ms: 5000
+  worker_ttl_ms: 15000
+  dispatch_policy: "inference_aware"
+  deployment_mode: "explicit"
+  telemetry_stale_ms: 10000
+  max_dispatch_attempts: 2
+  tls_profile: "loopback_dev"
+  fleet_store: "memory"
+  fleet_key_prefix: "axs:fleet:v1"
+  gateway_id: "gateway-mac-cluster-1"
+  retry_after_secs: 5
+  pool_max_idle_per_host: 8
+  request_timeout_secs: 300
+  first_byte_timeout_ms: 120000
+  stream_idle_timeout_ms: 30000
+  global_queue_max: 16
+  global_queue_depth: 32
+  global_queue_wait_ms: 10000
+  global_queue_policy: "queue"
+  tenant_max_concurrent: 0
+
+  pools:
+    - id: "mac-cluster"
+      runtime_kind: "ax_engine"
+      hardware_class: "apple-silicon-cluster"
+      trust_domain: "private-lab"
+      selector:
+        worker_pool: "mac-cluster"
+
+  domains:
+    - id: "mac-cluster-main"
+      kind: "mac_ax_engine_cluster"
+      pool: "mac-cluster"
+      trust_domain: "private-lab"
+      hardware_class: "apple-silicon-cluster"
+      required_qualification: "experimental"
+      selector:
+        domain_id: "mac-cluster-main"
+        endpoint_scope: "domain"
+        execution_owner: "ax_engine"
+      enabled: true
+
+  deployments:
+    - id: "llama-405b-mac-pp2"
+      logical_model: "llama/405b"
+      pool: "mac-cluster"
+      domain: "mac-cluster-main"
+      runtime_model_id: "llama-405b-int4-pp2"
+      expected_identity:
+        runtime_kind: "ax_engine"
+        runtime_version: "4.10.0"
+        revision: "llama-405b-int4-rev1"
+        artifact_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        tokenizer_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        template_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        quantization: "int4"
+      required_identity:
+        required_matching_fields:
+          - runtime_kind
+          - runtime_version
+          - revision
+          - artifact_digest
+          - tokenizer_digest
+          - template_digest
+          - quantization
+      required_capabilities: []
+      enabled: true
+
+  equivalence_classes: []
+
+# Secrets remain environment-only:
+#   AXS_API_KEY=<public-client-secret>
+#   AXS_ADMIN_API_KEY=<operator-secret>
+#   AXS_INTERNAL_API_TOKEN=<gateway-registration-control-secret>
+#   AXS_DISPATCH_TOKEN=<gateway-to-adapter-secret>

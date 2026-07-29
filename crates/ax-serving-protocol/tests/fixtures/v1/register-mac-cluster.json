@@ -1,0 +1,119 @@
+{
+  "protocol": {
+    "version": {
+      "major": 1,
+      "minor": 2
+    },
+    "capabilities": [
+      "control.drain",
+      "control.execution-domain.v1",
+      "control.mac-cluster.v1",
+      "dispatch.cancel",
+      "dispatch.typed-admission",
+      "telemetry.capacity",
+      "telemetry.domain-capacity.v1"
+    ]
+  },
+  "agent": {
+    "name": "ax-engine-cluster-adapter",
+    "version": "0.1.0"
+  },
+  "worker": {
+    "id": "mac-cluster-adapter-1",
+    "instance_id": "3e84f84b-14e8-4683-877c-d60d56c6cf92",
+    "advertise_url": "https://10.0.4.20:18080",
+    "pool_id": "mac-cluster",
+    "trust_domain": "private-lab",
+    "labels": {
+      "site": "lab-a"
+    }
+  },
+  "runtime": {
+    "kind": "ax_engine",
+    "version": "7.0.0",
+    "api": "openai-v1"
+  },
+  "hardware": {
+    "platform": "macos",
+    "accelerator": "apple-silicon",
+    "device_count": 3,
+    "hardware_class": "apple-silicon-cluster"
+  },
+  "domain": {
+    "id": "mac-cluster-main",
+    "kind": "mac_ax_engine_cluster",
+    "endpoint_scope": "domain",
+    "execution_owner": "ax_engine",
+    "qualification": "experimental",
+    "pool_id": "mac-cluster",
+    "trust_domain": "private-lab",
+    "hardware_class": "apple-silicon-cluster",
+    "architecture": "arm64",
+    "compatibility_manifest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "labels": {
+      "site": "lab-a",
+      "transport_class": "ethernet"
+    }
+  },
+  "domain_observation": {
+    "observed_at": "2026-07-28T12:00:00Z",
+    "generation": 1,
+    "ready": true,
+    "state": "ready",
+    "frontend_instances_ready": 1,
+    "aggregate_capacity": {
+      "active_requests": 0,
+      "max_concurrent_requests": 2,
+      "waiting_requests": 0,
+      "recent_error_rate": 0.0
+    },
+    "manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "models": [
+      {
+        "runtime_model_id": "llama-405b-int4-pp3",
+        "identity": {
+          "runtime_kind": "ax_engine",
+          "runtime_version": "7.0.0",
+          "revision": "llama-405b-int4-rev1",
+          "quantization": "int4"
+        },
+        "operations": [
+          "chat_completions"
+        ],
+        "capabilities": [],
+        "max_context_tokens": 8192,
+        "max_output_tokens": 2048
+      }
+    ]
+  },
+  "observation": {
+    "observed_at": "2026-07-28T12:00:00Z",
+    "runtime": {
+      "ready": true,
+      "state": "ready"
+    },
+    "inventory_generation": 1,
+    "models": [
+      {
+        "runtime_model_id": "llama-405b-int4-pp3",
+        "identity": {
+          "runtime_kind": "ax_engine",
+          "runtime_version": "7.0.0",
+          "revision": "llama-405b-int4-rev1",
+          "quantization": "int4"
+        },
+        "operations": [
+          "chat_completions"
+        ],
+        "capabilities": [],
+        "max_context_tokens": 8192,
+        "max_output_tokens": 2048
+      }
+    ],
+    "capacity": {
+      "active_requests": 0,
+      "max_concurrent_requests": 2,
+      "waiting_requests": 0
+    }
+  }
+}

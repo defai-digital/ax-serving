@@ -229,6 +229,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-mac-cluster-adapter"
+version = "2.2.0"
+dependencies = [
+ "anyhow",
+ "ax-serving-adapter-core",
+ "ax-serving-observability",
+ "ax-serving-protocol",
+ "axum 0.8.8",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "ax-serving-adapter-core"
 version = "2.2.0"
 dependencies = [

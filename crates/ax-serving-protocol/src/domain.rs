@@ -60,6 +60,7 @@ impl FromStr for CompatibilityManifestDigest {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionDomainKind {
     MacAxEngine,
+    MacAxEngineCluster,
     NvidiaDynamoPc,
     NvidiaDynamoThor,
     CompatibilityRuntimeEndpoint,
@@ -73,6 +74,7 @@ impl ExecutionDomainKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MacAxEngine => "mac_ax_engine",
+            Self::MacAxEngineCluster => "mac_ax_engine_cluster",
             Self::NvidiaDynamoPc => "nvidia_dynamo_pc",
             Self::NvidiaDynamoThor => "nvidia_dynamo_thor",
             Self::CompatibilityRuntimeEndpoint => "compatibility_runtime_endpoint",
@@ -174,6 +176,9 @@ impl ExecutionDomainDescriptor {
         let valid_contract = match self.kind {
             ExecutionDomainKind::MacAxEngine => {
                 self.endpoint_scope == EndpointScope::Node && self.execution_owner == "ax_engine"
+            }
+            ExecutionDomainKind::MacAxEngineCluster => {
+                self.endpoint_scope == EndpointScope::Domain && self.execution_owner == "ax_engine"
             }
             ExecutionDomainKind::NvidiaDynamoPc | ExecutionDomainKind::NvidiaDynamoThor => {
                 self.endpoint_scope == EndpointScope::Domain && self.execution_owner == "dynamo"
@@ -408,10 +413,11 @@ mod tests {
     use crate::{DomainId, PoolId, TrustDomainId};
 
     fn descriptor(kind: ExecutionDomainKind) -> ExecutionDomainDescriptor {
+        let domain_scoped = kind.is_dynamo() || kind == ExecutionDomainKind::MacAxEngineCluster;
         ExecutionDomainDescriptor {
             id: DomainId::new("domain-main").unwrap(),
             kind,
-            endpoint_scope: if kind.is_dynamo() {
+            endpoint_scope: if domain_scoped {
                 EndpointScope::Domain
             } else {
                 EndpointScope::Node
@@ -436,6 +442,17 @@ mod tests {
         let mut value = descriptor(ExecutionDomainKind::NvidiaDynamoPc);
         assert!(value.validate().is_ok());
         value.endpoint_scope = EndpointScope::Node;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn mac_cluster_domains_require_domain_scope_and_ax_engine_owner() {
+        let mut value = descriptor(ExecutionDomainKind::MacAxEngineCluster);
+        assert!(value.validate().is_ok());
+        value.endpoint_scope = EndpointScope::Node;
+        assert!(value.validate().is_err());
+        value.endpoint_scope = EndpointScope::Domain;
+        value.execution_owner = "dynamo".into();
         assert!(value.validate().is_err());
     }
 

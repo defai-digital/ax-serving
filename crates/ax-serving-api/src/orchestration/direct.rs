@@ -32,7 +32,7 @@ use ax_serving_protocol::{
 
 use super::deployment::{DeploymentCatalog, RouteCandidate};
 use super::error::ax_error_response;
-use super::fleet_state::{FleetStateStore, ReservationResult};
+use super::fleet_state::{DomainReservationResult, FleetStateStore, ReservationResult};
 use super::policy::{DispatchContext, DispatchPolicy};
 use super::registry::{RequestKind, WorkerId, WorkerRegistry};
 use super::request_profile::{RequestProfile, rewrite_runtime_model};
@@ -105,9 +105,18 @@ impl Drop for InflightGuard {
     }
 }
 
+#[derive(Clone)]
+enum SharedReservationTarget {
+    Worker(ax_serving_protocol::WorkerId),
+    Domain {
+        id: ax_serving_protocol::DomainId,
+        observation_generation: u64,
+    },
+}
+
 struct SharedReservationGuard {
     store: Arc<dyn FleetStateStore>,
-    worker_id: ax_serving_protocol::WorkerId,
+    target: SharedReservationTarget,
     attempt_id: ax_serving_protocol::AttemptId,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -115,35 +124,46 @@ struct SharedReservationGuard {
 impl SharedReservationGuard {
     fn new(
         store: Arc<dyn FleetStateStore>,
-        worker_id: ax_serving_protocol::WorkerId,
+        target: SharedReservationTarget,
         attempt_id: ax_serving_protocol::AttemptId,
         max_concurrent: usize,
         ttl_ms: u64,
     ) -> Self {
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let renew_store = Arc::clone(&store);
-        let renew_worker = worker_id.clone();
+        let renew_target = target.clone();
         let renew_every = std::time::Duration::from_millis((ttl_ms / 3).max(250));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(renew_every) => {
-                        match renew_store
-                            .try_reserve(
-                                &renew_worker,
-                                attempt_id,
-                                max_concurrent,
-                                ttl_ms,
-                            )
-                            .await
-                        {
-                            Ok(ReservationResult::Reserved) => {}
-                            Ok(ReservationResult::Saturated) => {
-                                warn!(%renew_worker, %attempt_id, "shared dispatch reservation renewal was fenced");
+                        let renewed = match &renew_target {
+                            SharedReservationTarget::Worker(worker_id) => renew_store
+                                .try_reserve(worker_id, attempt_id, max_concurrent, ttl_ms)
+                                .await
+                                .map(|result| result == ReservationResult::Reserved),
+                            SharedReservationTarget::Domain {
+                                id,
+                                observation_generation,
+                            } => renew_store
+                                .try_reserve_domain(
+                                    id,
+                                    *observation_generation,
+                                    attempt_id,
+                                    max_concurrent,
+                                    ttl_ms,
+                                )
+                                .await
+                                .map(|result| result == DomainReservationResult::Reserved),
+                        };
+                        match renewed {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(%attempt_id, "shared dispatch reservation renewal was fenced");
                                 break;
                             }
                             Err(error) => {
-                                warn!(%renew_worker, %attempt_id, %error, "shared dispatch reservation renewal failed");
+                                warn!(%attempt_id, %error, "shared dispatch reservation renewal failed");
                             }
                         }
                     }
@@ -153,7 +173,7 @@ impl SharedReservationGuard {
         });
         Self {
             store,
-            worker_id,
+            target,
             attempt_id,
             stop: Some(stop),
         }
@@ -166,12 +186,20 @@ impl Drop for SharedReservationGuard {
             let _ = stop.send(());
         }
         let store = Arc::clone(&self.store);
-        let worker_id = self.worker_id.clone();
+        let target = self.target.clone();
         let attempt_id = self.attempt_id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Err(error) = store.release_reservation(&worker_id, attempt_id).await {
-                    warn!(%worker_id, %attempt_id, %error, "shared dispatch reservation release failed");
+                let released = match &target {
+                    SharedReservationTarget::Worker(worker_id) => {
+                        store.release_reservation(worker_id, attempt_id).await
+                    }
+                    SharedReservationTarget::Domain { id, .. } => {
+                        store.release_domain_reservation(id, attempt_id).await
+                    }
+                };
+                if let Err(error) = released {
+                    warn!(%attempt_id, %error, "shared dispatch reservation release failed");
                 }
             });
         }
@@ -187,6 +215,8 @@ struct AttemptGuard {
 enum ReservationAcquireError {
     #[error("worker reservation capacity exhausted")]
     Saturated,
+    #[error("domain reservation generation changed")]
+    GenerationFenced,
     #[error("shared fleet state is unavailable")]
     Store(#[source] anyhow::Error),
 }
@@ -213,6 +243,32 @@ pub struct DirectDispatcher {
 
 const DEFAULT_DECISION_JOURNAL_CAPACITY: usize = 256;
 const MAX_RECORDED_DECISION_CANDIDATES: usize = 128;
+const DECISION_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+
+fn bounded_candidate_summary(
+    evidence: &[CandidateDecision],
+    selected_domain: &ax_serving_protocol::DomainId,
+    selected_deployment: &ax_serving_protocol::DeploymentId,
+) -> Vec<CandidateDecision> {
+    let mut seen = BTreeSet::new();
+    let mut summary = Vec::new();
+    for candidate in evidence
+        .iter()
+        .filter(|candidate| {
+            &candidate.domain == selected_domain && &candidate.deployment == selected_deployment
+        })
+        .chain(evidence.iter())
+    {
+        let key = (candidate.domain.clone(), candidate.deployment.clone());
+        if seen.insert(key) {
+            summary.push(candidate.clone());
+        }
+        if summary.len() == MAX_RECORDED_DECISION_CANDIDATES {
+            break;
+        }
+    }
+    summary
+}
 
 #[derive(Debug)]
 struct DecisionJournal {
@@ -655,32 +711,144 @@ impl DirectDispatcher {
 
     async fn reserve_attempt(
         &self,
-        worker_id: Option<ax_serving_protocol::WorkerId>,
+        target: Option<SharedReservationTarget>,
         attempt_id: ax_serving_protocol::AttemptId,
         max_concurrent: usize,
     ) -> Result<Option<SharedReservationGuard>, ReservationAcquireError> {
-        let (Some(store), Some(worker_id)) = (&self.fleet_store, worker_id) else {
+        let (Some(store), Some(target)) = (&self.fleet_store, target) else {
             return Ok(None);
         };
-        match store
-            .try_reserve(
-                &worker_id,
-                attempt_id,
-                max_concurrent,
-                self.reservation_ttl_ms,
-            )
-            .await
-            .map_err(ReservationAcquireError::Store)?
-        {
-            ReservationResult::Reserved => Ok(Some(SharedReservationGuard::new(
+        let result = match &target {
+            SharedReservationTarget::Worker(worker_id) => store
+                .try_reserve(
+                    worker_id,
+                    attempt_id,
+                    max_concurrent,
+                    self.reservation_ttl_ms,
+                )
+                .await
+                .map_err(ReservationAcquireError::Store)
+                .map(|result| match result {
+                    ReservationResult::Reserved => DomainReservationResult::Reserved,
+                    ReservationResult::Saturated => DomainReservationResult::Saturated,
+                })?,
+            SharedReservationTarget::Domain {
+                id,
+                observation_generation,
+            } => store
+                .try_reserve_domain(
+                    id,
+                    *observation_generation,
+                    attempt_id,
+                    max_concurrent,
+                    self.reservation_ttl_ms,
+                )
+                .await
+                .map_err(ReservationAcquireError::Store)?,
+        };
+        match result {
+            DomainReservationResult::Reserved => Ok(Some(SharedReservationGuard::new(
                 Arc::clone(store),
-                worker_id,
+                target,
                 attempt_id,
                 max_concurrent,
                 self.reservation_ttl_ms,
             ))),
-            ReservationResult::Saturated => Err(ReservationAcquireError::Saturated),
+            DomainReservationResult::Saturated => Err(ReservationAcquireError::Saturated),
+            DomainReservationResult::GenerationFenced => {
+                Err(ReservationAcquireError::GenerationFenced)
+            }
         }
+    }
+
+    fn reservation_target(candidate: &RouteCandidate) -> Option<(SharedReservationTarget, usize)> {
+        if candidate.endpoint.domain.as_ref().is_some_and(|domain| {
+            domain.endpoint_scope == ax_serving_protocol::EndpointScope::Domain
+        }) {
+            let domain = candidate.domain.as_ref()?;
+            let observation = candidate.endpoint.domain_observation.as_ref()?;
+            let max_concurrent = observation
+                .aggregate_capacity
+                .as_ref()
+                .and_then(|capacity| capacity.max_concurrent_requests)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(candidate.endpoint.worker.max_inflight)
+                .max(1);
+            return Some((
+                SharedReservationTarget::Domain {
+                    id: domain.id.clone(),
+                    observation_generation: observation.generation,
+                },
+                max_concurrent,
+            ));
+        }
+
+        candidate
+            .endpoint
+            .protocol_worker_id
+            .as_deref()
+            .and_then(|value| value.parse::<ax_serving_protocol::WorkerId>().ok())
+            .map(|worker_id| {
+                (
+                    SharedReservationTarget::Worker(worker_id),
+                    candidate.endpoint.worker.max_inflight,
+                )
+            })
+    }
+
+    /// Select a domain/deployment first, then its endpoint.
+    ///
+    /// Domain-scoped adapters naturally have one endpoint. Node-scoped Mac
+    /// domains may have several endpoints, so the same bounded policy chooses
+    /// a representative inside each group before comparing groups. This keeps
+    /// rank or node multiplicity from accidentally multiplying a domain's
+    /// chance of selection.
+    fn select_explicit_candidate<'a>(
+        candidates: &'a [RouteCandidate],
+        policy: &dyn DispatchPolicy,
+        context: &DispatchContext<'_>,
+    ) -> Option<&'a RouteCandidate> {
+        let mut groups = BTreeMap::<
+            (
+                Option<ax_serving_protocol::DomainId>,
+                ax_serving_protocol::DeploymentId,
+            ),
+            Vec<&RouteCandidate>,
+        >::new();
+        for candidate in candidates {
+            groups
+                .entry((
+                    candidate.domain.as_ref().map(|domain| domain.id.clone()),
+                    candidate.deployment.id.clone(),
+                ))
+                .or_default()
+                .push(candidate);
+        }
+
+        let mut representatives = Vec::with_capacity(groups.len());
+        for group in groups.values() {
+            let statuses = group
+                .iter()
+                .map(|candidate| candidate.endpoint.worker.clone())
+                .collect::<Vec<_>>();
+            if let Some(selected) = policy.select(&statuses, context) {
+                representatives.push(
+                    group
+                        .iter()
+                        .copied()
+                        .find(|candidate| candidate.endpoint.worker.id == selected.id)
+                        .expect("domain endpoint selection came from its candidate group"),
+                );
+            }
+        }
+        let statuses = representatives
+            .iter()
+            .map(|candidate| candidate.endpoint.worker.clone())
+            .collect::<Vec<_>>();
+        let selected = policy.select(&statuses, context)?;
+        representatives
+            .into_iter()
+            .find(|candidate| candidate.endpoint.worker.id == selected.id)
     }
 
     fn attach_dispatch_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -709,52 +877,19 @@ impl DirectDispatcher {
         self.decision_journal.tail(limit.clamp(1, 200))
     }
 
-    fn record_domain_decision(
+    async fn record_domain_decision(
         &self,
         profile: &RequestProfile,
-        candidates: &[RouteCandidate],
+        evidence: &[CandidateDecision],
+        observation_generations: &BTreeMap<ax_serving_protocol::DomainId, u64>,
         selected: &RouteCandidate,
     ) {
         let Some(selected_domain) = selected.domain.as_ref() else {
             return;
         };
 
-        let mut seen = BTreeSet::new();
-        let mut candidate_summary = Vec::new();
-        for candidate in std::iter::once(selected).chain(candidates.iter()) {
-            let Some(domain) = candidate.domain.as_ref() else {
-                continue;
-            };
-            let key = (domain.id.clone(), candidate.deployment.id.clone());
-            if !seen.insert(key) {
-                continue;
-            }
-            candidate_summary.push(CandidateDecision {
-                domain: domain.id.clone(),
-                deployment: candidate.deployment.id.clone(),
-                eligible: true,
-                rejection_reasons: BTreeSet::new(),
-                normalized_score_microunits: None,
-            });
-            if candidate_summary.len() == MAX_RECORDED_DECISION_CANDIDATES {
-                break;
-            }
-        }
-
-        let mut observation_generations = BTreeMap::new();
-        for candidate in candidates {
-            if let Some(domain) = candidate.domain.as_ref() {
-                let generation = candidate
-                    .endpoint
-                    .domain_observation
-                    .as_ref()
-                    .map_or(0, |observation| observation.generation);
-                observation_generations
-                    .entry(domain.id.clone())
-                    .and_modify(|accepted: &mut u64| *accepted = (*accepted).max(generation))
-                    .or_insert(generation);
-            }
-        }
+        let candidate_summary =
+            bounded_candidate_summary(evidence, &selected_domain.id, &selected.deployment.id);
 
         let mut reason_codes = BTreeSet::from([DecisionReasonCode::ExplicitDeployment]);
         if profile.decision.required_domain.as_ref() == Some(&selected_domain.id) {
@@ -780,13 +915,20 @@ impl DirectDispatcher {
             selected_domain: selected_domain.id.clone(),
             selected_deployment: selected.deployment.id.clone(),
             reason_codes,
-            observation_generations,
+            observation_generations: observation_generations.clone(),
             predicted_cost_microusd: None,
             predicted_latency_ms: None,
             decided_at: time::OffsetDateTime::now_utc(),
         };
         match record.validate() {
-            Ok(()) => self.decision_journal.record(record),
+            Ok(()) => {
+                self.decision_journal.record(record.clone());
+                if let Some(store) = &self.fleet_store
+                    && let Err(error) = store.put_decision(&record, DECISION_RETENTION_TTL_MS).await
+                {
+                    warn!(%error, "failed to persist bounded domain decision");
+                }
+            }
             Err(error) => warn!(%error, "discarding invalid bounded domain decision record"),
         }
     }
@@ -874,7 +1016,7 @@ impl DirectDispatcher {
                 );
             };
             let selection_started = std::time::Instant::now();
-            let candidates = match catalog.route_candidates(
+            let candidate_set = match catalog.route_candidates(
                 registry,
                 profile,
                 excluded_id,
@@ -911,6 +1053,7 @@ impl DirectDispatcher {
                     );
                 }
             };
+            let candidates = candidate_set.eligible;
             if candidates.is_empty() {
                 self.record_selection(selection_started, SelectionOutcome::NoCandidate);
                 let reason = if attempt_number == 0 {
@@ -936,11 +1079,7 @@ impl DirectDispatcher {
                 );
             }
 
-            let statuses = candidates
-                .iter()
-                .map(|candidate| candidate.endpoint.worker.clone())
-                .collect::<Vec<_>>();
-            let Some(selected) = policy.select(&statuses, &ctx) else {
+            let Some(candidate) = Self::select_explicit_candidate(&candidates, policy, &ctx) else {
                 self.record_selection(selection_started, SelectionOutcome::AtCapacity);
                 return trace_response(
                     ax_error_response(
@@ -960,11 +1099,7 @@ impl DirectDispatcher {
                 );
             };
             self.record_selection(selection_started, SelectionOutcome::Selected);
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.endpoint.worker.id == selected.id)
-                .expect("policy selection must come from the candidate snapshot")
-                .clone();
+            let candidate = candidate.clone();
             let selected_id = candidate.endpoint.worker.id;
             let Some(inflight_counter) = registry.inflight_counter(selected_id) else {
                 excluded_id = Some(selected_id);
@@ -979,21 +1114,30 @@ impl DirectDispatcher {
             };
 
             let attempt_id = ax_serving_protocol::AttemptId::new();
-            let protocol_worker_id = candidate
-                .endpoint
-                .protocol_worker_id
-                .as_deref()
-                .and_then(|value| value.parse::<ax_serving_protocol::WorkerId>().ok());
+            let (reservation_target, reservation_capacity) = Self::reservation_target(&candidate)
+                .map_or(
+                    (None, candidate.endpoint.worker.max_inflight),
+                    |(target, capacity)| (Some(target), capacity),
+                );
             let reservation = match self
-                .reserve_attempt(
-                    protocol_worker_id,
-                    attempt_id,
-                    candidate.endpoint.worker.max_inflight,
-                )
+                .reserve_attempt(reservation_target, attempt_id, reservation_capacity)
                 .await
             {
                 Ok(reservation) => reservation,
                 Err(ReservationAcquireError::Saturated) => {
+                    drop(guard);
+                    excluded_id = Some(selected_id);
+                    continue;
+                }
+                Err(ReservationAcquireError::GenerationFenced) => {
+                    warn!(
+                        domain_id = candidate
+                            .domain
+                            .as_ref()
+                            .map(|domain| domain.id.as_str())
+                            .unwrap_or(""),
+                        "domain generation changed before dispatch"
+                    );
                     drop(guard);
                     excluded_id = Some(selected_id);
                     continue;
@@ -1032,7 +1176,13 @@ impl DirectDispatcher {
                     );
                 }
             };
-            self.record_domain_decision(profile, &candidates, &candidate);
+            self.record_domain_decision(
+                profile,
+                &candidate_set.decisions,
+                &candidate_set.observation_generations,
+                &candidate,
+            )
+            .await;
             attempt_number = attempt_number.saturating_add(1);
             let url = worker_url(&candidate.endpoint.worker.addr, path);
             debug!(
@@ -1418,7 +1568,7 @@ impl DirectDispatcher {
         let attempt_id = ax_serving_protocol::AttemptId::new();
         let reservation_worker_id = registry
             .protocol_identity_for_internal(selected_id)
-            .map(|(worker_id, _)| worker_id);
+            .map(|(worker_id, _)| SharedReservationTarget::Worker(worker_id));
         let reservation = match self
             .reserve_attempt(reservation_worker_id, attempt_id, selected.max_inflight)
             .await
@@ -1443,6 +1593,9 @@ impl DirectDispatcher {
                         None,
                     )
                     .await;
+            }
+            Err(ReservationAcquireError::GenerationFenced) => {
+                unreachable!("legacy worker reservations are not generation fenced")
             }
             Err(ReservationAcquireError::Store(error)) => {
                 warn!(%error, "shared fleet state rejected dispatch reservation");
@@ -1687,7 +1840,7 @@ impl DirectDispatcher {
         let attempt_id = ax_serving_protocol::AttemptId::new();
         let reservation_worker_id = registry
             .protocol_identity_for_internal(selected2_id)
-            .map(|(worker_id, _)| worker_id);
+            .map(|(worker_id, _)| SharedReservationTarget::Worker(worker_id));
         let reservation = match self
             .reserve_attempt(reservation_worker_id, attempt_id, selected2.max_inflight)
             .await
@@ -1708,6 +1861,9 @@ impl DirectDispatcher {
                     Some(selected2_id),
                     "reroute_target_at_capacity",
                 );
+            }
+            Err(ReservationAcquireError::GenerationFenced) => {
+                unreachable!("legacy worker reservations are not generation fenced")
             }
             Err(ReservationAcquireError::Store(error)) => {
                 warn!(%error, "shared fleet state rejected safe-retry reservation");
@@ -2090,6 +2246,7 @@ fn worker_failure_response(_internal_message: impl Into<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2099,8 +2256,39 @@ mod tests {
     use super::{
         AtomicLatencyHistogram, AttemptGuard, DirectDispatcher, GATEWAY_LATENCY_BUCKETS_US,
         InflightGuard, InflightGuard as Guard, add_limited_body_len, append_limited_body_chunk,
-        response_declares_oversize, worker_url,
+        bounded_candidate_summary, response_declares_oversize, worker_url,
     };
+
+    #[test]
+    fn decision_summary_keeps_rejections_and_places_selected_candidate_first() {
+        use ax_serving_protocol::{
+            CandidateDecision, CandidateRejectionReason, DeploymentId, DomainId,
+        };
+
+        let selected_domain = DomainId::new("selected-domain").unwrap();
+        let selected_deployment = DeploymentId::new("selected-deployment").unwrap();
+        let rejected = CandidateDecision {
+            domain: DomainId::new("rejected-domain").unwrap(),
+            deployment: DeploymentId::new("rejected-deployment").unwrap(),
+            eligible: false,
+            rejection_reasons: BTreeSet::from([CandidateRejectionReason::CapacityUnavailable]),
+            normalized_score_microunits: None,
+        };
+        let selected = CandidateDecision {
+            domain: selected_domain.clone(),
+            deployment: selected_deployment.clone(),
+            eligible: true,
+            rejection_reasons: BTreeSet::new(),
+            normalized_score_microunits: None,
+        };
+
+        let summary = bounded_candidate_summary(
+            &[rejected.clone(), selected.clone()],
+            &selected_domain,
+            &selected_deployment,
+        );
+        assert_eq!(summary, vec![selected, rejected]);
+    }
 
     #[test]
     fn latency_histogram_uses_cumulative_bounded_buckets() {

@@ -10,9 +10,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use ax_serving_protocol::{
-    AgentDescriptor, AttemptId, DeploymentControlRecord, DeploymentId, DeploymentJobRecord, JobId,
-    ProtocolDescriptor, RegisterWorkerRequest, RegistrationId, WorkerId, WorkerInstanceId,
+    AgentDescriptor, AttemptId, DecisionRecordV1, DeploymentControlRecord, DeploymentId,
+    DeploymentJobRecord, DomainId, JobId, ProtocolDescriptor, RegisterWorkerRequest,
+    RegistrationId, RequestId, WorkerId, WorkerInstanceId,
 };
 use dashmap::DashMap;
 use redis::AsyncCommands;
@@ -39,6 +41,15 @@ pub enum FleetMutationResult {
 pub enum ReservationResult {
     Reserved,
     Saturated,
+}
+
+/// Result of a generation-fenced domain reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainReservationResult {
+    Reserved,
+    Saturated,
+    /// The reservation bucket belongs to another observed domain generation.
+    GenerationFenced,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +110,24 @@ pub trait FleetStateStore: Send + Sync {
         worker_id: &'a WorkerId,
         attempt_id: AttemptId,
     ) -> StoreFuture<'a, ()>;
+    /// Reserve aggregate capacity for one domain-scoped execution endpoint.
+    ///
+    /// Calling this again with the same attempt renews its lease. A different
+    /// observed generation cannot reuse a non-empty bucket, preventing active
+    /// gateways from mixing admission decisions across cluster generations.
+    fn try_reserve_domain<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        observation_generation: u64,
+        attempt_id: AttemptId,
+        max_concurrent: usize,
+        ttl_ms: u64,
+    ) -> StoreFuture<'a, DomainReservationResult>;
+    fn release_domain_reservation<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        attempt_id: AttemptId,
+    ) -> StoreFuture<'a, ()>;
     /// Acquire or renew short-lived ownership of an active health probe. In HA
     /// mode this prevents every gateway replica from probing the same worker.
     fn try_acquire_probe_lease<'a>(
@@ -127,6 +156,10 @@ pub trait FleetStateStore: Send + Sync {
         job_id: JobId,
     ) -> StoreFuture<'a, Option<DeploymentJobRecord>>;
     fn list_deployment_jobs(&self) -> StoreFuture<'_, Vec<DeploymentJobRecord>>;
+    /// Retain a bounded, prompt-free domain decision for replay and audit.
+    fn put_decision<'a>(&'a self, record: &'a DecisionRecordV1, ttl_ms: u64)
+    -> StoreFuture<'a, ()>;
+    fn list_decisions(&self, limit: usize) -> StoreFuture<'_, Vec<DecisionRecordV1>>;
 }
 
 #[derive(Clone)]
@@ -141,13 +174,27 @@ struct MemoryJobValue {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
+struct MemoryDecisionValue {
+    record: DecisionRecordV1,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct MemoryDomainReservations {
+    observation_generation: u64,
+    attempts: std::collections::BTreeMap<AttemptId, Instant>,
+}
+
 #[derive(Default)]
 pub struct MemoryFleetStateStore {
     records: DashMap<WorkerId, MemoryValue>,
     reservations: DashMap<WorkerId, std::collections::BTreeMap<AttemptId, Instant>>,
+    domain_reservations: DashMap<DomainId, MemoryDomainReservations>,
     probe_leases: DashMap<WorkerId, (String, Instant)>,
     deployments: DashMap<DeploymentId, DeploymentControlRecord>,
     deployment_jobs: DashMap<JobId, MemoryJobValue>,
+    decisions: DashMap<RequestId, MemoryDecisionValue>,
 }
 
 impl MemoryFleetStateStore {
@@ -295,6 +342,62 @@ impl FleetStateStore for MemoryFleetStateStore {
         })
     }
 
+    fn try_reserve_domain<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        observation_generation: u64,
+        attempt_id: AttemptId,
+        max_concurrent: usize,
+        ttl_ms: u64,
+    ) -> StoreFuture<'a, DomainReservationResult> {
+        Box::pin(async move {
+            let now = Instant::now();
+            let mut bucket = self
+                .domain_reservations
+                .entry(domain_id.clone())
+                .or_default();
+            bucket.attempts.retain(|_, expires_at| *expires_at > now);
+            if bucket.attempts.is_empty() {
+                bucket.observation_generation = observation_generation;
+            }
+            if bucket.observation_generation != observation_generation {
+                return Ok(DomainReservationResult::GenerationFenced);
+            }
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                bucket.attempts.entry(attempt_id)
+            {
+                entry.insert(now + Duration::from_millis(ttl_ms.max(1)));
+                return Ok(DomainReservationResult::Reserved);
+            }
+            if bucket.attempts.len() >= max_concurrent.max(1) {
+                return Ok(DomainReservationResult::Saturated);
+            }
+            bucket
+                .attempts
+                .insert(attempt_id, now + Duration::from_millis(ttl_ms.max(1)));
+            Ok(DomainReservationResult::Reserved)
+        })
+    }
+
+    fn release_domain_reservation<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        attempt_id: AttemptId,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            let mut remove_bucket = false;
+            if let Some(mut bucket) = self.domain_reservations.get_mut(domain_id) {
+                bucket.attempts.remove(&attempt_id);
+                remove_bucket = bucket.attempts.is_empty();
+            }
+            if remove_bucket {
+                self.domain_reservations
+                    .remove_if(domain_id, |_, bucket| bucket.attempts.is_empty());
+            }
+            Ok(())
+        })
+    }
+
     fn try_acquire_probe_lease<'a>(
         &'a self,
         worker_id: &'a WorkerId,
@@ -412,6 +515,41 @@ impl FleetStateStore for MemoryFleetStateStore {
                 .collect())
         })
     }
+
+    fn put_decision<'a>(
+        &'a self,
+        record: &'a DecisionRecordV1,
+        ttl_ms: u64,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            record
+                .validate()
+                .context("refusing to persist an invalid domain decision")?;
+            self.decisions.insert(
+                record.request_id,
+                MemoryDecisionValue {
+                    record: record.clone(),
+                    expires_at: Instant::now() + Duration::from_millis(ttl_ms.max(1)),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    fn list_decisions(&self, limit: usize) -> StoreFuture<'_, Vec<DecisionRecordV1>> {
+        Box::pin(async move {
+            let now = Instant::now();
+            self.decisions.retain(|_, value| value.expires_at > now);
+            let mut records = self
+                .decisions
+                .iter()
+                .map(|entry| entry.record.clone())
+                .collect::<Vec<_>>();
+            records.sort_by_key(|record| std::cmp::Reverse(record.decided_at));
+            records.truncate(limit.clamp(1, 200));
+            Ok(records)
+        })
+    }
 }
 
 pub struct RedisFleetStateStore {
@@ -450,6 +588,17 @@ impl RedisFleetStateStore {
         format!("{}:reservations:{}", self.key_prefix, worker_id)
     }
 
+    fn domain_reservation_key(&self, domain_id: &DomainId) -> String {
+        format!("{}:domain-reservations:{}", self.key_prefix, domain_id)
+    }
+
+    fn domain_reservation_generation_key(&self, domain_id: &DomainId) -> String {
+        format!(
+            "{}:domain-reservation-generation:{}",
+            self.key_prefix, domain_id
+        )
+    }
+
     fn probe_lease_key(&self, worker_id: &WorkerId) -> String {
         format!("{}:probe-owner:{}", self.key_prefix, worker_id)
     }
@@ -468,6 +617,14 @@ impl RedisFleetStateStore {
 
     fn deployment_job_index_key(&self) -> String {
         format!("{}:deployment-jobs", self.key_prefix)
+    }
+
+    fn decision_key(&self, request_id: RequestId) -> String {
+        format!("{}:decision:{}", self.key_prefix, request_id)
+    }
+
+    fn decision_index_key(&self) -> String {
+        format!("{}:decisions", self.key_prefix)
     }
 
     async fn connection(&self) -> anyhow::Result<redis::aio::MultiplexedConnection> {
@@ -692,6 +849,80 @@ impl FleetStateStore for RedisFleetStateStore {
         })
     }
 
+    fn try_reserve_domain<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        observation_generation: u64,
+        attempt_id: AttemptId,
+        max_concurrent: usize,
+        ttl_ms: u64,
+    ) -> StoreFuture<'a, DomainReservationResult> {
+        Box::pin(async move {
+            const TRY_RESERVE_DOMAIN: &str = r#"
+                local now = redis.call('TIME')
+                local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+                redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+                local count = redis.call('ZCARD', KEYS[1])
+                local generation = redis.call('GET', KEYS[2])
+                if count == 0 then
+                    generation = ARGV[2]
+                    redis.call('SET', KEYS[2], generation, 'PX', ARGV[4] * 2)
+                end
+                if generation and tonumber(generation) ~= tonumber(ARGV[2]) then
+                    return -1
+                end
+                local existing = redis.call('ZSCORE', KEYS[1], ARGV[1])
+                local expires_at = now_ms + tonumber(ARGV[4])
+                if existing then
+                    redis.call('ZADD', KEYS[1], expires_at, ARGV[1])
+                    redis.call('PEXPIRE', KEYS[1], ARGV[4] * 2)
+                    redis.call('PEXPIRE', KEYS[2], ARGV[4] * 2)
+                    return 1
+                end
+                if count >= tonumber(ARGV[3]) then
+                    return 0
+                end
+                redis.call('ZADD', KEYS[1], expires_at, ARGV[1])
+                redis.call('PEXPIRE', KEYS[1], ARGV[4] * 2)
+                redis.call('PEXPIRE', KEYS[2], ARGV[4] * 2)
+                return 1
+            "#;
+            let mut connection = self.connection().await?;
+            let result: i64 = redis::Script::new(TRY_RESERVE_DOMAIN)
+                .key(self.domain_reservation_key(domain_id))
+                .key(self.domain_reservation_generation_key(domain_id))
+                .arg(attempt_id.to_string())
+                .arg(observation_generation)
+                .arg(max_concurrent.max(1))
+                .arg(ttl_ms.max(1))
+                .invoke_async(&mut connection)
+                .await?;
+            Ok(match result {
+                1 => DomainReservationResult::Reserved,
+                0 => DomainReservationResult::Saturated,
+                -1 => DomainReservationResult::GenerationFenced,
+                other => anyhow::bail!("unexpected Redis domain reservation result {other}"),
+            })
+        })
+    }
+
+    fn release_domain_reservation<'a>(
+        &'a self,
+        domain_id: &'a DomainId,
+        attempt_id: AttemptId,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            let mut connection = self.connection().await?;
+            let _: usize = connection
+                .zrem(
+                    self.domain_reservation_key(domain_id),
+                    attempt_id.to_string(),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
     fn try_acquire_probe_lease<'a>(
         &'a self,
         worker_id: &'a WorkerId,
@@ -861,6 +1092,80 @@ impl FleetStateStore for RedisFleetStateStore {
             Ok(records)
         })
     }
+
+    fn put_decision<'a>(
+        &'a self,
+        record: &'a DecisionRecordV1,
+        ttl_ms: u64,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            record
+                .validate()
+                .context("refusing to persist an invalid domain decision")?;
+            let encoded = serde_json::to_string(record)?;
+            let decided_at_ms = record
+                .decided_at
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000)
+                .clamp(0, i128::from(i64::MAX)) as i64;
+            let mut connection = self.connection().await?;
+            let _: () = redis::pipe()
+                .atomic()
+                .set_ex(
+                    self.decision_key(record.request_id),
+                    encoded,
+                    ttl_ms.max(1).div_ceil(1_000),
+                )
+                .zadd(
+                    self.decision_index_key(),
+                    record.request_id.to_string(),
+                    decided_at_ms,
+                )
+                .expire(
+                    self.decision_index_key(),
+                    i64::try_from(ttl_ms.max(1).div_ceil(1_000)).unwrap_or(i64::MAX),
+                )
+                .query_async(&mut connection)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_decisions(&self, limit: usize) -> StoreFuture<'_, Vec<DecisionRecordV1>> {
+        Box::pin(async move {
+            let mut connection = self.connection().await?;
+            let ids: Vec<String> = connection
+                .zrevrange(
+                    self.decision_index_key(),
+                    0,
+                    limit.clamp(1, 200) as isize - 1,
+                )
+                .await?;
+            let mut records = Vec::with_capacity(ids.len());
+            for id in ids {
+                let request_id = match id.parse::<RequestId>() {
+                    Ok(request_id) => request_id,
+                    Err(_) => continue,
+                };
+                let encoded: Option<String> = connection.get(self.decision_key(request_id)).await?;
+                match encoded {
+                    Some(encoded) => {
+                        let record = serde_json::from_str::<DecisionRecordV1>(&encoded)?;
+                        record
+                            .validate()
+                            .context("stored domain decision failed validation")?;
+                        records.push(record);
+                    }
+                    None => {
+                        let _: usize = connection
+                            .zrem(self.decision_index_key(), id.as_str())
+                            .await?;
+                    }
+                }
+            }
+            Ok(records)
+        })
+    }
 }
 
 pub fn store_from_config(config: &OrchestratorConfig) -> anyhow::Result<Arc<dyn FleetStateStore>> {
@@ -894,7 +1199,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use ax_serving_protocol::{
-        AgentDescriptor, HardwareDescriptor, PoolId, ProtocolDescriptor, RegisterWorkerRequest,
+        AgentDescriptor, CandidateDecision, DecisionReasonCode, DecisionRecordV1, DeploymentId,
+        DomainId, HardwareDescriptor, LogicalModelId, Operation, PolicyId, PolicyMode,
+        PolicyVersion, PoolId, ProtocolDescriptor, RegisterWorkerRequest, RequestId,
         RuntimeDescriptor, RuntimeObservation, RuntimeStatus, TrustDomainId, WorkerDescriptor,
     };
 
@@ -955,6 +1262,34 @@ mod tests {
             lease_ttl_ms: 15_000,
             updated_at_unix_ms: unix_time_millis(),
             draining: false,
+        }
+    }
+
+    fn decision() -> DecisionRecordV1 {
+        let domain = DomainId::new("mac-cluster").unwrap();
+        let deployment = DeploymentId::new("llama-405b").unwrap();
+        DecisionRecordV1 {
+            request_id: RequestId::new(),
+            operation: Operation::chat_completions(),
+            logical_model: LogicalModelId::new("llama/405b").unwrap(),
+            routing_profile: None,
+            policy_id: PolicyId::new("explicit-catalog").unwrap(),
+            policy_version: PolicyVersion::new("1").unwrap(),
+            policy_mode: PolicyMode::Active,
+            candidate_summary: vec![CandidateDecision {
+                domain: domain.clone(),
+                deployment: deployment.clone(),
+                eligible: true,
+                rejection_reasons: BTreeSet::new(),
+                normalized_score_microunits: None,
+            }],
+            selected_domain: domain.clone(),
+            selected_deployment: deployment,
+            reason_codes: BTreeSet::from([DecisionReasonCode::OnlyEligible]),
+            observation_generations: BTreeMap::from([(domain, 1)]),
+            predicted_cost_microusd: None,
+            predicted_latency_ms: None,
+            decided_at: time::OffsetDateTime::now_utc(),
         }
     }
 
@@ -1059,6 +1394,55 @@ mod tests {
                 .unwrap(),
             super::ReservationResult::Reserved
         );
+    }
+
+    #[tokio::test]
+    async fn memory_domain_reservations_are_generation_fenced() {
+        let store = MemoryFleetStateStore::default();
+        let domain_id = ax_serving_protocol::DomainId::new("mac-cluster").unwrap();
+        let first = ax_serving_protocol::AttemptId::new();
+        let second = ax_serving_protocol::AttemptId::new();
+
+        assert_eq!(
+            store
+                .try_reserve_domain(&domain_id, 7, first, 1, 1_000)
+                .await
+                .unwrap(),
+            super::DomainReservationResult::Reserved
+        );
+        assert_eq!(
+            store
+                .try_reserve_domain(&domain_id, 8, second, 1, 1_000)
+                .await
+                .unwrap(),
+            super::DomainReservationResult::GenerationFenced
+        );
+        assert_eq!(
+            store
+                .try_reserve_domain(&domain_id, 7, second, 1, 1_000)
+                .await
+                .unwrap(),
+            super::DomainReservationResult::Saturated
+        );
+        store
+            .release_domain_reservation(&domain_id, first)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .try_reserve_domain(&domain_id, 8, second, 1, 1_000)
+                .await
+                .unwrap(),
+            super::DomainReservationResult::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_retains_bounded_valid_decisions() {
+        let store = MemoryFleetStateStore::default();
+        let decision = decision();
+        store.put_decision(&decision, 1_000).await.unwrap();
+        assert_eq!(store.list_decisions(10).await.unwrap(), vec![decision]);
     }
 
     #[tokio::test]

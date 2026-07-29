@@ -108,6 +108,7 @@ impl ProtocolCapability {
     pub const CONTROL_DRAIN: &'static str = "control.drain";
     pub const CONTROL_DEPLOYMENT_JOBS: &'static str = "control.deployment-jobs";
     pub const CONTROL_EXECUTION_DOMAIN: &'static str = "control.execution-domain.v1";
+    pub const CONTROL_MAC_CLUSTER: &'static str = "control.mac-cluster.v1";
     pub const CONTROL_INVENTORY_DELTA: &'static str = "control.inventory-delta";
     pub const DISPATCH_CANCEL: &'static str = "dispatch.cancel";
     pub const DISPATCH_TYPED_ADMISSION: &'static str = "dispatch.typed-admission";

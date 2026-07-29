@@ -4,12 +4,12 @@
 //! public logical model aliases to homogeneous runtime pools and records the
 //! operator certification required for cross-pool routing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ax_serving_protocol::{
-    DeploymentControlRecord, DeploymentDesiredState, DeploymentId, DeploymentIdentity,
-    DeploymentSpec, Digest, DomainId, DomainSpec, EquivalenceClassId, EquivalencePolicy,
-    ExecutionDomainKind, LogicalModelId, PoolId, PoolSpec,
+    CandidateDecision, CandidateRejectionReason, DeploymentControlRecord, DeploymentDesiredState,
+    DeploymentId, DeploymentIdentity, DeploymentSpec, Digest, DomainId, DomainSpec,
+    EquivalenceClassId, EquivalencePolicy, ExecutionDomainKind, LogicalModelId, PoolId, PoolSpec,
 };
 use serde::Serialize;
 
@@ -62,6 +62,14 @@ pub struct RouteCandidate {
     pub pool: PoolSpec,
     pub domain: Option<DomainSpec>,
     pub observed_identity: DeploymentIdentity,
+}
+
+/// Eligible execution endpoints plus bounded evidence for every considered
+/// domain/deployment candidate.
+pub struct RouteCandidateSet {
+    pub eligible: Vec<RouteCandidate>,
+    pub decisions: Vec<CandidateDecision>,
+    pub observation_generations: BTreeMap<DomainId, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,7 +417,7 @@ impl DeploymentCatalog {
         profile: &RequestProfile,
         excluded_id: Option<WorkerId>,
         retry_source: Option<&DeploymentSpec>,
-    ) -> anyhow::Result<Vec<RouteCandidate>> {
+    ) -> anyhow::Result<RouteCandidateSet> {
         let ModelResolution::Explicit { deployments, .. } =
             self.resolve(profile.logical_model.as_str())?
         else {
@@ -417,8 +425,29 @@ impl DeploymentCatalog {
         };
 
         let mut candidates = Vec::new();
+        let mut decisions = Vec::new();
+        let mut observation_generations = BTreeMap::new();
         for deployment in deployments {
+            let domain = self.domain_for_deployment(deployment);
+            let mut decision = domain.map(|domain| CandidateDecision {
+                domain: domain.id.clone(),
+                deployment: deployment.id.clone(),
+                eligible: false,
+                rejection_reasons: BTreeSet::new(),
+                normalized_score_microunits: None,
+            });
+            if let Some(domain) = domain {
+                observation_generations
+                    .entry(domain.id.clone())
+                    .or_insert(0);
+            }
             if retry_source.is_some_and(|source| !self.permits_failover(source, deployment)) {
+                if let Some(decision) = decision.as_mut() {
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::EquivalenceMissing);
+                    decisions.push(decision.clone());
+                }
                 continue;
             }
             if profile
@@ -426,13 +455,30 @@ impl DeploymentCatalog {
                 .as_ref()
                 .is_some_and(|required| required != &deployment.pool)
             {
+                if let Some(decision) = decision.as_mut() {
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::LocalityPolicy);
+                    decisions.push(decision.clone());
+                }
                 continue;
             }
             let Some(pool) = self.pool(&deployment.pool) else {
+                if let Some(decision) = decision.as_mut() {
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::DomainUnknown);
+                    decisions.push(decision.clone());
+                }
                 continue;
             };
-            let domain = self.domain_for_deployment(deployment);
             if domain.is_some_and(|domain| !domain.enabled) {
+                if let Some(decision) = decision.as_mut() {
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::DomainDisabled);
+                    decisions.push(decision.clone());
+                }
                 continue;
             }
             if profile
@@ -441,8 +487,15 @@ impl DeploymentCatalog {
                 .as_ref()
                 .is_some_and(|required| domain.map(|domain| &domain.id) != Some(required))
             {
+                if let Some(decision) = decision.as_mut() {
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::ExplicitDomainConstraint);
+                    decisions.push(decision.clone());
+                }
                 continue;
             }
+            let candidate_start = candidates.len();
             let mut required_capabilities = profile.required_capabilities.clone();
             required_capabilities.extend(deployment.required_capabilities.iter().cloned());
             for endpoint in registry.eligible_model_endpoints(
@@ -476,6 +529,16 @@ impl DeploymentCatalog {
                 if !observed_identity_matches(self, deployment, &observed_identity) {
                     continue;
                 }
+                if let (Some(domain), Some(observation)) =
+                    (domain, endpoint.domain_observation.as_ref())
+                {
+                    observation_generations
+                        .entry(domain.id.clone())
+                        .and_modify(|generation| {
+                            *generation = (*generation).max(observation.generation);
+                        })
+                        .or_insert(observation.generation);
+                }
                 candidates.push(RouteCandidate {
                     endpoint,
                     deployment: deployment.clone(),
@@ -483,6 +546,19 @@ impl DeploymentCatalog {
                     domain: domain.cloned(),
                     observed_identity,
                 });
+            }
+            if let Some(mut decision) = decision {
+                if candidates.len() > candidate_start {
+                    decision.eligible = true;
+                } else {
+                    // Detailed endpoint mismatches remain internal to the
+                    // registry. At the domain/deployment boundary the safe,
+                    // truthful result is that no admissible capacity exists.
+                    decision
+                        .rejection_reasons
+                        .insert(CandidateRejectionReason::CapacityUnavailable);
+                }
+                decisions.push(decision);
             }
         }
 
@@ -502,7 +578,11 @@ impl DeploymentCatalog {
                 candidate.domain.as_ref().map(|domain| &domain.id) == Some(preferred_domain)
             });
         }
-        Ok(candidates)
+        Ok(RouteCandidateSet {
+            eligible: candidates,
+            decisions,
+            observation_generations,
+        })
     }
 
     pub fn logical_models(&self) -> Vec<LogicalModelSummary> {
@@ -565,7 +645,9 @@ fn validate_domain(domain: &DomainSpec, pools: &BTreeMap<PoolId, PoolSpec>) -> a
         );
     }
     let expected_runtime = match domain.kind {
-        ExecutionDomainKind::MacAxEngine => Some("ax_engine"),
+        ExecutionDomainKind::MacAxEngine | ExecutionDomainKind::MacAxEngineCluster => {
+            Some("ax_engine")
+        }
         ExecutionDomainKind::NvidiaDynamoPc | ExecutionDomainKind::NvidiaDynamoThor => {
             Some("dynamo")
         }
@@ -705,6 +787,9 @@ fn endpoint_matches_domain(endpoint: &WorkerModelEndpoint, desired: &DomainSpec)
                 endpoint.runtime_kind.eq_ignore_ascii_case("ax_engine")
                     && endpoint.hardware_class.as_deref() == Some(desired.hardware_class.as_str())
             }
+            // A cluster is a protocol-v1.2 domain endpoint. It must never
+            // acquire legacy node semantics through implicit migration.
+            ExecutionDomainKind::MacAxEngineCluster => false,
             ExecutionDomainKind::CompatibilityRuntimeEndpoint => true,
             ExecutionDomainKind::NvidiaDynamoPc
             | ExecutionDomainKind::NvidiaDynamoThor
@@ -1314,6 +1399,28 @@ mod tests {
             models: Vec::new(),
         });
         endpoint.domain.as_mut().unwrap().id = DomainId::new("other-mac").unwrap();
+        assert!(!endpoint_matches_domain(&endpoint, &desired));
+    }
+
+    #[test]
+    fn mac_cluster_requires_an_explicit_domain_scoped_descriptor() {
+        let desired = domain(
+            "mac-cluster-main",
+            "mac-cluster",
+            ExecutionDomainKind::MacAxEngineCluster,
+            "apple-silicon-cluster",
+        );
+        let mut endpoint = dynamo_endpoint(&desired);
+        endpoint.runtime_kind = "ax_engine".into();
+        let descriptor = endpoint.domain.as_mut().unwrap();
+        descriptor.endpoint_scope = EndpointScope::Domain;
+        descriptor.execution_owner = "ax_engine".into();
+        descriptor.architecture = "arm64".into();
+        descriptor.validate().unwrap();
+
+        assert!(endpoint_matches_domain(&endpoint, &desired));
+        endpoint.domain = None;
+        endpoint.domain_observation = None;
         assert!(!endpoint_matches_domain(&endpoint, &desired));
     }
 }
