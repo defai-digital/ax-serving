@@ -135,20 +135,14 @@ mod tests {
             kind,
             domain_id: DomainId::new("mac-cluster-main").unwrap(),
             generation: 2,
-            manifest_digest: CompatibilityManifestDigest::new(format!(
-                "sha256:{}",
-                "a".repeat(64)
-            ))
-            .unwrap(),
+            manifest_digest: CompatibilityManifestDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap(),
             topology_label: "2x-m3-ultra-tb5".into(),
             ax_engine_build: "6.12.0+deadbeef".into(),
             transport_kind: "tcp".into(),
             duration_secs: 3_600,
             success: true,
-            metrics: BTreeMap::from([
-                ("ttft_p95_ms".into(), 120),
-                ("tok_per_s".into(), 18),
-            ]),
+            metrics: BTreeMap::from([("ttft_p95_ms".into(), 120), ("tok_per_s".into(), 18)]),
             recorded_at: OffsetDateTime::UNIX_EPOCH,
         }
     }

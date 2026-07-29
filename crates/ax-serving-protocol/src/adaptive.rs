@@ -6,9 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    DecisionProfileV1, DecisionValidationError, DomainId, PolicyMode, PolicyVersion,
-};
+use crate::{DecisionProfileV1, DecisionValidationError, DomainId, PolicyMode, PolicyVersion};
 
 /// Prompt-free cost and latency prediction for one complete domain candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,8 +118,7 @@ impl AdaptiveFederationPolicyV1 {
                 let Some(target) = target else {
                     return Ok(selection(baseline, None, self.mode, false));
                 };
-                let use_target =
-                    request_hash % 1_000_000 < u64::from(self.canary_share_ppm);
+                let use_target = request_hash % 1_000_000 < u64::from(self.canary_share_ppm);
                 if use_target {
                     Ok(selection(target, Some(baseline), self.mode, false))
                 } else {
@@ -169,7 +166,10 @@ fn best_candidate<'a>(candidates: &[&'a DomainCostSignal]) -> Option<&'a DomainC
     candidates.iter().copied().min_by(|left, right| {
         left.predicted_latency_ms
             .cmp(&right.predicted_latency_ms)
-            .then(left.predicted_cost_microusd.cmp(&right.predicted_cost_microusd))
+            .then(
+                left.predicted_cost_microusd
+                    .cmp(&right.predicted_cost_microusd),
+            )
             .then(right.stability_rank.cmp(&left.stability_rank))
             .then(left.domain.as_str().cmp(right.domain.as_str()))
     })
@@ -228,14 +228,9 @@ mod tests {
             signal("mac-single", 100, 100, true),
             signal("mac-cluster", 80, 200, true),
         ];
-        let decision = policy(PolicyMode::Shadow)
-            .select(&candidates, 1)
-            .unwrap();
+        let decision = policy(PolicyMode::Shadow).select(&candidates, 1).unwrap();
         assert_eq!(decision.selected_domain, domain("mac-single"));
-        assert_eq!(
-            decision.counterfactual_domain,
-            Some(domain("mac-cluster"))
-        );
+        assert_eq!(decision.counterfactual_domain, Some(domain("mac-cluster")));
         assert!(!decision.rolled_back);
     }
 
@@ -250,15 +245,11 @@ mod tests {
         // Spread hashes across the full ppm space so the 25% canary share is observable.
         for bucket in 0..1_000_u64 {
             let hash = bucket * 1_000;
-            if policy.select(&candidates, hash).unwrap().selected_domain == domain("mac-cluster")
-            {
+            if policy.select(&candidates, hash).unwrap().selected_domain == domain("mac-cluster") {
                 target_hits += 1;
             }
         }
-        assert!(
-            target_hits > 200 && target_hits < 300,
-            "hits={target_hits}"
-        );
+        assert!(target_hits > 200 && target_hits < 300, "hits={target_hits}");
     }
 
     #[test]
@@ -267,9 +258,7 @@ mod tests {
             signal("mac-single", 100, 100, true),
             signal("mac-cluster", 9_000, 200, true),
         ];
-        let decision = policy(PolicyMode::Active)
-            .select(&candidates, 42)
-            .unwrap();
+        let decision = policy(PolicyMode::Active).select(&candidates, 42).unwrap();
         assert_eq!(decision.selected_domain, domain("mac-single"));
     }
 
@@ -279,9 +268,7 @@ mod tests {
             signal("mac-single", 100, 100, true),
             signal("mac-cluster", 80, 200, true),
         ];
-        let decision = policy(PolicyMode::Rollback)
-            .select(&candidates, 7)
-            .unwrap();
+        let decision = policy(PolicyMode::Rollback).select(&candidates, 7).unwrap();
         assert_eq!(decision.selected_domain, domain("mac-single"));
         assert!(decision.rolled_back);
     }

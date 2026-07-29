@@ -78,6 +78,21 @@ orchestrator:
 
   equivalence_classes: []
 
+  # Adaptive federation is off by default. When enabled, only complete domains
+  # that already passed hard eligibility may be selected; shadow never mutates
+  # active traffic, and rollback restores the baseline domain.
+  # Example (disabled): compare a Mac cluster domain against a single-node Mac domain.
+  # target_domain and baseline_domain must differ and both must exist under domains.
+  adaptive_federation:
+    enabled: false
+    mode: "shadow"
+    canary_share_ppm: 100000
+    max_cost_microusd: 5000
+    latency_slo_ms: 2000
+    # target_domain: "mac-cluster-main"
+    # baseline_domain: "mac-single-main"
+    domains: []
+
 # Secrets remain environment-only:
 #   AXS_API_KEY=<public-client-secret>
 #   AXS_ADMIN_API_KEY=<operator-secret>

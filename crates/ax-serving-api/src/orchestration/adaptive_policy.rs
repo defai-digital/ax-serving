@@ -4,10 +4,95 @@
 //! replay, shadow, canary, and rollback evaluations without inspecting ranks,
 //! activations, KV, or prompts.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use ax_serving_protocol::{
-    AdaptiveFederationPolicyV1, AdaptivePolicyError, AdaptiveSelection, DomainCostSignal,
-    DomainId, PolicyMode, PolicyVersion,
+    AdaptiveFederationPolicyV1, AdaptivePolicyError, AdaptiveSelection, DomainCostSignal, DomainId,
+    PolicyMode, PolicyVersion,
 };
+
+use crate::config::AdaptiveFederationConfig;
+
+/// Validated runtime policy plus immutable per-domain certification signals.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDomainPolicy {
+    policy: AdaptiveFederationPolicyV1,
+    predictions: BTreeMap<DomainId, DomainCostSignal>,
+}
+
+impl AdaptiveDomainPolicy {
+    pub fn from_config(config: &AdaptiveFederationConfig) -> anyhow::Result<Option<Self>> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let mode = match config.mode.trim().to_ascii_lowercase().as_str() {
+            "shadow" => PolicyMode::Shadow,
+            "canary" => PolicyMode::Canary,
+            "active" => PolicyMode::Active,
+            "rollback" => PolicyMode::Rollback,
+            other => anyhow::bail!("unknown adaptive federation mode {other:?}"),
+        };
+        let target = config
+            .target_domain
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("adaptive target domain is missing"))?;
+        let baseline = config
+            .baseline_domain
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("adaptive baseline domain is missing"))?;
+        let policy = build_policy(
+            mode,
+            target,
+            baseline,
+            config.canary_share_ppm,
+            config.max_cost_microusd,
+            config.latency_slo_ms,
+        )?;
+        let predictions = config
+            .domains
+            .iter()
+            .map(|prediction| {
+                (
+                    prediction.domain.clone(),
+                    DomainCostSignal {
+                        domain: prediction.domain.clone(),
+                        predicted_cost_microusd: prediction.predicted_cost_microusd,
+                        predicted_latency_ms: prediction.predicted_latency_ms,
+                        ready: false,
+                        stability_rank: prediction.stability_rank,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok(Some(Self {
+            policy,
+            predictions,
+        }))
+    }
+
+    pub fn policy(&self) -> &AdaptiveFederationPolicyV1 {
+        &self.policy
+    }
+
+    /// Select using only complete domains present in the already hard-filtered
+    /// candidate set. Missing predictions remain ineligible and cannot win.
+    pub fn select_available(
+        &self,
+        available: &BTreeSet<DomainId>,
+        request_hash: u64,
+    ) -> Result<AdaptiveSelection, AdaptivePolicyError> {
+        let candidates = self
+            .predictions
+            .values()
+            .cloned()
+            .map(|mut signal| {
+                signal.ready = available.contains(&signal.domain);
+                signal
+            })
+            .collect::<Vec<_>>();
+        self.policy.select(&candidates, request_hash)
+    }
+}
 
 /// Build a validated adaptive policy from operator inputs.
 pub fn build_policy(
@@ -84,10 +169,7 @@ mod tests {
         ];
         let selected = select_domain(&policy, &candidates, 11).unwrap();
         assert_eq!(selected.selected_domain, domain("mac-single"));
-        assert_eq!(
-            selected.counterfactual_domain,
-            Some(domain("mac-cluster"))
-        );
+        assert_eq!(selected.counterfactual_domain, Some(domain("mac-cluster")));
     }
 
     #[test]
@@ -140,5 +222,38 @@ mod tests {
                 .iter()
                 .any(|item| item.selected_domain == domain("mac-single"))
         );
+    }
+
+    #[test]
+    fn configured_runtime_policy_never_selects_a_hard_filtered_domain() {
+        let config = AdaptiveFederationConfig {
+            enabled: true,
+            mode: "active".into(),
+            target_domain: Some(domain("mac-cluster")),
+            baseline_domain: Some(domain("mac-single")),
+            canary_share_ppm: 1_000_000,
+            max_cost_microusd: None,
+            latency_slo_ms: None,
+            domains: vec![
+                crate::config::AdaptiveDomainPredictionConfig {
+                    domain: domain("mac-single"),
+                    predicted_cost_microusd: 100,
+                    predicted_latency_ms: 120,
+                    stability_rank: 1,
+                },
+                crate::config::AdaptiveDomainPredictionConfig {
+                    domain: domain("mac-cluster"),
+                    predicted_cost_microusd: 200,
+                    predicted_latency_ms: 90,
+                    stability_rank: 1,
+                },
+            ],
+        };
+        let runtime = AdaptiveDomainPolicy::from_config(&config)
+            .unwrap()
+            .expect("enabled policy");
+        let available = BTreeSet::from([domain("mac-single")]);
+        let selected = runtime.select_available(&available, 1).unwrap();
+        assert_eq!(selected.selected_domain, domain("mac-single"));
     }
 }

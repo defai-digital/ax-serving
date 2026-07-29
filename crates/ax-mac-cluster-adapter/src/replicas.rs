@@ -52,9 +52,10 @@ impl ClusterReplicaObservation {
     pub fn validate(&self) -> Result<(), ReplicaAggregateError> {
         if self.replica_id.is_empty()
             || self.replica_id.len() > 128
-            || !self.replica_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-            })
+            || !self
+                .replica_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(ReplicaAggregateError::InvalidReplicaId);
         }

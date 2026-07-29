@@ -1,13 +1,16 @@
 //! Runtime-SDK-free adapter and gang coordinator for one Mac AX Engine cluster.
 
+pub mod artifacts;
 pub mod config;
 pub mod coordinator;
 pub mod evidence;
 pub mod manifest;
+pub mod metrics;
 pub mod planner;
 pub mod reconcile;
 pub mod registration;
 pub mod replicas;
+pub mod status;
 
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;

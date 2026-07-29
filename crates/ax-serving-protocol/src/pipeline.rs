@@ -95,7 +95,10 @@ pub struct MicroBatchCommitGate {
 }
 
 impl MicroBatchCommitGate {
-    pub fn new(request_sequence: u64, max_micro_batches: u16) -> Result<Self, PipelineContractError> {
+    pub fn new(
+        request_sequence: u64,
+        max_micro_batches: u16,
+    ) -> Result<Self, PipelineContractError> {
         if request_sequence == 0 {
             return Err(PipelineContractError::ZeroRequestSequence);
         }
@@ -111,7 +114,11 @@ impl MicroBatchCommitGate {
     }
 
     /// Admit the next ordered micro-batch or a cancellation tombstone.
-    pub fn admit(&mut self, micro_batch: u16, cancelled: bool) -> Result<(), PipelineContractError> {
+    pub fn admit(
+        &mut self,
+        micro_batch: u16,
+        cancelled: bool,
+    ) -> Result<(), PipelineContractError> {
         if self.cancelled {
             return Err(PipelineContractError::RequestAlreadyCancelled);
         }

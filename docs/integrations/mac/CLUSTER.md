@@ -179,10 +179,10 @@ to the adapter once weights are loaded.
 | Phase | In-repo surface | Physical / Engine pin |
 | --- | --- | --- |
 | 0–1 | Protocol 1.2 cluster domain, registration, heartbeat, drain, generation fence, domain reservation | Live Redis HA exercised when `AXS_TEST_REDIS_URL` is set |
-| 2 | Static PP manifest, gang lifecycle, rank-0 proxy, typed pre-admission / non-retry ambiguous failure | Real-weight two-Mac correctness still external |
-| 3 | Shard bootstrap plans, advisory placement, async reconcile, micro-batch contracts, multi-replica aggregation, evidence hooks | Load/fault/soak evidence retained via hooks; 60-minute hardware soak external |
-| 4 | TP/hybrid plan validation and required chunking profile digests | Model-native Engine TP/hybrid kernels external |
-| 5 | Adaptive federation replay/shadow/canary/rollback policy inputs | Production policy rollout external |
+| 2 | Static PP manifest, gang lifecycle, rank-0 proxy, typed pre-admission / non-retry ambiguous failure, generation restart policy | Real-weight two-Mac correctness still external |
+| 3 | Shard-aware artifact prepare/verify, advisory placement, async reconcile, micro-batch contracts, multi-replica aggregation, operator status, metrics, evidence hooks | Load/fault/soak evidence retained via hooks; 60-minute hardware soak external |
+| 4 | TP/hybrid plan validation, model-parallel topology projection, chunking profile contracts | Model-native Engine TP/hybrid kernels external |
+| 5 | Adaptive federation config + live dispatch selection with shadow/canary/active/rollback and decision retention | Production policy rollout external |
 
 ## Remaining qualification gates
 

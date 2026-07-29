@@ -27,9 +27,11 @@ use tracing::{Instrument as _, debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use ax_serving_protocol::{
-    CandidateDecision, DecisionReasonCode, DecisionRecordV1, PolicyId, PolicyMode, PolicyVersion,
+    AdaptiveSelection, CandidateDecision, DecisionReasonCode, DecisionRecordV1, PolicyId,
+    PolicyMode, PolicyVersion,
 };
 
+use super::adaptive_policy::AdaptiveDomainPolicy;
 use super::deployment::{DeploymentCatalog, RouteCandidate};
 use super::error::ax_error_response;
 use super::fleet_state::{DomainReservationResult, FleetStateStore, ReservationResult};
@@ -211,6 +213,11 @@ struct AttemptGuard {
     _reservation: Option<SharedReservationGuard>,
 }
 
+struct ExplicitCandidateSelection<'a> {
+    candidate: &'a RouteCandidate,
+    adaptive: Option<AdaptiveSelection>,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ReservationAcquireError {
     #[error("worker reservation capacity exhausted")]
@@ -239,6 +246,7 @@ pub struct DirectDispatcher {
     fleet_store: Option<Arc<dyn FleetStateStore>>,
     reservation_ttl_ms: u64,
     decision_journal: Arc<DecisionJournal>,
+    adaptive_policy: Option<Arc<AdaptiveDomainPolicy>>,
 }
 
 const DEFAULT_DECISION_JOURNAL_CAPACITY: usize = 256;
@@ -696,6 +704,7 @@ impl DirectDispatcher {
             fleet_store: None,
             reservation_ttl_ms: 15_000,
             decision_journal: Arc::new(DecisionJournal::new(DEFAULT_DECISION_JOURNAL_CAPACITY)),
+            adaptive_policy: None,
         })
     }
 
@@ -706,6 +715,11 @@ impl DirectDispatcher {
     ) -> Self {
         self.fleet_store = Some(fleet_store);
         self.reservation_ttl_ms = reservation_ttl_ms.max(1_000);
+        self
+    }
+
+    pub fn with_adaptive_policy(mut self, policy: Option<AdaptiveDomainPolicy>) -> Self {
+        self.adaptive_policy = policy.map(Arc::new);
         self
     }
 
@@ -804,10 +818,12 @@ impl DirectDispatcher {
     /// rank or node multiplicity from accidentally multiplying a domain's
     /// chance of selection.
     fn select_explicit_candidate<'a>(
+        &self,
         candidates: &'a [RouteCandidate],
         policy: &dyn DispatchPolicy,
         context: &DispatchContext<'_>,
-    ) -> Option<&'a RouteCandidate> {
+    ) -> Result<Option<ExplicitCandidateSelection<'a>>, ax_serving_protocol::AdaptivePolicyError>
+    {
         let mut groups = BTreeMap::<
             (
                 Option<ax_serving_protocol::DomainId>,
@@ -841,14 +857,41 @@ impl DirectDispatcher {
                 );
             }
         }
+        if let Some(adaptive_policy) = &self.adaptive_policy {
+            let available = representatives
+                .iter()
+                .filter_map(|candidate| candidate.domain.as_ref())
+                .map(|domain| domain.id.clone())
+                .collect::<BTreeSet<_>>();
+            let adaptive = adaptive_policy.select_available(&available, context.request_hash)?;
+            let candidate = representatives
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    candidate.domain.as_ref().map(|domain| &domain.id)
+                        == Some(&adaptive.selected_domain)
+                })
+                .ok_or(ax_serving_protocol::AdaptivePolicyError::MissingPolicyDomain)?;
+            return Ok(Some(ExplicitCandidateSelection {
+                candidate,
+                adaptive: Some(adaptive),
+            }));
+        }
+
         let statuses = representatives
             .iter()
             .map(|candidate| candidate.endpoint.worker.clone())
             .collect::<Vec<_>>();
-        let selected = policy.select(&statuses, context)?;
-        representatives
+        let Some(selected) = policy.select(&statuses, context) else {
+            return Ok(None);
+        };
+        Ok(representatives
             .into_iter()
             .find(|candidate| candidate.endpoint.worker.id == selected.id)
+            .map(|candidate| ExplicitCandidateSelection {
+                candidate,
+                adaptive: None,
+            }))
     }
 
     fn attach_dispatch_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -883,6 +926,7 @@ impl DirectDispatcher {
         evidence: &[CandidateDecision],
         observation_generations: &BTreeMap<ax_serving_protocol::DomainId, u64>,
         selected: &RouteCandidate,
+        adaptive: Option<&AdaptiveSelection>,
     ) {
         let Some(selected_domain) = selected.domain.as_ref() else {
             return;
@@ -900,24 +944,47 @@ impl DirectDispatcher {
         if candidate_summary.len() == 1 {
             reason_codes.insert(DecisionReasonCode::OnlyEligible);
         }
+        if let Some(adaptive) = adaptive {
+            reason_codes.insert(DecisionReasonCode::AdaptivePolicy);
+            reason_codes.insert(match adaptive.mode {
+                PolicyMode::Shadow => DecisionReasonCode::ShadowBaseline,
+                PolicyMode::Canary => DecisionReasonCode::CanaryAssignment,
+                PolicyMode::Rollback => DecisionReasonCode::PolicyRollback,
+                PolicyMode::Active => DecisionReasonCode::LowestNormalizedScore,
+            });
+        }
+
+        let policy_id = if adaptive.is_some() {
+            PolicyId::new("adaptive-federation").expect("static adaptive policy id is valid")
+        } else {
+            PolicyId::new("explicit-catalog").expect("static decision policy id is valid")
+        };
+        let policy_version = adaptive
+            .and_then(|_| self.adaptive_policy.as_ref())
+            .map(|policy| policy.policy().policy_version.clone())
+            .unwrap_or_else(|| {
+                PolicyVersion::new(env!("CARGO_PKG_VERSION"))
+                    .expect("static decision policy version is valid")
+            });
 
         let record = DecisionRecordV1 {
             request_id: profile.request_id,
             operation: profile.operation.clone(),
             logical_model: profile.logical_model.clone(),
             routing_profile: profile.decision.routing_profile.clone(),
-            policy_id: PolicyId::new("explicit-catalog")
-                .expect("static decision policy id is valid"),
-            policy_version: PolicyVersion::new(env!("CARGO_PKG_VERSION"))
-                .expect("static decision policy version is valid"),
-            policy_mode: PolicyMode::Active,
+            policy_id,
+            policy_version,
+            policy_mode: adaptive.map_or(PolicyMode::Active, |selection| selection.mode),
             candidate_summary,
             selected_domain: selected_domain.id.clone(),
             selected_deployment: selected.deployment.id.clone(),
             reason_codes,
             observation_generations: observation_generations.clone(),
-            predicted_cost_microusd: None,
-            predicted_latency_ms: None,
+            predicted_cost_microusd: adaptive.map(|selection| selection.predicted_cost_microusd),
+            predicted_latency_ms: adaptive.map(|selection| selection.predicted_latency_ms),
+            counterfactual_domain: adaptive
+                .and_then(|selection| selection.counterfactual_domain.clone()),
+            rolled_back: adaptive.is_some_and(|selection| selection.rolled_back),
             decided_at: time::OffsetDateTime::now_utc(),
         };
         match record.validate() {
@@ -1079,27 +1146,43 @@ impl DirectDispatcher {
                 );
             }
 
-            let Some(candidate) = Self::select_explicit_candidate(&candidates, policy, &ctx) else {
-                self.record_selection(selection_started, SelectionOutcome::AtCapacity);
-                return trace_response(
-                    ax_error_response(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        profile.request_id,
-                        "AXS_DEPLOYMENT_CAPACITY",
-                        format!(
-                            "all compatible deployments for '{}' are at capacity",
-                            profile.logical_model
+            let selection = match self.select_explicit_candidate(&candidates, policy, &ctx) {
+                Ok(Some(selection)) => selection,
+                Ok(None) => {
+                    self.record_selection(selection_started, SelectionOutcome::AtCapacity);
+                    return trace_response(
+                        ax_error_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            profile.request_id,
+                            "AXS_DEPLOYMENT_CAPACITY",
+                            format!(
+                                "all compatible deployments for '{}' are at capacity",
+                                profile.logical_model
+                            ),
+                            true,
+                            ax_serving_protocol::AdmissionPhase::Admission,
                         ),
+                        candidates.len(),
+                        None,
+                        "all_at_capacity",
+                    );
+                }
+                Err(error) => {
+                    self.record_selection(selection_started, SelectionOutcome::Error);
+                    warn!(%error, "adaptive federation selection failed closed");
+                    return ax_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        profile.request_id,
+                        "AXS_ADAPTIVE_POLICY_UNAVAILABLE",
+                        "adaptive federation policy has no safe eligible selection",
                         true,
-                        ax_serving_protocol::AdmissionPhase::Admission,
-                    ),
-                    candidates.len(),
-                    None,
-                    "all_at_capacity",
-                );
+                        ax_serving_protocol::AdmissionPhase::EndpointSelection,
+                    );
+                }
             };
             self.record_selection(selection_started, SelectionOutcome::Selected);
-            let candidate = candidate.clone();
+            let adaptive_selection = selection.adaptive;
+            let candidate = selection.candidate.clone();
             let selected_id = candidate.endpoint.worker.id;
             let Some(inflight_counter) = registry.inflight_counter(selected_id) else {
                 excluded_id = Some(selected_id);
@@ -1181,6 +1264,7 @@ impl DirectDispatcher {
                 &candidate_set.decisions,
                 &candidate_set.observation_generations,
                 &candidate,
+                adaptive_selection.as_ref(),
             )
             .await;
             attempt_number = attempt_number.saturating_add(1);

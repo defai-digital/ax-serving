@@ -138,6 +138,8 @@ impl OrchestratorLayer {
         fleet_store: Arc<dyn FleetStateStore>,
     ) -> Result<Self> {
         let policy = policy::policy_from_str(&config.dispatch_policy)?;
+        let adaptive_policy =
+            adaptive_policy::AdaptiveDomainPolicy::from_config(&config.adaptive_federation)?;
         let deployment_catalog = Arc::new(DeploymentCatalogStore::new(
             DeploymentCatalog::from_config(&config)?,
         ));
@@ -175,7 +177,8 @@ impl OrchestratorLayer {
                 config.stream_idle_timeout_ms,
                 config.dispatch_token.as_ref().map(|token| token.expose()),
             )?
-            .with_fleet_state(Arc::clone(&fleet_store), config.worker_ttl_ms),
+            .with_fleet_state(Arc::clone(&fleet_store), config.worker_ttl_ms)
+            .with_adaptive_policy(adaptive_policy),
             deployment_catalog,
             fleet_store,
             config: Arc::new(config),

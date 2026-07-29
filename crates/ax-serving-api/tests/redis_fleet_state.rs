@@ -310,6 +310,8 @@ fn decision() -> DecisionRecordV1 {
         observation_generations: BTreeMap::from([(domain, 4)]),
         predicted_cost_microusd: None,
         predicted_latency_ms: None,
+        counterfactual_domain: None,
+        rolled_back: false,
         decided_at: time::OffsetDateTime::now_utc(),
     }
 }
