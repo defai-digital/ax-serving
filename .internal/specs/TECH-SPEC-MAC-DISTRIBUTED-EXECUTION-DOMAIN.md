@@ -545,9 +545,11 @@ Exit: two gateways safely admit a mock cluster without exposing ranks.
 ### Phase 2: AX Engine static PP
 
 - Implement manifest validation, gang lifecycle, partial layer load, and direct activation transport
-  in AX Engine.
-- Support one decoder-only model family and one quantization.
+  in AX Engine. **Source implementation complete.**
+- Support one decoder-only model family and one quantization. **Initial dense Llama 3 path
+  complete; the retained real-weight certification matrix remains open.**
 - Wire typed admission, streaming, cancellation, drain, and rank failure through the adapter.
+  **Mock/numeric integration complete; physical two-Mac fault qualification remains open.**
 
 Exit: a model that cannot fit one Mac completes certified two-or-more-Mac inference.
 

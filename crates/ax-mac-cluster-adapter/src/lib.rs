@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ax_serving_adapter_core::proxy::{self, ProxyConfig};
 use ax_serving_protocol::WorkerInstanceId;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use config::MacClusterConfig;
 use coordinator::ClusterCoordinator;
@@ -44,8 +45,14 @@ pub async fn run_from_env() -> Result<()> {
         .timeout(Duration::from_secs(10))
         .build()
         .context("failed to construct AX control-plane client")?;
+    let mut rank0_headers = HeaderMap::new();
+    let mut rank0_authorization = HeaderValue::from_str(&format!("Bearer {}", config.rank0_token))
+        .context("AXS_MAC_CLUSTER_RANK0_TOKEN is not a valid Authorization credential")?;
+    rank0_authorization.set_sensitive(true);
+    rank0_headers.insert(AUTHORIZATION, rank0_authorization);
     let proxy_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
+        .default_headers(rank0_headers)
         .build()
         .context("failed to construct rank-0 proxy client")?;
 

@@ -16,9 +16,9 @@
     "max_output_tokens": 2048
   },
   "runtime": {
-    "ax_engine_version": "4.10.0",
+    "ax_engine_version": "6.12.0",
     "build_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "mlx_version": "0.29.0",
+    "mlx_version": "0.32.0",
     "os_baseline": "macos-26.0"
   },
   "parallelism": {
@@ -57,6 +57,12 @@
       "relative_path": "config.json",
       "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "size_bytes": 10000,
+      "kind": "config"
+    },
+    {
+      "relative_path": "model-manifest.json",
+      "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "size_bytes": 200000,
       "kind": "config"
     }
   ],

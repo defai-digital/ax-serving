@@ -331,6 +331,7 @@ mod tests {
             dispatch_token: Some("dispatch-token-value".into()),
             rank_control_token: "rank-control-token-value".into(),
             rank0_url: "http://127.0.0.1:18100".into(),
+            rank0_token: "rank0-runtime-token".into(),
             manifest_path: PathBuf::from("unused"),
             domain_id: DomainId::new("mac-cluster-main").unwrap(),
             worker_id: WorkerId::new("mac-cluster-adapter").unwrap(),

@@ -19,6 +19,7 @@ pub struct MacClusterConfig {
     pub dispatch_token: Option<String>,
     pub rank_control_token: String,
     pub rank0_url: String,
+    pub rank0_token: String,
     pub manifest_path: PathBuf,
     pub domain_id: DomainId,
     pub worker_id: WorkerId,
@@ -48,6 +49,7 @@ impl std::fmt::Debug for MacClusterConfig {
             )
             .field("rank_control_token", &"[REDACTED]")
             .field("rank0_url", &self.rank0_url)
+            .field("rank0_token", &"[REDACTED]")
             .field("manifest_path", &self.manifest_path)
             .field("domain_id", &self.domain_id)
             .field("worker_id", &self.worker_id)
@@ -106,6 +108,8 @@ impl MacClusterConfig {
         )?;
         let rank_control_token = required_env("AXS_MAC_CLUSTER_CONTROL_TOKEN")?;
         validate_secret("AXS_MAC_CLUSTER_CONTROL_TOKEN", &rank_control_token)?;
+        let rank0_token = required_env("AXS_MAC_CLUSTER_RANK0_TOKEN")?;
+        validate_secret("AXS_MAC_CLUSTER_RANK0_TOKEN", &rank0_token)?;
         let dispatch_token = optional_env("AXS_DISPATCH_TOKEN");
         if dispatch_token.is_none()
             && !permits_unauthenticated_dispatch(&tls_profile, allow_no_auth, listen_addr)
@@ -129,6 +133,7 @@ impl MacClusterConfig {
             dispatch_token,
             rank_control_token,
             rank0_url,
+            rank0_token,
             manifest_path: PathBuf::from(required_env("AXS_MAC_CLUSTER_MANIFEST_PATH")?),
             worker_id: WorkerId::new(
                 optional_env("AXS_MAC_CLUSTER_ADAPTER_ID")

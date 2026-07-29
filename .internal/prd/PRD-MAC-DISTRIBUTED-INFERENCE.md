@@ -241,6 +241,14 @@ Operator status must clearly distinguish:
 | 4. Advanced parallelism | TP/hybrid and profile-driven chunking | Per-model certification and performance win |
 | 5. Adaptive federation | Cluster participates in replayed/shadow cost/SLO policy | Replay, shadow, canary, rollback gates |
 
-Phase 1 completion is a control-plane claim only. Phase 2 remains unavailable because the pinned
-AX Engine runtime does not yet expose partial layer loading, distributed rank execution,
-activation transport, or generation-wide cancellation.
+Phase 1 is complete. The Phase 2 source implementation now provides generation-fenced static
+pipeline contracts, selective dense-Llama-3 stage loading, stage-local KV, bounded serialized
+activation transport, authenticated rank services, ordered cancellation/cleanup, rank heartbeats,
+and a greedy OpenAI-compatible rank-0 gateway. Mock HTTP tests and a two-stage numerical fixture
+exercise a real serialized activation boundary and match monolithic forward within the established
+tolerance.
+
+Phase 2 is not a production-support claim until a pinned real-weight model is qualified on at least
+two physical Macs. The current implementation deliberately excludes tensor/hybrid parallelism,
+dynamic stage balancing, automatic artifact download, non-greedy sampling, tool/structured output,
+and production fault/load/soak certification.

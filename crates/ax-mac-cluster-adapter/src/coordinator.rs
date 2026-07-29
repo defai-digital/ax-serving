@@ -70,6 +70,35 @@ pub struct RankBootstrapPlan {
     pub artifacts: Vec<ArtifactFilePlan>,
 }
 
+/// AX Engine-owned projection consumed by `ax-engine-pipeline-rank`.
+///
+/// This intentionally mirrors the runtime-neutral AX Engine JSON contract
+/// without making AX Serving depend on an MLX/runtime crate.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnginePipelineTopology {
+    pub cluster_id: String,
+    pub generation: u64,
+    pub manifest_digest: String,
+    pub model_artifact_digest: String,
+    pub total_layers: u32,
+    pub ranks: Vec<EnginePipelineRank>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EnginePipelineRank {
+    pub rank: u16,
+    pub node_identity_digest: String,
+    pub layers: EngineLayerRange,
+    pub owns_embeddings: bool,
+    pub owns_output_head: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EngineLayerRange {
+    pub start: u32,
+    pub end: u32,
+}
+
 impl ClusterCoordinator {
     pub fn new(manifest: ValidatedManifest, max_inflight: usize, stale_after: Duration) -> Self {
         Self {
@@ -245,6 +274,31 @@ impl ClusterCoordinator {
         })
     }
 
+    pub fn engine_topology(&self) -> EnginePipelineTopology {
+        let manifest = &self.manifest.manifest;
+        EnginePipelineTopology {
+            cluster_id: manifest.cluster_id.to_string(),
+            generation: manifest.generation,
+            manifest_digest: self.manifest.digest.to_string(),
+            model_artifact_digest: manifest.model.artifact_digest.to_string(),
+            total_layers: manifest.model.total_layers,
+            ranks: manifest
+                .ranks
+                .iter()
+                .map(|rank| EnginePipelineRank {
+                    rank: rank.rank,
+                    node_identity_digest: rank.node_identity_digest.to_string(),
+                    layers: EngineLayerRange {
+                        start: rank.layers.start,
+                        end: rank.layers.end,
+                    },
+                    owns_embeddings: rank.owns_embeddings,
+                    owns_output_head: rank.owns_output_head,
+                })
+                .collect(),
+        }
+    }
+
     async fn refresh_ready(&self) {
         let ready = self.status().await.state == ClusterLifecycleState::Ready;
         self.ready.store(ready, Ordering::Release);
@@ -341,6 +395,10 @@ pub fn router(coordinator: ClusterCoordinator, token: String) -> Router {
             "/internal/cluster/ranks/{rank}/plan",
             get(rank_bootstrap_plan),
         )
+        .route(
+            "/internal/cluster/engine-topology",
+            get(engine_pipeline_topology),
+        )
         .route("/internal/cluster/status", get(cluster_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), rank_auth))
         .with_state(state)
@@ -362,6 +420,12 @@ async fn rank_heartbeat(
 
 async fn cluster_status(State(state): State<RankApiState>) -> Json<ClusterStatus> {
     Json(state.coordinator.status().await)
+}
+
+async fn engine_pipeline_topology(
+    State(state): State<RankApiState>,
+) -> Json<EnginePipelineTopology> {
+    Json(state.coordinator.engine_topology())
 }
 
 async fn rank_bootstrap_plan(State(state): State<RankApiState>, Path(rank): Path<u16>) -> Response {
@@ -555,5 +619,21 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.relative_path == "tokenizer.json")
         );
+    }
+
+    #[test]
+    fn engine_topology_projection_matches_rank_and_layer_plan() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        let topology = coordinator.engine_topology();
+        assert_eq!(topology.generation, 1);
+        assert_eq!(topology.total_layers, 126);
+        assert_eq!(topology.ranks.len(), 2);
+        assert_eq!(topology.ranks[0].layers.start, 0);
+        assert_eq!(topology.ranks[0].layers.end, 63);
+        assert!(topology.ranks[0].owns_embeddings);
+        assert!(!topology.ranks[0].owns_output_head);
+        assert_eq!(topology.ranks[1].layers.start, 63);
+        assert_eq!(topology.ranks[1].layers.end, 126);
+        assert!(topology.ranks[1].owns_output_head);
     }
 }
