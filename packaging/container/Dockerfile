@@ -14,13 +14,15 @@ RUN cargo build --locked --release \
       -p ax-serving-cli --no-default-features --features gateway \
       --bin ax-serving-api --bin ax-servingctl \
     && cargo build --locked --release -p ax-thor-agent --bin ax-runtime-agent \
-    && cargo build --locked --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
+    && cargo build --locked --release -p ax-dynamo-adapter --bin ax-dynamo-adapter \
+    && cargo build --locked --release -p ax-mac-cluster-adapter --bin ax-mac-cluster-adapter
 
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 65532 --shell /usr/sbin/nologin ax-serving
+COPY --from=builder /src/LICENSE /src/NOTICE /src/LICENSING.md /src/TRADEMARKS.md /usr/local/share/doc/ax-serving/
 USER 65532:65532
 WORKDIR /home/ax-serving
 
@@ -41,3 +43,8 @@ FROM runtime-base AS dynamo-adapter
 COPY --from=builder /src/target/release/ax-dynamo-adapter /usr/local/bin/ax-dynamo-adapter
 EXPOSE 18082
 ENTRYPOINT ["/usr/local/bin/ax-dynamo-adapter"]
+
+FROM runtime-base AS mac-cluster-adapter
+COPY --from=builder /src/target/release/ax-mac-cluster-adapter /usr/local/bin/ax-mac-cluster-adapter
+EXPOSE 18083
+ENTRYPOINT ["/usr/local/bin/ax-mac-cluster-adapter"]

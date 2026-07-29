@@ -20,7 +20,7 @@ pub use super::admin::{
     metrics, prometheus_metrics,
 };
 pub use super::inference::{chat_completions, embeddings, text_completions};
-pub use super::license::{dashboard, get_license, set_license};
+pub use super::license::{dashboard, get_license};
 pub use super::models::{list_models, rest_load_model, rest_reload_model, rest_unload_model};
 
 // ── Shared helpers used by multiple modules ──────────────────────────────────

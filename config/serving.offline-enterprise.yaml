@@ -91,10 +91,3 @@ orchestrator:
   global_queue_policy: "queue"
   tenant_max_concurrent: 0
   # Set AXS_CACHE_AFFINITY_SECRET (32+ random bytes) if affinity hints are used.
-
-license:
-  buy_link: "https://license.automatosx.com"
-  config_dir: "ax-serving"
-  key_file: "license.key"
-  persist: true
-  dashboard_poll_ms: 2000

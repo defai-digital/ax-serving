@@ -1,6 +1,8 @@
 # AX Serving positioning
 
-AX Serving is a federated heterogeneous inference control plane for private AI fleets.
+AX Serving is a federated multi-domain inference control plane for private AI fleets. Heterogeneous
+hardware is a strong use case, but the product boundary is independently operated execution
+domains—not hardware mixing by itself.
 
 It sits above execution domains:
 
@@ -18,11 +20,20 @@ linking runtime SDKs or competing with Dynamo's worker scheduler.
 
 AX Serving selects a domain. Dynamo selects NVIDIA workers. AX Engine executes on Mac.
 
+The CPU-only gateway can run independently on Apple Silicon, Linux AMD64, or Linux ARM64 and govern
+local or remote domains over an operator-provided trusted network. See
+[Control-plane placement and mixed-fleet topologies](deployment-topologies.md).
+
+AX Serving v3 is the Apache-2.0 open infrastructure layer. AX Fabric and AX Trust may provide
+separate orchestration, governance, trust, managed-service, and enterprise value through the public
+contracts; they do not unlock or relicense AX Serving.
+
 ## Primary user
 
-The primary user is a platform team with at least two hardware/trust domains or a real need for
-central identity, admission, audit, or lifecycle. A single Dynamo deployment with one policy is not
-a strong fit; that user should call Dynamo directly.
+The primary user is a platform team with at least two execution, trust, region, or failure domains
+or a real need for central identity, admission, audit, or lifecycle. The domains may mix Mac and
+NVIDIA, or they may be separate CUDA/Dynamo domains. A single Dynamo deployment with one policy is
+not a strong fit; that user should call Dynamo directly.
 
 ## Differentiators that must be proved
 
@@ -57,10 +68,14 @@ AX Serving is not:
 3. “PC and Thor are independently deployed and must be independently certified.”
 4. “Homogeneous NVIDIA users should use Dynamo directly.”
 5. “AX Serving earns its place only through retained value and safety evidence.”
+6. “AX Serving is the open foundation; AX Fabric and AX Trust are separate products.”
 
 ## Current claim boundary
 
-The repository implements the portable gateway and Mac-capable runtime-agent foundations. The
-Dynamo Domain Adapter and final domain protocol are target design work, and Thor is experimental
-until live qualification. Public ownership boundaries are defined by the
-[runtime responsibility inventory](contracts/ax-serving-runtime-responsibility-inventory.md).
+The repository implements the portable gateway, protocol v1.2 execution-domain
+foundation, Mac-capable runtime agent, runtime-SDK-free Dynamo Domain Adapter,
+and runtime-neutral Mac cluster coordinator with source/mock conformance. The
+Mac cluster control plane is not a distributed AX Engine runtime claim. Live
+Mac/NVIDIA federation and published multi-architecture Linux artifacts are not production qualified.
+Thor remains experimental until independent live qualification. See the
+[deployment topology guide](deployment-topologies.md) for the public claim boundary.

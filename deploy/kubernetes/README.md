@@ -4,9 +4,9 @@ These manifests are an integration baseline, not a certified production
 release. They deploy two portable gateway replicas with Redis/Valkey-backed
 fleet state and show a runtime plus `ax-runtime-agent` sidecar pattern.
 
-The sidecar is the current endpoint-adapter example. The final NVIDIA architecture uses a separate,
-pinned Dynamo domain and future Dynamo Domain Adapter; these manifests do not install or certify
-Dynamo or Thor.
+The sidecar is the current Mac endpoint-adapter example. The final NVIDIA architecture uses a
+separate, pinned Dynamo domain and `ax-dynamo-adapter`; these manifests do not install or certify
+the adapter, Dynamo, or Thor.
 
 Before applying the base:
 

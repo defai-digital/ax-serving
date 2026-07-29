@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ax_serving_api::orchestration::{
-    LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
+    OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     direct::DirectDispatcher,
     fleet_state::{FleetStateStore, MemoryFleetStateStore},
     internal_routes::{
@@ -41,49 +41,6 @@ use tower::ServiceExt;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct TestConfigHome {
-    _guard: MutexGuard<'static, ()>,
-    _dir: tempfile::TempDir,
-    previous_xdg: Option<std::ffi::OsString>,
-    previous_home: Option<std::ffi::OsString>,
-}
-
-impl TestConfigHome {
-    fn new() -> Self {
-        let guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let previous_home = std::env::var_os("HOME");
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            std::env::set_var("HOME", dir.path());
-        }
-        Self {
-            _guard: guard,
-            _dir: dir,
-            previous_xdg,
-            previous_home,
-        }
-    }
-}
-
-impl Drop for TestConfigHome {
-    fn drop(&mut self) {
-        // SAFETY: test-only env mutation is serialized by ENV_LOCK.
-        unsafe {
-            match &self.previous_xdg {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-}
 
 struct EnvVarsGuard {
     _guard: MutexGuard<'static, ()>,
@@ -278,7 +235,6 @@ async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -497,7 +453,6 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
     let gateway_a = Arc::new(
         OrchestratorLayer::new_with_fleet_store(
             config.clone(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
             Arc::clone(&fleet_store),
         )
@@ -506,7 +461,6 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
     let layer = Arc::new(
         OrchestratorLayer::new_with_fleet_store(
             config,
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
             Arc::clone(&fleet_store),
         )
@@ -981,14 +935,7 @@ async fn test_health_endpoint_shape() {
     // We just test the health endpoint shape without starting full servers —
     // use OrchestratorLayer directly and call proxy_health logic via a
     // one-shot axum server.
-    let layer = Arc::new(
-        OrchestratorLayer::new(
-            cfg,
-            ax_serving_api::config::LicenseConfig::default(),
-            ProjectPolicyConfig::default(),
-        )
-        .unwrap(),
-    );
+    let layer = Arc::new(OrchestratorLayer::new(cfg, ProjectPolicyConfig::default()).unwrap());
 
     let public_router = {
         let l = Arc::clone(&layer);
@@ -1031,7 +978,6 @@ async fn test_non_loopback_internal_bind_requires_token() {
             internal_bind_addr: "0.0.0.0".into(),
             ..OrchestratorConfig::default()
         },
-        LicenseConfig::default(),
         ProjectPolicyConfig::default(),
     )
     .await;
@@ -1058,7 +1004,6 @@ async fn test_invalid_allowed_node_cidrs_fails_startup() {
             allowed_node_cidrs: "not-a-cidr".into(),
             ..OrchestratorConfig::default()
         },
-        LicenseConfig::default(),
         ProjectPolicyConfig::default(),
     )
     .await;
@@ -1075,7 +1020,6 @@ async fn test_internal_router_real_server_enforces_token_and_allowlist() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1084,7 +1028,6 @@ async fn test_internal_router_real_server_enforces_token_and_allowlist() {
         registry: layer.registry.clone(),
         fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
-        license: Arc::clone(&layer.license),
     };
     let addr = skip_if_no_socket!(
         spawn_internal_router_with_auth(
@@ -1490,7 +1433,6 @@ async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1499,7 +1441,6 @@ async fn test_internal_heartbeat_roundtrip_persists_extended_fields() {
         registry: layer.registry.clone(),
         fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
-        license: Arc::clone(&layer.license),
     };
     let app = internal_router(state);
 
@@ -1589,7 +1530,6 @@ async fn test_admin_status_requires_auth_and_returns_operational_summary() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1648,7 +1588,7 @@ async fn test_admin_status_requires_auth_and_returns_operational_summary() {
     assert_eq!(json["workers"]["eligible"], 1);
     assert_eq!(json["workers"]["runtimes"]["ax_engine"]["workers"], 1);
     assert_eq!(json["workers"]["runtimes"]["ax_engine"]["eligible"], 1);
-    assert!(json["license"]["edition"].is_string());
+    assert_eq!(json["license"]["license"], "Apache-2.0");
 }
 
 #[tokio::test]
@@ -1656,7 +1596,6 @@ async fn test_admin_status_reports_auth_required_from_runtime_state() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1707,11 +1646,9 @@ async fn test_admin_status_reports_auth_required_from_runtime_state() {
 
 #[tokio::test]
 async fn test_admin_startup_report_and_diagnostics_include_audit() {
-    let _config_home = TestConfigHome::new();
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1741,22 +1678,19 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
     assert_eq!(startup_json["auth_required"], true);
     assert!(startup_json["dispatch_runtime"].is_object());
 
-    let license_set = app
+    let license_response = app
         .clone()
         .oneshot(
             axum::http::Request::builder()
-                .method(axum::http::Method::POST)
+                .method(axum::http::Method::GET)
                 .uri("/v1/license")
-                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
-                .header("content-type", "application/json")
-                .header("x-request-id", "req-orch-license")
-                .body(axum::body::Body::from(r#"{"key":"biz-key"}"#))
+                .body(axum::body::Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    let license_status = license_set.status();
-    let license_body = axum::body::to_bytes(license_set.into_body(), usize::MAX)
+    let license_status = license_response.status();
+    let license_body = axum::body::to_bytes(license_response.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(
@@ -1765,6 +1699,8 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
         "license body: {}",
         String::from_utf8_lossy(&license_body)
     );
+    let license_json: serde_json::Value = serde_json::from_slice(&license_body).unwrap();
+    assert_eq!(license_json["license"], "Apache-2.0");
 
     let diag = app
         .clone()
@@ -1791,13 +1727,7 @@ async fn test_admin_startup_report_and_diagnostics_include_audit() {
     );
     let diag_json: serde_json::Value = serde_json::from_slice(&diag_body).unwrap();
     assert_eq!(diag_json["request_id"], "req-orch-diag");
-    assert!(
-        diag_json["audit_tail"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["action"] == "license_set" && e["actor"] == "request:req-orch-license")
-    );
+    assert!(diag_json["audit_tail"].is_array());
 
     let audit = app
         .oneshot(
@@ -1831,7 +1761,6 @@ async fn test_admin_diagnostics_groups_runtime_details_and_issues() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -1978,7 +1907,6 @@ async fn test_admin_diagnostics_reports_runtime_specific_hardware_guidance() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2038,7 +1966,6 @@ async fn test_admin_diagnostics_reports_runtime_telemetry_recovery_actions() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2135,7 +2062,6 @@ async fn test_admin_diagnostics_flags_absent_hardware_class_for_known_runtime() 
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2194,7 +2120,6 @@ async fn test_admin_fleet_summarizes_pools_and_node_classes() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2284,7 +2209,6 @@ async fn test_proxy_models_uses_structured_capability_models() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2346,7 +2270,6 @@ async fn test_admin_policy_returns_project_policy_summary() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             sample_project_policy(Some("fabric")),
         )
         .unwrap(),
@@ -2377,66 +2300,10 @@ async fn test_admin_policy_returns_project_policy_summary() {
 }
 
 #[tokio::test]
-async fn test_license_validation_errors_are_audited() {
-    let _config_home = TestConfigHome::new();
-    let layer = Arc::new(
-        OrchestratorLayer::new(
-            OrchestratorConfig::default(),
-            LicenseConfig::default(),
-            ProjectPolicyConfig::default(),
-        )
-        .unwrap(),
-    );
-    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
-
-    let resp = app
-        .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method(axum::http::Method::POST)
-                .uri("/v1/license")
-                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
-                .header("content-type", "application/json")
-                .header("x-request-id", "req-orch-license-invalid")
-                .body(axum::body::Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-
-    let audit = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method(axum::http::Method::GET)
-                .uri("/v1/admin/audit?limit=10")
-                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(audit.status(), axum::http::StatusCode::OK);
-    let audit_json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(audit.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(audit_json["events"].as_array().unwrap().iter().any(|e| {
-        e["action"] == "license_set"
-            && e["actor"] == "request:req-orch-license-invalid"
-            && e["outcome"] == "error"
-            && e["detail"]["error"] == "missing field: key"
-    }));
-}
-
-#[tokio::test]
 async fn test_worker_admin_validation_errors_are_audited() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2513,7 +2380,6 @@ async fn test_pool_header_prefers_matching_worker_pool() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2565,7 +2431,6 @@ async fn test_pool_header_does_not_retry_generic_worker_failure() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2613,12 +2478,7 @@ async fn test_pool_header_does_not_retry_generic_worker_failure() {
 #[tokio::test]
 async fn test_project_policy_proxy_requires_header() {
     let layer = Arc::new(
-        OrchestratorLayer::new(
-            OrchestratorConfig::default(),
-            LicenseConfig::default(),
-            sample_project_policy(None),
-        )
-        .unwrap(),
+        OrchestratorLayer::new(OrchestratorConfig::default(), sample_project_policy(None)).unwrap(),
     );
     let worker = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#).await
@@ -2649,12 +2509,7 @@ async fn test_project_policy_proxy_requires_header() {
 #[tokio::test]
 async fn test_project_policy_enforces_worker_pool() {
     let layer = Arc::new(
-        OrchestratorLayer::new(
-            OrchestratorConfig::default(),
-            LicenseConfig::default(),
-            sample_project_policy(None),
-        )
-        .unwrap(),
+        OrchestratorLayer::new(OrchestratorConfig::default(), sample_project_policy(None)).unwrap(),
     );
     let blue = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
@@ -2701,12 +2556,7 @@ async fn test_project_policy_enforces_worker_pool() {
 #[tokio::test]
 async fn test_project_policy_worker_pool_does_not_fallback() {
     let layer = Arc::new(
-        OrchestratorLayer::new(
-            OrchestratorConfig::default(),
-            LicenseConfig::default(),
-            sample_project_policy(None),
-        )
-        .unwrap(),
+        OrchestratorLayer::new(OrchestratorConfig::default(), sample_project_policy(None)).unwrap(),
     );
     let blue = skip_if_no_socket!(
         spawn_mock_worker(200, r#"{"choices":[{"message":{"content":"blue"}}]}"#).await
@@ -2740,7 +2590,6 @@ async fn test_proxy_embeddings_route_and_project_policy() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig {
                 enabled: true,
                 default_project: None,
@@ -2809,7 +2658,6 @@ async fn test_proxy_embeddings_does_not_route_to_legacy_llm_only_worker() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -2930,7 +2778,6 @@ async fn test_proxy_embeddings_routes_by_input_context() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -3244,7 +3091,6 @@ async fn test_proxy_rejects_invalid_endpoint_bodies_before_dispatch() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -3329,7 +3175,6 @@ async fn test_proxy_accepts_valid_body_above_axum_default_limit() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -3593,7 +3438,6 @@ async fn test_public_worker_admin_flow_lists_drains_and_evicts() {
     let layer = Arc::new(
         OrchestratorLayer::new(
             OrchestratorConfig::default(),
-            LicenseConfig::default(),
             ProjectPolicyConfig::default(),
         )
         .unwrap(),
@@ -3717,14 +3561,7 @@ async fn spawn_orchestrator_with_layer(
     Arc<ax_serving_api::orchestration::OrchestratorLayer>,
 )> {
     use ax_serving_api::orchestration::{OrchestratorLayer, proxy_router};
-    let layer = Arc::new(
-        OrchestratorLayer::new(
-            cfg,
-            ax_serving_api::config::LicenseConfig::default(),
-            ProjectPolicyConfig::default(),
-        )
-        .ok()?,
-    );
+    let layer = Arc::new(OrchestratorLayer::new(cfg, ProjectPolicyConfig::default()).ok()?);
     let router = proxy_router(Arc::clone(&layer));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().ok()?;

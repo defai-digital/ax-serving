@@ -1,108 +1,56 @@
-# Enterprise Release Governance
+# Separate Product Release Governance
 
-This runbook defines how enterprise artifacts are built and delivered without
-publishing enterprise source code in the public repository.
+This runbook governs releases of products and services that integrate with the
+Apache-2.0 AX Serving project, including AX Fabric and AX Trust.
+
+AX Serving remains an independently releasable open-source project. A separate
+product may add value around it, but must not claim that private entitlement is
+required to use, modify, redistribute, or operate AX Serving under Apache-2.0.
 
 ## Preconditions
 
-An enterprise release may proceed only when:
+A separate-product release may proceed only when:
 
-1. the target public-core version is tagged or frozen
-2. the enterprise repository version is set
-3. compatibility metadata is prepared
-4. release notes and upgrade notes are drafted
+1. the target AX Serving version is tagged or frozen;
+2. the product version and applicable commercial terms are set;
+3. compatibility metadata identifies the AX Serving and contract versions;
+4. integration, release, and upgrade notes are ready;
+5. third-party notices and AX Serving attribution are included where required.
 
-## Release Inputs
+## Validation gates
 
-Every enterprise release should identify:
+Run:
 
-- target public-core version
-- enterprise repository version
-- supported previous enterprise release
-- contract revisions used by the release
-- private artifact destinations
+1. product build and test validation;
+2. integration smoke tests against the recorded AX Serving release;
+3. deployment-bundle validation;
+4. compatibility-metadata validation;
+5. source-provenance and notice review;
+6. a check that no private source or customer data entered public artifacts.
 
-## Validation Gates
+Private products may be delivered through private registries, internal artifact
+stores, managed services, or customer bundles. Do not publish their proprietary
+source in AX Serving release archives or public documentation.
 
-Run these checks before publishing:
+## Required release outputs
 
-1. build validation for the enterprise repository
-2. integration smoke tests against the target public-core version
-3. deployment bundle validation where applicable
-4. compatibility metadata validation
-5. release note and upgrade note review
+Every release should produce:
 
-## Publication Rules
+- versioned product artifacts;
+- compatibility metadata;
+- release notes and, when applicable, upgrade notes;
+- provenance for the AX Serving baseline;
+- the Apache-2.0 license and notices when AX Serving is redistributed.
 
-Enterprise artifacts may be published to:
+Use
+[enterprise-compatibility-metadata.example.yaml](../contracts/enterprise-compatibility-metadata.example.yaml)
+as the machine-readable starting point. Contract changes should follow the
+[contract change template](../contracts/ax-serving-contract-change-template.md).
 
-- private container registries
-- private package registries
-- internal artifact stores
-- customer delivery bundles
+## Operational principle
 
-Enterprise artifacts must not be published to:
-
-- the public GitHub repository
-- public GitHub Releases as source bundles
-- public package registries
-- public docs that contain proprietary source snapshots
-
-## Required Enterprise Release Outputs
-
-Every enterprise release should produce:
-
-- versioned private artifacts
-- compatibility metadata
-- release notes
-- upgrade notes when applicable
-- internal provenance record for the public-core baseline used
-
-## Compatibility Metadata Rule
-
-Use a machine-readable metadata file per enterprise release.
-
-Minimum fields:
-
-- enterprise product name
-- enterprise version
-- supported public-core range
-- contract revision markers
-- tested public-core versions
-- artifact references
-
-See:
-
-- [enterprise-compatibility-metadata.example.yaml](../contracts/enterprise-compatibility-metadata.example.yaml)
-
-## Contract Change Rule
-
-If a public contract changes in a way that affects enterprise repositories:
-
-1. publish a contract change note
-2. update compatibility metadata if required
-3. update the affected enterprise runbook or release note
-
-See:
-
-- [ax-serving-contract-change-template.md](../contracts/ax-serving-contract-change-template.md)
-
-## Approval Rule
-
-An enterprise release is not complete until:
-
-1. the owning enterprise team approves the release
-2. the public-core baseline is recorded
-3. artifact destinations are confirmed private
-4. customer-facing notes are prepared
-
-## Operational Principle
-
-The public repository remains the source of the open-source core.
-
-Enterprise value is delivered by:
-
-- private repositories
-- private artifacts
-- private release governance
-- stable public contracts
+AX Serving provides the open inference-federation foundation. AX Fabric, AX
+Trust, managed operations, support, certification, indemnification, and
+customer-specific integration may be offered separately through stable public
+boundaries. Separate product terms do not narrow the Apache-2.0 rights granted
+for AX Serving.

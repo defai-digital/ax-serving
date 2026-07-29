@@ -4,9 +4,11 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "2.2.0"
+version = "3.0.0"
 authors = ["AutomatosX Team (DEFAI Private Limited)"]
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
+repository = "https://github.com/defai-digital/ax-serving"
+homepage = "https://github.com/defai-digital/ax-serving"
 
 [workspace.dependencies]
 # Async runtime

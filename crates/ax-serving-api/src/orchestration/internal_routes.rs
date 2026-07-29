@@ -41,7 +41,6 @@ use super::fleet_state::{FleetMutationResult, FleetStateStore, unix_time_millis}
 use super::registry::{
     HeartbeatRequest, ProtocolRegistryError, RegisterRequest, WorkerId, WorkerRegistry,
 };
-use crate::license::LicenseState;
 use ax_serving_protocol::{
     CURRENT_PROTOCOL, ProtocolCapability, RegisterWorkerRequest, WorkerId as ProtocolWorkerId,
     negotiate_protocol,
@@ -59,7 +58,6 @@ pub struct InternalState {
     pub registry: WorkerRegistry,
     pub fleet_store: Arc<dyn FleetStateStore>,
     pub config: Arc<OrchestratorConfig>,
-    pub license: Arc<LicenseState>,
 }
 
 #[derive(Clone)]
@@ -394,21 +392,14 @@ async fn handle_register(State(s): State<InternalState>, body: Bytes) -> impl In
     // Validate addr before registering — a malformed addr would silently route
     // to a sentinel endpoint in the registry, accepting the worker but never
     // sending it traffic.
-    let addr = match advertised_endpoint(&req.addr) {
-        Ok(addr) => addr,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid worker addr '{}': {error}", req.addr),
-            )
-                .into_response();
-        }
-    };
-
-    // Detect remote (non-loopback) workers for the license reminder.
-    if !addr.is_loopback() {
-        s.license.mark_remote_worker_seen();
+    if let Err(error) = advertised_endpoint(&req.addr) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid worker addr '{}': {error}", req.addr),
+        )
+            .into_response();
     }
+
     let resp = s.registry.register(req, s.config.worker_heartbeat_ms);
     info!(worker_id = %resp.worker_id, "worker registered");
     (StatusCode::OK, Json(resp)).into_response()
@@ -453,9 +444,6 @@ async fn handle_protocol_register(
         }
     };
 
-    if !addr.is_loopback() {
-        state.license.mark_remote_worker_seen();
-    }
     let stable_id = request.worker.id.clone();
     let response = match state.registry.register_protocol(
         request,
@@ -698,7 +686,6 @@ async fn handle_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LicenseConfig;
     use axum::{Router, middleware, routing::get};
     use tower::ServiceExt;
 
@@ -711,7 +698,6 @@ mod tests {
             registry: WorkerRegistry::new(),
             fleet_store,
             config: Arc::new(OrchestratorConfig::default()),
-            license: LicenseState::new(&LicenseConfig::default()),
         }
     }
 

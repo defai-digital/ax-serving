@@ -2,7 +2,7 @@
 # packaging/build-pkg.sh — build a signed + notarized macOS .pkg installer
 #
 # Usage (local signing + notarization):
-#   VERSION=2.2.0 \
+#   VERSION=3.0.0 \
 #   DEVELOPER_ID_INSTALLER="Developer ID Installer: ACME Corp (TEAM1234567)" \
 #   APPLE_ID="you@example.com" \
 #   APPLE_TEAM_ID="TEAM1234567" \
@@ -10,7 +10,7 @@
 #   ./packaging/build-pkg.sh
 #
 # Unsigned local build (skip signing + notarization):
-#   VERSION=2.2.0 ./packaging/build-pkg.sh
+#   VERSION=3.0.0 ./packaging/build-pkg.sh
 #
 # Prerequisites: Xcode Command Line Tools, cargo, Developer ID Installer cert
 # in Keychain (for signed builds).
@@ -33,6 +33,7 @@ cd "$REPO_ROOT"
 cargo build --release -p ax-serving-cli --features embedded-compat --bins
 cargo build --release -p ax-thor-agent --bins
 cargo build --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
+cargo build --release -p ax-mac-cluster-adapter --bin ax-mac-cluster-adapter
 
 # ── 2. Stage payload ─────────────────────────────────────────────────────────
 echo "==> Staging payload…"
@@ -44,12 +45,16 @@ cp target/release/ax-servingctl  "$STAGING/usr/local/bin/"
 cp target/release/ax-runtime-agent "$STAGING/usr/local/bin/"
 cp target/release/ax-thor-agent "$STAGING/usr/local/bin/"
 cp target/release/ax-dynamo-adapter "$STAGING/usr/local/bin/"
+cp target/release/ax-mac-cluster-adapter "$STAGING/usr/local/bin/"
 
 # Copy default config to /etc/ax-serving (postinstall script can do this too)
 mkdir -p "$STAGING/etc/ax-serving"
 cp config/backends.yaml "$STAGING/etc/ax-serving/"
 cp config/serving.yaml  "$STAGING/etc/ax-serving/"
 cp config/dynamo-adapter.example.env "$STAGING/etc/ax-serving/"
+cp config/mac-cluster-adapter.example.env "$STAGING/etc/ax-serving/"
+cp config/mac-cluster-manifest.example.json "$STAGING/etc/ax-serving/"
+cp config/serving.mac-cluster.example.yaml "$STAGING/etc/ax-serving/"
 cp integrations/nvidia/compatibility-manifest.schema.json "$STAGING/etc/ax-serving/"
 cp integrations/nvidia/compatibility-manifest.example.json "$STAGING/etc/ax-serving/"
 
@@ -57,8 +62,9 @@ cp integrations/nvidia/compatibility-manifest.example.json "$STAGING/etc/ax-serv
 mkdir -p "$STAGING/usr/local/share/doc/ax-serving"
 cp README.md "$STAGING/usr/local/share/doc/ax-serving/"
 cp LICENSE "$STAGING/usr/local/share/doc/ax-serving/"
+cp NOTICE "$STAGING/usr/local/share/doc/ax-serving/"
 cp LICENSING.md "$STAGING/usr/local/share/doc/ax-serving/"
-cp LICENSE-COMMERCIAL.md "$STAGING/usr/local/share/doc/ax-serving/"
+cp TRADEMARKS.md "$STAGING/usr/local/share/doc/ax-serving/"
 
 # ── 3. Build component .pkg ──────────────────────────────────────────────────
 echo "==> Running pkgbuild…"

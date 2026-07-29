@@ -109,7 +109,7 @@ pub struct ServingLayer {
     /// Prevents unbounded generation from monopolizing the inference slot.
     /// Controlled via `AXS_DEFAULT_MAX_TOKENS` (default 2048).
     pub default_max_tokens: u32,
-    /// Soft license reminder state.
+    /// Immutable open-source license metadata.
     pub license: Arc<LicenseState>,
     /// Whether the public REST surface requires bearer authentication.
     pub public_auth_required: AtomicBool,
@@ -167,7 +167,7 @@ impl ServingLayer {
             cache_inflight: Arc::new(CacheInflight::new()),
             cache_inflight_max_retries,
             default_max_tokens: config.default_max_tokens,
-            license: LicenseState::new(&config.license),
+            license: LicenseState::new(),
             public_auth_required: AtomicBool::new(false),
             audit: AuditLog::default_shared(),
         };

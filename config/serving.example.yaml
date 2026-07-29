@@ -131,17 +131,3 @@ orchestrator:
                                # ("queue"/"reject" → HTTP 429 | "shed_oldest" → HTTP 503)
   tenant_max_concurrent: 0      # env: AXS_TENANT_MAX_CONCURRENT (0 disables)
   # Set AXS_CACHE_AFFINITY_SECRET (32+ random bytes); never store it in YAML.
-
-# ── License reminder & dashboard ─────────────────────────────────────────────
-# Trust-based; no enforcement or feature gating.
-license:
-  buy_link: "https://license.automatosx.com"  # env: AXS_LICENSE_BUY_LINK
-                               # (URL shown in dashboard "Buy Business Edition" link)
-  config_dir: "ax-serving"    # env: AXS_LICENSE_CONFIG_DIR
-                               # (directory under ~/.config/ for the license key file)
-  key_file: "license.key"     # env: AXS_LICENSE_KEY_FILE
-                               # (key filename within config_dir)
-  persist: true               # env: AXS_LICENSE_PERSIST
-                               # (disable for ephemeral/test processes)
-  dashboard_poll_ms: 2000     # env: AXS_DASHBOARD_POLL_MS
-                               # (dashboard polling interval in ms; min 500)

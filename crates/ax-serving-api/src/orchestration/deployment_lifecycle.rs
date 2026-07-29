@@ -837,9 +837,7 @@ mod tests {
     use time::OffsetDateTime;
     use tower::ServiceExt;
 
-    use super::super::{
-        LicenseConfig, OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig, proxy_router,
-    };
+    use super::super::{OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig, proxy_router};
 
     fn deployment(id: &str, logical_model: &str, enabled: bool) -> DeploymentSpec {
         DeploymentSpec {
@@ -885,14 +883,8 @@ mod tests {
             deployments: vec![deployment("baseline", "public/baseline", true)],
             ..OrchestratorConfig::default()
         };
-        let layer = Arc::new(
-            OrchestratorLayer::new(
-                config,
-                LicenseConfig::default(),
-                ProjectPolicyConfig::default(),
-            )
-            .unwrap(),
-        );
+        let layer =
+            Arc::new(OrchestratorLayer::new(config, ProjectPolicyConfig::default()).unwrap());
         layer.reconcile_deployment_state().await.unwrap();
         layer
     }
@@ -1060,14 +1052,8 @@ mod tests {
             }],
             ..OrchestratorConfig::default()
         };
-        let layer = Arc::new(
-            OrchestratorLayer::new(
-                config,
-                LicenseConfig::default(),
-                ProjectPolicyConfig::default(),
-            )
-            .unwrap(),
-        );
+        let layer =
+            Arc::new(OrchestratorLayer::new(config, ProjectPolicyConfig::default()).unwrap());
         layer.reconcile_deployment_state().await.unwrap();
         let worker_addr = "127.0.0.1:18081".parse().unwrap();
         layer

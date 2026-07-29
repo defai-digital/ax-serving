@@ -3,6 +3,8 @@
 AX Serving is worth evaluating when a team answers yes to several of these:
 
 - We operate both Apple Silicon and NVIDIA inference capacity.
+- We operate multiple CUDA/Dynamo domains across regions, offices, trust boundaries, or independent
+  rollout and failure domains.
 - NVIDIA PC and Thor must be separate deployment, trust, or failure domains.
 - Clients should use logical models rather than runtime/domain addresses.
 - We need tenant, privacy, residency, locality, budget, or SLO policy above runtimes.
@@ -33,6 +35,8 @@ latency cost, deploy AX Engine or Dynamo directly and do not expand AX policy sc
 
 ## Current availability
 
-The current source contains the gateway and Mac-capable agent foundations. The final Dynamo domain
-adapter and Thor qualification remain roadmap work. Review the
+The current source contains the portable gateway, execution-domain foundation, Mac-capable agent,
+and Dynamo Domain Adapter with source/mock conformance. Live mixed-domain certification,
+production-qualified multi-architecture Linux artifacts, and Thor qualification remain release
+work. See the [deployment topology guide](deployment-topologies.md) and
 [multi-worker runbook](runbooks/multi-worker.md) before planning a deployment.

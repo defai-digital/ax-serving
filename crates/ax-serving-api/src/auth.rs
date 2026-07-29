@@ -98,8 +98,7 @@ pub(crate) fn bearer_token_from_authorization(value: &str) -> Option<&str> {
 /// Minimal load-balancer probes remain unauthenticated. Metrics, diagnostics,
 /// and dashboards are operator surfaces and use the independent admin key.
 ///
-/// Only read-only license state (`GET /v1/license`) is exempt; mutating
-/// endpoints (`POST /v1/license`, `DELETE /v1/workers/{id}`) require auth.
+/// The read-only Apache license identity (`GET /v1/license`) is also exempt.
 fn is_exempt(method: &Method, path: &str) -> bool {
     path == "/health"
         || path == "/livez"
@@ -108,7 +107,7 @@ fn is_exempt(method: &Method, path: &str) -> bool {
         || (*method == Method::GET && path == "/v1/license")
 }
 
-fn is_admin_path(method: &Method, path: &str) -> bool {
+fn is_admin_path(path: &str) -> bool {
     path.starts_with("/admin/v1/")
         || path == "/admin/v1/deployments"
         || path.starts_with("/v1/admin/")
@@ -117,7 +116,6 @@ fn is_admin_path(method: &Method, path: &str) -> bool {
         || path == "/metrics"
         || path == "/v1/metrics"
         || path == "/dashboard"
-        || (path == "/v1/license" && *method != Method::GET)
 }
 
 pub async fn gateway_auth_middleware(
@@ -128,7 +126,7 @@ pub async fn gateway_auth_middleware(
     if is_exempt(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
-    let admin_path = is_admin_path(request.method(), request.uri().path());
+    let admin_path = is_admin_path(request.uri().path());
     let required_keys = if admin_path {
         &state.admin_keys
     } else {
@@ -276,7 +274,6 @@ mod tests {
         assert!(!is_exempt(&Method::GET, "/v1/metrics"));
         assert!(!is_exempt(&Method::GET, "/dashboard"));
         assert!(is_exempt(&Method::GET, "/v1/license"));
-        assert!(!is_exempt(&Method::POST, "/v1/license"));
         assert!(!is_exempt(&Method::DELETE, "/v1/workers/abc-123"));
         assert!(!is_exempt(&Method::GET, "/v1/workers"));
         assert!(!is_exempt(&Method::GET, "/v1/chat/completions"));

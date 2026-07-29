@@ -1,124 +1,62 @@
-# Enterprise Private Repository Bootstrap
+# Separate Product Repository Bootstrap
 
-This runbook defines the minimum setup for any private AX Serving enterprise
-repository.
+This runbook defines the minimum boundary between the Apache-2.0 AX Serving
+project and separately distributed products or services such as AX Fabric and
+AX Trust.
 
-It exists to keep enterprise source code private by default and to stop private
-deliverables from leaking back into the public workspace.
+It must not be used to create a private fork of AX Serving, withhold AX Serving
+runtime adapters, or reintroduce license-key enforcement into the open-source
+gateway. Changes to AX Serving itself should be contributed to this repository.
 
-## Target Repositories
+## Repository boundaries
 
-Bootstrap these repositories as private repositories:
+Separate repositories may contain product-specific:
 
-- `ax-serving-enterprise-control-plane`
-- `ax-serving-enterprise-workers`
-- `ax-serving-enterprise-deploy`
-- `ax-serving-enterprise-connectors`
+- AX Fabric orchestration, workflow, and fleet-management services;
+- AX Trust identity, policy, attestation, and governance services;
+- managed-service operations and customer-specific integrations;
+- private deployment overlays, support tooling, and delivery automation.
 
-## Repository Rules
+They should consume a tagged AX Serving release through its documented REST,
+SSE, protocol, configuration, deployment, and artifact contracts. They must not
+depend on unpublished workspace crates, hidden Cargo features, or private
+in-process hooks.
 
-Every enterprise repository must start with these controls:
+## Repository controls
 
-1. repository visibility is private
-2. branch protection is enabled on the default branch
-3. CODEOWNERS requires review from the owning enterprise team
-4. CI secrets are stored only in the private repository or private runner
-5. releases publish only to private registries or private artifact stores
-6. public GitHub release notes must not include enterprise source bundles
-7. public repository submodules or mirrors must not contain enterprise source
+When a separate product repository is private:
 
-## Bootstrap Checklist
+1. enable branch protection and required review;
+2. keep CI and customer secrets in the private repository or private runner;
+3. publish private artifacts only to approved registries or delivery systems;
+4. record the compatible AX Serving version and contract revisions;
+5. keep proprietary source and customer data out of AX Serving issues, release
+   archives, examples, and documentation;
+6. preserve the Apache-2.0 license and notices when redistributing AX Serving.
 
-### 1. Repository Creation
+Each repository should include:
 
-- create the repository as private
-- enable signed commits if required by commercial operations policy
-- add maintainers and enterprise-team reviewers
-- add branch protection and required status checks
+- `README.md`;
+- its applicable license or commercial notice;
+- `SECURITY.md`;
+- `CODEOWNERS`;
+- CI definitions;
+- compatibility metadata;
+- release and upgrade notes.
 
-### 2. Baseline Files
+## Dependency and release rules
 
-Each enterprise repository should start with:
+Separate products may depend on released AX Serving packages, tagged source
+baselines, and documented public contracts. They must not require direct edits
+inside the AX Serving repository as a normal build or release step.
 
-- `README.md`
-- `LICENSE.txt` or internal commercial notice
-- `SECURITY.md`
-- `CODEOWNERS`
-- CI workflow definitions
-- release checklist or release automation entrypoint
+Before a customer delivery:
 
-### 3. CI/CD Baseline
-
-Each enterprise repository must define:
-
-- build validation
-- integration smoke tests against a tagged or frozen public-core release
-- artifact publishing to a private registry
-- compatibility metadata generation
-
-### 4. Dependency Rules
-
-Private repositories may depend on:
-
-- released public crates if intentionally published
-- tagged public-core source baselines under internal build policy
-- documented public APIs and protocols
-
-Private repositories must not depend on:
-
-- unpublished local branches from the public repo
-- hidden Cargo features in the public workspace
-- direct edits inside the public repository as a normal release step
-
-## Artifact And Registry Rules
-
-Use private distribution channels only:
-
-- private container registry
-- private package registry
-- internal artifact storage
-- customer delivery portal or signed bundle exchange
-
-Do not publish enterprise source archives to:
-
-- the public GitHub repository
-- public GitHub Releases
-- public package registries
-- public documentation examples that embed proprietary source
-
-## Suggested Repository Boundaries
-
-### `ax-serving-enterprise-control-plane`
-
-- enterprise auth
-- RBAC / tenant / org policy services
-- governance workflows
-- private management UI
-
-### `ax-serving-enterprise-workers`
-
-- NVIDIA / Thor-class worker binaries
-- accelerator runtime adapters
-- private worker packaging
-
-### `ax-serving-enterprise-deploy`
-
-- Helm / Terraform / operator assets
-- air-gapped bundles
-- installers and entitlement activation flows
-
-### `ax-serving-enterprise-connectors`
-
-- SIEM
-- KMS / secret manager integration
-- customer-specific but reusable adapters
-
-## First Release Exit Criteria
-
-Before the first customer delivery from a private repository:
-
-1. compatibility metadata exists
-2. release notes exist
-3. upgrade notes exist if replacing a previous private release
-4. source publication path is confirmed private only
-5. integration tests have passed against a public-core baseline
+1. record the exact AX Serving release and source provenance;
+2. run integration tests against that release;
+3. validate compatibility metadata and deployment bundles;
+4. prepare release and upgrade notes;
+5. confirm that AX Serving license and notice files accompany any
+   redistribution;
+6. verify that private source and customer material are absent from public
+   artifacts.

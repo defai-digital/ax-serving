@@ -63,6 +63,6 @@ secret file. The default worker bind is loopback. A public bind requires both
 
 ## Licensing
 
-This migrated integration remains Apache-2.0; see [LICENSE](LICENSE). The AX
-Serving gateway and adapter workspace remain governed by the repository’s
-AGPL/commercial licensing.
+This migrated integration and the AX Serving workspace are Apache-2.0; see
+[LICENSE](LICENSE) and the repository-level
+[licensing policy](../../../LICENSING.md).

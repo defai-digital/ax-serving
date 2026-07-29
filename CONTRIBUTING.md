@@ -1,98 +1,103 @@
 # Contributing
 
-Thanks for your interest in AX Serving.
+Thanks for helping improve AX Serving.
 
-## What We Accept
+## Before starting
 
-We welcome:
+For bug fixes and small documentation improvements, open a focused pull
+request. For new features, protocol changes, architectural changes, or
+substantial refactors, open an issue first and wait for maintainer agreement
+on scope.
 
-- bug reports,
-- reproducible issue reports,
-- security reports through the appropriate private channel,
-- feature requests,
-- performance benchmark reports.
+Public contributions must:
 
-## Public Code Contributions
+- keep the Rust workspace and affected SDKs buildable;
+- preserve the runtime-SDK-free portable gateway boundary;
+- use mock backends unless hardware is essential to the test;
+- include tests and documentation appropriate to the behavior change;
+- avoid secrets, private infrastructure details, and sensitive vulnerability
+  information;
+- follow the repository's Conventional Commit and pull-request guidance.
 
-We do not currently accept unsolicited public code contributions, pull requests,
-or patches.
+## Developer Certificate of Origin
 
-If you want to propose a code change:
+Every commit in a contribution must include a `Signed-off-by` trailer:
 
-1. open an issue first,
-2. describe the problem, reproduction, and expected outcome,
-3. wait for explicit written approval from the maintainers before preparing a
-   patch.
+```text
+Signed-off-by: Your Name <your.email@example.com>
+```
 
-Without prior written approval, public pull requests may be closed without
-review.
+Add it with `git commit -s`. By signing off, you certify that you have the
+right to submit the contribution under the repository's license and the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/).
 
-## Why
+Contributions accepted into AX Serving are licensed under Apache-2.0 in
+accordance with section 5 of [LICENSE](LICENSE), unless a separate written
+contributor agreement applies.
 
-AX Serving uses a dual-license model. To keep licensing, product direction, and
-commercial distribution rights clear, code changes are handled only by the core
-maintainers or by separately approved contributors under written terms.
+## Validation
 
-The public repository is also intended to remain the open-source serving core.
-Changes that introduce private crates, hidden enterprise-only code paths, or
-proprietary dependencies into the public workspace are out of bounds unless the
-maintainers explicitly approve a documented repository-boundary change.
+Run the narrowest relevant tests, then the portable baseline where practical:
 
-See:
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --tests -- -D warnings
+cargo test --workspace --lib
+AXS_ALLOW_NO_AUTH=true cargo test -p ax-serving-api --test orchestration
+```
 
-- [LICENSING.md](LICENSING.md)
-- [LICENSE](LICENSE)
-- [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)
+Hardware-dependent tests require their pinned environment. A skipped hardware
+test is not support evidence.
 
-## Public Workspace Boundary
+JavaScript SDK changes:
 
-When proposing public-repository changes, treat these as default rules:
+```bash
+cd sdk/javascript
+npm ci
+npm test
+```
 
-- keep the public Rust workspace self-contained and buildable
-- prefer documented REST / gRPC / worker-protocol boundaries over internal
-  proprietary module hooks
-- do not add private or unpublished workspace members to `crates/*`
-- do not rely on hidden Cargo features to carry enterprise-only logic
+Python SDK changes:
 
-Enterprise products should normally integrate through separate private
-repositories and service boundaries rather than through mixed public/private
-workspace code.
+```bash
+python -m pip install -e "sdk/python[dev]"
+pytest sdk/python/tests
+```
 
-Execution documents:
+## Pull requests
 
-- [docs/contracts/ax-serving-public-contract-inventory.md](docs/contracts/ax-serving-public-contract-inventory.md)
-- [docs/runbooks/enterprise-private-repo-bootstrap.md](docs/runbooks/enterprise-private-repo-bootstrap.md)
-- [docs/runbooks/enterprise-release-governance.md](docs/runbooks/enterprise-release-governance.md)
+Pull requests should:
 
-## Issue Reports
+1. explain the problem and scope;
+2. link the approved issue when one was required;
+3. list validation commands and results;
+4. include compatibility, rollout, or benchmark evidence when behavior or
+   performance changes;
+5. preserve third-party license and attribution notices.
 
-Please include:
+Maintainers may request a contributor agreement for substantial, corporate, or
+provenance-sensitive contributions.
 
-- AX Serving version or commit,
-- macOS version and Apple Silicon chip,
-- model name and quantization,
-- exact command or request,
-- expected behavior,
-- actual behavior,
-- logs or error output,
-- minimal reproduction if possible.
+## Public workspace boundary
 
-For performance issues, include:
+Keep the public workspace self-contained. Prefer documented REST, protocol, and
+artifact boundaries over private in-process hooks. Do not add unpublished
+workspace dependencies, hidden enterprise-only features, or proprietary
+runtime dependencies to the portable gateway.
 
-- prompt length,
-- decode length,
-- concurrency,
-- backend used,
-- release vs debug build,
-- thermal context if known.
+Related contracts:
+
+- [Public contract inventory](docs/contracts/ax-serving-public-contract-inventory.md)
+- [Contract change template](docs/contracts/ax-serving-contract-change-template.md)
+- [AX Fabric runtime contract](docs/contracts/ax-fabric-runtime-contract.md)
 
 ## Security
 
-Do not post sensitive security details publicly in an issue if public disclosure
-would create risk. Report privately through the project's security contact or
-commercial support channel.
+Do not open a public issue for a vulnerability when disclosure would create
+risk. Use the private security channel described by the repository or contact
+the maintainers directly.
 
-## Trademarks and Naming
+## Trademarks
 
-This policy does not grant trademark rights in the AX Serving, AutomatosX, or
-DEFAI names, logos, or branding.
+Contributing does not grant rights to AX Serving, AutomatosX, DEFAI, or related
+names, logos, and marks. See [TRADEMARKS.md](TRADEMARKS.md).

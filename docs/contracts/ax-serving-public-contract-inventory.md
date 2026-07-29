@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Source contract; release stability follows tagged release notes |
-| Last updated | 2026-07-15 |
+| Last updated | 2026-07-28 |
 | Related | [Runtime-agent protocol](ax-serving-node-contract.md) |
 
 This inventory identifies supported integration boundaries. Internal Rust
@@ -26,6 +26,10 @@ gate.
 
 OpenAI compatibility means documented request/response behavior for supported
 fields; it does not imply every extension of every upstream runtime.
+
+`GET /v1/license` is an unauthenticated, read-only build-metadata endpoint. In
+v3 it reports the immutable `Apache-2.0` license identity. License activation
+and `POST /v1/license` are not public contracts.
 
 ## Errors and tracing
 

@@ -124,10 +124,7 @@ fn router_with_timeout(
         .route("/v1/admin/policy", get(routes::admin_policy))
         .route("/metrics", get(routes::prometheus_metrics))
         .route("/dashboard", get(routes::dashboard))
-        .route(
-            "/v1/license",
-            get(routes::get_license).post(routes::set_license),
-        )
+        .route("/v1/license", get(routes::get_license))
         .route_layer(middleware::from_fn_with_state(keys, auth::auth_middleware))
         .layer(middleware::from_fn(auth::request_id_and_headers_middleware))
         .layer(TimeoutLayer::with_status_code(

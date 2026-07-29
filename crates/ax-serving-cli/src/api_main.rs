@@ -105,7 +105,6 @@ fn main() -> Result<()> {
     serve_config.validate()?;
 
     let config = serve_config.orchestrator;
-    let license_config = serve_config.license;
     let project_policy = serve_config.project_policy;
 
     // Keep advertiser alive for process lifetime (agents browse internal port).
@@ -123,7 +122,7 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(start_orchestrator(config, license_config, project_policy))
+        .block_on(start_orchestrator(config, project_policy))
 }
 
 fn maybe_start_gateway_advertise(

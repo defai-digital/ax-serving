@@ -13,8 +13,8 @@
 class AxServing < Formula
   desc "Runtime-neutral inference gateway plus Apple Silicon compatibility tools"
   homepage "https://github.com/defai-digital/ax-serving"
-  version "2.2.0"
-  license "AGPL-3.0-or-later"
+  version "3.0.0"
+  license "Apache-2.0"
 
   # Only Apple Silicon is supported
   on_macos do
@@ -33,19 +33,24 @@ class AxServing < Formula
     bin.install "bin/ax-runtime-agent"
     bin.install "bin/ax-thor-agent"
     bin.install "bin/ax-dynamo-adapter"
+    bin.install "bin/ax-mac-cluster-adapter"
 
     # Install default configs to $(brew --prefix)/etc/ax-serving/
     (etc/"ax-serving").mkpath
     etc.install "config/backends.yaml" => "ax-serving/backends.yaml"
     etc.install "config/serving.yaml" => "ax-serving/serving.yaml"
     etc.install "config/dynamo-adapter.example.env" => "ax-serving/dynamo-adapter.example.env"
+    etc.install "config/mac-cluster-adapter.example.env" => "ax-serving/mac-cluster-adapter.example.env"
+    etc.install "config/mac-cluster-manifest.example.json" => "ax-serving/mac-cluster-manifest.example.json"
+    etc.install "config/serving.mac-cluster.example.yaml" => "ax-serving/serving.mac-cluster.example.yaml"
     etc.install "config/compatibility-manifest.schema.json" => "ax-serving/compatibility-manifest.schema.json"
     etc.install "config/compatibility-manifest.example.json" => "ax-serving/compatibility-manifest.example.json"
 
     doc.install "README.md"
     doc.install "LICENSE"
+    doc.install "NOTICE"
     doc.install "LICENSING.md"
-    doc.install "LICENSE-COMMERCIAL.md"
+    doc.install "TRADEMARKS.md"
   end
 
   # brew services start ax-serving — runs the runtime-neutral gateway
@@ -61,7 +66,7 @@ class AxServing < Formula
 
   def caveats
     <<~EOS
-      ax-serving has been installed. Six binaries are available:
+      ax-serving has been installed. Seven binaries are available:
 
         ax-serving         — macOS embedded compatibility server
         ax-serving-api     — portable runtime-neutral gateway
@@ -69,10 +74,13 @@ class AxServing < Formula
         ax-runtime-agent   — generic runtime-node adapter
         ax-thor-agent      — deprecated runtime-node adapter alias
         ax-dynamo-adapter  — NVIDIA Dynamo execution-domain adapter
+        ax-mac-cluster-adapter — experimental Mac cluster domain adapter
 
       Hybrid candidates run ax-serving-api as the gateway, register
       ax-runtime-agent in front of AX Engine, and place ax-dynamo-adapter
       in front of each independently qualified NVIDIA Dynamo domain.
+      The Mac cluster adapter is a protocol/coordinator foundation and is not
+      evidence of distributed AX Engine runtime support.
       Complete the PRD evidence gates before treating a deployment as
       production certified.
 

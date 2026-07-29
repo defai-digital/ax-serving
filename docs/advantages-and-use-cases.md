@@ -3,9 +3,14 @@
 AX Serving is useful when one client/API policy must govern more than one independently operated
 inference domain.
 
+The CPU-only gateway may run on Apple Silicon, Linux AMD64, or Linux ARM64 independently of the
+inference hardware it governs. See
+[Control-plane placement and mixed-fleet topologies](deployment-topologies.md).
+
 ## Strong fits
 
 - A private fleet containing Mac AX Engine and NVIDIA Dynamo capacity.
+- Multiple CUDA/Dynamo domains separated by office, region, trust, failure, or rollout policy.
 - NVIDIA PC and Thor devices that must remain separate performance/failure domains.
 - Tenant, privacy, residency, locality, budget, or SLO policy that no one runtime can enforce
   globally.
@@ -53,4 +58,4 @@ inference domain.
 | Does AX replace Dynamo/vLLM? | No. Dynamo and its backend remain the NVIDIA execution system. |
 
 See the [runtime responsibility inventory](contracts/ax-serving-runtime-responsibility-inventory.md)
-for the public architecture and ownership boundaries.
+and [deployment topology guide](deployment-topologies.md).

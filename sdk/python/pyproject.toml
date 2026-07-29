@@ -4,12 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ax-serving"
-version = "2.2.0"
+version = "3.0.0"
 requires-python = ">=3.10"
 description = "AX Serving portable REST/SSE client with embedded gRPC compatibility"
+license = "Apache-2.0"
 dependencies = [
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://github.com/defai-digital/ax-serving"
+Repository = "https://github.com/defai-digital/ax-serving"
+Issues = "https://github.com/defai-digital/ax-serving/issues"
 
 [project.optional-dependencies]
 grpc = ["grpcio>=1.78.0", "protobuf>=6.31.1"]

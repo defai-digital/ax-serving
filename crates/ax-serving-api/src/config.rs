@@ -113,8 +113,6 @@ pub struct ServeConfig {
     pub mlx: MlxConfig,
     /// Multi-worker orchestrator settings (`ax-serving-api`).
     pub orchestrator: OrchestratorConfig,
-    /// License reminder and dashboard settings.
-    pub license: LicenseConfig,
     /// Project-scoped runtime admission policy.
     pub project_policy: ProjectPolicyConfig,
 }
@@ -128,7 +126,6 @@ const DEFAULT_GRPC_SOCKET: &str = "/tmp/ax-serving.sock";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const MIN_WORKER_HEARTBEAT_MS: u64 = 100;
 const MIN_WORKER_TTL_MS: u64 = 500;
-const MIN_DASHBOARD_POLL_MS: u64 = 500;
 
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -154,7 +151,6 @@ impl Default for ServeConfig {
             llamacpp: LlamaCppConfig::default(),
             mlx: MlxConfig::default(),
             orchestrator: OrchestratorConfig::default(),
-            license: LicenseConfig::default(),
             project_policy: ProjectPolicyConfig::default(),
         }
     }
@@ -391,41 +387,6 @@ impl Default for OrchestratorConfig {
             shutdown_propagation_ms: 5_000,
             shutdown_drain_secs: 300,
             shutdown_hard_secs: 330,
-        }
-    }
-}
-
-// ── LicenseConfig ─────────────────────────────────────────────────────────────
-
-/// License reminder and dashboard settings.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct LicenseConfig {
-    /// URL shown in the dashboard commercial licensing link.
-    /// env: `AXS_LICENSE_BUY_LINK`
-    pub buy_link: String,
-    /// Directory under `~/.config/` (or `$XDG_CONFIG_HOME/`) where the license key file lives.
-    /// env: `AXS_LICENSE_CONFIG_DIR`
-    pub config_dir: String,
-    /// License key filename within `config_dir`.
-    /// env: `AXS_LICENSE_KEY_FILE`
-    pub key_file: String,
-    /// Persist the soft license key to disk. Disable for ephemeral/test processes.
-    /// env: `AXS_LICENSE_PERSIST`
-    pub persist: bool,
-    /// Dashboard polling interval in milliseconds.
-    /// env: `AXS_DASHBOARD_POLL_MS`
-    pub dashboard_poll_ms: u64,
-}
-
-impl Default for LicenseConfig {
-    fn default() -> Self {
-        Self {
-            buy_link: "https://license.automatosx.com".into(),
-            config_dir: "ax-serving".into(),
-            key_file: "license.key".into(),
-            persist: true,
-            dashboard_poll_ms: 2000,
         }
     }
 }
@@ -819,11 +780,6 @@ impl ServeConfig {
             }
         }
 
-        // ── License/dashboard ───────────────────────────────────────────────
-        if self.license.dashboard_poll_ms < MIN_DASHBOARD_POLL_MS {
-            anyhow::bail!("dashboard_poll_ms must be >= {}", MIN_DASHBOARD_POLL_MS);
-        }
-
         Ok(())
     }
 
@@ -1070,22 +1026,6 @@ impl ServeConfig {
             self.orchestrator.shutdown_hard_secs = secs;
         }
 
-        // ── License / dashboard ───────────────────────────────────────────────
-        if let Some(v) = env_str("AXS_LICENSE_BUY_LINK")? {
-            self.license.buy_link = v;
-        }
-        if let Some(v) = env_str("AXS_LICENSE_CONFIG_DIR")? {
-            self.license.config_dir = v;
-        }
-        if let Some(v) = env_str("AXS_LICENSE_KEY_FILE")? {
-            self.license.key_file = v;
-        }
-        if let Some(enabled) = env_bool("AXS_LICENSE_PERSIST")? {
-            self.license.persist = enabled;
-        }
-        if let Some(ms) = env_parse::<u64>("AXS_DASHBOARD_POLL_MS")? {
-            self.license.dashboard_poll_ms = ms.max(MIN_DASHBOARD_POLL_MS);
-        }
         Ok(())
     }
 
@@ -1357,14 +1297,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_too_low_dashboard_poll_ms() {
-        let mut cfg = valid_cfg();
-        cfg.license.dashboard_poll_ms = MIN_DASHBOARD_POLL_MS - 1;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("dashboard_poll_ms"), "got: {err}");
-    }
-
-    #[test]
     fn validate_accepts_queue_depth_less_than_queue_max() {
         let mut cfg = valid_cfg();
         cfg.orchestrator.global_queue_max = 200;
@@ -1610,16 +1542,6 @@ mod tests {
         cfg.apply_env_overrides();
         unsafe { std::env::remove_var("AXS_WORKER_HEARTBEAT_MS") };
         assert_eq!(cfg.orchestrator.worker_heartbeat_ms, 100, "floor is 100ms");
-    }
-
-    #[test]
-    fn env_override_dashboard_poll_ms_enforces_minimum() {
-        let _g = crate::test_env::lock();
-        unsafe { std::env::set_var("AXS_DASHBOARD_POLL_MS", "100") }; // below 500 ms floor
-        let mut cfg = ServeConfig::default();
-        cfg.apply_env_overrides();
-        unsafe { std::env::remove_var("AXS_DASHBOARD_POLL_MS") };
-        assert_eq!(cfg.license.dashboard_poll_ms, 500, "floor is 500ms");
     }
 
     #[test]

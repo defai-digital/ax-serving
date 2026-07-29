@@ -31,7 +31,6 @@
   .banner a { color: #fbbf24; }
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; }
   .badge-oss { background: #1e2433; color: var(--grey); border: 1px solid var(--border); }
-  .badge-business { background: #052e16; color: var(--green); border: 1px solid #166534; }
   .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
   .label { color: var(--muted); min-width: 100px; }
   input[type=text] { background: #0f1117; border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 7px 12px; font-size: 13px; width: 280px; outline: none; }
@@ -40,8 +39,6 @@
   button:hover { background: #2563eb; }
   button.danger { background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; padding: 3px 10px; font-size: 12px; }
   button.danger:hover { background: #450a0a; border-color: var(--red); }
-  .buy-link { font-size: 13px; margin-top: 8px; }
-  .buy-link a { color: var(--blue); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { color: var(--muted); font-weight: 500; text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--border); }
   td { padding: 10px 12px 10px 0; border-bottom: 1px solid #1e2433; }
@@ -76,25 +73,14 @@
   <!-- License panel -->
   <div class="card" id="license-card">
     <h2>License</h2>
-    <div id="license-reminder" class="banner" style="display:none">
-      <span class="banner-icon">⚠</span>
-      <p>Remote workers detected.
-      Commercial licensing is available for deployments that need to operate outside AGPL obligations.<br>
-      <a id="banner-buy-link" href="#" target="_blank" rel="noopener">Commercial licensing →</a></p>
-    </div>
     <div class="row">
-      <span class="label">Edition</span>
-      <span id="edition-badge" class="badge badge-oss">AGPL</span>
+      <span class="label">Open-source license</span>
+      <span class="badge badge-oss">Apache-2.0</span>
     </div>
-    <div class="row">
-      <span class="label">License key</span>
-      <input type="text" id="license-key-input" placeholder="Enter commercial key…">
-      <button onclick="activateLicense()">Activate</button>
+    <div class="subtle">
+      Source, license, and notices are available from the
+      <a href="https://github.com/defai-digital/ax-serving" target="_blank" rel="noopener">AX Serving repository</a>.
     </div>
-    <div class="buy-link">
-      Need commercial terms? <a id="footer-buy-link" href="#" target="_blank" rel="noopener">Contact licensing</a>
-    </div>
-    <div id="license-msg" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
   </div>
 
   <!-- Workers panel (orchestrator mode) -->
@@ -175,30 +161,6 @@
     const r = await fetch(path);
     if (!r.ok) throw new Error(`${path} → ${r.status}`);
     return r.json();
-  }
-
-  async function refreshLicense() {
-    try {
-      const d = await fetchJSON('/v1/license');
-      const badge = document.getElementById('edition-badge');
-      if (d.edition === 'business') {
-        badge.textContent = 'Commercial key';
-        badge.className = 'badge badge-business';
-      } else {
-        badge.textContent = 'AGPL';
-        badge.className = 'badge badge-oss';
-      }
-      document.getElementById('license-reminder').style.display =
-        d.needs_reminder ? 'flex' : 'none';
-      // Update buy links and poll interval from server config.
-      if (d.buy_link) {
-        document.getElementById('banner-buy-link').href = d.buy_link;
-        document.getElementById('footer-buy-link').href = d.buy_link;
-      }
-      if (d.dashboard_poll_ms && d.dashboard_poll_ms > 0) {
-        pollMs = d.dashboard_poll_ms;
-      }
-    } catch (_) {}
   }
 
   async function refreshMetrics() {
@@ -369,30 +331,6 @@
     } catch(e) { alert('Remove failed: ' + e.message); }
   }
 
-  async function activateLicense() {
-    const key = document.getElementById('license-key-input').value.trim();
-    if (!key) { setLicenseMsg('Enter a key first.'); return; }
-    try {
-      const r = await fetch('/v1/license', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({key}),
-      });
-      const d = await r.json();
-      if (r.ok) {
-        setLicenseMsg('License activated.');
-        document.getElementById('license-key-input').value = '';
-        await refreshLicense();
-      } else {
-        setLicenseMsg('Error: ' + (d.error || r.status));
-      }
-    } catch(e) { setLicenseMsg('Request failed: ' + e.message); }
-  }
-
-  function setLicenseMsg(msg) {
-    document.getElementById('license-msg').textContent = msg;
-  }
-
   function showError(msg) {
     const el = document.getElementById('error-bar');
     el.textContent = '⚠ ' + msg;
@@ -412,7 +350,7 @@
   }
 
   async function tick() {
-    await Promise.all([refreshLicense(), refreshMetrics()]);
+    await refreshMetrics();
     setTimeout(tick, pollMs);
   }
 

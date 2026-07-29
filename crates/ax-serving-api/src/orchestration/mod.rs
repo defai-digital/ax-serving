@@ -75,7 +75,7 @@ use crate::audit::AuditLog;
 use crate::license::LicenseState;
 use crate::rest::schema::MAX_HTTP_REQUEST_BODY_BYTES;
 
-pub use crate::config::{LicenseConfig, OrchestratorConfig, ProjectPolicyConfig};
+pub use crate::config::{OrchestratorConfig, ProjectPolicyConfig};
 
 fn is_loopback_bind_host(host: &str) -> bool {
     matches!(host, "localhost")
@@ -113,7 +113,7 @@ pub struct OrchestratorLayer {
     pub tenant_limiter: Arc<TenantLimiter>,
     /// Value emitted in `Retry-After` header on 429 responses (from config).
     pub retry_after_secs: u64,
-    /// Soft license reminder state.
+    /// Immutable open-source license metadata.
     pub license: Arc<LicenseState>,
     /// Project-scoped admission policy shared with the public serving API.
     pub project_policy: Arc<ProjectPolicyConfig>,
@@ -126,18 +126,13 @@ pub struct OrchestratorLayer {
 }
 
 impl OrchestratorLayer {
-    pub fn new(
-        config: OrchestratorConfig,
-        license_config: LicenseConfig,
-        project_policy: ProjectPolicyConfig,
-    ) -> Result<Self> {
+    pub fn new(config: OrchestratorConfig, project_policy: ProjectPolicyConfig) -> Result<Self> {
         let fleet_store = store_from_config(&config)?;
-        Self::new_with_fleet_store(config, license_config, project_policy, fleet_store)
+        Self::new_with_fleet_store(config, project_policy, fleet_store)
     }
 
     pub fn new_with_fleet_store(
         config: OrchestratorConfig,
-        license_config: LicenseConfig,
         project_policy: ProjectPolicyConfig,
         fleet_store: Arc<dyn FleetStateStore>,
     ) -> Result<Self> {
@@ -186,7 +181,7 @@ impl OrchestratorLayer {
             queue: GlobalQueue::new(queue_config),
             tenant_limiter: TenantLimiter::shared(),
             retry_after_secs,
-            license: LicenseState::new(&license_config),
+            license: LicenseState::new(),
             project_policy: Arc::new(project_policy),
             public_auth_required: AtomicBool::new(false),
             audit: AuditLog::default_shared(),
@@ -331,10 +326,7 @@ pub fn proxy_router(layer: Arc<OrchestratorLayer>) -> Router {
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{id}", get(get_job))
         .route("/dashboard", get(proxy_dashboard))
-        .route(
-            "/v1/license",
-            get(proxy_get_license).post(proxy_set_license),
-        )
+        .route("/v1/license", get(proxy_get_license))
         .route("/v1/workers", get(proxy_list_workers))
         .route(
             "/v1/workers/{id}",
@@ -408,14 +400,9 @@ async fn ensure_public_connect_info(mut request: Request, next: middleware::Next
 /// Runs until SIGINT / SIGTERM.
 pub async fn start_orchestrator(
     config: OrchestratorConfig,
-    license_config: LicenseConfig,
     project_policy: ProjectPolicyConfig,
 ) -> Result<()> {
-    let layer = Arc::new(OrchestratorLayer::new(
-        config.clone(),
-        license_config,
-        project_policy,
-    )?);
+    let layer = Arc::new(OrchestratorLayer::new(config.clone(), project_policy)?);
     let restored_workers = layer
         .reconcile_fleet_state()
         .await
@@ -497,7 +484,6 @@ pub async fn start_orchestrator(
         registry: layer.registry.clone(),
         fleet_store: Arc::clone(&layer.fleet_store),
         config: Arc::clone(&layer.config),
-        license: Arc::clone(&layer.license),
     };
     let internal_app = {
         let app = internal_router(internal_state);
@@ -771,11 +757,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = match OrchestratorLayer::new(
-            config,
-            LicenseConfig::default(),
-            ProjectPolicyConfig::default(),
-        ) {
+        let err = match OrchestratorLayer::new(config, ProjectPolicyConfig::default()) {
             Ok(_) => panic!("invalid global queue policy should be rejected"),
             Err(err) => err.to_string(),
         };
@@ -790,13 +772,6 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            OrchestratorLayer::new(
-                config,
-                LicenseConfig::default(),
-                ProjectPolicyConfig::default(),
-            )
-            .is_ok()
-        );
+        assert!(OrchestratorLayer::new(config, ProjectPolicyConfig::default()).is_ok());
     }
 }

@@ -517,14 +517,12 @@ fn make_layer() -> Arc<ServingLayer> {
     let backend: Arc<dyn InferenceBackend> = Arc::new(NullBackend);
     let mut config = ServeConfig::default();
     config.cache.enabled = false;
-    config.license.persist = false;
     Arc::new(ServingLayer::new(backend, config))
 }
 
 fn make_layer_with_backend(backend: Arc<dyn InferenceBackend>) -> Arc<ServingLayer> {
     let mut config = ServeConfig::default();
     config.cache.enabled = false;
-    config.license.persist = false;
     Arc::new(ServingLayer::new(backend, config))
 }
 
@@ -3379,10 +3377,8 @@ async fn license_get_returns_json() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = body_text(resp).await;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(
-        json["edition"].is_string(),
-        "license response must include 'edition'"
-    );
+    assert_eq!(json["license"], "Apache-2.0");
+    assert_eq!(json["name"], "Apache License 2.0");
 }
 
 #[tokio::test]
@@ -3423,7 +3419,7 @@ async fn admin_startup_report_requires_auth_and_returns_runtime_summary() {
     assert_eq!(json["service"], "serving");
     assert_eq!(json["auth_required"], true);
     assert!(json["runtime"]["rest_addr"].is_string());
-    assert!(json["license"]["edition"].is_string());
+    assert_eq!(json["license"]["license"], "Apache-2.0");
     assert!(json["scheduler"]["effective_inflight_limit"].is_u64());
     assert!(json["cache"]["enabled"].is_boolean());
     assert_eq!(json["cache"]["kv_prefix_cache"], false);
@@ -3475,24 +3471,8 @@ async fn admin_status_requires_auth_and_returns_operational_summary() {
 }
 
 #[tokio::test]
-async fn admin_diagnostics_and_audit_capture_license_change() {
+async fn admin_diagnostics_and_audit_include_startup_event() {
     let (_layer, app) = make_app_with_key_and_layer("secret");
-
-    let set_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/license")
-                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
-                .header("content-type", "application/json")
-                .header("x-request-id", "req-license-audit")
-                .body(Body::from(r#"{"key":"business-key"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(set_resp.status(), StatusCode::OK);
 
     let diag_resp = app
         .clone()
@@ -3521,7 +3501,7 @@ async fn admin_diagnostics_and_audit_capture_license_change() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["action"] == "license_set" && e["outcome"] == "ok")
+            .any(|e| e["action"] == "startup" && e["outcome"] == "ok")
     );
 
     let audit_resp = app
@@ -3547,88 +3527,8 @@ async fn admin_diagnostics_and_audit_capture_license_change() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["action"] == "license_set" && e["actor"] == "request:req-license-audit")
+            .any(|e| e["action"] == "startup" && e["target_type"] == "serving_layer")
     );
-}
-
-#[tokio::test]
-async fn license_set_missing_key_400() {
-    let app = make_app_no_auth();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/license")
-                .header("Content-Type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn license_set_empty_key_400() {
-    let app = make_app_no_auth();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/license")
-                .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"key":""}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn license_set_validation_errors_are_audited() {
-    let (_layer, app) = make_app_with_key_and_layer("secret");
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/license")
-                .header("Authorization", "Bearer secret")
-                .header("Content-Type", "application/json")
-                .header("X-Request-ID", "req-license-invalid")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let audit = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/v1/admin/audit?limit=10")
-                .header("Authorization", "Bearer secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(audit.status(), StatusCode::OK);
-    let audit_json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(audit.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(audit_json["events"].as_array().unwrap().iter().any(|e| {
-        e["action"] == "license_set"
-            && e["actor"] == "request:req-license-invalid"
-            && e["outcome"] == "error"
-            && e["detail"]["error"] == "missing field: key"
-    }));
 }
 
 // ── Security header tests ─────────────────────────────────────────────────────

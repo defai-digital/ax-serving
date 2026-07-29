@@ -5,7 +5,7 @@ This repository uses SemVer tags and GitHub Releases.
 ## Release Types
 
 - Stable: `v1.2.3`
-- Prerelease / beta: `v2.0.0-beta.1`
+- Prerelease / beta: `v3.0.0-beta.1`
 
 GitHub does not have a separate "beta channel" object. The standard pattern is:
 
@@ -29,21 +29,21 @@ Before tagging any release:
 
 Examples:
 
-- `Cargo.toml` version `2.0.0-beta.1` -> tag `v2.0.0-beta.1`
-- `Cargo.toml` version `2.0.0` -> tag `v2.0.0`
+- `Cargo.toml` version `3.0.0-beta.1` -> tag `v3.0.0-beta.1`
+- `Cargo.toml` version `3.0.0` -> tag `v3.0.0`
 
 The release workflow validates these version matches and fails fast on mismatch.
 
 ## Stable Release Process
 
 1. Land the release commit on the intended branch.
-2. Set versions to the stable version, for example `2.0.0`.
+2. Set versions to the stable version, for example `3.0.0`.
 3. Run the normal validation gates.
 4. Create and push the tag:
 
 ```bash
-git tag v2.0.0
-git push origin v2.0.0
+git tag v3.0.0
+git push origin v3.0.0
 ```
 
 Effects:
@@ -55,13 +55,13 @@ Effects:
 ## Beta Release Process
 
 1. Land the beta candidate commit on the intended branch.
-2. Set versions to the prerelease version, for example `2.0.0-beta.1`.
+2. Set versions to the prerelease version, for example `3.0.0-beta.1`.
 3. Run the normal validation gates.
 4. Create and push the tag:
 
 ```bash
-git tag v2.0.0-beta.1
-git push origin v2.0.0-beta.1
+git tag v3.0.0-beta.1
+git push origin v3.0.0-beta.1
 ```
 
 Effects:
@@ -72,7 +72,7 @@ Effects:
 
 ## Notes
 
-- Do not use a bare `v2.0-beta1` style tag. Use valid SemVer prerelease formatting like `v2.0.0-beta.1`.
+- Do not use a bare `v3.0-beta1` style tag. Use valid SemVer prerelease formatting like `v3.0.0-beta.1`.
 - Do not publish a beta by reusing the stable version number.
 - If multiple betas are needed, increment the prerelease suffix: `beta.1`, `beta.2`, `beta.3`.
 

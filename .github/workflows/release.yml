@@ -180,6 +180,7 @@ jobs:
           cargo build --release -p ax-serving-cli --features embedded-compat --bin ax-serving
           cargo build --release -p ax-thor-agent --bins
           cargo build --release -p ax-dynamo-adapter --bin ax-dynamo-adapter
+          cargo build --release -p ax-mac-cluster-adapter --bin ax-mac-cluster-adapter
       - name: Package release archive
         id: package
         env:
@@ -194,9 +195,10 @@ jobs:
           cp target/release/ax-runtime-agent "$STAGE/bin/"
           cp target/release/ax-thor-agent "$STAGE/bin/"
           cp target/release/ax-dynamo-adapter "$STAGE/bin/"
-          cp config/backends.yaml config/serving.yaml config/serving.example.yaml config/serving.hybrid.example.yaml config/dynamo-adapter.example.env "$STAGE/config/"
+          cp target/release/ax-mac-cluster-adapter "$STAGE/bin/"
+          cp config/backends.yaml config/serving.yaml config/serving.example.yaml config/serving.hybrid.example.yaml config/serving.mac-cluster.example.yaml config/dynamo-adapter.example.env config/mac-cluster-adapter.example.env config/mac-cluster-manifest.example.json "$STAGE/config/"
           cp integrations/nvidia/compatibility-manifest.schema.json integrations/nvidia/compatibility-manifest.example.json "$STAGE/config/"
-          cp README.md QUICKSTART.md LICENSE LICENSING.md LICENSE-COMMERCIAL.md "$STAGE/"
+          cp README.md QUICKSTART.md LICENSE NOTICE LICENSING.md TRADEMARKS.md "$STAGE/"
           tar -czf "$TARBALL" "$STAGE"
           shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
