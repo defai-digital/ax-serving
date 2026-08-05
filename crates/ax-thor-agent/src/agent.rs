@@ -385,14 +385,14 @@ fn normalize_identifier(raw: &str) -> String {
 }
 
 fn accelerator_name(config: &ThorConfig) -> String {
-    if config.runtime.eq_ignore_ascii_case("ax_engine") {
-        "apple-gpu".into()
-    } else if config.hardware_class.to_ascii_lowercase().contains("cuda")
-        || matches!(config.runtime.as_str(), "vllm" | "sglang")
-    {
-        "nvidia-gpu".into()
-    } else {
-        "unknown".into()
+    // Match on the normalized runtime kind so aliases/casing accepted by
+    // `normalize_runtime_kind` (e.g. "axengine", "native", "vLLM", "sg-lang")
+    // resolve to the same accelerator as their canonical spellings.
+    match normalize_runtime_kind(&config.runtime).as_str() {
+        "ax_engine" => "apple-gpu".into(),
+        "vllm" | "sglang" => "nvidia-gpu".into(),
+        _ if config.hardware_class.to_ascii_lowercase().contains("cuda") => "nvidia-gpu".into(),
+        _ => "unknown".into(),
     }
 }
 
@@ -597,8 +597,7 @@ pub async fn heartbeat_loop(
                 .await
                 {
                     Ok(registration) => {
-                        *runtime.models.write().await = registration.models;
-                        *runtime.session.write().await = Some(registration.session);
+                        install_registration(&runtime, registration).await;
                     }
                     Err(err) => {
                         tracing::warn!(%err, "runtime-node agent re-registration failed, clearing stale session");
@@ -656,6 +655,18 @@ fn normalize_operation(raw: &str) -> Option<String> {
         _ => normalized.as_str(),
     };
     Some(operation.to_string())
+}
+
+/// Install a (re-)registration into the shared runtime state.
+///
+/// A successful registration means the control plane has (re-)admitted this
+/// node, so any stale drain state from a prior session must be cleared and the
+/// inventory generation restarts at 1, matching `registration_body`.
+async fn install_registration(runtime: &SharedRuntime, registration: RegistrationState) {
+    *runtime.models.write().await = registration.models;
+    *runtime.session.write().await = Some(registration.session);
+    runtime.draining.store(false, Ordering::Release);
+    runtime.inventory_generation.store(1, Ordering::Release);
 }
 
 pub async fn drain(
@@ -912,5 +923,69 @@ mod tests {
                 .operations
                 .contains(&Operation::embeddings())
         );
+    }
+
+    #[test]
+    fn accelerator_name_uses_normalized_runtime_kind() {
+        use super::accelerator_name;
+
+        let mut config = test_config();
+        for alias in ["ax_engine", "axengine", "AxEngine", "native"] {
+            config.runtime = alias.into();
+            assert_eq!(
+                accelerator_name(&config),
+                "apple-gpu",
+                "runtime alias {alias} must map to apple-gpu"
+            );
+        }
+        for alias in ["vllm", "vLLM", "sglang", "sg-lang"] {
+            config.runtime = alias.into();
+            assert_eq!(
+                accelerator_name(&config),
+                "nvidia-gpu",
+                "runtime alias {alias} must map to nvidia-gpu"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_registration_resets_drain_state_and_inventory_generation() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::{RegistrationState, WorkerSession, install_registration};
+        use ax_serving_protocol::{LeaseToken, RegistrationId, WorkerId as ProtocolWorkerId};
+
+        let runtime = SharedRuntime::new();
+        runtime.draining.store(true, Ordering::Release);
+        runtime.inventory_generation.store(7, Ordering::Release);
+
+        install_registration(
+            &runtime,
+            RegistrationState {
+                session: WorkerSession {
+                    worker_id: ProtocolWorkerId::new("worker-1").unwrap(),
+                    instance_id: WorkerInstanceId::new(),
+                    registration_id: RegistrationId::new(),
+                    lease_token: LeaseToken::new("0123456789abcdef").unwrap(),
+                    heartbeat_interval_ms: 5_000,
+                    sequence: Arc::new(AtomicU64::new(0)),
+                },
+                models: vec!["model-a".to_string()],
+            },
+        )
+        .await;
+
+        assert!(
+            !runtime.draining.load(Ordering::Acquire),
+            "re-registration re-admits the node; stale drain state must be cleared"
+        );
+        assert_eq!(
+            runtime.inventory_generation.load(Ordering::Acquire),
+            1,
+            "inventory generation must restart at 1 for a fresh registration"
+        );
+        assert!(runtime.session.read().await.is_some());
+        assert_eq!(runtime.models.read().await.as_slice(), ["model-a"]);
     }
 }

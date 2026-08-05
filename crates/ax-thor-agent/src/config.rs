@@ -209,26 +209,24 @@ fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
     if trimmed.is_empty() {
         bail!("{field} URL is empty");
     }
-    let trimmed = trimmed.trim_end_matches('/');
-    if trimmed.is_empty() {
-        bail!("{field} URL is empty after trimming trailing slashes");
-    }
 
-    let mut rest = trimmed;
-    let has_scheme = if let Some(scheme_end) = trimmed.find("://") {
+    // Detect the scheme before trimming trailing slashes, so inputs like
+    // "http://" cannot collapse into a slash-less string that evades the
+    // empty-host check and gets re-prefixed into a garbage URL.
+    let (scheme, rest) = if let Some(scheme_end) = trimmed.find("://") {
         let scheme = &trimmed[..scheme_end];
         if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-            rest = &trimmed[scheme_end + 3..];
-            true
+            (Some(scheme), &trimmed[scheme_end + 3..])
         } else {
             bail!("{field} has unsupported URL scheme: {trimmed}");
         }
     } else {
-        false
+        (None, trimmed)
     };
 
+    let rest = rest.trim_end_matches('/');
     if rest.is_empty() {
-        bail!("{field} URL is incomplete: {trimmed}");
+        bail!("{field} URL is missing a host: {trimmed}");
     }
     if rest.contains('/') {
         bail!("{field} URL must not include a path: {trimmed}");
@@ -237,10 +235,9 @@ fn normalize_http_base_url(raw: &str, field: &str) -> Result<String> {
         bail!("{field} URL must not include query params or fragments: {trimmed}");
     }
 
-    if has_scheme {
-        Ok(trimmed.to_string())
-    } else {
-        Ok(format!("http://{trimmed}"))
+    match scheme {
+        Some(scheme) => Ok(format!("{scheme}://{rest}")),
+        None => Ok(format!("http://{rest}")),
     }
 }
 
@@ -700,6 +697,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported URL scheme"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_http_base_url_rejects_scheme_without_host() {
+        for raw in ["http://", "https://", " http://// "] {
+            let err = normalize_http_base_url(raw, "AXS_CONTROL_PLANE_URL")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("missing a host"), "input {raw:?}: got: {err}");
+        }
     }
 
     #[test]
