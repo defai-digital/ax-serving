@@ -121,6 +121,75 @@ fn push_stream_token_piece(
     flush_stream_token_batch(tx, buffer, buffered_pieces)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StopPieceAction {
+    emit: String,
+    matched: bool,
+}
+
+/// Split `text` so the tail keeps exactly `keep_tail_chars` characters.
+fn split_keep_tail_chars(text: &str, keep_tail_chars: usize) -> (String, String) {
+    if keep_tail_chars == 0 {
+        return (text.to_string(), String::new());
+    }
+
+    let total_chars = text.chars().count();
+    if total_chars <= keep_tail_chars {
+        return (String::new(), text.to_string());
+    }
+
+    let split_at = text
+        .char_indices()
+        .nth(total_chars - keep_tail_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    (text[..split_at].to_string(), text[split_at..].to_string())
+}
+
+/// Accumulate a decoded piece and decide what may be emitted to the client.
+///
+/// Holds back the last `max(stop_seq_len) - 1` chars so a stop sequence is
+/// always matched entirely within `pending` and can never leak partial stop
+/// text into the stream. Mirrors `consume_stop_piece` in `ax_engine.rs`.
+fn consume_stop_piece(pending: &mut String, piece: &str, stop_seqs: &[String]) -> StopPieceAction {
+    pending.push_str(piece);
+
+    if stop_seqs.is_empty() {
+        let emit = std::mem::take(pending);
+        return StopPieceAction {
+            emit,
+            matched: false,
+        };
+    }
+
+    if let Some(matched) = stop_seqs
+        .iter()
+        .filter(|seq| pending.ends_with(seq.as_str()))
+        .max_by_key(|seq| seq.len())
+    {
+        let emit_len = pending.len().saturating_sub(matched.len());
+        let emit = pending[..emit_len].to_string();
+        pending.clear();
+        return StopPieceAction {
+            emit,
+            matched: true,
+        };
+    }
+
+    let hold_chars = stop_seqs
+        .iter()
+        .map(|seq| seq.chars().count().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    let (emit, tail) = split_keep_tail_chars(pending, hold_chars);
+    *pending = tail;
+
+    StopPieceAction {
+        emit,
+        matched: false,
+    }
+}
+
 // ── Safe pointer wrappers ─────────────────────────────────────────────────────
 
 /// Wrapper for `*mut llama_model`. Read-only after load → Send + Sync.
@@ -151,12 +220,21 @@ impl Drop for LlamaContextPtr {
 
 // ── Context pool ──────────────────────────────────────────────────────────────
 
+/// Pool state: idle contexts plus a `closed` flag set by `drain_all()` so a
+/// thread parked in `acquire()` while the model is being unloaded wakes up
+/// and fails instead of waiting on a condvar that will never be signalled.
+struct PoolInner {
+    available: Vec<LlamaContextPtr>,
+    closed: bool,
+}
+
 /// A pool of `llama_context` pointers — at most one per concurrent request.
 ///
-/// `acquire()` blocks until a context is available; `release()` returns it.
+/// `acquire()` blocks until a context is available and returns `None` once
+/// the pool is closed; `release()` returns a context to the pool.
 /// All contexts are drained (and freed) before the owning model is freed.
 struct LlamaContextPool {
-    available: Mutex<Vec<LlamaContextPtr>>,
+    inner: Mutex<PoolInner>,
     cv: std::sync::Condvar,
     total: usize,
 }
@@ -165,15 +243,20 @@ impl LlamaContextPool {
     fn new(contexts: Vec<LlamaContextPtr>) -> Self {
         let total = contexts.len();
         Self {
-            available: Mutex::new(contexts),
+            inner: Mutex::new(PoolInner {
+                available: contexts,
+                closed: false,
+            }),
             cv: std::sync::Condvar::new(),
             total,
         }
     }
 
     /// Borrow a context, blocking until one is available.
-    fn acquire(&self) -> LlamaContextPtr {
-        let mut guard = match self.available.lock() {
+    ///
+    /// Returns `None` if the pool was closed (model unload) while waiting.
+    fn acquire(&self) -> Option<LlamaContextPtr> {
+        let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(err) => {
                 warn!("libllama context pool mutex poisoned during acquire; recovering");
@@ -181,8 +264,11 @@ impl LlamaContextPool {
             }
         };
         loop {
-            if let Some(ctx) = guard.pop() {
-                return ctx;
+            if let Some(ctx) = guard.available.pop() {
+                return Some(ctx);
+            }
+            if guard.closed {
+                return None;
             }
             guard = match self.cv.wait(guard) {
                 Ok(guard) => guard,
@@ -196,28 +282,32 @@ impl LlamaContextPool {
 
     /// Return a context to the pool.
     fn release(&self, ctx: LlamaContextPtr) {
-        let mut guard = match self.available.lock() {
+        let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(err) => {
                 warn!("libllama context pool mutex poisoned during release; recovering");
                 err.into_inner()
             }
         };
-        guard.push(ctx);
+        guard.available.push(ctx);
         self.cv.notify_one();
     }
 
     /// Wait for all in-flight requests to return their contexts, then drain
     /// and free every context. Called from `LlamaModelHolder::drop`.
     fn drain_all(&self) {
-        let mut guard = match self.available.lock() {
+        let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(err) => {
                 warn!("libllama context pool mutex poisoned during drain_all; recovering");
                 err.into_inner()
             }
         };
-        while guard.len() < self.total {
+        // Close the pool and wake every waiter so no acquire() can block
+        // forever waiting for a context that will never be released again.
+        guard.closed = true;
+        self.cv.notify_all();
+        while guard.available.len() < self.total {
             guard = match self.cv.wait(guard) {
                 Ok(guard) => guard,
                 Err(err) => {
@@ -226,7 +316,7 @@ impl LlamaContextPool {
                 }
             };
         }
-        guard.clear(); // Drops all LlamaContextPtr — calls llama_free on each.
+        guard.available.clear(); // Drops all LlamaContextPtr — calls llama_free on each.
     }
 }
 
@@ -241,6 +331,9 @@ struct LlamaModelHolder {
     pool: LlamaContextPool,
     model: LlamaModelPtr,
     meta: ModelMetadata,
+    /// Prompt batch size the pool contexts were created with; used to chunk
+    /// prefill batches in `run_generate`.
+    n_batch: u32,
     ffi_lock: Mutex<()>,
 }
 
@@ -391,6 +484,18 @@ impl InferenceBackend for LibLlamaBackend {
             path.display()
         );
 
+        // Read the GGUF header once — used for architecture detection and for
+        // auto-enabling embedding mode (pooling_type > 0), mirroring the
+        // auto-detection in LlamaCppBackend::load_model.
+        let gguf_meta = crate::gguf_meta::read_gguf_meta(path).ok();
+
+        // Without `embeddings = true` on the context params, llama.cpp never
+        // produces embedding outputs and `llama_get_embeddings*` return NULL.
+        let embeddings_enabled = match config.enable_embeddings {
+            Some(enabled) => enabled,
+            None => gguf_meta.as_ref().is_some_and(|m| m.pooling_type > 0),
+        };
+
         // ── Read metadata from the model ──────────────────────────────────────
         let ctx_len = if config.context_length > 0 {
             config.context_length
@@ -411,9 +516,9 @@ impl InferenceBackend for LibLlamaBackend {
         let n_vocab = unsafe { ffi::llama_vocab_n_tokens(vocab) as u32 };
 
         // Architecture name from GGUF header (fast path — no inference needed).
-        let arch = crate::gguf_meta::read_gguf_meta(path)
+        let arch = gguf_meta
             .map(|m| m.architecture)
-            .unwrap_or_else(|_| "gguf-libllama".to_string());
+            .unwrap_or_else(|| "gguf-libllama".to_string());
 
         let peak_rss = crate::current_rss_bytes().saturating_sub(rss_before);
         let load_ms = start.elapsed().as_millis() as u64;
@@ -446,6 +551,8 @@ impl InferenceBackend for LibLlamaBackend {
                 } else {
                     ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED
                 };
+                // Required for llama_get_embeddings* to return non-NULL.
+                params.embeddings = embeddings_enabled;
                 ffi::llama_new_context_with_model(model_ptr, params)
             };
 
@@ -474,6 +581,7 @@ impl InferenceBackend for LibLlamaBackend {
             pool: LlamaContextPool::new(contexts),
             model: LlamaModelPtr(model_ptr),
             meta: meta.clone(),
+            n_batch: self.n_batch,
             ffi_lock: Mutex::new(()),
         });
 
@@ -517,12 +625,26 @@ impl InferenceBackend for LibLlamaBackend {
             .name(format!("ax-libllama-generate-{handle:?}"))
             .spawn(move || {
                 // Acquire a context (blocks until one is available in the pool).
-                let ctx = holder.pool.acquire();
+                // `None` means the pool was closed while waiting (model unload).
+                let Some(ctx) = holder.pool.acquire() else {
+                    let _ = tx.blocking_send(GenerateEvent::Error(
+                        "libllama model is being unloaded; no context available".to_string(),
+                    ));
+                    return;
+                };
 
                 // Guarantee release even if run_generate panics (BUG-021).
                 let pool_ref = &holder.pool;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_generate(holder.model.0, ctx.0, &holder.meta, &input, &params, &tx)
+                    run_generate(
+                        holder.model.0,
+                        ctx.0,
+                        &holder.meta,
+                        holder.n_batch,
+                        &input,
+                        &params,
+                        &tx,
+                    )
                 }));
 
                 pool_ref.release(ctx);
@@ -576,12 +698,14 @@ impl InferenceBackend for LibLlamaBackend {
             err.into_inner()
         });
         let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
-        let mut out = String::new();
+        // Accumulate raw piece bytes and decode once: per-token lossy decode
+        // corrupts multi-byte UTF-8 characters split across tokens.
+        let mut bytes = Vec::new();
         for &tok in tokens {
-            let piece = unsafe { token_to_piece(vocab, backend_token_to_llama_token(tok)?) };
-            out.push_str(&piece);
+            let piece = unsafe { token_to_piece_bytes(vocab, backend_token_to_llama_token(tok)?) };
+            bytes.extend_from_slice(&piece);
         }
-        Ok(out)
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn eos_tokens(&self, handle: ModelHandle) -> Result<Vec<u32>> {
@@ -648,8 +772,10 @@ impl InferenceBackend for LibLlamaBackend {
         // Maximum context tokens for truncation.
         let n_ctx = holder.meta.context_length as usize;
 
-        // Acquire a context from the pool.
-        let ctx = holder.pool.acquire();
+        // Acquire a context from the pool. `None` = pool closed during unload.
+        let Some(ctx) = holder.pool.acquire() else {
+            anyhow::bail!("libllama model is being unloaded; no context available");
+        };
 
         let result = (|| -> Result<EmbedResult> {
             let vocab = unsafe { ffi::llama_model_get_vocab(holder.model.0) };
@@ -796,13 +922,18 @@ unsafe fn compute_logprob(
     (sampled_lp, top_entries)
 }
 
-/// Convert a single token to its UTF-8 text piece.
+/// Convert a single token to its raw bytes.
+///
+/// Byte-level BPE tokens may hold an *incomplete* UTF-8 sequence, so callers
+/// building streamed text must accumulate these bytes and decode only the
+/// valid prefix (see [`take_decodable_utf8`]) instead of lossy-decoding each
+/// piece on its own.
 ///
 /// # Safety
 /// `vocab` must be a valid, non-null vocab pointer returned by
 /// `llama_model_get_vocab`. The pointer remains valid for the lifetime of the
 /// owning `LlamaModelHolder`.
-unsafe fn token_to_piece(vocab: *const ffi::llama_vocab, token: i32) -> String {
+unsafe fn token_to_piece_bytes(vocab: *const ffi::llama_vocab, token: i32) -> Vec<u8> {
     let mut buf = vec![0u8; 32];
     let n = unsafe {
         ffi::llama_token_to_piece(
@@ -828,15 +959,57 @@ unsafe fn token_to_piece(vocab: *const ffi::llama_vocab, token: i32) -> String {
             )
         };
         if n2 > 0 {
-            String::from_utf8_lossy(&buf[..n2 as usize]).into_owned()
+            buf.truncate(n2 as usize);
         } else {
-            String::new()
+            buf.clear();
         }
-    } else if n > 0 {
-        String::from_utf8_lossy(&buf[..n as usize]).into_owned()
     } else {
-        String::new()
+        buf.truncate(n as usize);
     }
+    buf
+}
+
+/// Convert a single token to its UTF-8 text piece (lossy — incomplete
+/// sequences become U+FFFD). Only use for standalone display; streaming code
+/// should accumulate [`token_to_piece_bytes`] instead.
+///
+/// # Safety
+/// Same contract as [`token_to_piece_bytes`].
+unsafe fn token_to_piece(vocab: *const ffi::llama_vocab, token: i32) -> String {
+    String::from_utf8_lossy(&unsafe { token_to_piece_bytes(vocab, token) }).into_owned()
+}
+
+/// Drain the longest prefix of `buf` that is safe to emit as UTF-8 text.
+///
+/// An incomplete multi-byte sequence at the tail is kept in `buf` until more
+/// token bytes arrive; genuinely invalid bytes are included so they render as
+/// U+FFFD via `from_utf8_lossy` instead of being silently dropped.
+fn take_decodable_utf8(buf: &mut Vec<u8>) -> String {
+    let mut end = 0usize;
+    let mut rest = buf.as_slice();
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(_) => {
+                end = buf.len();
+                break;
+            }
+            Err(err) => {
+                end += err.valid_up_to();
+                match err.error_len() {
+                    // Genuinely invalid byte(s): include them (rendered U+FFFD).
+                    Some(bad) => {
+                        end += bad;
+                        rest = &rest[err.valid_up_to() + bad..];
+                    }
+                    // Incomplete trailing sequence — hold it back.
+                    None => break,
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf[..end]).into_owned();
+    buf.drain(..end);
+    text
 }
 
 /// Tokenize `text` into a `Vec<llama_token>` (i32).
@@ -944,9 +1117,10 @@ fn llama_tokens_to_backend_tokens(tokens: Vec<i32>) -> Result<Vec<u32>> {
 ///   mirostat_v2 → dist
 ///
 /// # Safety
-/// `model` must be valid and non-null (needed for grammar sampler if used).
+/// `model` must be valid and non-null (needed for the penalties sampler's
+/// `n_vocab` argument, and for the grammar sampler if used).
 unsafe fn build_sampler(
-    _model: *const ffi::llama_model,
+    model: *const ffi::llama_model,
     params: &GenerationParams,
 ) -> Result<*mut ffi::llama_sampler> {
     let seed = params.seed.unwrap_or_else(|| {
@@ -1000,9 +1174,10 @@ unsafe fn build_sampler(
     let pres = params.presence_penalty.unwrap_or(0.0) as f32;
     if rep != 1.0 || freq != 0.0 || pres != 0.0 {
         unsafe {
+            let n_vocab = ffi::llama_vocab_n_tokens(ffi::llama_model_get_vocab(model));
             ffi::llama_sampler_chain_add(
                 chain,
-                ffi::llama_sampler_init_penalties(64, rep, freq, pres),
+                ffi::llama_sampler_init_penalties(n_vocab, 64, rep, freq, pres),
             );
         }
     }
@@ -1076,6 +1251,7 @@ fn run_generate(
     model: *mut ffi::llama_model,
     ctx: *mut ffi::llama_context,
     meta: &ModelMetadata,
+    n_batch: u32,
     input: &GenerateInput,
     params: &GenerationParams,
     tx: &tokio::sync::mpsc::Sender<GenerateEvent>,
@@ -1109,32 +1285,47 @@ fn run_generate(
         n_input < ctx_size,
         "input ({n_input} tokens) exceeds context length ({ctx_size})"
     );
-    let n_input_i32 = llama_batch_token_count(n_input)?;
 
     let max_new = params.max_tokens.unwrap_or(512).min(ctx_size - n_input);
-
-    let eos = unsafe { ffi::llama_vocab_eos(vocab) };
 
     // 3. Build sampler chain.
     let sampler = unsafe { build_sampler(model, params) }?;
 
-    // 4. Prefill — all input tokens in one batch, logits only on the last.
+    // 4. Prefill — feed the prompt in chunks of at most `n_batch` tokens
+    //    (llama_decode rejects a batch larger than the context's n_batch).
+    //    Logits are computed only for the last token of the final chunk.
     let prefill_start = Instant::now();
-    let prefill_ok = unsafe {
-        let mut batch = ffi::llama_batch_init(n_input_i32, 0, 1);
-        batch.n_tokens = n_input_i32;
-        for (i, &tok) in tokens.iter().enumerate() {
-            *batch.token.add(i) = tok;
-            *batch.pos.add(i) = llama_position(i)?;
-            *batch.n_seq_id.add(i) = 1;
-            *(*batch.seq_id.add(i)).add(0) = 0;
-            // Only compute logits for the last position in the prefill batch.
-            *batch.logits.add(i) = if i == n_input - 1 { 1 } else { 0 };
+    let chunk_size = n_batch.max(1) as usize;
+    let mut prefill_ok = true;
+    let mut chunk_start = 0usize;
+    while chunk_start < n_input {
+        let chunk_end = (chunk_start + chunk_size).min(n_input);
+        let n_chunk = llama_batch_token_count(chunk_end - chunk_start)?;
+        let chunk_ok = unsafe {
+            let mut batch = ffi::llama_batch_init(n_chunk, 0, 1);
+            batch.n_tokens = n_chunk;
+            for (i, &tok) in tokens[chunk_start..chunk_end].iter().enumerate() {
+                *batch.token.add(i) = tok;
+                *batch.pos.add(i) = llama_position(chunk_start + i)?;
+                *batch.n_seq_id.add(i) = 1;
+                *(*batch.seq_id.add(i)).add(0) = 0;
+                // Only compute logits for the last position of the last chunk.
+                *batch.logits.add(i) = if chunk_end == n_input && i + 1 == chunk_end - chunk_start {
+                    1
+                } else {
+                    0
+                };
+            }
+            let ret = ffi::llama_decode(ctx, batch);
+            ffi::llama_batch_free(batch);
+            ret == 0
+        };
+        if !chunk_ok {
+            prefill_ok = false;
+            break;
         }
-        let ret = ffi::llama_decode(ctx, batch);
-        ffi::llama_batch_free(batch);
-        ret == 0
-    };
+        chunk_start = chunk_end;
+    }
 
     if !prefill_ok {
         if !sampler.is_null() {
@@ -1161,64 +1352,66 @@ fn run_generate(
     let decode_start = Instant::now();
     let mut n_decoded = 0usize;
     let mut current_pos = n_input;
-    let mut accumulated = String::new();
-    // Only keep the tail needed for stop-sequence matching to bound memory.
-    let max_stop_len = params.stop_seqs.iter().map(|s| s.len()).max().unwrap_or(0);
+    // Incremental detokenization: `pending_bytes` holds raw token bytes that
+    // do not yet form valid UTF-8; `pending_text` holds decoded text kept back
+    // by the stop-sequence matcher so a stop sequence can never be split
+    // across emitted chunks and leak into the client stream.
+    let mut pending_bytes: Vec<u8> = Vec::new();
+    let mut pending_text = String::new();
+    let mut stopped_on_stop_seq = false;
 
     loop {
-        // Check EOS.
-        if next_tok == eos {
+        // Stop on ANY end-of-generation token (EOS, EOT, ...), not just the
+        // vocab EOS — chat models commonly terminate turns with an EOG token
+        // distinct from EOS (e.g. <|eot_id|> vs <|end_of_text|>).
+        if unsafe { ffi::llama_vocab_is_eog(vocab, next_tok) } {
             break;
         }
 
-        // Convert token → text.
-        let piece = unsafe { token_to_piece(vocab, next_tok) };
-        accumulated.push_str(&piece);
+        // Convert token → raw bytes, then decode only the valid UTF-8 prefix
+        // (a multi-byte character split across tokens is held back until it
+        // completes instead of being emitted as U+FFFD).
+        pending_bytes.extend_from_slice(&unsafe { token_to_piece_bytes(vocab, next_tok) });
+        let piece = take_decodable_utf8(&mut pending_bytes);
 
         n_decoded += 1;
 
-        // Check stop sequences BEFORE emitting to avoid leaking stop text.
-        if params
-            .stop_seqs
-            .iter()
-            .any(|seq| accumulated.ends_with(seq.as_str()))
-        {
-            break;
-        }
+        // Route the piece through the stop-sequence hold-back: text is only
+        // emitted once it can no longer be part of a stop-sequence match, so
+        // stop text never leaks into the stream.
+        let action = consume_stop_piece(&mut pending_text, &piece, &params.stop_seqs);
 
-        // Trim accumulated to only keep the tail needed for stop-sequence matching.
-        if max_stop_len > 0 && accumulated.len() > max_stop_len * 2 {
-            let tail_start = accumulated.len() - max_stop_len;
-            // Find a valid char boundary at or after tail_start.
-            let boundary = accumulated.ceil_char_boundary(tail_start);
-            accumulated.drain(..boundary);
-        }
-
-        // Emit token event (and optionally logprob).
+        // Emit token event (and optionally logprob). When the hold-back
+        // suppresses this piece, suppress the logprob event too so Token and
+        // TokenLogprob stay paired (same convention as the ax-engine backend).
         if emit_logprobs {
             let (lp, top) =
                 unsafe { compute_logprob(ctx, vocab, next_tok, n_vocab, n_top_logprobs) };
-            if tx
-                .blocking_send(GenerateEvent::Token(piece.clone()))
-                .is_err()
-            {
-                break;
-            }
-            if tx
-                .blocking_send(GenerateEvent::TokenLogprob { logprob: lp, top })
-                .is_err()
-            {
-                break;
+            if !action.emit.is_empty() {
+                if tx.blocking_send(GenerateEvent::Token(action.emit)).is_err() {
+                    break;
+                }
+                if tx
+                    .blocking_send(GenerateEvent::TokenLogprob { logprob: lp, top })
+                    .is_err()
+                {
+                    break;
+                }
             }
         } else if !push_stream_token_piece(
             tx,
-            piece,
+            action.emit,
             stream_batch_size,
             &mut first_stream_chunk_sent,
             &mut stream_token_buffer,
             &mut buffered_stream_tokens,
         ) {
             // Receiver dropped (client disconnected).
+            break;
+        }
+
+        if action.matched {
+            stopped_on_stop_seq = true;
             break;
         }
 
@@ -1256,6 +1449,29 @@ fn run_generate(
 
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
+    // Flush text still held back by the incremental decoder and the
+    // stop-sequence matcher — unless generation stopped on a stop sequence,
+    // in which case the held text is (part of) the stop sequence itself.
+    if !stopped_on_stop_seq {
+        let tail = String::from_utf8_lossy(&pending_bytes).into_owned();
+        pending_bytes.clear();
+        pending_text.push_str(&tail);
+        if !push_stream_token_piece(
+            tx,
+            std::mem::take(&mut pending_text),
+            stream_batch_size,
+            &mut first_stream_chunk_sent,
+            &mut stream_token_buffer,
+            &mut buffered_stream_tokens,
+        ) {
+            // Free sampler before early return to avoid leak on client disconnect.
+            if !sampler.is_null() {
+                unsafe { ffi::llama_sampler_free(sampler) };
+            }
+            return Ok(());
+        }
+    }
+
     if !emit_logprobs
         && !flush_stream_token_batch(tx, &mut stream_token_buffer, &mut buffered_stream_tokens)
     {
@@ -1288,7 +1504,9 @@ fn run_generate(
         completion_tokens: n_decoded,
         prefill_tok_per_sec: prefill_tps,
         decode_tok_per_sec: decode_tps,
-        stop_reason: if n_decoded >= max_new {
+        stop_reason: if stopped_on_stop_seq {
+            "stop".to_string()
+        } else if n_decoded >= max_new {
             "length".to_string()
         } else {
             "stop".to_string()
@@ -1305,10 +1523,10 @@ mod tests {
     use crate::GenerateEvent;
 
     use super::{
-        backend_token_to_llama_token, backend_tokens_to_llama_tokens, flush_stream_token_batch,
-        llama_batch_token_count, llama_position, llama_text_byte_count,
+        backend_token_to_llama_token, backend_tokens_to_llama_tokens, consume_stop_piece,
+        flush_stream_token_batch, llama_batch_token_count, llama_position, llama_text_byte_count,
         llama_token_to_backend_token, llama_tokens_to_backend_tokens, llama_top_k,
-        push_stream_token_piece, saturating_usize_to_u32,
+        push_stream_token_piece, saturating_usize_to_u32, take_decodable_utf8,
     };
 
     #[test]
@@ -1374,6 +1592,40 @@ mod tests {
             Ok(GenerateEvent::Token(text)) => assert_eq!(text, "bc"),
             other => panic!("expected batched token event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn take_decodable_utf8_holds_incomplete_multibyte_tail() {
+        // "€" is U+20AC = 0xE2 0x82 0xAC — split across two token pieces.
+        let mut buf = vec![0xE2u8, 0x82];
+        assert_eq!(take_decodable_utf8(&mut buf), "");
+        assert_eq!(buf, vec![0xE2u8, 0x82], "incomplete tail must be kept");
+
+        buf.extend_from_slice(&[0xAC, b'!']);
+        assert_eq!(take_decodable_utf8(&mut buf), "€!");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_decodable_utf8_renders_invalid_bytes_as_replacement_char() {
+        let mut buf = vec![b'a', 0xFF, b'b'];
+        assert_eq!(take_decodable_utf8(&mut buf), "a\u{FFFD}b");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn consume_stop_piece_holds_back_partial_stop_sequence() {
+        let mut pending = String::new();
+        let stop = vec!["END".to_string()];
+
+        let first = consume_stop_piece(&mut pending, "hello EN", &stop);
+        assert_eq!(first.emit, "hello ");
+        assert!(!first.matched);
+
+        let second = consume_stop_piece(&mut pending, "D", &stop);
+        assert!(second.matched);
+        assert!(second.emit.is_empty(), "stop text must not be emitted");
+        assert!(pending.is_empty());
     }
 
     #[test]

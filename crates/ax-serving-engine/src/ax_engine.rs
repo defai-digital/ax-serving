@@ -736,6 +736,50 @@ fn decode_tokens(tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String> {
         .map_err(|err| anyhow::anyhow!("token decode failed: {err}"))
 }
 
+/// Incremental detokenizer for streamed output.
+///
+/// BPE tokens frequently split multi-byte UTF-8 characters; decoding each
+/// delta token in isolation yields U+FFFD mojibake in the client stream.
+/// This accumulates token IDs and emits only the decodable prefix, treating a
+/// trailing U+FFFD as the marker of an incomplete sequence to hold back until
+/// more tokens arrive (same strategy as HF `TextIteratorStreamer`).
+struct IncrementalDetokenizer<'a> {
+    tokenizer: &'a Tokenizer,
+    ids: Vec<u32>,
+    /// Byte length of the decoded text already emitted.
+    printed: usize,
+}
+
+impl<'a> IncrementalDetokenizer<'a> {
+    fn new(tokenizer: &'a Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            ids: Vec::new(),
+            printed: 0,
+        }
+    }
+
+    /// Add one token and return any newly decodable text (may be empty).
+    fn push(&mut self, token: u32) -> Result<String> {
+        self.ids.push(token);
+        let text = decode_tokens(self.tokenizer, &self.ids)?;
+        let usable = text.strip_suffix('\u{FFFD}').unwrap_or(&text);
+        let Some(piece) = usable.get(self.printed..) else {
+            return Ok(String::new());
+        };
+        let piece = piece.to_string();
+        self.printed = usable.len();
+        Ok(piece)
+    }
+
+    /// Decode everything remaining, including any incomplete trailing
+    /// sequence (rendered as U+FFFD). Call once at end of stream.
+    fn finish(&mut self) -> Result<String> {
+        let text = decode_tokens(self.tokenizer, &self.ids)?;
+        Ok(text.get(self.printed..).unwrap_or_default().to_string())
+    }
+}
+
 fn build_sampling(params: &GenerationParams) -> GenerateSampling {
     GenerateSampling {
         temperature: params.temperature.unwrap_or(0.0) as f32,
@@ -984,6 +1028,7 @@ fn run_generate_on_session(
     let mut stream_token_buffer = String::new();
     let mut buffered_stream_tokens = 0usize;
     let mut response = None;
+    let mut detok = IncrementalDetokenizer::new(tokenizer);
 
     loop {
         let Some(event) = session
@@ -1000,7 +1045,10 @@ fn run_generate_on_session(
                     emitted_tokens += 1;
                     first_token_at.get_or_insert_with(Instant::now);
 
-                    let piece = decode_tokens(tokenizer, &[token])?;
+                    // Decode incrementally: a multi-byte UTF-8 character split
+                    // across tokens is held back until it completes instead of
+                    // being emitted as U+FFFD mojibake.
+                    let piece = detok.push(token)?;
                     let action = consume_stop_piece(&mut stop_buffer, &piece, &params.stop_seqs);
                     if emit_logprobs {
                         // Keep Token and TokenLogprob events 1:1. When the
@@ -1055,17 +1103,34 @@ fn run_generate_on_session(
         }
     }
 
-    if !stopped_on_stop_sequence
-        && !push_stream_token_piece(
+    if !stopped_on_stop_sequence {
+        // Flush any text the incremental detokenizer is still holding through
+        // the stop-sequence matcher, then emit whatever remains.
+        let tail = detok.finish()?;
+        let action = consume_stop_piece(&mut stop_buffer, &tail, &params.stop_seqs);
+        stopped_on_stop_sequence = action.matched;
+        if !push_stream_token_piece(
             &tx,
-            std::mem::take(&mut stop_buffer),
+            action.emit,
             stream_batch_size,
             &mut first_stream_chunk_sent,
             &mut stream_token_buffer,
             &mut buffered_stream_tokens,
-        )
-    {
-        return Ok(());
+        ) {
+            return Ok(());
+        }
+        if !stopped_on_stop_sequence
+            && !push_stream_token_piece(
+                &tx,
+                std::mem::take(&mut stop_buffer),
+                stream_batch_size,
+                &mut first_stream_chunk_sent,
+                &mut stream_token_buffer,
+                &mut buffered_stream_tokens,
+            )
+        {
+            return Ok(());
+        }
     }
     if !flush_stream_token_batch(&tx, &mut stream_token_buffer, &mut buffered_stream_tokens) {
         return Ok(());
