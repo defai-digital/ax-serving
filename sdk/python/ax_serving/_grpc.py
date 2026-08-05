@@ -16,6 +16,55 @@ _THERMAL_MAP = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
 _FINISH_MAP = {0: "unspecified", 1: "eos", 2: "max_tokens", 3: "stop_sequence"}
 
 
+class InferStream:
+    """Iterator over streamed text pieces with per-stream termination metadata.
+
+    Finish reason and metrics belong to this iterator, not the shared client, so
+    concurrent ``infer()`` calls cannot overwrite each other's state.
+    """
+
+    def __init__(
+        self,
+        responses: Iterator[Any],
+        *,
+        on_finish: Any | None = None,
+    ) -> None:
+        self._responses = iter(responses)
+        self._on_finish = on_finish
+        self.finish_reason: str | None = None
+        self.metrics: GenerationMetrics | None = None
+        self._exhausted = False
+
+    def __iter__(self) -> "InferStream":
+        return self
+
+    def __next__(self) -> str:
+        if self._exhausted:
+            raise StopIteration
+        while True:
+            try:
+                resp = next(self._responses)
+            except StopIteration:
+                self._exhausted = True
+                raise
+            if not resp.finished:
+                return resp.text
+            self.finish_reason = _FINISH_MAP.get(resp.finish_reason, "eos")
+            if hasattr(resp, "HasField") and resp.HasField("metrics"):
+                m = resp.metrics
+                self.metrics = GenerationMetrics(
+                    prefill_tokens=m.prefill_tokens,
+                    decode_tokens=m.decode_tokens,
+                    prefill_tok_per_sec=m.prefill_tok_per_sec,
+                    decode_tok_per_sec=m.decode_tok_per_sec,
+                    total_time_ms=m.total_time_ms,
+                )
+            self._exhausted = True
+            if self._on_finish is not None:
+                self._on_finish(self.finish_reason)
+            raise StopIteration
+
+
 def _make_channel(socket: str | None, host: str | None, port: int) -> grpc.Channel:
     """Create a gRPC channel.
 
@@ -69,7 +118,8 @@ class GrpcClient:
         self._timeout = timeout
         self._channel: grpc.Channel | None = None
         self._stub: pb_grpc.AxServingServiceStub | None = None
-        # Populated after a streaming ``infer()`` completes.
+        # Deprecated: shared across streams; prefer ``InferStream.finish_reason``.
+        # Kept for backward compatibility with single-stream callers.
         self.last_finish_reason: str | None = None
 
     def _ensure_connected(self) -> pb_grpc.AxServingServiceStub:
@@ -138,11 +188,16 @@ class GrpcClient:
         repeat_penalty: float = 1.1,
         max_tokens: int = 512,
         seed: int = 0,
-    ) -> Iterator[str]:
+    ) -> InferStream:
         """Stream generated text tokens.
 
-        Yields decoded text pieces.  The final piece is an empty string when
-        ``finished=True`` (which carries the metrics).
+        Returns an :class:`InferStream` that yields decoded text pieces. After
+        the iterator is exhausted, read ``stream.finish_reason`` (and optionally
+        ``stream.metrics``) for that call's termination metadata. Do not share
+        finish metadata via the client when running concurrent streams.
+
+        For single-stream callers, ``client.last_finish_reason`` is still updated
+        when the stream ends (best-effort; racy under concurrent ``infer()``).
 
         Args:
             model_id: ID of a loaded model.
@@ -179,13 +234,14 @@ class GrpcClient:
             max_tokens=max_tokens,
         )
 
-        self.last_finish_reason = None
-        for resp in stub.Infer(req, timeout=self._timeout):
-            if not resp.finished:
-                yield resp.text
-            else:
-                self.last_finish_reason = _FINISH_MAP.get(resp.finish_reason, "eos")
-                # On finish the caller can inspect metrics via infer_full()
+        responses = stub.Infer(req, timeout=self._timeout)
+
+        def _mirror_finish(reason: str | None) -> None:
+            # Best-effort legacy mirror for single-stream callers. Concurrent
+            # streams must read InferStream.finish_reason instead.
+            self.last_finish_reason = reason
+
+        return InferStream(responses, on_finish=_mirror_finish)
 
     def infer_full(
         self,

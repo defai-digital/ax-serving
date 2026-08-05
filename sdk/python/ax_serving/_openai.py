@@ -181,10 +181,16 @@ class _Completions:
 
         if stream:
             def _stream() -> Generator[_CompletionChunk, None, None]:
-                for tok in grpc_client.infer(model, messages=messages, **grpc_kwargs):
+                # Finish reason is owned by the iterator, not the shared client,
+                # so concurrent streams cannot steal each other's termination.
+                token_stream = grpc_client.infer(
+                    model, messages=messages, **grpc_kwargs
+                )
+                for tok in token_stream:
                     yield _CompletionChunk(tok, model)
                 reason = _openai_finish_reason(
-                    getattr(grpc_client, "last_finish_reason", None)
+                    getattr(token_stream, "finish_reason", None)
+                    or getattr(grpc_client, "last_finish_reason", None)
                 )
                 yield _CompletionChunk(None, model, finish_reason=reason)
             return _stream()

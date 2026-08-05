@@ -310,6 +310,16 @@ def test_grpc_chat_ignores_rest_only_options() -> None:
 
 
 def test_grpc_chat_maps_embedded_finish_reasons_to_openai() -> None:
+    class FakeStream:
+        def __init__(self, finish_reason: str) -> None:
+            self.finish_reason = finish_reason
+
+        def __iter__(self) -> "FakeStream":
+            return self
+
+        def __next__(self) -> str:
+            raise StopIteration
+
     class FakeGrpc:
         def __init__(self, finish_reason: str) -> None:
             self._finish_reason = finish_reason
@@ -323,9 +333,8 @@ def test_grpc_chat_maps_embedded_finish_reasons_to_openai() -> None:
             )
 
         def infer(self, model_id: str, messages: list[dict[str, str]] | None = None, **kwargs: Any):
-            self.last_finish_reason = self._finish_reason
-            if False:  # pragma: no cover - make this a generator
-                yield ""
+            # Stream-local finish reason (not client-shared).
+            return FakeStream(self._finish_reason)
 
     for embedded, openai in (("eos", "stop"), ("max_tokens", "length"), ("stop_sequence", "stop")):
         client = Client(grpc_port=50051)
@@ -346,3 +355,93 @@ def test_grpc_chat_maps_embedded_finish_reasons_to_openai() -> None:
         )
         assert chunks[-1].choices[0].finish_reason == openai
         assert chunks[-1].choices[0].delta.content is None
+
+
+def test_infer_stream_finish_reason_is_stream_local() -> None:
+    """Parallel streams must not share finish_reason via the client."""
+    from ax_serving._grpc import InferStream
+
+    class _Resp:
+        def __init__(self, text: str = "", finished: bool = False, finish_reason: int = 0) -> None:
+            self.text = text
+            self.finished = finished
+            self.finish_reason = finish_reason
+
+        def HasField(self, name: str) -> bool:
+            return False
+
+    # FINISH_MAP: 1=eos, 2=max_tokens
+    stream_a = InferStream(
+        [_Resp("a"), _Resp(finished=True, finish_reason=2)],
+    )
+    stream_b = InferStream(
+        [_Resp("b"), _Resp(finished=True, finish_reason=1)],
+    )
+
+    # Interleave consumption the way concurrent threads would.
+    assert next(stream_a) == "a"
+    assert next(stream_b) == "b"
+    assert list(stream_a) == []
+    assert list(stream_b) == []
+
+    assert stream_a.finish_reason == "max_tokens"
+    assert stream_b.finish_reason == "eos"
+
+
+def test_infer_stream_mirrors_finish_to_on_finish_callback() -> None:
+    from ax_serving._grpc import InferStream
+
+    class _Resp:
+        def __init__(self, text: str = "", finished: bool = False, finish_reason: int = 0) -> None:
+            self.text = text
+            self.finished = finished
+            self.finish_reason = finish_reason
+
+        def HasField(self, name: str) -> bool:
+            return False
+
+    mirrored: list[str | None] = []
+    stream = InferStream(
+        [_Resp("hi"), _Resp(finished=True, finish_reason=2)],
+        on_finish=mirrored.append,
+    )
+    assert list(stream) == ["hi"]
+    assert stream.finish_reason == "max_tokens"
+    assert mirrored == ["max_tokens"]
+
+
+def test_openai_stream_uses_stream_finish_reason_not_client() -> None:
+    """OpenAI wrapper must not read a shared client last_finish_reason."""
+
+    class FakeStream:
+        def __init__(self, pieces: list[str], finish_reason: str) -> None:
+            self._pieces = list(pieces)
+            self.finish_reason = finish_reason
+
+        def __iter__(self) -> "FakeStream":
+            return self
+
+        def __next__(self) -> str:
+            if not self._pieces:
+                raise StopIteration
+            return self._pieces.pop(0)
+
+    class FakeGrpc:
+        def __init__(self) -> None:
+            # Poisoned shared state that would win under the old bug.
+            self.last_finish_reason = "eos"
+
+        def infer(self, model_id: str, messages: list[dict[str, str]] | None = None, **kwargs: Any):
+            return FakeStream(["x"], "max_tokens")
+
+    client = Client(grpc_port=50051)
+    client._grpc = FakeGrpc()
+    chunks = list(
+        client.chat.completions.create(
+            model="default",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+    )
+    assert chunks[0].choices[0].delta.content == "x"
+    assert chunks[-1].choices[0].finish_reason == "length"

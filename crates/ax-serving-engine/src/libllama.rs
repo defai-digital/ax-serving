@@ -146,11 +146,40 @@ fn split_keep_tail_chars(text: &str, keep_tail_chars: usize) -> (String, String)
     (text[..split_at].to_string(), text[split_at..].to_string())
 }
 
+/// Find the earliest stop sequence in `text`.
+///
+/// When several stops share the same start byte index, prefer the longest so a
+/// multi-char stop is not shadowed by a shorter one at the same position.
+/// Returns `(byte_index, match_len)`.
+fn find_earliest_stop(text: &str, stop_seqs: &[String]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for seq in stop_seqs {
+        if seq.is_empty() {
+            continue;
+        }
+        if let Some(idx) = text.find(seq.as_str()) {
+            let len = seq.len();
+            best = Some(match best {
+                None => (idx, len),
+                Some((best_idx, best_len))
+                    if idx < best_idx || (idx == best_idx && len > best_len) =>
+                {
+                    (idx, len)
+                }
+                Some(prev) => prev,
+            });
+        }
+    }
+    best
+}
+
 /// Accumulate a decoded piece and decide what may be emitted to the client.
 ///
 /// Holds back the last `max(stop_seq_len) - 1` chars so a stop sequence is
 /// always matched entirely within `pending` and can never leak partial stop
-/// text into the stream. Mirrors `consume_stop_piece` in `ax_engine.rs`.
+/// text into the stream. Searches the whole buffer (not only the suffix) so a
+/// single BPE piece containing `prefix<stop>suffix` still matches. Mirrors
+/// `consume_stop_piece` in `ax_engine.rs`.
 fn consume_stop_piece(pending: &mut String, piece: &str, stop_seqs: &[String]) -> StopPieceAction {
     pending.push_str(piece);
 
@@ -162,13 +191,11 @@ fn consume_stop_piece(pending: &mut String, piece: &str, stop_seqs: &[String]) -
         };
     }
 
-    if let Some(matched) = stop_seqs
-        .iter()
-        .filter(|seq| pending.ends_with(seq.as_str()))
-        .max_by_key(|seq| seq.len())
-    {
-        let emit_len = pending.len().saturating_sub(matched.len());
-        let emit = pending[..emit_len].to_string();
+    // Search the whole buffer, not only the suffix. A single decoded BPE piece
+    // may contain prefix<stop>suffix; matching only with ends_with would miss it
+    // and leak the stop (and trailing text) to the client.
+    if let Some((idx, _match_len)) = find_earliest_stop(pending, stop_seqs) {
+        let emit = pending[..idx].to_string();
         pending.clear();
         return StopPieceAction {
             emit,
@@ -1626,6 +1653,20 @@ mod tests {
         assert!(second.matched);
         assert!(second.emit.is_empty(), "stop text must not be emitted");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn consume_stop_piece_matches_stop_in_middle_of_decoded_fragment() {
+        let mut pending = String::new();
+        let stop = vec!["END".to_string()];
+
+        let action = consume_stop_piece(&mut pending, "hello ENDmore text", &stop);
+        assert!(action.matched);
+        assert_eq!(action.emit, "hello ");
+        assert!(
+            pending.is_empty(),
+            "buffer must be cleared on match so trailing text is not emitted later"
+        );
     }
 
     #[test]
