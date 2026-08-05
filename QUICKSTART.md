@@ -36,14 +36,19 @@ state:
 AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
 ```
 
-Verify process health. Readiness is intentionally `503` until a runtime is
-registered and ready:
+Verify process health and distinguish gateway readiness from inference routability:
 
 ```bash
 curl -i http://127.0.0.1:18080/livez
 curl -i http://127.0.0.1:18080/readyz
+curl -i http://127.0.0.1:18080/routablez
 curl -sS http://127.0.0.1:18080/health | jq .
 ```
+
+With the default `control_plane` readiness mode, `/readyz` becomes `200` when the gateway
+configuration, listeners, and fleet store are ready; it does not require an eligible runtime.
+`/routablez` remains `503` until at least one runtime is eligible. The legacy
+`orchestrator.readyz_mode: eligible_workers` setting makes `/readyz` require a runtime as well.
 
 ## 3. Attach a runtime
 
@@ -53,7 +58,8 @@ Start the runtime first. It must expose:
 - `GET /v1/models`;
 - the OpenAI-compatible inference operations it advertises.
 
-For a local vLLM endpoint on port 8000:
+For a local vLLM endpoint on port 8000, the generic agent provides a migration/testing
+compatibility path:
 
 ```bash
 AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
@@ -66,6 +72,11 @@ AXS_NODE_WORKER_POOL=cuda \
 AXS_NODE_MAX_INFLIGHT=16 \
 target/release/ax-runtime-agent
 ```
+
+This direct path registers `compatibility_runtime_endpoint`, whether it runs on an AMD64 PC or a
+Thor device. It is not a `nvidia_dynamo_pc` or `nvidia_dynamo_thor` domain. The target NVIDIA
+production topology uses one [`ax-dynamo-adapter`](docs/integrations/nvidia/DYNAMO.md) for each
+separately operated Dynamo domain.
 
 For AX Engine on Apple Silicon, point the same agent at the AX Engine server:
 

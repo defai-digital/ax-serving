@@ -10,6 +10,7 @@ inference hardware it governs. See
 ## Strong fits
 
 - A private fleet containing Mac AX Engine and NVIDIA Dynamo capacity.
+- Multiple Mac AX Engine endpoints separated by office, trust, maintenance, or failure policy.
 - Multiple CUDA/Dynamo domains separated by office, region, trust, failure, or rollout policy.
 - NVIDIA PC and Thor devices that must remain separate performance/failure domains.
 - Tenant, privacy, residency, locality, budget, or SLO policy that no one runtime can enforce
@@ -20,8 +21,8 @@ inference hardware it governs. See
 
 ## Poor fits
 
-- One model on one NVIDIA deployment: use Dynamo directly.
-- One model on one Mac: use AX Engine directly.
+- One NVIDIA Dynamo domain that already satisfies all traffic and policy: use Dynamo directly.
+- One Mac/AX Engine endpoint that already satisfies all traffic and policy: use AX Engine directly.
 - A need for CUDA token scheduling or KV-aware NVIDIA worker routing: use Dynamo and its backend.
 - A need to split a graph, KV cache, or prefill/decode phase across Mac, PC, and Thor.
 - An agent application framework with tools, MCP, memory, sandboxes, and workflow state.
@@ -45,7 +46,8 @@ inference hardware it governs. See
 - Explicit identity/equivalence and upstream compatibility manifests require operational discipline.
 - Cross-domain quality labels and value evidence are workload-specific.
 - Thor requires separate live qualification despite generic ARM64/Blackwell prerequisites.
-- If the fleet stays homogeneous, the added complexity has little value.
+- If one execution domain already satisfies all traffic and policy, the added complexity has little
+  value.
 
 ## Correct comparisons
 

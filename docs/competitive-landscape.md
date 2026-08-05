@@ -21,10 +21,10 @@ Compare systems at the layer where they make decisions.
 
 ## Where another system is better
 
-- one NVIDIA deployment: use Dynamo directly;
+- one NVIDIA Dynamo domain that already satisfies all traffic and policy: use Dynamo directly;
 - CUDA kernels/token scheduling: use and tune the backend runtime;
 - NVIDIA worker/KV routing and scaling: use Dynamo;
-- one Mac model: use AX Engine directly;
+- one Mac/AX Engine endpoint that already satisfies all traffic and policy: use AX Engine directly;
 - end-user desktop/chat UX: use a desktop/local application;
 - agent planning/tools/memory: use an agent framework;
 - standardized Kubernetes inference routing that already meets all identity/policy needs: integrate

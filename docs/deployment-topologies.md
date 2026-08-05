@@ -55,7 +55,9 @@ Mac and NVIDIA use different adapter boundaries:
 - AX Serving selects a domain. Dynamo selects the NVIDIA worker inside that domain.
 
 The direct vLLM/SGLang mode in `ax-runtime-agent` remains available for migration and testing. It is
-`compatibility_runtime_endpoint`, not the target NVIDIA production path.
+`compatibility_runtime_endpoint`, not the target NVIDIA production path. This remains true on both
+AMD64 PCs and Thor: the legacy `ax-thor-agent` executable is an alias for `ax-runtime-agent` and
+cannot register a Dynamo domain.
 
 ## Local-office topology
 
@@ -133,7 +135,9 @@ Use the execution system directly when federation adds no measurable value:
 
 An all-CUDA fleet can still need AX Serving when it contains separate Dynamo domains for regions,
 trust boundaries, failure isolation, PC versus Thor qualification, or independent rollout. The
-product boundary is multi-domain governance, not hardware mixing by itself.
+same is true for an all-Mac fleet with several independently operated endpoints. Conversely, mixed
+hardware alone does not justify AX Serving. The product boundary is multi-domain governance, not
+hardware mixing by itself.
 
 ## Current claim boundary
 

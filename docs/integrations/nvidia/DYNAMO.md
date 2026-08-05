@@ -5,6 +5,13 @@ AX Serving integrates NVIDIA capacity at the Dynamo domain boundary. One
 frontend and its backend graph. AX Serving never registers or selects Dynamo
 GPU workers.
 
+Use the canonical upstream
+[`ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo) and consult NVIDIA's
+[current support matrix](https://docs.nvidia.com/dynamo/latest/resources/support-matrix). An AX
+compatibility manifest must still pin the exact released tag, commit, images, backend, graph, and
+qualification evidence used by the domain. Upstream support for AMD64, ARM64, or Blackwell does not
+automatically qualify a specific PC or Thor deployment for AX Serving.
+
 ## Ownership
 
 | Concern | Owner |

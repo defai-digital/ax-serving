@@ -26,14 +26,15 @@ local or remote domains over an operator-provided trusted network. See
 
 AX Serving v3 is the Apache-2.0 open infrastructure layer. AX Fabric and AX Trust may provide
 separate orchestration, governance, trust, managed-service, and enterprise value through the public
-contracts; they do not unlock or relicense AX Serving.
+contracts. They are not required to operate AX Serving and do not unlock or relicense it.
 
 ## Primary user
 
-The primary user is a platform team with at least two execution, trust, region, or failure domains
-or a real need for central identity, admission, audit, or lifecycle. The domains may mix Mac and
-NVIDIA, or they may be separate CUDA/Dynamo domains. A single Dynamo deployment with one policy is
-not a strong fit; that user should call Dynamo directly.
+The primary user is a platform team with at least two execution, trust, region, rollout, or failure
+domains, or a real need for central identity, admission, audit, or lifecycle. The domains may mix
+Mac and NVIDIA, be all Mac, or be separate CUDA/Dynamo domains. Hardware heterogeneity alone is
+neither required nor sufficient. A single Dynamo deployment with one policy is not a strong fit;
+that user should call Dynamo directly.
 
 ## Differentiators that must be proved
 
@@ -66,7 +67,8 @@ AX Serving is not:
 1. “AX Serving federates execution domains; it does not replace them.”
 2. “Dynamo manages NVIDIA workers; AX manages cross-domain policy.”
 3. “PC and Thor are independently deployed and must be independently certified.”
-4. “Homogeneous NVIDIA users should use Dynamo directly.”
+4. “Single-domain NVIDIA users should use Dynamo directly; separate CUDA domains may still need
+   AX-level federation.”
 5. “AX Serving earns its place only through retained value and safety evidence.”
 6. “AX Serving is the open foundation; AX Fabric and AX Trust are separate products.”
 

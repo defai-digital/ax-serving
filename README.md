@@ -3,47 +3,72 @@
 [![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-AX Serving is a **federated heterogeneous inference control plane** for private AI fleets. It
-provides one authenticated OpenAI-compatible API and governs execution across:
+AX Serving is an Apache-2.0 **federation gateway and multi-domain inference control plane** for
+private AI fleets. It presents one authenticated OpenAI-compatible API and selects among
+independently operated execution domains. It does not run models or schedule accelerator workers.
+
+The target architecture federates:
 
 - Apple Silicon Macs running AX Engine through `ax-runtime-agent`;
-- future model-parallel Mac clusters represented by the experimental
-  `ax-mac-cluster-adapter`;
 - NVIDIA GPU PCs managed inside an upstream NVIDIA Dynamo domain;
-- NVIDIA Thor devices managed inside a separate, independently qualified Dynamo domain.
+- NVIDIA Thor devices managed inside a separate Dynamo domain with independent qualification;
+- future model-parallel Mac clusters represented by the experimental
+  `ax-mac-cluster-adapter`.
 
 The defining rule is:
 
 > **AX Serving selects an execution domain. Dynamo selects NVIDIA workers. AX Engine executes on
 > Mac. No layer makes the same placement decision twice.**
 
-AX Serving does not generate tokens or replace the systems inside a domain. It owns public
-authentication, tenant and trust policy, logical models, deployment identity and equivalence,
-cross-domain admission, safe failover, audit, and operator workflows.
+AX Serving does not generate tokens or replace the systems inside a domain. It owns the
+cross-domain API boundary: public authentication, tenant and trust policy, logical models,
+deployment identity and equivalence, admission, conservative failover, audit, and operator
+workflows.
 
 The CPU-only control plane is independent of inference hardware: it is designed to run on Apple
 Silicon, Linux AMD64, or Linux ARM64—including a Thor host when co-location is appropriate—and can
 govern local-office or remote Mac, NVIDIA PC, and Thor domains over a trusted network. Control-plane
-portability does not imply that every host or execution domain is production-qualified. See
+portability does not imply that every host, runtime, or execution domain is production-qualified.
+Running the gateway on a Thor host is a control-plane placement choice; it does not make Thor a
+qualified inference domain. See
 [Control-plane placement and mixed-fleet topologies](docs/deployment-topologies.md) for the
 deployment matrix, adapter placement, LAN/WAN examples, and current claim boundary.
 
+## Is AX Serving the right layer?
+
+Hardware mix is not the product boundary. The boundary is whether several independently operated
+execution domains need one policy and API.
+
+| Fleet situation | Recommended entry point |
+| --- | --- |
+| One AX Engine endpoint with one policy | Call AX Engine directly |
+| One NVIDIA Dynamo deployment with one policy | Call Dynamo directly |
+| Several Mac endpoints needing shared admission, failover, drain, and audit | Evaluate AX Serving |
+| Several CUDA/Dynamo domains separated by office, region, trust, rollout, or failure boundary | Evaluate AX Serving |
+| Mac plus NVIDIA, or PC plus separately qualified Thor | Core AX Serving use case |
+
+An all-Mac or all-CUDA fleet can use AX Serving. A mixed-hardware fleet does not automatically need
+it. AX Serving earns the extra network hop and operational layer only when federation produces
+measurable policy, availability, utilization, privacy/locality, cost/SLO, or workflow value.
+
 ## Project status
 
-The target architecture is accepted. Its source implementation is incremental, and source/mock
-tests are not live hardware certification.
+The v3 target architecture is accepted. Its implementation and qualification are incremental.
+“Source implemented” below means that code and automated tests exist; it does not mean live
+hardware, performance, fault, security, or production certification.
 
 | Area | Current state |
 | --- | --- |
-| Portable REST/SSE gateway and protocol v1.2 | Implemented; protocol v1.0/v1.1 migration fixtures remain supported |
-| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation implemented; full domain-selection policy and live evidence remain |
-| Mac -> `ax-runtime-agent` -> AX Engine | Implemented; pinned live AX Engine certification pending |
+| Portable REST/SSE gateway and protocol v1.2 | Source implemented and CI-tested on Linux AMD64/ARM64 and Apple Silicon; protocol v1.0/v1.1 migration fixtures remain supported |
+| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; complete policy and live mixed-domain evidence remain |
+| Mac -> `ax-runtime-agent` -> AX Engine | Source implemented with mock tests; pinned live AX Engine qualification pending |
 | Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phase 1 coordinator, gang manifest, registration, proxy, and HA admission implemented with source/mock tests; distributed AX Engine PP is not implemented |
-| NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy implemented with source/mock conformance; live qualification pending |
-| NVIDIA Thor -> separate Dynamo domain | Source path exists but is experimental and not a support claim |
+| Direct vLLM/SGLang -> `ax-runtime-agent` | Source implemented for migration/testing as `compatibility_runtime_endpoint`; not the target NVIDIA production path |
+| NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy source implemented with mock conformance; live qualification pending |
+| NVIDIA Thor -> separate `ax-dynamo-adapter` -> Dynamo domain | Source path exists but is experimental; no Thor production-support claim |
 | Streaming, cancellation, deadlines, and safe pre-commit retry | Implemented with mock/fault tests; live mixed-domain evidence pending |
 | Fleet state and decisions | Generation-fenced domain reservations and bounded decision persistence implemented for memory and Redis/Valkey; two-gateway partition/soak and offline replay evidence pending |
-| Packaging | CPU-only gateway/adapter container, Compose, Kubernetes, and Helm sources implemented; release qualification pending |
+| Packaging | CPU-only gateway/adapter container, Compose, Kubernetes, and Helm sources implemented; signed release artifacts and runtime qualification have separate gates |
 
 Source and mock conformance are development evidence only. Production claims require retained
 live-runtime qualification, performance, fault, and soak artifacts.
@@ -57,14 +82,17 @@ live-runtime qualification, performance, fault, and soak artifacts.
 | NVIDIA token execution | A Dynamo-certified vLLM, SGLang, or TensorRT-LLM backend |
 | Apple Silicon token execution | AX Engine |
 
-This product is useful when a fleet is genuinely heterogeneous or policy-segmented. If every
-request goes to one NVIDIA deployment with one policy, call Dynamo directly; AX Serving would add
-an unnecessary hop. AX Serving must prove value through cross-domain utilization, policy-correct
-availability, privacy/locality, cost/SLO improvement, or simpler operations.
+This product is useful when a fleet has multiple execution, trust, region, rollout, or failure
+domains. Heterogeneous hardware is an important use case, not a requirement. If every request goes
+to one NVIDIA deployment with one policy, call Dynamo directly; AX Serving would add an unnecessary
+hop.
 
-AX Serving v3 is the Apache-2.0 open infrastructure layer. Separately distributed products such as
-AX Fabric and AX Trust can integrate through the public contracts, but they do not unlock, relicense,
-or replace AX Serving functionality.
+AX Serving v3 is the Apache-2.0 infrastructure layer described in this repository. All
+functionality shipped here remains available under that license.
+Separately distributed products such as AX Fabric and AX Trust may add orchestration, governance,
+attestation, managed operations, or enterprise services through public contracts. They are not
+required to use, modify, redistribute, or operate AX Serving, and they do not unlock or relicense
+its open-source functionality.
 
 ## Architecture
 
@@ -96,10 +124,10 @@ TensorRT-LLM SDKs. Integration happens through versioned wire contracts and immu
 identity.
 
 The canonical Dynamo upstream is
-[`https://github.com/ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo). The design uses pinned
-upstream releases and immutable NGC image digests through a service adapter; it does not maintain a
-private Dynamo fork. Release `v1.2.1` is the initial integration reference, not an unqualified
-support promise.
+[`https://github.com/ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo). Each AX qualification
+manifest must pin an exact released tag, commit, backend version, graph configuration, and immutable
+image digests; AX Serving does not maintain a private Dynamo fork. Upstream architecture support
+does not by itself qualify a PC or Thor deployment for AX Serving.
 
 ### Execution domains
 
@@ -112,10 +140,12 @@ boundary.
 | `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | Coordinator/control-plane source exists; AX Engine distributed execution does not |
 | `nvidia_dynamo_pc` | One adapter for one PC Dynamo deployment | Dynamo and its selected backend | Exact Dynamo/backend/image/config manifest must be certified |
 | `nvidia_dynamo_thor` | One adapter for one separate Thor deployment | Dynamo and a Thor-qualified backend | Always separate from PC; experimental until its own gates pass |
-| `compatibility_runtime_endpoint` | One direct runtime node | Configured legacy runtime | Migration and testing only |
+| `compatibility_runtime_endpoint` | One direct vLLM/SGLang or other compatible runtime node | Configured runtime | Migration and testing only; never a Dynamo-domain claim |
 
 PC and Thor never share a tensor-parallel group, artifacts, capacity calibration, or certification
-by default. One request attempt remains in one domain.
+by default. The legacy `ax-thor-agent` binary is only an alias for the generic
+`ax-runtime-agent`; when pointed directly at vLLM/SGLang it registers a compatibility endpoint, not
+a `nvidia_dynamo_thor` domain. One request attempt remains in one domain.
 
 ### Core model
 
@@ -170,7 +200,10 @@ or backend lifecycle. It does not tokenize prompts, render chat templates, parse
 or move KV state across Mac, PC, and Thor. It is not an agent planner, tool runner, MCP host,
 sandbox, workflow engine, or durable agent-memory system.
 
-## Quick start: current portable gateway and Mac agent
+## Development quick start: portable gateway and Mac agent
+
+For a full walkthrough, including direct-runtime migration mode, explicit hybrid routing,
+authentication, HA, lifecycle, and observability, see [QUICKSTART.md](QUICKSTART.md).
 
 Build the implemented portable binaries:
 
@@ -220,8 +253,9 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-The current agent can also proxy direct vLLM/SGLang endpoints for migration and testing. That path
-is compatibility-only in the final design; it is not the target NVIDIA production architecture.
+The current agent can also proxy direct vLLM/SGLang endpoints—including on Thor—for migration and
+testing. That path always registers as `compatibility_runtime_endpoint`; it is not a Dynamo domain
+and is not the target NVIDIA production architecture.
 For the NVIDIA path, follow the
 [Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) and validate an immutable manifest before
 starting `ax-dynamo-adapter`. Source/mock conformance is not live hardware certification.
@@ -351,7 +385,10 @@ Dynamo remains a separately pinned and operated execution domain.
 
 - [Runtime responsibility inventory](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Node protocol contract](docs/contracts/ax-serving-node-contract.md)
+- [Product positioning and claim boundary](docs/market-positioning.md)
+- [Use cases and trade-offs](docs/advantages-and-use-cases.md)
 - [Deployment topologies and qualification boundary](docs/deployment-topologies.md)
+- [NVIDIA Dynamo domain integration](docs/integrations/nvidia/DYNAMO.md)
 - [Multi-worker operations runbook](docs/runbooks/multi-worker.md)
 
 ## Licensing

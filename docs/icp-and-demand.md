@@ -3,6 +3,8 @@
 AX Serving is worth evaluating when a team answers yes to several of these:
 
 - We operate both Apple Silicon and NVIDIA inference capacity.
+- We operate multiple Mac AX Engine endpoints across offices, trust boundaries, or independent
+  maintenance and failure domains.
 - We operate multiple CUDA/Dynamo domains across regions, offices, trust boundaries, or independent
   rollout and failure domains.
 - NVIDIA PC and Thor must be separate deployment, trust, or failure domains.
