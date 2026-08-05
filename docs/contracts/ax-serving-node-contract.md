@@ -352,6 +352,38 @@ digest. Without a domain ID, operators can use the explicit Mac/compatibility
 migration mapping. NVIDIA production domains require the separate adapter, a
 valid v1.1 descriptor, and a ready aggregate observation.
 
+### Generic OpenAI-compatible runtime onboarding
+
+Any OpenAI-compatible runtime (for example `llama-server`, `mlxcel-server`,
+or Ollama) can sit behind `ax-runtime-agent` as a
+`compatibility_runtime_endpoint` node without code changes. The minimal
+runtime surface is:
+
+- `GET /v1/models` — non-empty `data[].id` inventory; extra metadata fields
+  are decoded tolerantly and unknown fields are ignored.
+- `POST /v1/chat/completions` (and `POST /v1/completions` when text
+  completions are claimed) — blocking and streaming byte preservation per
+  this contract.
+- Readiness — `GET /health` by default; any 2xx status counts as ready. For
+  runtimes without a health endpoint, set
+  `AXS_NODE_RUNTIME_HEALTH_PATH=/v1/models` (legacy alias
+  `AXS_THOR_RUNTIME_HEALTH_PATH`) and the same plumbing probes that path
+  instead.
+- Telemetry (optional) — `GET /metrics` in Prometheus text format. Built-in
+  alias tables cover `ax_runtime_*`, `ax_engine_*`, `axs_*`, `vllm:*`,
+  `sglang:*`, and the llama.cpp server gauges `llamacpp:requests_processing`
+  (active requests) and `llamacpp:requests_deferred` (queue depth). Runtimes
+  with other metric names can map them explicitly via
+  `AXS_NODE_METRIC_QUEUE_DEPTH` and `AXS_NODE_METRIC_ACTIVE_SEQUENCES`
+  (legacy `AXS_THOR_METRIC_*` aliases).
+
+Signals a runtime does not measure are reported as absent, never fabricated:
+the gateway's default dispatch policy penalizes missing signals, so a node
+with no queue metric is treated as *unknown*, not as permanently un-queued.
+Onboarding a generic runtime must not add runtime-name conditionals to the
+gateway, adapter, or protocol crates; operator configuration and the
+tolerant decoding rules above are the entire extension surface.
+
 The protocol types, fixtures, and validation rules in `crates/ax-serving-protocol` are normative.
 The public [Mac cluster integration guide](../integrations/mac/CLUSTER.md) documents the current
 v1.2 source-level setup and its limitations.
