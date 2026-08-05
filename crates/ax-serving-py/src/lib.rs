@@ -185,14 +185,19 @@ impl AxModel {
         py: Python<'_>,
         mut rx: mpsc::Receiver<GenerateEvent>,
     ) -> PyResult<String> {
-        let runtime_guard = self
-            .runtime_lock
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("runtime lock poisoned"))?;
         let runtime = &self.runtime;
 
+        // The runtime lock must be acquired inside `py.detach` (i.e. after the
+        // GIL is released). Acquiring it before `detach` deadlocks when two
+        // Python threads use the same model concurrently: the second thread
+        // blocks on the mutex while holding the GIL, and the first thread
+        // blocks re-acquiring the GIL at the end of `detach`.
         let result: Result<String, String> = py.detach(move || {
-            runtime.block_on(async move {
+            let runtime_guard = self
+                .runtime_lock
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            let result = runtime.block_on(async move {
                 let mut output = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -203,9 +208,10 @@ impl AxModel {
                     }
                 }
                 Ok(output)
-            })
+            });
+            drop(runtime_guard);
+            result
         });
-        drop(runtime_guard);
 
         result.map_err(PyRuntimeError::new_err)
     }
