@@ -256,6 +256,11 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
 The current agent can also proxy direct vLLM/SGLang endpoints—including on Thor—for migration and
 testing. That path always registers as `compatibility_runtime_endpoint`; it is not a Dynamo domain
 and is not the target NVIDIA production architecture.
+The same compatibility path covers generic OpenAI-compatible runtimes (llama.cpp `llama-server`,
+`mlxcel-server`, Ollama): set `AXS_NODE_RUNTIME_HEALTH_PATH` when the runtime has no `/health`
+endpoint (e.g. `/v1/models`, any 2xx is ready) and `AXS_NODE_METRIC_QUEUE_DEPTH` /
+`AXS_NODE_METRIC_ACTIVE_SEQUENCES` when its Prometheus `/metrics` names are outside the built-in
+alias tables. Signals a runtime does not measure are reported as unknown, never fabricated.
 For the NVIDIA path, follow the
 [Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) and validate an immutable manifest before
 starting `ax-dynamo-adapter`. Source/mock conformance is not live hardware certification.

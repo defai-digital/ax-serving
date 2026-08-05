@@ -133,6 +133,48 @@ process being alive is insufficient.
 The current `ax-runtime-agent` can point directly at vLLM/SGLang for migration and testing. This is
 not the final production NVIDIA architecture and must not be used as Dynamo federation evidence.
 
+### Generic OpenAI-compatible runtime (llama.cpp example)
+
+The same agent fronts any OpenAI-compatible runtime — llama.cpp `llama-server`, `mlxcel-server`,
+Ollama, and similar — as a `compatibility_runtime_endpoint` node. Start the runtime first (for
+llama.cpp, `llama-server --port 8080 --metrics`), then attach the agent:
+
+```bash
+AXS_CONTROL_PLANE_URL=https://ax-serving-control.example \
+AXS_NODE_RUNTIME=llamacpp \
+AXS_RUNTIME_VERSION='replace-with-pinned-version' \
+AXS_NODE_RUNTIME_URL=http://127.0.0.1:8080 \
+AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
+AXS_NODE_ADVERTISED_ADDR=10.20.1.11:18081 \
+AXS_NODE_ID=generic-llamacpp-01 \
+AXS_NODE_WORKER_POOL=generic-compat \
+AXS_NODE_HARDWARE_CLASS=x86-cpu \
+AXS_NODE_DOMAIN_ID=generic-local \
+AXS_NODE_DOMAIN_QUALIFICATION=experimental \
+AXS_TRUST_DOMAIN=private-local \
+AXS_TLS_PROFILE=trusted_mesh \
+AXS_WORKER_TOKEN='adapter-control-key' \
+AXS_DISPATCH_TOKEN='gateway-adapter-key' \
+target/release/ax-runtime-agent
+```
+
+Runtime-specific notes:
+
+- **Readiness path**: the agent probes `GET /health` by default and treats any 2xx as ready. For a
+  runtime without a health endpoint (e.g. Ollama), set `AXS_NODE_RUNTIME_HEALTH_PATH=/v1/models`
+  (legacy alias `AXS_THOR_RUNTIME_HEALTH_PATH`); llama.cpp's `llama-server` already serves
+  `/health` and needs no override.
+- **Telemetry**: if the runtime exposes Prometheus `/metrics`, the agent recognizes the llama.cpp
+  gauges `llamacpp:requests_processing` (active) and `llamacpp:requests_deferred` (queued) plus the
+  built-in AX/vLLM/SGLang alias tables. For other metric names, map them explicitly with
+  `AXS_NODE_METRIC_QUEUE_DEPTH` and `AXS_NODE_METRIC_ACTIVE_SEQUENCES` (legacy `AXS_THOR_METRIC_*`
+  aliases), e.g. `AXS_NODE_METRIC_QUEUE_DEPTH=myruntime_requests_queued`.
+- **Missing telemetry stays missing**: a runtime without queue metrics reports queue depth as
+  unknown, not zero. The default dispatch policy penalizes unknown signals, so saturation-aware
+  dispatch keeps working instead of over-preferring a node that merely fails to report.
+- Set `AXS_NODE_DOMAIN_QUALIFICATION=certified` only with retained live-conformance evidence for
+  the exact runtime/model identity; otherwise keep `experimental` or the default `unverified`.
+
 ### Target PC Dynamo path
 
 The approved target is:
