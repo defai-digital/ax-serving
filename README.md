@@ -395,5 +395,5 @@ Dynamo remains a separately pinned and operated execution domain.
 
 AX Serving is open-source software under the [Apache License, Version 2.0](LICENSE). See
 [LICENSING.md](LICENSING.md), [NOTICE](NOTICE), and [TRADEMARKS.md](TRADEMARKS.md) for scope,
-attribution, and trademark guidance. Version 3.0.0 removes the former commercial-license activation
-API and configuration; see the [v3 migration note](docs/migrations/v3-apache-2.0.md).
+attribution, and trademark guidance. Version 2.3.0 removes the former commercial-license activation
+API and configuration; see the [v2.3 migration note](docs/migrations/v2.3-apache-2.0.md).

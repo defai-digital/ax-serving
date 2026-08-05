@@ -13,7 +13,7 @@
 class AxServing < Formula
   desc "Runtime-neutral inference gateway plus Apple Silicon compatibility tools"
   homepage "https://github.com/defai-digital/ax-serving"
-  version "3.0.0"
+  version "2.3.0"
   license "Apache-2.0"
 
   # Only Apple Silicon is supported

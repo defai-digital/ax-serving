@@ -3,7 +3,7 @@ name: ax-serving
 description: CPU-only AX Serving gateway (no inference runtimes or accelerators)
 type: application
 version: 0.1.0
-appVersion: "3.0.0"
+appVersion: "2.3.0"
 keywords:
   - inference
   - gateway
