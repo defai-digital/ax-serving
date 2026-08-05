@@ -482,7 +482,16 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
             .context("AXS_CONTROL_PLANE_URL missing from thor config")?,
     )?;
     let worker_id = resolve_worker_id(&env_file).context("thor worker_id is not available")?;
-    let runtime_url = runtime_base_url(&env_file)?;
+    // Agent health (inflight / queue_depth) is served by the thor agent on its
+    // listen address, not by the vLLM runtime — probing the runtime's /health
+    // never yields agent JSON, so is_idle() would never become true.
+    let listen_addr = parse_socket_addr(
+        env_file
+            .get_first(LISTEN_ADDR_ALIASES)
+            .unwrap_or(DEFAULT_THOR_LISTEN_ADDR),
+        "listen address",
+    )?;
+    let agent_base = local_probe_base(listen_addr);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(5))
@@ -506,7 +515,7 @@ pub async fn drain(args: DrainArgs) -> Result<()> {
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(args.idle_timeout_secs.max(1));
     loop {
-        let health = probe_agent_health(&client, &format!("{runtime_url}/health")).await;
+        let health = probe_agent_health(&client, &format!("{agent_base}/health")).await;
         if health.is_idle() {
             post_control_plane_action(
                 &client,

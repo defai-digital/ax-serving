@@ -1416,7 +1416,8 @@ fn print_support_bundle_human(report: &SupportBundleReport) {
 
 fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
