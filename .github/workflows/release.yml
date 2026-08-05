@@ -307,6 +307,10 @@ jobs:
     name: Publish JavaScript SDK
     needs: build-macos
     runs-on: ubuntu-latest
+    # The npm scope is an optional distribution channel and may not be
+    # provisioned yet. Keep registry failures visible without failing the
+    # already-published, attested GitHub release.
+    continue-on-error: true
     steps:
       - name: Check npm publishing configuration
         id: config
@@ -345,6 +349,9 @@ jobs:
     name: Publish Python SDK
     needs: build-macos
     runs-on: ubuntu-latest
+    # PyPI trusted publishing must be configured outside this repository. A
+    # missing publisher must not turn a successful GitHub release red.
+    continue-on-error: true
     environment:
       name: pypi
       url: https://pypi.org/project/ax-serving/
@@ -359,9 +366,12 @@ jobs:
       - name: Build and test distribution
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade build pytest pytest-asyncio
+          python -m pip install --upgrade pip build
+          python -m pip install -e '.[dev]'
           python -m pytest -q
           python -m build
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip check
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/python/dist/
