@@ -18,6 +18,9 @@
 //   `AXS_LLAMA_LIB_DIR`     — directory containing `libllama.dylib`
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(llama_sampler_penalties_has_n_vocab)");
+    println!("cargo:rustc-check-cfg=cfg(llama_sampler_penalties_has_last_n)");
+
     // Only run when the `libllama` feature is explicitly enabled.
     if std::env::var("CARGO_FEATURE_LIBLLAMA").is_err() {
         return;
@@ -89,6 +92,32 @@ fn main() {
         .to_string()
         // Rust 2024 requires `unsafe extern` blocks.
         .replace("extern \"C\" {", "unsafe extern \"C\" {");
+
+    // llama.cpp has shipped three penalty-sampler signatures:
+    //   (penalty_last_n, repeat, frequency, presence)
+    //   (n_vocab, penalty_last_n, repeat, frequency, presence)
+    //   (n_vocab, repeat, frequency, presence)
+    // Detect the exact generated binding instead of coupling AX Serving to a
+    // particular Homebrew bottle or silently swapping two integer arguments.
+    let (_, penalties_tail) = bindings_rs
+        .split_once("pub fn llama_sampler_init_penalties(")
+        .expect("llama_sampler_init_penalties missing from generated bindings");
+    let (penalties_signature, _) = penalties_tail
+        .split_once(") ->")
+        .expect("could not parse llama_sampler_init_penalties binding");
+    let has_n_vocab = penalties_signature.contains("n_vocab:");
+    let has_last_n = penalties_signature.contains("penalty_last_n:");
+    assert!(
+        has_n_vocab || has_last_n,
+        "unsupported llama_sampler_init_penalties binding"
+    );
+    if has_n_vocab {
+        println!("cargo:rustc-cfg=llama_sampler_penalties_has_n_vocab");
+    }
+    if has_last_n {
+        println!("cargo:rustc-cfg=llama_sampler_penalties_has_last_n");
+    }
+
     std::fs::write(out_dir.join("libllama_bindings.rs"), bindings_rs)
         .expect("failed to write libllama_bindings.rs");
 }

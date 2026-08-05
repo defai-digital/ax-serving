@@ -1202,10 +1202,31 @@ unsafe fn build_sampler(
     if rep != 1.0 || freq != 0.0 || pres != 0.0 {
         unsafe {
             let n_vocab = ffi::llama_vocab_n_tokens(ffi::llama_model_get_vocab(model));
-            ffi::llama_sampler_chain_add(
-                chain,
-                ffi::llama_sampler_init_penalties(n_vocab, 64, rep, freq, pres),
-            );
+            let penalties = {
+                #[cfg(all(
+                    llama_sampler_penalties_has_n_vocab,
+                    llama_sampler_penalties_has_last_n
+                ))]
+                {
+                    ffi::llama_sampler_init_penalties(n_vocab, 64, rep, freq, pres)
+                }
+                #[cfg(all(
+                    llama_sampler_penalties_has_n_vocab,
+                    not(llama_sampler_penalties_has_last_n)
+                ))]
+                {
+                    ffi::llama_sampler_init_penalties(n_vocab, rep, freq, pres)
+                }
+                #[cfg(all(
+                    not(llama_sampler_penalties_has_n_vocab),
+                    llama_sampler_penalties_has_last_n
+                ))]
+                {
+                    let _ = n_vocab;
+                    ffi::llama_sampler_init_penalties(64, rep, freq, pres)
+                }
+            };
+            ffi::llama_sampler_chain_add(chain, penalties);
         }
     }
 
