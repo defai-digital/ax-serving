@@ -117,7 +117,11 @@ pub fn browse_services(
             Ok(ServiceEvent::SearchStopped(_)) => break,
             Ok(_) => {}
             Err(_) => {
-                // flume timeout or disconnect — keep looping until deadline.
+                // Timeout: keep looping until the deadline. A disconnected
+                // channel returns immediately, so break instead of spinning.
+                if receiver.is_disconnected() {
+                    break;
+                }
             }
         }
     }
