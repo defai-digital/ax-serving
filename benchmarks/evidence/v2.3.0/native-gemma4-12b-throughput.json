@@ -1,0 +1,25 @@
+{
+  "model": "gemma4",
+  "results": [
+    {
+      "decode_tok_per_sec": 58.49524746998937,
+      "prefill_tok_per_sec": 201.25786163522014,
+      "prompt_length": 39
+    },
+    {
+      "decode_tok_per_sec": 69.77012763009111,
+      "prefill_tok_per_sec": 353.854520701783,
+      "prompt_length": 209
+    },
+    {
+      "decode_tok_per_sec": 48.95633747652246,
+      "prefill_tok_per_sec": 399.53024442655175,
+      "prompt_length": 509
+    },
+    {
+      "decode_tok_per_sec": 65.16054319346243,
+      "prefill_tok_per_sec": 29240.538408546578,
+      "prompt_length": 1024
+    }
+  ]
+}

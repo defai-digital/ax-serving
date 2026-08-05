@@ -1,0 +1,88 @@
+{
+  "tool": "llama-bench",
+  "build_commit": "a4701c98f",
+  "build_number": 9020,
+  "cpu_info": "Accelerate, Apple M2 Ultra",
+  "gpu_info": "Apple M2 Ultra",
+  "backends": "BLAS,MTL",
+  "model_type": "qwen35 9B IQ4_XS - 4.25 bpw",
+  "model_size": 5157685248,
+  "model_n_params": 8953803264,
+  "config": {
+    "n_batch": 2048,
+    "n_ubatch": 512,
+    "n_threads": 16,
+    "n_gpu_layers": 99,
+    "flash_attn": false,
+    "type_k": "f16",
+    "type_v": "f16",
+    "measured_iterations": 5
+  },
+  "results": [
+    {
+      "n_prompt": 39,
+      "n_gen": 0,
+      "avg_tok_per_sec": 400.754032,
+      "stddev_tok_per_sec": 0.412906,
+      "samples_tok_per_sec": [
+        400.381,
+        400.419,
+        400.695,
+        400.881,
+        401.395
+      ]
+    },
+    {
+      "n_prompt": 209,
+      "n_gen": 0,
+      "avg_tok_per_sec": 819.369899,
+      "stddev_tok_per_sec": 1.757942,
+      "samples_tok_per_sec": [
+        821.504,
+        819.062,
+        820.31,
+        816.762,
+        819.211
+      ]
+    },
+    {
+      "n_prompt": 509,
+      "n_gen": 0,
+      "avg_tok_per_sec": 928.315507,
+      "stddev_tok_per_sec": 0.771476,
+      "samples_tok_per_sec": [
+        929.004,
+        927.698,
+        928.471,
+        929.061,
+        927.343
+      ]
+    },
+    {
+      "n_prompt": 1024,
+      "n_gen": 0,
+      "avg_tok_per_sec": 945.810874,
+      "stddev_tok_per_sec": 0.438124,
+      "samples_tok_per_sec": [
+        945.754,
+        945.651,
+        945.444,
+        946.569,
+        945.637
+      ]
+    },
+    {
+      "n_prompt": 0,
+      "n_gen": 128,
+      "avg_tok_per_sec": 67.783808,
+      "stddev_tok_per_sec": 0.02289,
+      "samples_tok_per_sec": [
+        67.8178,
+        67.76,
+        67.7719,
+        67.7738,
+        67.7955
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "model": "llama3",
+  "results": [
+    {
+      "decode_tok_per_sec": 292.0640162430672,
+      "prefill_tok_per_sec": 3239.135400012458,
+      "prompt_length": 39
+    },
+    {
+      "decode_tok_per_sec": 265.7817198522466,
+      "prefill_tok_per_sec": 9911.574058024631,
+      "prompt_length": 209
+    },
+    {
+      "decode_tok_per_sec": 450.9749023940574,
+      "prefill_tok_per_sec": 5550.11369391546,
+      "prompt_length": 509
+    },
+    {
+      "decode_tok_per_sec": 446.5567384455921,
+      "prefill_tok_per_sec": 180697.8997574872,
+      "prompt_length": 1024
+    }
+  ]
+}

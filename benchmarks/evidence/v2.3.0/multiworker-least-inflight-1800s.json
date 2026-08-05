@@ -1,0 +1,25 @@
+{
+  "config": {
+    "concurrency": 16,
+    "decode_tokens": 128,
+    "mode": "direct",
+    "model_id": "minicpm5-1b",
+    "total_requests": 4757,
+    "url": "http://127.0.0.1:18080"
+  },
+  "results": {
+    "errors": 0,
+    "gates": {
+      "overhead_p50_lt_5ms": false
+    },
+    "latency_ms": {
+      "mean": 6064.5639172020165,
+      "p50": 6259.897875,
+      "p95": 8372.742457999999,
+      "p99": 9417.473667
+    },
+    "requests_per_sec": 2.632286653083765,
+    "success": 4757,
+    "total_duration_ms": 1807174
+  }
+}

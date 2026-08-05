@@ -1,0 +1,25 @@
+{
+  "model": "mistral3",
+  "results": [
+    {
+      "decode_tok_per_sec": 34.133241455599084,
+      "prefill_tok_per_sec": 263.4686383956981,
+      "prompt_length": 39
+    },
+    {
+      "decode_tok_per_sec": 44.711283870544065,
+      "prefill_tok_per_sec": 1270.5685287154445,
+      "prompt_length": 209
+    },
+    {
+      "decode_tok_per_sec": 32.39391429979736,
+      "prefill_tok_per_sec": 659.8314839909657,
+      "prompt_length": 509
+    },
+    {
+      "decode_tok_per_sec": 38.54084493226485,
+      "prefill_tok_per_sec": 31811.36852569529,
+      "prompt_length": 1024
+    }
+  ]
+}

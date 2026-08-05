@@ -1,115 +1,97 @@
 {
   "_meta": {
-    "description": "Phase 1 inference baselines for the native backend models. BMS-AX-SERVING-v1.0 §4.",
-    "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
-    "os": "macOS 14.x (Sonoma)",
-    "build": "cargo build --workspace --release",
-    "date": null,
-    "note": "Results are null — fill in on reference hardware after running: cargo run -p ax-serving-bench --release -- bench -m <model_path>"
+    "description": "AX Engine native-backend release baselines for v2.3.0.",
+    "hardware": "Apple Mac Studio, M2 Ultra, 24 CPU cores (16 performance + 8 efficiency), 192 GB unified memory",
+    "os": "macOS 26.6 (25G72)",
+    "build": "cargo build --release -p ax-serving-bench",
+    "git_commit": "72077118d5fdf0412c69b912ee614d7a7029a555",
+    "date": "2026-08-05",
+    "throughput_protocol": {
+      "prompt_lengths": [
+        39,
+        209,
+        509,
+        1024
+      ],
+      "decode_tokens": 128,
+      "warmup_iterations": 2,
+      "measured_iterations": 5,
+      "aggregation": "Minimum observed throughput across the four prompt lengths"
+    },
+    "ttft_protocol": {
+      "prompt_length": 128,
+      "decode_tokens": 64,
+      "warmup_iterations": 2,
+      "measured_iterations": 5,
+      "aggregation": "P50 time to first token"
+    },
+    "target_policy": "Throughput floors are rounded down from 90% of the measured release result; the TTFT ceiling is 100 ms.",
+    "evidence_directory": "benchmarks/evidence/v2.3.0"
   },
   "models": [
     {
-      "model_id": "llama3-8b",
-      "gguf_filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
+      "model_id": "minicpm5-1b",
+      "artifact": "AX-MiniCPM5-1B-MLX-AXQ-4bit",
+      "artifact_manifest_sha256": "7e51ebe6c2ce5c2276105322a5026eb653542f7b3b7da30aab221bd8b43c0b01",
+      "quant": "AXQ 4-bit",
       "backend": "native",
       "targets": {
-        "decode_tok_per_sec": 100.0,
-        "prefill_tok_per_sec": 1200.0,
-        "ttft_ms": 500.0
+        "decode_tok_per_sec": 239.0,
+        "prefill_tok_per_sec": 2915.0,
+        "ttft_ms": 100.0
       },
       "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
+        "decode_tok_per_sec": 265.7817198522466,
+        "prefill_tok_per_sec": 3239.135400012458,
+        "ttft_ms": 9.411375,
         "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
+          "decode_gate_pass": true,
+          "prefill_gate_pass": true,
+          "ttft_gate_pass": true
         }
       }
     },
     {
-      "model_id": "qwen3-8b",
-      "gguf_filename": "Qwen3-8B-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
+      "model_id": "gemma4-12b",
+      "artifact": "AX-gemma-4-12b-MLX-AXQ-4bit",
+      "artifact_manifest_sha256": "80a72cdf0ad436e1038fa2d3b736246ceae7387757040b6cb69f708f9d75d71c",
+      "quant": "AXQ 4-bit",
       "backend": "native",
       "targets": {
-        "decode_tok_per_sec": 35.0,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": 500.0
+        "decode_tok_per_sec": 44.0,
+        "prefill_tok_per_sec": 181.0,
+        "ttft_ms": 100.0
       },
       "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
+        "decode_tok_per_sec": 48.95633747652246,
+        "prefill_tok_per_sec": 201.25786163522014,
+        "ttft_ms": 35.566292,
         "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
+          "decode_gate_pass": true,
+          "prefill_gate_pass": true,
+          "ttft_gate_pass": true
         }
       }
     },
     {
-      "model_id": "gemma3-4b",
-      "gguf_filename": "gemma-3-4b-it-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
+      "model_id": "mistral-small-3.1-24b",
+      "artifact": "AX-Mistral-Small-3.1-24B-Instruct-2503-MLX-AXQ-4bit",
+      "artifact_manifest_sha256": "7d4f882cbbb8d785c646a6baacfd99b5b6fff764864b1b742ee483e6d8237568",
+      "quant": "AXQ 4-bit",
       "backend": "native",
       "targets": {
-        "decode_tok_per_sec": 90.0,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": 500.0
+        "decode_tok_per_sec": 29.0,
+        "prefill_tok_per_sec": 237.0,
+        "ttft_ms": 100.0
       },
       "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
+        "decode_tok_per_sec": 32.39391429979736,
+        "prefill_tok_per_sec": 263.4686383956981,
+        "ttft_ms": 33.500916,
         "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
-        }
-      }
-    },
-    {
-      "model_id": "glm4-9b",
-      "gguf_filename": "glm-4-9b-chat-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
-      "backend": "native",
-      "targets": {
-        "decode_tok_per_sec": 30.0,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": 500.0
-      },
-      "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
-        "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
-        }
-      }
-    },
-    {
-      "model_id": "deepseek-r1-7b",
-      "gguf_filename": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
-      "backend": "native",
-      "targets": {
-        "decode_tok_per_sec": 80.0,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": 500.0
-      },
-      "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
-        "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
+          "decode_gate_pass": true,
+          "prefill_gate_pass": true,
+          "ttft_gate_pass": true
         }
       }
     }

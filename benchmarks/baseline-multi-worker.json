@@ -1,14 +1,36 @@
 {
   "_meta": {
-    "description": "Multi-worker orchestration baselines (ADR-012, TASK-MW-019).",
-    "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
-    "os": "macOS 14.x (Sonoma)",
-    "build": "cargo build --workspace --release",
-    "date": "2026-03-01",
-    "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-    "model_id": "llama3-8b",
+    "description": "Direct multi-worker orchestration release baselines for v2.3.0.",
+    "hardware": "Apple Mac Studio, M2 Ultra, 24 CPU cores (16 performance + 8 efficiency), 192 GB unified memory",
+    "os": "macOS 26.6 (25G72)",
+    "build_commands": [
+      "cargo build --release -p ax-serving-bench",
+      "cargo build --release -p ax-serving-cli --features embedded-compat --bin ax-serving",
+      "cargo build --release -p ax-serving-cli --bin ax-serving-api"
+    ],
+    "git_commit": "72077118d5fdf0412c69b912ee614d7a7029a555",
+    "date": "2026-08-05",
+    "model": "AX-MiniCPM5-1B-MLX-AXQ-4bit",
+    "model_id": "minicpm5-1b",
+    "artifact_manifest_sha256": "7e51ebe6c2ce5c2276105322a5026eb653542f7b3b7da30aab221bd8b43c0b01",
+    "worker_placement": "Four embedded compatibility workers on one loopback Mac Studio host",
+    "workers": 4,
+    "concurrency": 16,
+    "per_worker_control_concurrency": 4,
     "decode_tokens": 128,
-    "note": "Baselines measured at 16 concurrent clients, 30-minute runs. Fill in on reference hardware."
+    "duration_secs": 1800,
+    "gate_policy": {
+      "throughput_vs_control_min_ratio": 3.2,
+      "throughput_rationale": "At least 80% of ideal linear scaling across four workers",
+      "p95_vs_control_max_ratio": 1.5,
+      "error_rate_max_pct": 1.0
+    },
+    "dispatch_overhead_note": "The runner's overhead flag compares end-to-end LLM P50 latency with 5 ms, so it is not an isolated gateway dispatch measurement and is not an applicable release gate for these live-model runs.",
+    "excluded_scenarios": [
+      "The benchmark CLI does not drive a NATS dispatcher.",
+      "The benchmark CLI sends one model ID per run and therefore does not exercise a two-model affinity scenario."
+    ],
+    "evidence_directory": "benchmarks/evidence/v2.3.0"
   },
   "configs": [
     {
@@ -19,24 +41,26 @@
       "concurrency": 16,
       "duration_secs": 1800,
       "results": {
-        "requests_total": null,
-        "success": null,
-        "errors": null,
-        "error_rate_pct": null,
-        "requests_per_sec": null,
+        "requests_total": 4757,
+        "success": 4757,
+        "errors": 0,
+        "error_rate_pct": 0.0,
+        "total_duration_ms": 1807174,
+        "requests_per_sec": 2.632286653083765,
         "latency_ms": {
-          "mean": null,
-          "p50": null,
-          "p95": null,
-          "p99": null
+          "mean": 6064.5639172020165,
+          "p50": 6259.897875,
+          "p95": 8372.742457999999,
+          "p99": 9417.473667
         },
         "gates": {
-          "throughput_vs_single_worker_ratio": null,
-          "throughput_gate_pass": null,
-          "p95_vs_single_worker_ratio": null,
-          "p95_gate_pass": null,
-          "error_rate_lt_1pct": null,
-          "dispatch_overhead_p50_lt_5ms": null
+          "throughput_vs_single_worker_ratio": 3.9938632472578735,
+          "throughput_gate_pass": true,
+          "p95_vs_single_worker_ratio": 1.3302202661639668,
+          "p95_gate_pass": true,
+          "error_rate_lt_1pct": true,
+          "dispatch_overhead_gate_applicable": false,
+          "runner_reported_overhead_p50_lt_5ms": false
         }
       }
     },
@@ -48,90 +72,60 @@
       "concurrency": 16,
       "duration_secs": 1800,
       "results": {
-        "requests_total": null,
-        "success": null,
-        "errors": null,
-        "error_rate_pct": null,
-        "requests_per_sec": null,
+        "requests_total": 4358,
+        "success": 4358,
+        "errors": 0,
+        "error_rate_pct": 0.0,
+        "total_duration_ms": 1808672,
+        "requests_per_sec": 2.409502662727128,
         "latency_ms": {
-          "mean": null,
-          "p50": null,
-          "p95": null,
-          "p99": null
+          "mean": 6623.758293103709,
+          "p50": 6323.760792,
+          "p95": 12530.0335,
+          "p99": 14917.430124999999
         },
         "gates": {
-          "throughput_vs_single_worker_ratio": null,
-          "throughput_gate_pass": null,
-          "p95_vs_single_worker_ratio": null,
-          "p95_gate_pass": null,
-          "error_rate_lt_1pct": null,
-          "dispatch_overhead_p50_lt_5ms": null
-        }
-      }
-    },
-    {
-      "id": "direct-model_affinity-2x2w",
-      "mode": "direct",
-      "policy": "model_affinity",
-      "workers": 4,
-      "concurrency": 16,
-      "duration_secs": 1800,
-      "note": "2 workers per 2 models (model_affinity scenario)",
-      "results": {
-        "requests_total": null,
-        "success": null,
-        "errors": null,
-        "error_rate_pct": null,
-        "requests_per_sec": null,
-        "latency_ms": {
-          "mean": null,
-          "p50": null,
-          "p95": null,
-          "p99": null
-        },
-        "gates": {
-          "throughput_vs_single_worker_ratio": null,
-          "throughput_gate_pass": null,
-          "p95_vs_single_worker_ratio": null,
-          "p95_gate_pass": null,
-          "error_rate_lt_1pct": null,
-          "dispatch_overhead_p50_lt_5ms": null
-        }
-      }
-    },
-    {
-      "id": "nats-least_inflight-4w",
-      "mode": "nats",
-      "policy": "least_inflight",
-      "workers": 4,
-      "concurrency": 16,
-      "duration_secs": 1800,
-      "results": {
-        "requests_total": null,
-        "success": null,
-        "errors": null,
-        "error_rate_pct": null,
-        "requests_per_sec": null,
-        "latency_ms": {
-          "mean": null,
-          "p50": null,
-          "p95": null,
-          "p99": null
-        },
-        "gates": {
-          "throughput_vs_single_worker_ratio": null,
-          "throughput_gate_pass": null,
-          "p95_vs_single_worker_ratio": null,
-          "p95_gate_pass": null,
-          "error_rate_lt_1pct": null,
-          "dispatch_overhead_p50_lt_5ms": null
+          "throughput_vs_single_worker_ratio": 3.6558420100493625,
+          "throughput_gate_pass": true,
+          "p95_vs_single_worker_ratio": 1.9907102817294637,
+          "p95_gate_pass": false,
+          "error_rate_lt_1pct": true,
+          "dispatch_overhead_gate_applicable": false,
+          "runner_reported_overhead_p50_lt_5ms": false
         }
       }
     }
   ],
   "single_worker_baseline": {
-    "model_id": "llama3-8b",
-    "decode_tok_per_sec": null,
-    "note": "Copy from benchmarks/baseline.json llama3-8b entry after measuring on reference hardware."
+    "model_id": "minicpm5-1b",
+    "native_decode_tok_per_sec": 265.7817198522466,
+    "sequential_control": {
+      "concurrency": 1,
+      "requests_total": 100,
+      "success": 100,
+      "errors": 0,
+      "total_duration_ms": 148737,
+      "requests_per_sec": 0.6723276656111122,
+      "latency_ms": {
+        "mean": 1487.3138104699995,
+        "p50": 1542.8881250000002,
+        "p95": 1553.257292,
+        "p99": 1574.9306669999999
+      }
+    },
+    "scaling_control": {
+      "concurrency": 4,
+      "requests_total": 100,
+      "success": 100,
+      "errors": 0,
+      "total_duration_ms": 151726,
+      "requests_per_sec": 0.6590828203472048,
+      "latency_ms": {
+        "mean": 5975.2454350000025,
+        "p50": 6255.713458,
+        "p95": 6294.252667000001,
+        "p99": 6304.674583
+      }
+    }
   }
 }

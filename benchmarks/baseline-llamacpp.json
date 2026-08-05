@@ -1,32 +1,56 @@
 {
   "_meta": {
-    "description": "Phase 1 inference baselines for llama.cpp backend models. BMS-AX-SERVING-v1.0 §4.",
-    "hardware": "Apple M3 Pro 12-core, 36 GB unified memory",
-    "os": "macOS 14.x (Sonoma)",
-    "build": "cargo build --workspace --release",
-    "llama_server": "llama-server from llama.cpp (latest release)",
-    "date": null,
-    "note": "Results are null — fill in on reference hardware after running: cargo run -p ax-serving-bench --release -- bench -m <model_path>"
+    "description": "llama.cpp backend release baseline for v2.3.0.",
+    "hardware": "Apple Mac Studio, M2 Ultra, 24 CPU cores (16 performance + 8 efficiency), 192 GB unified memory",
+    "os": "macOS 26.6 (25G72)",
+    "git_commit": "72077118d5fdf0412c69b912ee614d7a7029a555",
+    "llama_cpp": "llama.cpp build 9020 (a4701c98f), Metal + Accelerate",
+    "date": "2026-08-05",
+    "throughput_protocol": {
+      "tool": "llama-bench",
+      "prompt_lengths": [
+        39,
+        209,
+        509,
+        1024
+      ],
+      "decode_tokens": 128,
+      "measured_iterations": 5,
+      "aggregation": "Minimum prompt throughput across the four prompt lengths and mean generation throughput"
+    },
+    "ttft_protocol": {
+      "tool": "llama-server streaming HTTP",
+      "prompt_tokens_approx": 128,
+      "decode_tokens": 64,
+      "warmup_iterations": 2,
+      "measured_iterations": 5,
+      "aggregation": "P50 time to first streamed content or reasoning token"
+    },
+    "target_policy": "Throughput floors are rounded down from 90% of the measured release result; the TTFT ceiling is 100 ms.",
+    "evidence_directory": "benchmarks/evidence/v2.3.0"
   },
   "models": [
     {
-      "model_id": "gptj-6b",
-      "gguf_filename": "gpt-j-6b-Q4_K_M.gguf",
-      "quant": "Q4_K_M",
+      "model_id": "qwen3.5-9b",
+      "gguf_filename": "Qwen3_5-9B-IQ4_XS/model.gguf",
+      "artifact_sha256": "7e918aeca06c52bcb528ea6b04b4ec957e75ee8c0a73138854c0dfcf371ea429",
+      "model_size_bytes": 5157685248,
+      "parameter_count": 8953803264,
+      "quant": "IQ4_XS (4.25 bpw)",
       "backend": "llama_cpp",
       "targets": {
-        "decode_tok_per_sec": 40.0,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": 500.0
+        "decode_tok_per_sec": 61.0,
+        "prefill_tok_per_sec": 360.0,
+        "ttft_ms": 100.0
       },
       "results": {
-        "decode_tok_per_sec": null,
-        "prefill_tok_per_sec": null,
-        "ttft_ms": null,
+        "decode_tok_per_sec": 67.783808,
+        "prefill_tok_per_sec": 400.754032,
+        "ttft_ms": 75.22087500547059,
         "gates": {
-          "decode_gate_pass": null,
-          "prefill_gate_pass": null,
-          "ttft_gate_pass": null
+          "decode_gate_pass": true,
+          "prefill_gate_pass": true,
+          "ttft_gate_pass": true
         }
       }
     }
