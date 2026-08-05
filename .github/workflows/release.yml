@@ -201,8 +201,11 @@ jobs:
           cp README.md QUICKSTART.md LICENSE NOTICE LICENSING.md TRADEMARKS.md "$STAGE/"
           tar -czf "$TARBALL" "$STAGE"
           shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(awk '{print $1}' "${TARBALL}.sha256")" >> "$GITHUB_OUTPUT"
+          {
+            echo "stage=$STAGE"
+            echo "tarball=$TARBALL"
+            echo "sha256=$(awk '{print $1}' "${TARBALL}.sha256")"
+          } >> "$GITHUB_OUTPUT"
       - name: Sign archive with Minisign when configured
         id: minisign
         env:
@@ -223,9 +226,11 @@ jobs:
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          path: ${{ steps.package.outputs.tarball }}
+          path: ${{ steps.package.outputs.stage }}
           format: spdx-json
           output-file: ${{ steps.package.outputs.tarball }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
       - name: Attest archive provenance
         uses: actions/attest-build-provenance@v4
         with:
