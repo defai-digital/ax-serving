@@ -136,6 +136,7 @@ fn cluster_registration(address: SocketAddr, generation: u64) -> RegisterWorkerR
             kind: "ax_engine".into(),
             version: "6.12.0".into(),
             api: "openai-http".into(),
+            endpoint: None,
         },
         hardware: HardwareDescriptor {
             platform: "macos".into(),

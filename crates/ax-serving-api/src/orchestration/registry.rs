@@ -40,6 +40,7 @@ use ax_serving_protocol::{
 use super::fleet_state::{SharedWorkerRecord, unix_time_millis};
 
 const MAX_WORKER_INFLIGHT: usize = 1_000_000;
+const MAX_RUNTIME_KIND_LEN: usize = 128;
 
 // ── WorkerId ──────────────────────────────────────────────────────────────────
 
@@ -86,7 +87,7 @@ impl BackendKind {
             "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
             "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
             "vllm" | "v_llm" | "v-llm" => Self::Vllm,
-            "native" => Self::Native,
+            "native" | "ax_engine" | "ax-engine" | "axengine" => Self::Native,
             _ => Self::Auto,
         }
     }
@@ -105,6 +106,17 @@ impl BackendKind {
 fn backend_filter_from_hint(hint: Option<&str>) -> Option<BackendKind> {
     let raw = hint?.trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    // `ax_engine` is the canonical runtime identity, while `native` is the
+    // canonical backend identity. BackendKind accepts AX Engine spellings at
+    // API boundaries for compatibility, but the shared legacy dispatch hint
+    // must not turn a runtime-only `ax_engine` request into an additional
+    // Native-backend constraint (older agents may report backend=auto).
+    if matches!(
+        raw.to_ascii_lowercase().replace('-', "_").as_str(),
+        "ax_engine" | "axengine"
+    ) {
         return None;
     }
     match BackendKind::parse(raw) {
@@ -126,24 +138,39 @@ fn runtime_filter_from_hint(hint: Option<&str>) -> Option<RuntimeKind> {
 
 // ── RuntimeKind ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeKind {
     AxEngine,
     LlamaCpp,
     SgLang,
     Vllm,
+    Other(String),
     Unknown,
 }
 
 impl RuntimeKind {
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
-            "ax_engine" | "ax-engine" | "axengine" | "native" => Self::AxEngine,
-            "llama_cpp" | "llamacpp" | "llama-cpp" => Self::LlamaCpp,
-            "sglang" | "sg_lang" | "sg-lang" => Self::SgLang,
-            "vllm" | "v_llm" | "v-llm" => Self::Vllm,
-            _ => Self::Unknown,
+        let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+        if normalized.is_empty()
+            || normalized.len() > MAX_RUNTIME_KIND_LEN
+            || !normalized
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+            || !normalized.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '.')
+            })
+        {
+            return Self::Unknown;
+        }
+        match normalized.as_str() {
+            "auto" | "unknown" => Self::Unknown,
+            "ax_engine" | "axengine" | "native" => Self::AxEngine,
+            "llama_cpp" | "llamacpp" => Self::LlamaCpp,
+            "sglang" | "sg_lang" => Self::SgLang,
+            "vllm" | "v_llm" => Self::Vllm,
+            "tensorrt_llm" | "trt_llm" | "trtllm" => Self::Other("tensorrt_llm".into()),
+            _ => Self::Other(normalized),
         }
     }
 
@@ -157,14 +184,34 @@ impl RuntimeKind {
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::AxEngine => "ax_engine",
             Self::LlamaCpp => "llama_cpp",
             Self::SgLang => "sglang",
             Self::Vllm => "vllm",
+            Self::Other(kind) => kind,
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl Serialize for RuntimeKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
     }
 }
 
@@ -292,6 +339,8 @@ pub struct WorkerEntry {
     pub reported_inflight: usize,
     pub health: WorkerHealth,
     pub last_heartbeat: Instant,
+    /// Cadence promised to this worker at registration.
+    heartbeat_interval_ms: u64,
     /// Authoritative upstream runtime readiness when reported by a v1-capable agent.
     pub runtime_ready: Option<bool>,
     pub runtime_state: Option<String>,
@@ -872,6 +921,7 @@ impl WorkerRegistry {
                 existing.max_inflight = max_inflight;
                 existing.health = WorkerHealth::Healthy;
                 existing.last_heartbeat = Instant::now();
+                existing.heartbeat_interval_ms = heartbeat_interval_ms;
                 existing.runtime_ready = None;
                 existing.runtime_state = None;
                 existing.runtime_status_reason = None;
@@ -927,6 +977,7 @@ impl WorkerRegistry {
                 reported_inflight: 0,
                 health: WorkerHealth::Healthy,
                 last_heartbeat: Instant::now(),
+                heartbeat_interval_ms,
                 runtime_ready: None,
                 runtime_state: None,
                 runtime_status_reason: None,
@@ -1015,7 +1066,7 @@ impl WorkerRegistry {
             runtime_mode: Some("adapter".into()),
             runtime_version: Some(request.runtime.version.clone()),
             hardware_class: request.hardware.hardware_class.clone(),
-            runtime_endpoint: None,
+            runtime_endpoint: request.runtime.endpoint.clone(),
             supported_operations: operations,
             max_inflight: effective_registration_capacity(&request)
                 .and_then(|capacity| capacity.max_concurrent_requests)
@@ -1386,7 +1437,7 @@ impl WorkerRegistry {
                 runtime_mode: Some("adapter".into()),
                 runtime_version: Some(request.runtime.version.clone()),
                 hardware_class: request.hardware.hardware_class.clone(),
-                runtime_endpoint: None,
+                runtime_endpoint: request.runtime.endpoint.clone(),
                 supported_operations: operations,
                 max_inflight: effective_registration_capacity(request)
                     .and_then(|capacity| capacity.max_concurrent_requests)
@@ -1877,13 +1928,25 @@ impl WorkerRegistry {
                 continue;
             }
 
-            entry.health = if age_ms <= ttl_ms / 3 {
+            // A heartbeat performs bounded runtime probes before reporting and
+            // therefore cannot arrive at the exact advertised cadence. Keep a
+            // 50% scheduling-jitter allowance, bounded by the hard TTL. Split
+            // the remaining lease window between the two missed-heartbeat
+            // states so eviction still happens at exactly `ttl_ms`.
+            let healthy_until = entry
+                .heartbeat_interval_ms
+                .saturating_add(entry.heartbeat_interval_ms / 2)
+                .min(ttl_ms);
+            let missed_once_until =
+                healthy_until.saturating_add(ttl_ms.saturating_sub(healthy_until) / 2);
+
+            entry.health = if age_ms <= healthy_until {
                 if matches!(entry.health, WorkerHealth::Unhealthy { .. }) {
                     entry.health.clone()
                 } else {
                     WorkerHealth::Healthy
                 }
-            } else if age_ms <= (2 * ttl_ms) / 3 {
+            } else if age_ms <= missed_once_until {
                 WorkerHealth::Unhealthy { missed: 1 }
             } else if age_ms <= ttl_ms {
                 WorkerHealth::Unhealthy { missed: 2 }
@@ -4549,6 +4612,8 @@ mod tests {
         assert_eq!(BackendKind::parse("v-llm"), BackendKind::Vllm);
         assert_eq!(BackendKind::parse("native"), BackendKind::Native);
         assert_eq!(BackendKind::parse("NATIVE"), BackendKind::Native);
+        assert_eq!(BackendKind::parse("ax_engine"), BackendKind::Native);
+        assert_eq!(BackendKind::parse("ax-engine"), BackendKind::Native);
         assert_eq!(BackendKind::parse("auto"), BackendKind::Auto);
         assert_eq!(BackendKind::parse("unknown"), BackendKind::Auto);
         assert_eq!(BackendKind::parse(""), BackendKind::Auto);
@@ -4560,6 +4625,94 @@ mod tests {
         assert_eq!(RuntimeKind::parse(" LLAMA_CPP "), RuntimeKind::LlamaCpp);
         assert_eq!(RuntimeKind::parse(" sglang "), RuntimeKind::SgLang);
         assert_eq!(RuntimeKind::parse(" V-LLM "), RuntimeKind::Vllm);
+    }
+
+    #[test]
+    fn runtime_kind_preserves_valid_generic_identities() {
+        assert_eq!(
+            RuntimeKind::parse("TensorRT-LLM"),
+            RuntimeKind::Other("tensorrt_llm".into())
+        );
+        assert_eq!(
+            RuntimeKind::parse("trtllm"),
+            RuntimeKind::Other("tensorrt_llm".into())
+        );
+        assert_eq!(
+            RuntimeKind::parse("ollama"),
+            RuntimeKind::Other("ollama".into())
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeKind::parse("TensorRT-LLM")).unwrap(),
+            r#""tensorrt_llm""#
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeKind>(r#""ollama""#).unwrap(),
+            RuntimeKind::Other("ollama".into())
+        );
+    }
+
+    #[test]
+    fn runtime_kind_rejects_reserved_or_malformed_identities() {
+        for invalid in [
+            "",
+            "auto",
+            "unknown",
+            "bad runtime",
+            "../runtime",
+            "runtime!",
+        ] {
+            assert_eq!(
+                RuntimeKind::parse(invalid),
+                RuntimeKind::Unknown,
+                "{invalid:?} must not become a routable runtime identity"
+            );
+        }
+        assert_eq!(
+            RuntimeKind::parse(&"r".repeat(MAX_RUNTIME_KIND_LEN + 1)),
+            RuntimeKind::Unknown
+        );
+    }
+
+    #[test]
+    fn register_preserves_and_filters_generic_runtime_identity() {
+        let registry = WorkerRegistry::new();
+        let response = registry.register(
+            RegisterRequest {
+                backend: "auto".into(),
+                runtime: Some("TensorRT-LLM".into()),
+                ..reg_req("127.0.0.1:8081", &["tinyllama"], 8)
+            },
+            5_000,
+        );
+        let id = WorkerId::parse(&response.worker_id).unwrap();
+        let snapshot = registry.get_snapshot(id).unwrap();
+        assert_eq!(snapshot.runtime, "tensorrt_llm");
+
+        assert_eq!(
+            registry
+                .dispatch_workers_filtered(
+                    "tinyllama",
+                    RequestKind::Llm,
+                    Some("tensorrt_llm"),
+                    None,
+                    None,
+                    None,
+                )
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .dispatch_workers_filtered(
+                    "tinyllama",
+                    RequestKind::Llm,
+                    Some("ollama"),
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4608,12 +4761,14 @@ mod tests {
     #[test]
     fn tick_health_state_transitions_all_four_stages() {
         let r = WorkerRegistry::new();
-        // ttl = 9000 ms → boundaries at ttl/3 = 3000 ms, 2*ttl/3 = 6000 ms.
+        // heartbeat = 2000 ms and ttl = 9000 ms → the healthy boundary is
+        // 3000 ms (50% scheduling grace), then the remaining lease window is
+        // split at 6000 ms between missed-heartbeat states.
         let ttl_ms = 9_000u64;
 
         // Helper: register a worker then backdates its last_heartbeat.
         let make_aged = |age_ms: u64| -> WorkerId {
-            let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+            let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 2_000);
             let id = WorkerId::parse(&resp.worker_id).unwrap();
             let past = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(age_ms))
@@ -4647,6 +4802,24 @@ mod tests {
         assert_eq!(
             r.inner.get(&id_miss2).unwrap().health,
             WorkerHealth::Unhealthy { missed: 2 }
+        );
+    }
+
+    #[test]
+    fn tick_tolerates_bounded_heartbeat_scheduling_jitter() {
+        let r = WorkerRegistry::new();
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5_000);
+        let id = WorkerId::parse(&resp.worker_id).unwrap();
+        r.inner.get_mut(&id).unwrap().last_heartbeat = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(5_500))
+            .unwrap();
+
+        r.tick(15_000);
+
+        assert_eq!(
+            r.inner.get(&id).unwrap().health,
+            WorkerHealth::Healthy,
+            "probe and scheduling overhead must not flap a worker just after its 5 s cadence"
         );
     }
 

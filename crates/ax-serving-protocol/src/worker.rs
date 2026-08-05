@@ -34,6 +34,10 @@ pub struct RuntimeDescriptor {
     pub kind: String,
     pub version: String,
     pub api: String,
+    /// Operator-visible upstream runtime endpoint. This is diagnostic
+    /// metadata, not the dispatch address advertised by `WorkerDescriptor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,7 +469,7 @@ pub enum WorkerState {
 mod tests {
     use time::OffsetDateTime;
 
-    use super::{CapacityObservation, RuntimeObservation, RuntimeStatus};
+    use super::{CapacityObservation, RuntimeDescriptor, RuntimeObservation, RuntimeStatus};
     use crate::LeaseToken;
 
     #[test]
@@ -524,5 +528,22 @@ mod tests {
         let json = serde_json::to_string(&observation).unwrap();
         let decoded: RuntimeObservation = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, observation);
+    }
+
+    #[test]
+    fn runtime_endpoint_is_additive_and_backward_compatible() {
+        let without_endpoint: RuntimeDescriptor =
+            serde_json::from_str(r#"{"kind":"vllm","version":"1","api":"openai-v1"}"#).unwrap();
+        assert_eq!(without_endpoint.endpoint, None);
+
+        let with_endpoint = RuntimeDescriptor {
+            kind: "tensorrt_llm".into(),
+            version: "1.3.0".into(),
+            api: "openai-v1".into(),
+            endpoint: Some("http://runtime:8000".into()),
+        };
+        let encoded = serde_json::to_string(&with_endpoint).unwrap();
+        let decoded: RuntimeDescriptor = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, with_endpoint);
     }
 }

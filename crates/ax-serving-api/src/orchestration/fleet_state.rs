@@ -1242,6 +1242,7 @@ mod tests {
                 kind: "vllm".into(),
                 version: "1".into(),
                 api: "openai-http".into(),
+                endpoint: None,
             },
             hardware: HardwareDescriptor {
                 platform: "linux".into(),

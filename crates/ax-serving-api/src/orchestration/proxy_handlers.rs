@@ -21,7 +21,7 @@ use super::deployment::DeploymentMode;
 use super::error::ax_error_response;
 use super::queue::{AcquireResult, QueuePriority};
 use super::registry::{BackendKind, RuntimeKind};
-use super::request_profile::{PriorityClass, RequestProfile, validate_unique_routing_fields};
+use super::request_profile::{PriorityClass, RequestProfile, strip_ax_routing_hints};
 use crate::auth::{AxRequestId, RequestId};
 use crate::project_policy;
 use crate::rest::schema::{
@@ -86,16 +86,19 @@ async fn proxy_inference(
         );
         return response;
     };
-    if let Err(error) = validate_unique_routing_fields(&body) {
-        return ax_error_response(
-            StatusCode::BAD_REQUEST,
-            request_id,
-            "AXS_INVALID_REQUEST_JSON",
-            error.to_string(),
-            false,
-            ax_serving_protocol::AdmissionPhase::Admission,
-        );
-    }
+    let sanitized_body = match strip_ax_routing_hints(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return ax_error_response(
+                StatusCode::BAD_REQUEST,
+                request_id,
+                "AXS_INVALID_REQUEST_JSON",
+                error.to_string(),
+                false,
+                ax_serving_protocol::AdmissionPhase::Admission,
+            );
+        }
+    };
     let requested_pool = req_headers
         .get("x-ax-worker-pool")
         .and_then(|v| v.to_str().ok())
@@ -128,7 +131,7 @@ async fn proxy_inference(
             );
         }
     };
-    let backend_hint = match validate_dispatch_hint(meta.runtime.clone().or(meta.backend.clone())) {
+    let backend_hint = match validate_dispatch_hints(meta.backend.clone(), meta.runtime.clone()) {
         Ok(hint) => hint,
         Err(error) => {
             return ax_error_response(
@@ -278,6 +281,7 @@ async fn proxy_inference(
             );
         }
     };
+    let body = sanitized_body.map_or(body, Bytes::from);
 
     let tenant_permit = if layer.config.tenant_max_concurrent > 0 {
         match layer.tenant_limiter.try_acquire(
@@ -861,24 +865,62 @@ fn validate_proxy_model_id(model: Option<String>) -> Result<String, (StatusCode,
     Ok(model)
 }
 
-fn validate_dispatch_hint(hint: Option<String>) -> Result<Option<String>, String> {
-    let Some(raw) = hint else {
-        return Ok(None);
-    };
+fn normalized_dispatch_hint(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-        return Ok(None);
+        None
+    } else {
+        Some(trimmed.to_string())
     }
+}
 
-    if BackendKind::parse(trimmed) != BackendKind::Auto
-        || RuntimeKind::parse(trimmed) != RuntimeKind::Unknown
-    {
-        return Ok(Some(trimmed.to_ascii_lowercase()));
+fn validate_dispatch_hints(
+    backend: Option<String>,
+    runtime: Option<String>,
+) -> Result<Option<String>, String> {
+    let backend = backend.and_then(normalized_dispatch_hint);
+    let runtime = runtime.and_then(normalized_dispatch_hint);
+    let backend = backend
+        .map(|raw| {
+            let kind = BackendKind::parse(&raw);
+            if kind == BackendKind::Auto {
+                Err(format!(
+                    "invalid backend hint; expected native, llama_cpp, sglang, vllm, or auto but got {raw}"
+                ))
+            } else {
+                Ok(kind)
+            }
+        })
+        .transpose()?;
+    let runtime = runtime
+        .map(|raw| {
+            let kind = RuntimeKind::parse(&raw);
+            if kind == RuntimeKind::Unknown {
+                Err(format!(
+                    "invalid runtime hint; expected a registered runtime identifier or auto but got {raw}"
+                ))
+            } else {
+                Ok(kind)
+            }
+        })
+        .transpose()?;
+
+    match (backend, runtime) {
+        (Some(backend), Some(runtime)) => {
+            let backend_runtime = RuntimeKind::from_backend(&backend);
+            if backend_runtime != runtime {
+                return Err(format!(
+                    "backend and runtime hints conflict: {} does not select {}",
+                    backend.as_str(),
+                    runtime.as_str()
+                ));
+            }
+            Ok(Some(runtime.as_str().to_string()))
+        }
+        (Some(backend), None) => Ok(Some(backend.as_str().to_string())),
+        (None, Some(runtime)) => Ok(Some(runtime.as_str().to_string())),
+        (None, None) => Ok(None),
     }
-
-    Err(format!(
-        "invalid backend/runtime hint; expected native, ax_engine, llama_cpp, sglang, vllm, or auto but got {trimmed}"
-    ))
 }
 
 fn fairness_client_key(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
@@ -1729,7 +1771,7 @@ impl RuntimeDiagnostic {
         if let Some(hardware_class) = worker.hardware_class.as_deref() {
             increment_count(&mut self.hardware_classes, hardware_class);
             if let Some(expected) = expected_hardware_classes(worker.runtime.as_str())
-                && !expected.contains(&hardware_class)
+                && !hardware_class_matches_any(hardware_class, expected)
             {
                 self.unexpected_hardware_class_workers
                     .push(worker.id.to_string());
@@ -2049,9 +2091,18 @@ fn worker_replacement_commands(worker_ids: &[String]) -> Vec<String> {
 fn expected_hardware_classes(runtime: &str) -> Option<&'static [&'static str]> {
     match runtime {
         "ax_engine" => Some(&["mac"]),
-        "vllm" => Some(&["pc-cuda", "thor"]),
+        "vllm" | "sglang" | "tensorrt_llm" => Some(&["pc-cuda", "thor"]),
         _ => None,
     }
+}
+
+fn hardware_class_matches_any(observed: &str, expected: &[&str]) -> bool {
+    expected.iter().any(|candidate| {
+        observed == *candidate
+            || observed.strip_prefix(candidate).is_some_and(|suffix| {
+                suffix.starts_with('-') || suffix.starts_with('_') || suffix.starts_with('.')
+            })
+    })
 }
 
 fn runtime_guidance(runtime: &str) -> serde_json::Value {
@@ -2086,13 +2137,42 @@ fn runtime_guidance(runtime: &str) -> serde_json::Value {
                 "PC CUDA and Thor placement should be represented by hardware_class and worker_pool"
             ]
         }),
-        _ => serde_json::json!({
+        "tensorrt_llm" => serde_json::json!({
+            "runtime_owner": "NVIDIA TensorRT-LLM",
+            "expected_hardware_classes": ["pc-cuda", "thor"],
+            "adapter": "ax-runtime-agent",
+            "required_registration": {
+                "runtime": "tensorrt_llm",
+                "hardware_class": "pc-cuda or thor"
+            },
+            "operator_checks": [
+                "TensorRT-LLM OpenAI-compatible endpoint exposes /v1/models",
+                "AXS_NODE_RUNTIME_HEALTH_PATH targets a stable 2xx readiness endpoint",
+                "adapter reports runtime version, model inventory, and supported operations",
+                "production NVIDIA domains use ax-dynamo-adapter; this direct endpoint remains a compatibility path"
+            ]
+        }),
+        "unknown" => serde_json::json!({
             "runtime_owner": "unknown",
             "expected_hardware_classes": [],
             "adapter": "unknown",
             "operator_checks": [
                 "register the node with runtime ax_engine or vllm",
                 "verify the adapter follows the AX Serving node contract"
+            ]
+        }),
+        other => serde_json::json!({
+            "runtime_owner": other,
+            "expected_hardware_classes": [],
+            "adapter": "ax-runtime-agent",
+            "required_registration": {
+                "runtime": other
+            },
+            "operator_checks": [
+                "OpenAI-compatible endpoint exposes /v1/models",
+                "configure AXS_NODE_RUNTIME_HEALTH_PATH when /health is unavailable",
+                "declare supported operations and model identity metadata",
+                "verify the adapter follows the AX Serving compatibility node contract"
             ]
         }),
     }
@@ -2319,7 +2399,10 @@ pub(super) async fn proxy_get_license(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{derive_cache_affinity_key, fairness_client_key};
+    use super::{
+        derive_cache_affinity_key, fairness_client_key, hardware_class_matches_any,
+        runtime_guidance, validate_dispatch_hints,
+    };
 
     #[test]
     fn fairness_client_key_hashes_authorization_header() {
@@ -2374,5 +2457,52 @@ mod tests {
 
         let error = derive_cache_affinity_key(&headers, "tenant-a", None).unwrap_err();
         assert!(error.contains("AXS_CACHE_AFFINITY_SECRET"));
+    }
+
+    #[test]
+    fn generic_runtime_hints_accept_identifiers_and_reject_malformed_values() {
+        assert_eq!(
+            validate_dispatch_hints(None, Some("TensorRT-LLM".into())).unwrap(),
+            Some("tensorrt_llm".into())
+        );
+        assert_eq!(
+            validate_dispatch_hints(None, Some("ollama".into())).unwrap(),
+            Some("ollama".into())
+        );
+        assert!(validate_dispatch_hints(None, Some("bad runtime!".into())).is_err());
+        assert!(validate_dispatch_hints(None, Some("../runtime".into())).is_err());
+        assert!(validate_dispatch_hints(Some("not-a-backend".into()), None).is_err());
+        assert!(validate_dispatch_hints(Some("vllm".into()), Some("tensorrt_llm".into())).is_err());
+        assert_eq!(
+            validate_dispatch_hints(Some("native".into()), Some("ax-engine".into())).unwrap(),
+            Some("ax_engine".into())
+        );
+    }
+
+    #[test]
+    fn runtime_hardware_classes_allow_specific_subclasses() {
+        assert!(hardware_class_matches_any(
+            "pc-cuda-sm120",
+            &["pc-cuda", "thor"]
+        ));
+        assert!(hardware_class_matches_any(
+            "thor-jetpack-7",
+            &["pc-cuda", "thor"]
+        ));
+        assert!(!hardware_class_matches_any(
+            "pc-cudaish",
+            &["pc-cuda", "thor"]
+        ));
+    }
+
+    #[test]
+    fn tensorrt_and_generic_runtime_guidance_is_actionable() {
+        let tensorrt = runtime_guidance("tensorrt_llm");
+        assert_eq!(tensorrt["runtime_owner"], "NVIDIA TensorRT-LLM");
+        assert_eq!(tensorrt["adapter"], "ax-runtime-agent");
+
+        let generic = runtime_guidance("ollama");
+        assert_eq!(generic["runtime_owner"], "ollama");
+        assert_eq!(generic["adapter"], "ax-runtime-agent");
     }
 }

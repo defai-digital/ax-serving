@@ -3,8 +3,13 @@ pub mod config;
 pub mod proxy;
 pub mod sglang;
 
-use anyhow::Result;
+use std::future::{Future, IntoFuture};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use tokio::sync::oneshot;
 
 use agent::SharedRuntime;
 use config::ThorConfig;
@@ -25,11 +30,95 @@ async fn begin_shutdown_drain(
     config: ThorConfig,
     runtime: SharedRuntime,
 ) {
-    // Stop heartbeats before drain so the control plane does not re-admit this
-    // runtime node while it is shutting down.
+    // Reject direct dispatch immediately, then stop heartbeats before asking
+    // the control plane to drain. This closes the window where shutdown has
+    // begun but a request can still enter through the agent listener.
+    runtime.draining.store(true, Ordering::Release);
     heartbeat_abort.abort();
     if let Err(e) = agent::drain(&cp_client, &config, &runtime).await {
         tracing::warn!(%e, "drain request failed");
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to register SIGTERM handler; using Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerExit {
+    ListenerClosed,
+    GracefulShutdown,
+    ForcedShutdown,
+}
+
+/// Serve until an explicit shutdown signal or an HTTP listener failure.
+///
+/// The graceful-shutdown deadline intentionally starts only after
+/// `shutdown_signal` resolves. Applying it to the whole server future would
+/// turn an operator drain bound into a process lifetime limit.
+async fn serve_until_shutdown<S, D>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown_signal: S,
+    shutdown_drain: D,
+    shutdown_timeout: Duration,
+) -> Result<ServerExit>
+where
+    S: Future<Output = ()> + Send,
+    D: Future<Output = ()> + Send,
+{
+    let (graceful_tx, graceful_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = graceful_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::pin!(shutdown_signal);
+
+    tokio::select! {
+        result = &mut server => {
+            result.context("runtime-node HTTP server failed")?;
+            return Ok(ServerExit::ListenerClosed);
+        }
+        _ = &mut shutdown_signal => {}
+    }
+
+    let shutdown = async {
+        shutdown_drain.await;
+        let _ = graceful_tx.send(());
+        (&mut server).await
+    };
+    match tokio::time::timeout(shutdown_timeout, shutdown).await {
+        Ok(result) => {
+            result.context("runtime-node HTTP server failed during graceful shutdown")?;
+            Ok(ServerExit::GracefulShutdown)
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "graceful shutdown deadline exceeded; forcing runtime-node exit"
+            );
+            Ok(ServerExit::ForcedShutdown)
+        }
     }
 }
 
@@ -90,8 +179,6 @@ pub async fn run_from_env() -> Result<()> {
         )
         .await;
     });
-    let heartbeat_abort = heartbeat_task.abort_handle();
-
     let app = proxy::router(
         &config,
         proxy_client,
@@ -101,35 +188,18 @@ pub async fn run_from_env() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "runtime-node agent listening");
 
-    let server_shutdown_secs = config.shutdown_timeout_secs.unwrap_or(30).max(1);
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs.unwrap_or(30).max(1));
+    let shutdown_heartbeat_abort = heartbeat_task.abort_handle();
     let shutdown_client = control_client.clone();
     let shutdown_config = config.clone();
     let shutdown_runtime = runtime.clone();
-    let shutdown = async move {
-        #[cfg(unix)]
-        {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(%e, "failed to register SIGTERM handler; using Ctrl-C only");
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+    let shutdown_drain = async move {
         tracing::info!(
-            "shutdown signal received, draining connections (timeout {server_shutdown_secs}s)"
+            timeout_secs = shutdown_timeout.as_secs(),
+            "shutdown signal received, draining connections"
         );
         begin_shutdown_drain(
-            heartbeat_abort,
+            shutdown_heartbeat_abort,
             shutdown_client,
             shutdown_config,
             shutdown_runtime,
@@ -137,30 +207,32 @@ pub async fn run_from_env() -> Result<()> {
         .await;
     };
 
-    // Wrap graceful shutdown with a hard deadline so stuck streams don't hang forever (BUG-054).
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(server_shutdown_secs + 5),
-        server,
+    let serve_result = serve_until_shutdown(
+        listener,
+        app,
+        wait_for_shutdown_signal(),
+        shutdown_drain,
+        shutdown_timeout,
     )
     .await;
 
-    // If the server exits without the shutdown signal path completing, make
-    // sure the heartbeat task cannot outlive this runtime-node process.
+    // A listener failure bypasses the signal path. It still must stop
+    // heartbeats, reject new dispatch, and remove the worker registration.
     heartbeat_task.abort();
-    let shutdown_deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(config.shutdown_timeout_secs.unwrap_or(30).max(1));
-    while runtime.inflight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-        if tokio::time::Instant::now() > shutdown_deadline {
-            tracing::warn!("shutdown timeout exceeded with inflight requests; forcing exit");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if !runtime.draining.load(Ordering::Acquire) {
+        begin_shutdown_drain(
+            heartbeat_task.abort_handle(),
+            control_client.clone(),
+            config.clone(),
+            runtime.clone(),
+        )
+        .await;
     }
     if let Err(e) = agent::drain_complete(&control_client, &config, &runtime).await {
         tracing::warn!(%e, "drain-complete request failed");
     }
 
+    serve_result?;
     Ok(())
 }
 
@@ -179,8 +251,10 @@ pub(crate) mod test_env {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
 
     use anyhow::Result;
     use ax_serving_protocol::{
@@ -189,11 +263,11 @@ mod tests {
     use axum::{
         Router,
         extract::{Path, State},
-        routing::post,
+        routing::{get, post},
     };
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify, oneshot};
 
-    use super::{begin_shutdown_drain, runtime_default_headers};
+    use super::{ServerExit, begin_shutdown_drain, runtime_default_headers, serve_until_shutdown};
     use crate::agent::{SharedRuntime, WorkerSession};
     use crate::config::ThorConfig;
 
@@ -241,6 +315,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_lifetime_is_not_limited_by_shutdown_timeout() -> Result<()> {
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let drain_called = Arc::new(AtomicBool::new(false));
+        let drain_observation = Arc::clone(&drain_called);
+
+        let server = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            async move {
+                drain_observation.store(true, Ordering::Release);
+            },
+            Duration::from_millis(50),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !server.is_finished(),
+            "shutdown timeout must not act as a process lifetime"
+        );
+        let response = reqwest::get(format!("http://{addr}/health")).await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(!drain_called.load(Ordering::Acquire));
+
+        shutdown_tx
+            .send(())
+            .expect("server should still be running");
+        let exit = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not shut down")??;
+        assert_eq!(exit, ServerExit::GracefulShutdown);
+        assert!(drain_called.load(Ordering::Acquire));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_forces_a_stuck_request_after_signal() -> Result<()> {
+        async fn hang(State(started): State<Arc<Notify>>) -> Result<String, Infallible> {
+            started.notify_one();
+            std::future::pending().await
+        }
+
+        let request_started = Arc::new(Notify::new());
+        let app = Router::new()
+            .route("/hang", get(hang))
+            .with_state(Arc::clone(&request_started));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let server = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            async {},
+            Duration::from_millis(50),
+        ));
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/hang")).await });
+        tokio::time::timeout(Duration::from_secs(1), request_started.notified())
+            .await
+            .expect("request did not reach the server");
+
+        shutdown_tx
+            .send(())
+            .expect("server should still be running");
+        let exit = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("forced shutdown exceeded its deadline")??;
+        assert_eq!(exit, ServerExit::ForcedShutdown);
+        request.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shutdown_drain_aborts_heartbeat_before_control_plane_drain() -> Result<()> {
         async fn handle_drain(
             State(drains): State<Arc<Mutex<Vec<String>>>>,
@@ -277,11 +435,12 @@ mod tests {
             heartbeat_abort,
             reqwest::Client::new(),
             test_config(format!("http://{addr}")),
-            runtime,
+            runtime.clone(),
         )
         .await;
 
         assert!(heartbeat_task.await.unwrap_err().is_cancelled());
+        assert!(runtime.draining.load(Ordering::Acquire));
         assert_eq!(drains.lock().await.as_slice(), ["worker-1"]);
         server.abort();
 

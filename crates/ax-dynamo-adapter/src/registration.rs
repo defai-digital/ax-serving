@@ -116,6 +116,7 @@ pub fn registration_body(
             kind: "dynamo".into(),
             version: manifest.manifest.dynamo.tag.clone(),
             api: "openai-v1".into(),
+            endpoint: Some(config.frontend_url.clone()),
         },
         hardware: HardwareDescriptor {
             platform: manifest.manifest.platform.os.clone(),

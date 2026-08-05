@@ -146,6 +146,7 @@ async fn spawn_not_admitted_worker() -> Option<SocketAddr> {
 #[derive(Default)]
 struct EchoWorkerState {
     models: Mutex<Vec<String>>,
+    bodies: Mutex<Vec<serde_json::Value>>,
     domain_ids: Mutex<Vec<String>>,
     public_authorization_seen: Mutex<bool>,
 }
@@ -162,6 +163,7 @@ async fn spawn_echo_model_worker() -> Option<(SocketAddr, Arc<EchoWorkerState>)>
     ) -> Json<serde_json::Value> {
         let model = body["model"].as_str().unwrap_or_default().to_string();
         state.models.lock().unwrap().push(model.clone());
+        state.bodies.lock().unwrap().push(body.clone());
         if let Some(domain) = headers
             .get("x-ax-domain-id")
             .and_then(|value| value.to_str().ok())
@@ -291,6 +293,7 @@ fn register_adaptive_domain_worker(
                     kind: "ax_engine".into(),
                     version: "6.12.0".into(),
                     api: "openai-http".into(),
+                    endpoint: None,
                 },
                 hardware: HardwareDescriptor {
                     platform: "macos".into(),
@@ -522,6 +525,75 @@ fn reg_req(addr: SocketAddr, caps: &[&str]) -> RegisterRequest {
     }
 }
 
+fn protocol_reg_req(
+    addr: SocketAddr,
+    worker_id: &str,
+    runtime_kind: &str,
+    model_id: &str,
+) -> ProtocolRegisterRequest {
+    ProtocolRegisterRequest {
+        protocol: ProtocolDescriptor::current(Vec::new()),
+        agent: AgentDescriptor {
+            name: "test-runtime-agent".into(),
+            version: "1.0.0".into(),
+            build_sha: None,
+        },
+        worker: ProtocolWorkerDescriptor {
+            id: ProtocolWorkerId::new(worker_id).unwrap(),
+            instance_id: WorkerInstanceId::new(),
+            advertise_url: format!("http://{addr}"),
+            pool_id: PoolId::new(format!("{runtime_kind}-pool")).unwrap(),
+            trust_domain: TrustDomainId::new("private").unwrap(),
+            labels: BTreeMap::from([
+                ("node_class".into(), "pc-cuda".into()),
+                ("friendly_name".into(), "test-node".into()),
+            ]),
+        },
+        runtime: RuntimeDescriptor {
+            kind: runtime_kind.into(),
+            version: "test".into(),
+            api: "openai-v1".into(),
+            endpoint: Some("http://runtime.test:8000".into()),
+        },
+        hardware: HardwareDescriptor {
+            platform: "linux".into(),
+            accelerator: "nvidia-gpu".into(),
+            device_count: 1,
+            memory_bytes: None,
+            hardware_class: Some("pc-cuda-sm120".into()),
+        },
+        domain: None,
+        domain_observation: None,
+        observation: RuntimeObservation {
+            observed_at: time::OffsetDateTime::now_utc(),
+            runtime: RuntimeStatus::ready(),
+            inventory_generation: 1,
+            models: vec![RuntimeModelDescriptor {
+                runtime_model_id: RuntimeModelId::new(model_id).unwrap(),
+                identity: DeploymentIdentity {
+                    runtime_kind: runtime_kind.into(),
+                    runtime_version: Some("test".into()),
+                    revision: None,
+                    artifact_digest: None,
+                    tokenizer_digest: None,
+                    template_digest: None,
+                    quantization: None,
+                },
+                operations: BTreeSet::from([Operation::chat_completions()]),
+                capabilities: BTreeSet::new(),
+                max_context_tokens: Some(2_048),
+                max_output_tokens: Some(512),
+            }],
+            capacity: Some(CapacityObservation {
+                active_requests: Some(0),
+                max_concurrent_requests: Some(8),
+                waiting_requests: Some(0),
+                ..Default::default()
+            }),
+        },
+    }
+}
+
 #[tokio::test]
 async fn gateway_prometheus_metrics_are_normalized_and_low_cardinality() {
     let layer = Arc::new(
@@ -671,6 +743,104 @@ async fn test_register_heartbeat_eligible() {
     assert!(registry.eligible_workers("unknown-model").is_empty());
 }
 
+#[test]
+fn test_protocol_registration_preserves_generic_runtime_identity() {
+    let registry = WorkerRegistry::new();
+    let request = protocol_reg_req(
+        "127.0.0.1:18081".parse().unwrap(),
+        "df-rtx5090",
+        "tensorrt_llm",
+        "tinyllama-trtllm",
+    );
+    registry
+        .register_protocol(
+            request,
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(
+                "http://127.0.0.1:18081",
+            )
+            .unwrap(),
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities: BTreeSet::new(),
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+
+    let workers = registry.list_all();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].runtime, "tensorrt_llm");
+    assert_eq!(
+        workers[0].runtime_endpoint.as_deref(),
+        Some("http://runtime.test:8000")
+    );
+    assert_eq!(
+        workers[0].model_inventory[0].runtime_kind.as_deref(),
+        Some("tensorrt_llm")
+    );
+    assert_eq!(
+        registry
+            .eligible_workers_filtered(
+                "tinyllama-trtllm",
+                RequestKind::Llm,
+                Some("tensorrt_llm"),
+                None,
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_strips_ax_routing_hints_before_upstream_dispatch() {
+    let (worker_addr, worker_state) = skip_if_no_socket!(spawn_echo_model_worker().await);
+    let (gateway_addr, layer) =
+        skip_if_no_socket!(spawn_orchestrator_with_layer(OrchestratorConfig::default()).await);
+    layer
+        .registry
+        .register_protocol(
+            protocol_reg_req(
+                worker_addr,
+                "strict-runtime-worker",
+                "tensorrt_llm",
+                "strict-model",
+            ),
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(&format!(
+                "http://{worker_addr}"
+            ))
+            .unwrap(),
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities: BTreeSet::new(),
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+
+    let response = Client::new()
+        .post(format!("http://{gateway_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "strict-model",
+            "backend": "auto",
+            "runtime": "tensorrt_llm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "extension": {"runtime": "runtime-owned", "backend": "runtime-owned"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bodies = worker_state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].get("backend").is_none());
+    assert!(bodies[0].get("runtime").is_none());
+    assert_eq!(bodies[0]["extension"]["runtime"], "runtime-owned");
+    assert_eq!(bodies[0]["extension"]["backend"], "runtime-owned");
+}
+
 /// Dispatch a real request to a mock worker and verify it succeeds.
 #[tokio::test]
 async fn test_dispatch_to_mock_worker() {
@@ -781,6 +951,7 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
                     kind: "vllm".into(),
                     version: "0.9.0".into(),
                     api: "openai-http".into(),
+                    endpoint: None,
                 },
                 hardware: HardwareDescriptor {
                     platform: "linux".into(),
@@ -2388,6 +2559,87 @@ async fn test_admin_diagnostics_reports_runtime_specific_hardware_guidance() {
 }
 
 #[tokio::test]
+async fn test_admin_diagnostics_preserves_tensorrt_runtime_and_hardware_subclass() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+    let request = protocol_reg_req(
+        "127.0.0.1:28085".parse().unwrap(),
+        "df-rtx5090",
+        "tensorrt_llm",
+        "tinyllama-trtllm",
+    );
+    layer
+        .registry
+        .register_protocol(
+            request,
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(
+                "http://127.0.0.1:28085",
+            )
+            .unwrap(),
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities: BTreeSet::new(),
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let runtimes = &json["runtime_diagnostics"]["runtimes"];
+    assert!(runtimes.get("unknown").is_none());
+    let tensorrt = &runtimes["tensorrt_llm"];
+    assert_eq!(tensorrt["workers"], 1);
+    assert_eq!(tensorrt["hardware_classes"]["pc-cuda-sm120"], 1);
+    assert_eq!(
+        tensorrt["runtime_endpoints"],
+        serde_json::json!(["http://runtime.test:8000"])
+    );
+    assert_eq!(
+        tensorrt["runtime_guidance"]["runtime_owner"],
+        "NVIDIA TensorRT-LLM"
+    );
+    assert!(
+        !tensorrt["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "unexpected_hardware_class")
+    );
+    assert!(
+        !tensorrt["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "missing_runtime_endpoint")
+    );
+}
+
+#[tokio::test]
 async fn test_admin_diagnostics_reports_runtime_telemetry_recovery_actions() {
     let layer = Arc::new(
         OrchestratorLayer::new(
@@ -3455,7 +3707,7 @@ async fn test_invalid_backend_or_runtime_hint_returns_422() {
         }),
         serde_json::json!({
             "model": "shared-backend-model",
-            "runtime": "definitely-not-a-runtime",
+            "runtime": "../definitely-not-a-runtime",
             "messages": [{"role": "user", "content": "hello"}]
         }),
     ] {

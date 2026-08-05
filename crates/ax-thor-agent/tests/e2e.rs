@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ax_serving_protocol::{DomainId, QualificationState};
 use ax_thor_agent::agent::{self, SharedRuntime};
 use ax_thor_agent::config::{ExecutionDomainConfig, ThorConfig};
@@ -17,6 +19,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Default)]
@@ -32,6 +36,100 @@ struct ControlPlaneState {
 struct SgLangState {
     chats: Mutex<Vec<Value>>,
     authorization_headers: Mutex<Vec<Option<String>>>,
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_agent_lives_past_shutdown_timeout_then_handles_sigterm() -> Result<()> {
+    exercise_runtime_agent_signal(libc::SIGTERM, Some(Duration::from_millis(6_250))).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_agent_handles_sigint_and_drains() -> Result<()> {
+    exercise_runtime_agent_signal(libc::SIGINT, None).await
+}
+
+#[cfg(unix)]
+async fn exercise_runtime_agent_signal(
+    signal: i32,
+    minimum_lifetime: Option<Duration>,
+) -> Result<()> {
+    let control_state = Arc::new(ControlPlaneState::default());
+    let (control_base, _control_task) =
+        spawn_server(control_plane_router(Arc::clone(&control_state))).await?;
+    let (runtime_base, _runtime_task) = spawn_server(generic_runtime_router()).await?;
+    let worker_id = format!("signal-test-{}", uuid::Uuid::new_v4().simple());
+    let mut child = spawn_runtime_agent(&control_base, &runtime_base, &worker_id)?;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !control_state.heartbeats.lock().await.is_empty() {
+                return Ok(());
+            }
+            if let Some(status) = child.try_wait()? {
+                bail!("runtime agent exited before its first heartbeat: {status}");
+            }
+            control_state.heartbeat_notify.notified().await;
+        }
+    })
+    .await
+    .context("timed out waiting for runtime agent heartbeat")??;
+
+    if let Some(minimum_lifetime) = minimum_lifetime {
+        tokio::time::sleep(minimum_lifetime).await;
+        assert!(
+            child.try_wait()?.is_none(),
+            "shutdown timeout must not terminate a signal-free runtime agent"
+        );
+    }
+
+    let pid = child.id().context("runtime agent has no process id")?;
+    let signal_result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if signal_result != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill().await;
+        bail!("failed to signal runtime agent: {error}");
+    }
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .context("runtime agent did not honor its shutdown deadline")??;
+    assert!(status.success(), "runtime agent exited with {status}");
+    assert_eq!(
+        control_state.drains.lock().await.as_slice(),
+        [worker_id.as_str()]
+    );
+    assert_eq!(
+        control_state.drain_completes.lock().await.as_slice(),
+        [worker_id.as_str()]
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_runtime_agent(
+    control_plane_url: &str,
+    runtime_url: &str,
+    worker_id: &str,
+) -> Result<Child> {
+    Command::new(env!("CARGO_BIN_EXE_ax-runtime-agent"))
+        .env_clear()
+        .env("AXS_CONTROL_PLANE_URL", control_plane_url)
+        .env("AXS_NODE_RUNTIME", "ollama")
+        .env("AXS_NODE_RUNTIME_URL", runtime_url)
+        .env("AXS_NODE_RUNTIME_HEALTH_PATH", "/v1/models")
+        .env("AXS_NODE_LISTEN_ADDR", "127.0.0.1:0")
+        .env("AXS_NODE_ADVERTISED_URL", "http://127.0.0.1:18081")
+        .env("AXS_NODE_ID", worker_id)
+        .env("AXS_NODE_SHUTDOWN_TIMEOUT_SECS", "1")
+        .env("AXS_DISCOVER_LAN", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn ax-runtime-agent")
 }
 
 #[tokio::test]

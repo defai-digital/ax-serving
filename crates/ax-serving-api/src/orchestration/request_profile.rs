@@ -94,27 +94,109 @@ pub enum RequestBodyError {
     EncodeModel(#[source] serde_json::Error),
 }
 
+const ROUTING_FIELDS: &[&str] = &[
+    "model",
+    "backend",
+    "runtime",
+    "stream",
+    "max_tokens",
+    "max_completion_tokens",
+    "tools",
+    "response_format",
+];
+
+#[derive(Debug)]
+struct TopLevelMember {
+    key: String,
+    key_start: usize,
+    delimiter: Option<usize>,
+}
+
 /// Reject duplicate fields whose ambiguity could alter admission or routing.
 pub fn validate_unique_routing_fields(body: &[u8]) -> Result<(), RequestBodyError> {
-    const ROUTING_FIELDS: &[&str] = &[
-        "model",
-        "backend",
-        "runtime",
-        "stream",
-        "max_tokens",
-        "max_completion_tokens",
-        "tools",
-        "response_format",
-    ];
+    scan_top_level_members(body).map(|_| ())
+}
+
+/// Remove AX Serving-only top-level routing hints before runtime dispatch.
+///
+/// The scanner preserves every byte outside the removed `backend` and
+/// `runtime` members, including unknown extension fields, nested fields, and
+/// number formatting. It also enforces the same duplicate-routing-field guard
+/// as [`validate_unique_routing_fields`]. `None` means no rewrite was needed.
+pub fn strip_ax_routing_hints(body: &[u8]) -> Result<Option<Vec<u8>>, RequestBodyError> {
+    let (members, close_brace) = scan_top_level_members(body)?;
+    if !members
+        .iter()
+        .any(|member| matches!(member.key.as_str(), "backend" | "runtime"))
+    {
+        return Ok(None);
+    }
+
+    let mut removal_ranges = Vec::new();
+    let mut index = 0;
+    while index < members.len() {
+        if !matches!(members[index].key.as_str(), "backend" | "runtime") {
+            index += 1;
+            continue;
+        }
+
+        let run_start = index;
+        while index + 1 < members.len()
+            && matches!(members[index + 1].key.as_str(), "backend" | "runtime")
+        {
+            index += 1;
+        }
+        let run_end = index;
+
+        let (start, end) = if run_end + 1 < members.len() {
+            (
+                members[run_start].key_start,
+                members[run_end]
+                    .delimiter
+                    .expect("non-final top-level member has a delimiter")
+                    + 1,
+            )
+        } else if run_start > 0 {
+            (
+                members[run_start - 1]
+                    .delimiter
+                    .expect("member before a final run has a delimiter"),
+                close_brace,
+            )
+        } else {
+            (members[run_start].key_start, close_brace)
+        };
+        removal_ranges.push((start, end));
+        index += 1;
+    }
+
+    let removed_bytes = removal_ranges
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum::<usize>();
+    let mut sanitized = Vec::with_capacity(body.len() - removed_bytes);
+    let mut copied_through = 0;
+    for (start, end) in removal_ranges {
+        sanitized.extend_from_slice(&body[copied_through..start]);
+        copied_through = end;
+    }
+    sanitized.extend_from_slice(&body[copied_through..]);
+    Ok(Some(sanitized))
+}
+
+fn scan_top_level_members(body: &[u8]) -> Result<(Vec<TopLevelMember>, usize), RequestBodyError> {
     let mut cursor = skip_whitespace(body, 0);
     if body.get(cursor) != Some(&b'{') {
         return Err(RequestBodyError::NotObject);
     }
     cursor += 1;
     let mut seen = BTreeSet::new();
+    let mut members = Vec::new();
+    let close_brace;
     loop {
         cursor = skip_whitespace(body, cursor);
         if body.get(cursor) == Some(&b'}') {
+            close_brace = cursor;
             cursor += 1;
             break;
         }
@@ -132,19 +214,34 @@ pub fn validate_unique_routing_fields(body: &[u8]) -> Result<(), RequestBodyErro
         cursor = skip_whitespace(body, cursor + 1);
         cursor = scan_value(body, cursor, 0)?;
         cursor = skip_whitespace(body, cursor);
-        match body.get(cursor) {
-            Some(b',') => cursor += 1,
-            Some(b'}') => {
+        let delimiter = match body.get(cursor) {
+            Some(b',') => {
+                let delimiter = cursor;
                 cursor += 1;
+                Some(delimiter)
+            }
+            Some(b'}') => {
+                close_brace = cursor;
+                cursor += 1;
+                members.push(TopLevelMember {
+                    key,
+                    key_start,
+                    delimiter: None,
+                });
                 break;
             }
             _ => return Err(RequestBodyError::Malformed),
-        }
+        };
+        members.push(TopLevelMember {
+            key,
+            key_start,
+            delimiter,
+        });
     }
     if skip_whitespace(body, cursor) != body.len() {
         return Err(RequestBodyError::Malformed);
     }
-    Ok(())
+    Ok((members, close_brace))
 }
 
 /// Replace only the top-level `model` string while preserving all other
@@ -325,7 +422,10 @@ fn scan_primitive(body: &[u8], start: usize) -> Result<usize, RequestBodyError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{PriorityClass, rewrite_runtime_model, validate_unique_routing_fields};
+    use super::{
+        PriorityClass, rewrite_runtime_model, strip_ax_routing_hints,
+        validate_unique_routing_fields,
+    };
 
     #[test]
     fn priority_is_bounded_and_defaults_to_normal() {
@@ -360,5 +460,57 @@ mod tests {
         assert!(validate_unique_routing_fields(body).is_err());
         let harmless = br#"{"model":"one","metadata":1,"other":2}"#;
         validate_unique_routing_fields(harmless).unwrap();
+    }
+
+    #[test]
+    fn ax_routing_hints_are_stripped_without_reencoding_runtime_fields() {
+        let body = br#"{ "runtime":"tensorrt_llm", "model":"m", "extension":1.2300, "nested":{"runtime":"keep","backend":"keep"} }"#;
+        let sanitized = strip_ax_routing_hints(body).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(sanitized).unwrap(),
+            r#"{  "model":"m", "extension":1.2300, "nested":{"runtime":"keep","backend":"keep"} }"#
+        );
+    }
+
+    #[test]
+    fn adjacent_ax_routing_hints_are_removed_from_every_object_position() {
+        for (body, expected) in [
+            (
+                br#"{"runtime":"r","backend":"auto","model":"m"}"#.as_slice(),
+                br#"{"model":"m"}"#.as_slice(),
+            ),
+            (
+                br#"{"model":"m","runtime":"r","backend":"auto","stream":false}"#.as_slice(),
+                br#"{"model":"m","stream":false}"#.as_slice(),
+            ),
+            (
+                br#"{"model":"m","runtime":"r","backend":"auto"}"#.as_slice(),
+                br#"{"model":"m"}"#.as_slice(),
+            ),
+            (
+                br#"{"runtime":"r","backend":"auto"}"#.as_slice(),
+                br#"{}"#.as_slice(),
+            ),
+        ] {
+            assert_eq!(strip_ax_routing_hints(body).unwrap().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn separated_and_escaped_ax_routing_hints_are_removed() {
+        let body = br#"{"\u0072untime":"r","model":"m","backend":"auto","stream":false}"#;
+        assert_eq!(
+            strip_ax_routing_hints(body).unwrap().unwrap(),
+            br#"{"model":"m","stream":false}"#
+        );
+    }
+
+    #[test]
+    fn routing_sanitizer_rejects_duplicates_and_skips_unmodified_bodies() {
+        assert!(strip_ax_routing_hints(br#"{"model":"m","runtime":"a","runtime":"b"}"#).is_err());
+        assert_eq!(
+            strip_ax_routing_hints(br#"{"model":"m","metadata":{"runtime":"nested"}}"#).unwrap(),
+            None
+        );
     }
 }

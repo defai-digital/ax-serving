@@ -128,6 +128,7 @@ pub fn registration_body(
             kind: "ax_engine".into(),
             version: manifest.manifest.runtime.ax_engine_version.clone(),
             api: "openai-v1".into(),
+            endpoint: Some(config.rank0_url.clone()),
         },
         hardware: HardwareDescriptor {
             platform: "macos".into(),

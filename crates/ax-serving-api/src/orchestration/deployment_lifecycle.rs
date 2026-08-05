@@ -1044,6 +1044,7 @@ mod tests {
                         kind: "vllm".into(),
                         version: "1.0.0".into(),
                         api: "openai-v1".into(),
+                        endpoint: None,
                     },
                     hardware: HardwareDescriptor {
                         platform: "linux".into(),
@@ -1177,6 +1178,7 @@ mod tests {
                         kind: "vllm".into(),
                         version: "1.0.0".into(),
                         api: "openai-v1".into(),
+                        endpoint: None,
                     },
                     hardware: HardwareDescriptor {
                         platform: "linux".into(),

@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ax_serving_protocol::{
@@ -62,6 +63,10 @@ const CONTROL_PLANE_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 fn control_plane_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(CONTROL_PLANE_REQUEST_TIMEOUT_SECS)
+}
+
+fn heartbeat_sleep_duration(interval_ms: u64, iteration_elapsed: Duration) -> Duration {
+    Duration::from_millis(interval_ms).saturating_sub(iteration_elapsed)
 }
 
 fn with_internal_token(
@@ -228,6 +233,7 @@ fn registration_body(
             kind: normalize_runtime_kind(&config.runtime),
             version: config.runtime_version.clone(),
             api: "openai-v1".into(),
+            endpoint: Some(config.runtime_url.clone()),
         },
         hardware: HardwareDescriptor {
             platform: std::env::consts::OS.into(),
@@ -360,6 +366,7 @@ fn normalize_runtime_kind(raw: &str) -> String {
         "axengine" | "ax_engine" | "native" => "ax_engine".into(),
         "v_llm" | "vllm" => "vllm".into(),
         "sg_lang" | "sglang" => "sglang".into(),
+        "tensorrt_llm" | "trt_llm" | "trtllm" => "tensorrt_llm".into(),
         other => other.to_string(),
     }
 }
@@ -390,7 +397,7 @@ fn accelerator_name(config: &ThorConfig) -> String {
     // resolve to the same accelerator as their canonical spellings.
     match normalize_runtime_kind(&config.runtime).as_str() {
         "ax_engine" => "apple-gpu".into(),
-        "vllm" | "sglang" => "nvidia-gpu".into(),
+        "vllm" | "sglang" | "tensorrt_llm" => "nvidia-gpu".into(),
         _ if config.hardware_class.to_ascii_lowercase().contains("cuda") => "nvidia-gpu".into(),
         _ => "unknown".into(),
     }
@@ -456,6 +463,7 @@ pub async fn heartbeat_loop(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         };
+        let iteration_started = Instant::now();
 
         let readiness = sglang::probe_runtime(
             &runtime_client,
@@ -639,8 +647,9 @@ pub async fn heartbeat_loop(
             Err(err) => tracing::warn!(%err, "runtime-node heartbeat failed"),
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(
+        tokio::time::sleep(heartbeat_sleep_duration(
             session.heartbeat_interval_ms,
+            iteration_started.elapsed(),
         ))
         .await;
     }
@@ -761,7 +770,7 @@ pub async fn drain_complete(
 mod tests {
     use super::{
         CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, capacity_observation,
-        control_plane_request_timeout, registration_body,
+        control_plane_request_timeout, heartbeat_sleep_duration, registration_body,
     };
     use crate::config::{ExecutionDomainConfig, ThorConfig};
     use crate::sglang::{ModelInfo, RuntimeTelemetry};
@@ -799,6 +808,18 @@ mod tests {
             telemetry_metrics: Default::default(),
             model_identity: Default::default(),
         }
+    }
+
+    #[test]
+    fn heartbeat_cadence_does_not_accumulate_probe_time() {
+        assert_eq!(
+            heartbeat_sleep_duration(5_000, std::time::Duration::from_millis(275)),
+            std::time::Duration::from_millis(4_725)
+        );
+        assert_eq!(
+            heartbeat_sleep_duration(5_000, std::time::Duration::from_secs(6)),
+            std::time::Duration::ZERO
+        );
     }
 
     #[tokio::test]
@@ -970,7 +991,14 @@ mod tests {
                 "runtime alias {alias} must map to apple-gpu"
             );
         }
-        for alias in ["vllm", "vLLM", "sglang", "sg-lang"] {
+        for alias in [
+            "vllm",
+            "vLLM",
+            "sglang",
+            "sg-lang",
+            "TensorRT-LLM",
+            "trtllm",
+        ] {
             config.runtime = alias.into();
             assert_eq!(
                 accelerator_name(&config),
