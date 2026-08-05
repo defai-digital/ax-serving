@@ -380,7 +380,13 @@ fn unix_nanos(time: SystemTime) -> u128 {
 }
 
 fn env_filter(default_level: tracing::Level) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::from_env("AXS_LOG").add_directive(default_level.into())
+    // `with_default_directive` applies only when AXS_LOG yields no directives;
+    // `from_env("AXS_LOG").add_directive(...)` would overwrite a bare global
+    // directive (e.g. "debug") because Directive equality ignores the level.
+    tracing_subscriber::EnvFilter::builder()
+        .with_env_var("AXS_LOG")
+        .with_default_directive(default_level.into())
+        .from_env_lossy()
 }
 
 fn log_format() -> String {
@@ -496,7 +502,9 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(CHILD_ENV, "1")
-                .env("AXS_LOG", "off")
+                // Must not silence spans: the env filter gates the telemetry
+                // layer too, so "off" would disable the info_span! below.
+                .env_remove("AXS_LOG")
                 .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
                 .output()

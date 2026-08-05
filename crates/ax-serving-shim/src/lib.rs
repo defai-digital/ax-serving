@@ -39,8 +39,10 @@ pub extern "C" fn llama_backend_init(_numa: bool) {
     // Safe to call multiple times (subscriber is a OnceLock).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("AXS_LOG")
-                .add_directive(tracing::Level::WARN.into()),
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("AXS_LOG")
+                .with_default_directive(tracing::Level::WARN.into())
+                .from_env_lossy(),
         )
         .try_init();
 }
