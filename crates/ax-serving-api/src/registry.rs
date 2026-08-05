@@ -4,7 +4,7 @@
 //! Uses Arc<RwLock<HashMap>> for concurrent reads during inference,
 //! exclusive write lock only for load/unload (rare operations).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -607,13 +607,17 @@ impl ModelRegistry {
                     // unload was in flight, and blindly overwriting its entry
                     // would leak the newly loaded handle.
                     let mut guard = self.inner_write();
-                    if guard.contains_key(&id) {
-                        warn!(
-                            "idle eviction: not re-inserting '{id}' — a newer load claimed \
-                             the id; the failed-unload handle may leak until process exit"
-                        );
-                    } else {
-                        guard.insert(id, entry); // re-insert: avoid handle leak
+                    match guard.entry(id) {
+                        Entry::Occupied(occupied) => {
+                            warn!(
+                                "idle eviction: not re-inserting '{}' — a newer load claimed \
+                                 the id; the failed-unload handle may leak until process exit",
+                                occupied.key()
+                            );
+                        }
+                        Entry::Vacant(vacant) => {
+                            vacant.insert(entry); // re-insert: avoid handle leak
+                        }
                     }
                 } else {
                     evicted.push(id);
