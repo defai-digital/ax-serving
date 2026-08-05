@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 
-pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
+pub async fn wait_for_runtime(
+    client: &reqwest::Client,
+    base_url: &str,
+    health_path: &str,
+) -> Result<()> {
     let timeout_secs = runtime_startup_timeout_secs()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let url = format!("{base_url}/health");
+    let url = format!("{base_url}{health_path}");
     loop {
         // BUG-115: check deadline BEFORE attempting the probe so the configured
         // timeout is a hard upper bound even if the connect timeout is longer.
@@ -21,9 +25,16 @@ pub async fn wait_for_runtime(client: &reqwest::Client, base_url: &str) -> Resul
 }
 
 /// Perform one authoritative runtime readiness probe.
-pub async fn probe_runtime(client: &reqwest::Client, base_url: &str) -> Result<()> {
+///
+/// Any 2xx status from `health_path` counts as ready, so runtimes without a
+/// dedicated health endpoint can be probed via e.g. `/v1/models`.
+pub async fn probe_runtime(
+    client: &reqwest::Client,
+    base_url: &str,
+    health_path: &str,
+) -> Result<()> {
     client
-        .get(format!("{base_url}/health"))
+        .get(format!("{base_url}{health_path}"))
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -55,7 +66,7 @@ fn runtime_startup_timeout_secs() -> Result<u64> {
 }
 
 pub async fn wait_for_sglang(client: &reqwest::Client, base_url: &str) -> Result<()> {
-    wait_for_runtime(client, base_url).await
+    wait_for_runtime(client, base_url, "/health").await
 }
 
 /// Model information returned from the runtime.
@@ -299,6 +310,21 @@ fn operations_from_model_entry<'a>(
     operations
 }
 
+/// Optional operator-supplied Prometheus metric names for runtimes whose
+/// `/metrics` names are not covered by the built-in alias tables below.
+///
+/// Each value must be a valid Prometheus metric name; samples are merged with
+/// the built-in aliases for the same concept (max across aliases, never
+/// summed together). Leave unset to use only the built-in aliases.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryMetricOverrides {
+    /// Gauge name reporting the number of requests waiting in the runtime's
+    /// queue (e.g. `AXS_NODE_METRIC_QUEUE_DEPTH=myruntime_requests_queued`).
+    pub queue_depth: Option<String>,
+    /// Gauge name reporting the number of actively processing requests.
+    pub active_sequences: Option<String>,
+}
+
 /// Best-effort runtime telemetry translated into the AX Serving heartbeat
 /// contract. Runtimes that do not expose `/metrics` keep using safe defaults.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -320,8 +346,9 @@ pub struct RuntimeTelemetry {
 pub async fn get_runtime_telemetry(
     client: &reqwest::Client,
     base_url: &str,
+    overrides: &TelemetryMetricOverrides,
 ) -> Result<RuntimeTelemetry> {
-    let prometheus = get_prometheus_runtime_telemetry(client, base_url).await;
+    let prometheus = get_prometheus_runtime_telemetry(client, base_url, overrides).await;
     match prometheus {
         // Prometheus gave us the critical routing fields — use it as-is.
         Ok(telemetry)
@@ -345,6 +372,7 @@ pub async fn get_runtime_telemetry(
 async fn get_prometheus_runtime_telemetry(
     client: &reqwest::Client,
     base_url: &str,
+    overrides: &TelemetryMetricOverrides,
 ) -> Result<RuntimeTelemetry> {
     let url = format!("{base_url}/metrics");
     let metrics = client
@@ -358,7 +386,7 @@ async fn get_prometheus_runtime_telemetry(
         .text()
         .await
         .context("failed to read runtime /metrics response")?;
-    Ok(parse_prometheus_telemetry(&metrics))
+    Ok(parse_prometheus_telemetry(&metrics, overrides))
 }
 
 async fn get_json_runtime_telemetry(
@@ -380,8 +408,46 @@ async fn get_json_runtime_telemetry(
     Ok(parse_json_telemetry(&metrics))
 }
 
-pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
+pub fn parse_prometheus_telemetry(
+    metrics: &str,
+    overrides: &TelemetryMetricOverrides,
+) -> RuntimeTelemetry {
     let samples = collect_prometheus_samples(metrics);
+    // Built-in aliases plus any operator-supplied names; samples across
+    // aliases for one concept take the max, never the sum, so merging an
+    // override into the same table cannot double-count.
+    let active_sequences_aliases: Vec<&str> = [
+        "ax_runtime_active_sequences",
+        "axs_scheduler_decode_sequences_active",
+        "axs_scheduler_inflight_count",
+        "ax_engine_jobs_in_flight",
+        "ax_engine_generation_jobs_pending",
+        "vllm:num_requests_running",
+        "vllm_num_requests_running",
+        "sglang:num_running_reqs",
+        "sglang_num_running_reqs",
+        // llama.cpp `llama-server --metrics` (upstream tools/server README).
+        "llamacpp:requests_processing",
+        "llamacpp_requests_processing",
+    ]
+    .into_iter()
+    .chain(overrides.active_sequences.as_deref())
+    .collect();
+    let queue_depth_aliases: Vec<&str> = [
+        "ax_runtime_queue_depth",
+        "axs_scheduler_queue_depth",
+        "ax_engine_generation_commands_queued",
+        "vllm:num_requests_waiting",
+        "vllm_num_requests_waiting",
+        "sglang:num_queue_reqs",
+        "sglang_num_queue_reqs",
+        // llama.cpp `llama-server --metrics` (upstream tools/server README).
+        "llamacpp:requests_deferred",
+        "llamacpp_requests_deferred",
+    ]
+    .into_iter()
+    .chain(overrides.queue_depth.as_deref())
+    .collect();
     let ttft_bucket_p95_ms = prometheus_histogram_quantile_seconds(
         metrics,
         &[
@@ -392,20 +458,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
     )
     .and_then(seconds_to_ms);
     RuntimeTelemetry {
-        active_sequences: sum_usize(
-            &samples,
-            &[
-                "ax_runtime_active_sequences",
-                "axs_scheduler_decode_sequences_active",
-                "axs_scheduler_inflight_count",
-                "ax_engine_jobs_in_flight",
-                "ax_engine_generation_jobs_pending",
-                "vllm:num_requests_running",
-                "vllm_num_requests_running",
-                "sglang:num_running_reqs",
-                "sglang_num_running_reqs",
-            ],
-        ),
+        active_sequences: sum_usize(&samples, &active_sequences_aliases),
         decode_tok_per_sec: sum_per_alias_max_across(
             &samples,
             &[
@@ -430,18 +483,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
             ],
         )
         .or(ttft_bucket_p95_ms),
-        queue_depth: sum_usize(
-            &samples,
-            &[
-                "ax_runtime_queue_depth",
-                "axs_scheduler_queue_depth",
-                "ax_engine_generation_commands_queued",
-                "vllm:num_requests_waiting",
-                "vllm_num_requests_waiting",
-                "sglang:num_queue_reqs",
-                "sglang_num_queue_reqs",
-            ],
-        ),
+        queue_depth: sum_usize(&samples, &queue_depth_aliases),
         error_rate: max_f64(&samples, &["ax_runtime_error_rate", "axs_slo_error_rate"]),
         kv_pages_used: sum_u64(
             &samples,
@@ -866,8 +908,9 @@ fn json_duration_ms_any(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_STARTUP_TIMEOUT_SECS, RuntimeTelemetry, parse_json_telemetry,
-        parse_model_info_response, parse_prometheus_telemetry, runtime_startup_timeout_secs,
+        DEFAULT_STARTUP_TIMEOUT_SECS, RuntimeTelemetry, TelemetryMetricOverrides,
+        parse_json_telemetry, parse_model_info_response, parse_prometheus_telemetry,
+        runtime_startup_timeout_secs,
     };
     use std::ffi::OsString;
 
@@ -948,6 +991,7 @@ ax_runtime_active_batch_size 2
 ax_runtime_max_batch_size 16
 ax_runtime_batch_utilization 0.125
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(
@@ -979,6 +1023,7 @@ vllm:avg_generation_throughput_toks_per_s 91.5
 vllm:gpu_cache_usage_perc 87
 vllm:batch_utilization 0.5
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.active_sequences, Some(2));
@@ -986,6 +1031,65 @@ vllm:batch_utilization 0.5
         assert_eq!(telemetry.decode_tok_per_sec, Some(91.5));
         assert_eq!(telemetry.kv_utilization, Some(0.87));
         assert_eq!(telemetry.batch_utilization, Some(0.5));
+    }
+
+    #[test]
+    fn parses_llamacpp_alias_metrics() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+# HELP llamacpp:requests_processing Number of requests processing.
+llamacpp:requests_processing 2
+# HELP llamacpp:requests_deferred Number of requests deferred.
+llamacpp:requests_deferred 3
+"#,
+            &TelemetryMetricOverrides::default(),
+        );
+
+        assert_eq!(telemetry.active_sequences, Some(2));
+        assert_eq!(telemetry.queue_depth, Some(3));
+        // No other llama.cpp metric maps onto the heartbeat contract.
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.kv_utilization, None);
+    }
+
+    #[test]
+    fn operator_metric_overrides_extend_alias_tables() {
+        let overrides = TelemetryMetricOverrides {
+            queue_depth: Some("myruntime_requests_queued".to_string()),
+            active_sequences: Some("myruntime_requests_active".to_string()),
+        };
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+myruntime_requests_active 4
+myruntime_requests_queued{pool="default"} 6
+unrelated_runtime_metric 99
+"#,
+            &overrides,
+        );
+
+        assert_eq!(telemetry.active_sequences, Some(4));
+        assert_eq!(telemetry.queue_depth, Some(6));
+        // Unknown metrics are ignored; they must not leak into other fields.
+        assert_eq!(telemetry.decode_tok_per_sec, None);
+        assert_eq!(telemetry.error_rate, None);
+        assert_eq!(telemetry.kv_utilization, None);
+    }
+
+    #[test]
+    fn operator_metric_overrides_do_not_double_count_builtin_aliases() {
+        let overrides = TelemetryMetricOverrides {
+            queue_depth: Some("myruntime_requests_queued".to_string()),
+            active_sequences: None,
+        };
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+myruntime_requests_queued 6
+ax_runtime_queue_depth 6
+"#,
+            &overrides,
+        );
+
+        assert_eq!(telemetry.queue_depth, Some(6));
     }
 
     #[test]
@@ -1000,6 +1104,7 @@ ax_engine_step_kv_usage_blocks 12
 ax_runtime_prefix_reusable_tokens 256
 vllm:prefix_cache_hits 256
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         // Per-label series sum within one alias, but a runtime exposing both an
@@ -1019,6 +1124,7 @@ ax_engine_generation_commands_queued 4
 ax_engine_step_scheduled_requests 2
 ax_engine_step_kv_usage_blocks 96
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.active_sequences, Some(3));
@@ -1039,6 +1145,7 @@ ax_runtime_kv_utilization -Inf
 ax_runtime_batch_utilization NaN
 ax_runtime_queue_depth 3
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.decode_tok_per_sec, None);
@@ -1057,6 +1164,7 @@ ax_runtime_queue_depth 1e40
 ax_runtime_ttft_p95_ms 1e40
 ax_runtime_kv_pages_used 1e40
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.active_sequences, None);
@@ -1077,6 +1185,7 @@ axs_scheduler_max_inflight 16
 axs_kv_cache_utilization 65
 axs_batch_pressure 0.25
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.active_sequences, Some(3));
@@ -1096,6 +1205,7 @@ vllm:time_to_first_token_seconds_bucket{le="0.2"} 90
 vllm:time_to_first_token_seconds_bucket{le="0.4"} 100
 vllm:time_to_first_token_seconds_bucket{le="+Inf"} 100
 "#,
+            &TelemetryMetricOverrides::default(),
         );
 
         assert_eq!(telemetry.ttft_p95_ms, Some(300));

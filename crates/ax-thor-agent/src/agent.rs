@@ -396,6 +396,50 @@ fn accelerator_name(config: &ThorConfig) -> String {
     }
 }
 
+/// Build the heartbeat capacity observation from runtime telemetry.
+///
+/// Fields the runtime does not measure stay `None`: the dispatch policy
+/// deliberately penalizes missing signals, so fabricating a value (e.g.
+/// queue depth `Some(0)` when the runtime exposes no queue metric) would
+/// make an unsaturated-looking node out of one whose saturation is simply
+/// unknown. Only locally measured values (agent-tracked inflight, RSS) and
+/// config limits may be reported unconditionally.
+fn capacity_observation(
+    config: &ThorConfig,
+    telemetry: &sglang::RuntimeTelemetry,
+    current_inflight: usize,
+    rss_bytes: u64,
+) -> CapacityObservation {
+    let kv_cache_used_ratio = telemetry.kv_utilization.or_else(|| {
+        match (telemetry.kv_pages_used, telemetry.kv_pages_total) {
+            (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64),
+            _ => None,
+        }
+    });
+    CapacityObservation {
+        active_requests: Some(
+            telemetry
+                .active_sequences
+                .unwrap_or(current_inflight)
+                .min(u64::MAX as usize) as u64,
+        ),
+        max_concurrent_requests: Some(config.max_inflight as u64),
+        waiting_requests: telemetry
+            .queue_depth
+            .map(|depth| depth.min(u64::MAX as usize) as u64),
+        process_rss_bytes: Some(rss_bytes),
+        recent_error_rate: telemetry.error_rate,
+        kv_cache_used_ratio,
+        prefix_cache_hit_ratio: None,
+        batch_token_capacity: telemetry.max_batch_size.map(u64::from),
+        batch_tokens_in_use: telemetry.active_batch_size.map(u64::from),
+        ttft_ewma_ms: telemetry.ttft_p95_ms.map(|value| value as f64),
+        inter_token_ewma_ms: None,
+        generated_tokens_per_second: telemetry.decode_tok_per_sec,
+        observation_window_ms: None,
+    }
+}
+
 pub async fn heartbeat_loop(
     control_client: reqwest::Client,
     runtime_client: reqwest::Client,
@@ -413,7 +457,12 @@ pub async fn heartbeat_loop(
             continue;
         };
 
-        let readiness = sglang::probe_runtime(&runtime_client, &config.runtime_url).await;
+        let readiness = sglang::probe_runtime(
+            &runtime_client,
+            &config.runtime_url,
+            &config.runtime_health_path,
+        )
+        .await;
         let (models, runtime_models, runtime_ready, runtime_status_reason) = match readiness {
             Ok(()) => match sglang::get_model_info(&runtime_client, &config.runtime_url).await {
                 Ok(model_info) => {
@@ -466,7 +515,13 @@ pub async fn heartbeat_loop(
         let current_inflight = runtime.inflight.load(Ordering::Relaxed);
         let rss_bytes = current_rss_bytes();
         let telemetry = if runtime_ready {
-            match sglang::get_runtime_telemetry(&runtime_client, &config.runtime_url).await {
+            match sglang::get_runtime_telemetry(
+                &runtime_client,
+                &config.runtime_url,
+                &config.telemetry_metrics,
+            )
+            .await
+            {
                 Ok(telemetry) => telemetry,
                 Err(err) => {
                     tracing::debug!(%err, "runtime metrics unavailable; using heartbeat defaults");
@@ -476,32 +531,7 @@ pub async fn heartbeat_loop(
         } else {
             sglang::RuntimeTelemetry::default()
         };
-        let kv_cache_used_ratio = telemetry.kv_utilization.or_else(|| {
-            match (telemetry.kv_pages_used, telemetry.kv_pages_total) {
-                (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64),
-                _ => None,
-            }
-        });
-        let capacity = CapacityObservation {
-            active_requests: Some(
-                telemetry
-                    .active_sequences
-                    .unwrap_or(current_inflight)
-                    .min(u64::MAX as usize) as u64,
-            ),
-            max_concurrent_requests: Some(config.max_inflight as u64),
-            waiting_requests: Some(telemetry.queue_depth.unwrap_or(0).min(u64::MAX as usize) as u64),
-            process_rss_bytes: Some(rss_bytes),
-            recent_error_rate: telemetry.error_rate,
-            kv_cache_used_ratio,
-            prefix_cache_hit_ratio: None,
-            batch_token_capacity: telemetry.max_batch_size.map(u64::from),
-            batch_tokens_in_use: telemetry.active_batch_size.map(u64::from),
-            ttft_ewma_ms: telemetry.ttft_p95_ms.map(|value| value as f64),
-            inter_token_ewma_ms: None,
-            generated_tokens_per_second: telemetry.decode_tok_per_sec,
-            observation_window_ms: None,
-        };
+        let capacity = capacity_observation(&config, &telemetry, current_inflight, rss_bytes);
         let sequence = session.sequence.fetch_add(1, Ordering::AcqRel) + 1;
         let observed_at = time::OffsetDateTime::now_utc();
         let runtime_status = if runtime_ready {
@@ -730,11 +760,11 @@ pub async fn drain_complete(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, control_plane_request_timeout,
-        registration_body,
+        CONTROL_PLANE_REQUEST_TIMEOUT_SECS, SharedRuntime, capacity_observation,
+        control_plane_request_timeout, registration_body,
     };
     use crate::config::{ExecutionDomainConfig, ThorConfig};
-    use crate::sglang::ModelInfo;
+    use crate::sglang::{ModelInfo, RuntimeTelemetry};
     use ax_serving_protocol::{
         DomainId, ExecutionDomainKind, Operation, ProtocolCapability, QualificationState,
         WorkerInstanceId,
@@ -765,6 +795,8 @@ mod tests {
             max_context: None,
             embedding: None,
             vision: None,
+            runtime_health_path: "/health".into(),
+            telemetry_metrics: Default::default(),
             model_identity: Default::default(),
         }
     }
@@ -946,6 +978,64 @@ mod tests {
                 "runtime alias {alias} must map to nvidia-gpu"
             );
         }
+    }
+
+    #[test]
+    fn capacity_observation_reports_none_when_queue_depth_unknown() {
+        let config = test_config();
+        let telemetry = RuntimeTelemetry {
+            active_sequences: Some(2),
+            ..Default::default()
+        };
+
+        let capacity = capacity_observation(&config, &telemetry, 1, 42);
+
+        // A runtime with no queue metric must report unknown, not Some(0):
+        // the dispatch policy penalizes missing signals, and Some(0) would
+        // bypass that penalty by looking permanently un-queued.
+        assert_eq!(capacity.waiting_requests, None);
+        assert_eq!(capacity.active_requests, Some(2));
+        assert_eq!(capacity.kv_cache_used_ratio, None);
+        assert_eq!(capacity.ttft_ewma_ms, None);
+        assert_eq!(capacity.batch_token_capacity, None);
+        assert_eq!(capacity.generated_tokens_per_second, None);
+    }
+
+    #[test]
+    fn capacity_observation_reports_measured_queue_depth() {
+        let config = test_config();
+        let telemetry = RuntimeTelemetry {
+            queue_depth: Some(3),
+            kv_pages_used: Some(4),
+            kv_pages_total: Some(8),
+            ttft_p95_ms: Some(120),
+            ..Default::default()
+        };
+
+        let capacity = capacity_observation(&config, &telemetry, 0, 42);
+
+        assert_eq!(capacity.waiting_requests, Some(3));
+        // A measured zero is a real signal and must survive as Some(0).
+        assert_eq!(capacity.active_requests, Some(0));
+        assert_eq!(capacity.kv_cache_used_ratio, Some(0.5));
+        assert_eq!(capacity.ttft_ewma_ms, Some(120.0));
+    }
+
+    #[test]
+    fn capacity_observation_falls_back_to_local_inflight_when_runtime_silent() {
+        let config = test_config();
+        let telemetry = RuntimeTelemetry::default();
+
+        let capacity = capacity_observation(&config, &telemetry, 2, 42);
+
+        // Agent-tracked inflight is a genuine local measurement, unlike a
+        // fabricated queue depth.
+        assert_eq!(capacity.active_requests, Some(2));
+        assert_eq!(capacity.waiting_requests, None);
+        assert_eq!(
+            capacity.max_concurrent_requests,
+            Some(config.max_inflight as u64)
+        );
     }
 
     #[tokio::test]

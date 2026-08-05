@@ -57,7 +57,12 @@ pub async fn run_from_env() -> Result<()> {
         .default_headers(runtime_headers)
         .build()?;
 
-    sglang::wait_for_runtime(&runtime_client, &config.runtime_url).await?;
+    sglang::wait_for_runtime(
+        &runtime_client,
+        &config.runtime_url,
+        &config.runtime_health_path,
+    )
+    .await?;
 
     let runtime = SharedRuntime::new();
     let registration = agent::register(
@@ -217,6 +222,8 @@ mod tests {
             max_context: None,
             embedding: None,
             vision: None,
+            runtime_health_path: "/health".into(),
+            telemetry_metrics: Default::default(),
             model_identity: Default::default(),
         }
     }

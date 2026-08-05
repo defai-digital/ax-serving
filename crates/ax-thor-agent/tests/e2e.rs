@@ -7,6 +7,7 @@ use ax_serving_protocol::{DomainId, QualificationState};
 use ax_thor_agent::agent::{self, SharedRuntime};
 use ax_thor_agent::config::{ExecutionDomainConfig, ThorConfig};
 use ax_thor_agent::proxy;
+use ax_thor_agent::sglang::TelemetryMetricOverrides;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -70,6 +71,8 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         max_context: None,
         embedding: None,
         vision: None,
+        runtime_health_path: "/health".into(),
+        telemetry_metrics: Default::default(),
         model_identity: Default::default(),
     };
 
@@ -254,6 +257,8 @@ async fn thor_proxy_rejects_oversized_runtime_content_length_without_buffering()
         max_context: None,
         embedding: None,
         vision: None,
+        runtime_health_path: "/health".into(),
+        telemetry_metrics: Default::default(),
         model_identity: Default::default(),
     };
     let client = reqwest::Client::builder()
@@ -319,6 +324,8 @@ async fn thor_proxy_accepts_valid_body_above_axum_default_limit() -> Result<()> 
         max_context: None,
         embedding: None,
         vision: None,
+        runtime_health_path: "/health".into(),
+        telemetry_metrics: Default::default(),
         model_identity: Default::default(),
     };
     let client = reqwest::Client::builder()
@@ -361,6 +368,117 @@ async fn thor_proxy_accepts_valid_body_above_axum_default_limit() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn thor_agent_fronts_generic_runtime_without_health_endpoint() -> Result<()> {
+    let control_state = Arc::new(ControlPlaneState::default());
+    let (control_base, _control_task) =
+        spawn_server(control_plane_router(control_state.clone())).await?;
+    let (runtime_base, _runtime_task) = spawn_server(generic_runtime_router()).await?;
+
+    let config = ThorConfig {
+        control_plane_url: control_base.clone(),
+        worker_token: Some("secret".into()),
+        runtime_url: runtime_base,
+        runtime_api_key: None,
+        dispatch_token: None,
+        tls_profile: "loopback_dev".into(),
+        runtime: "ollama".into(),
+        runtime_version: "test".into(),
+        worker_id: "worker-generic".into(),
+        trust_domain: "test".into(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertised_url: "http://127.0.0.1:18081".into(),
+        max_inflight: 8,
+        worker_pool: None,
+        node_class: "thor".into(),
+        hardware_class: "thor".into(),
+        execution_domain: None,
+        friendly_name: None,
+        chip_model: None,
+        shutdown_timeout_secs: None,
+        max_context: None,
+        embedding: None,
+        vision: None,
+        // This runtime has no /health endpoint; readiness is any 2xx from
+        // the configured path.
+        runtime_health_path: "/v1/models".into(),
+        telemetry_metrics: TelemetryMetricOverrides {
+            queue_depth: Some("generic_requests_queued".into()),
+            active_sequences: None,
+        },
+        model_identity: Default::default(),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build reqwest client")?;
+
+    // Sanity: the mock runtime really has no /health endpoint.
+    let status = client
+        .get(format!("{}/health", config.runtime_url))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let runtime = SharedRuntime::new();
+    let registration = agent::register(&client, &client, &config, runtime.instance_id).await?;
+    {
+        *runtime.models.write().await = registration.models;
+        *runtime.session.write().await = Some(registration.session);
+    }
+
+    let heartbeat_task = tokio::spawn(agent::heartbeat_loop(
+        client.clone(),
+        client.clone(),
+        config.clone(),
+        runtime.clone(),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !control_state.heartbeats.lock().await.is_empty() {
+                break;
+            }
+            control_state.heartbeat_notify.notified().await;
+        }
+    })
+    .await
+    .context("timed out waiting for thor heartbeat")?;
+
+    let heartbeats = control_state.heartbeats.lock().await;
+    assert!(!heartbeats.is_empty());
+    assert_eq!(heartbeats[0].0, "worker-generic");
+    assert_eq!(heartbeats[0].1["runtime"]["ready"], json!(true));
+    // Queue depth comes from the operator-mapped metric name; active
+    // sequences from the built-in llamacpp alias.
+    assert_eq!(heartbeats[0].1["capacity"]["waiting_requests"], json!(5));
+    assert_eq!(heartbeats[0].1["capacity"]["active_requests"], json!(2));
+    drop(heartbeats);
+
+    // The agent-side /health route follows the configured upstream path.
+    let (proxy_base, _proxy_task) = spawn_server(proxy::router(
+        &config,
+        client.clone(),
+        runtime.inflight.clone(),
+        runtime.draining.clone(),
+    ))
+    .await?;
+    let health: Value = client
+        .get(format!("{proxy_base}/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health["agent_live"], json!(true));
+    assert_eq!(health["runtime_ready"], json!(true));
+
+    heartbeat_task.abort();
+    Ok(())
+}
+
 fn control_plane_router(state: Arc<ControlPlaneState>) -> Router {
     Router::new()
         .route("/internal/workers/register", post(handle_register))
@@ -371,6 +489,21 @@ fn control_plane_router(state: Arc<ControlPlaneState>) -> Router {
             post(handle_drain_complete),
         )
         .with_state(state)
+}
+
+/// Mock generic OpenAI-compatible runtime: no `/health` endpoint, only
+/// `/v1/models` and a `/metrics` endpoint mixing a built-in llamacpp alias
+/// with a runtime-specific gauge that needs the operator override.
+fn generic_runtime_router() -> Router {
+    Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "qwen3-8b"}]})) }),
+        )
+        .route(
+            "/metrics",
+            get(|| async { "llamacpp:requests_processing 2\ngeneric_requests_queued 5\n" }),
+        )
 }
 
 fn sglang_router(state: Arc<SgLangState>) -> Router {

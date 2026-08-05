@@ -20,7 +20,7 @@ pub fn router(
     proxy::router(
         ProxyConfig {
             upstream_url: config.runtime_url.clone(),
-            upstream_health_path: "/health".into(),
+            upstream_health_path: config.runtime_health_path.clone(),
             dispatch_token: config.dispatch_token.clone(),
             max_inflight: config.max_inflight,
             expected_domain_id: None,

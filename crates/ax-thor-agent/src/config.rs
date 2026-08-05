@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
+use ax_serving_adapter_core::openai_runtime::TelemetryMetricOverrides;
 use ax_serving_protocol::{
     CompatibilityManifestDigest, Digest, DomainId, ProtocolCapability, QualificationState,
 };
@@ -12,6 +13,7 @@ const DEFAULT_NODE_CLASS: &str = "mac";
 const DEFAULT_RUNTIME: &str = "ax_engine";
 const DEFAULT_TRUST_DOMAIN: &str = "local";
 const DEFAULT_TLS_PROFILE: &str = "loopback_dev";
+const DEFAULT_RUNTIME_HEALTH_PATH: &str = "/health";
 
 fn load_first_optional_string_env(keys: &[&str]) -> Option<String> {
     load_first_optional_string_env_with_key(keys).map(|(_, value)| value)
@@ -337,6 +339,14 @@ pub struct ThorConfig {
     /// env: `AXS_NODE_VISION` — override vision capability (true/false).
     /// If unset, the agent derives the capability from runtime model metadata.
     pub vision: Option<bool>,
+    /// env: `AXS_NODE_RUNTIME_HEALTH_PATH` (legacy `AXS_THOR_RUNTIME_HEALTH_PATH`)
+    /// — upstream readiness path; any 2xx status counts as ready. Defaults to
+    /// `/health`; set `/v1/models` for runtimes without a health endpoint.
+    pub runtime_health_path: String,
+    /// Optional Prometheus metric-name overrides (env `AXS_NODE_METRIC_*`,
+    /// legacy `AXS_THOR_METRIC_*`) for runtimes whose `/metrics` names are
+    /// not covered by the built-in alias tables.
+    pub telemetry_metrics: TelemetryMetricOverrides,
     /// Operator-supplied semantic model identity. Runtime discovery remains
     /// authoritative for loaded model IDs, while these values provide the
     /// certification metadata most OpenAI-compatible `/v1/models` endpoints omit.
@@ -373,6 +383,8 @@ impl std::fmt::Debug for ThorConfig {
             .field("max_context", &self.max_context)
             .field("embedding", &self.embedding)
             .field("vision", &self.vision)
+            .field("runtime_health_path", &self.runtime_health_path)
+            .field("telemetry_metrics", &self.telemetry_metrics)
             .field("model_identity", &self.model_identity)
             .finish()
     }
@@ -475,6 +487,25 @@ impl ThorConfig {
             parse_first_env::<u32>(&["AXS_NODE_MAX_CONTEXT", "AXS_THOR_MAX_CONTEXT"])?;
         let embedding = parse_first_bool_env(&["AXS_NODE_EMBEDDING", "AXS_THOR_EMBEDDING"])?;
         let vision = parse_first_bool_env(&["AXS_NODE_VISION", "AXS_THOR_VISION"])?;
+        let runtime_health_path = load_first_optional_string_env_with_key(&[
+            "AXS_NODE_RUNTIME_HEALTH_PATH",
+            "AXS_THOR_RUNTIME_HEALTH_PATH",
+        ])
+        .map(|(key, value)| {
+            parse_runtime_health_path(&value).with_context(|| format!("invalid {key}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| DEFAULT_RUNTIME_HEALTH_PATH.into());
+        let telemetry_metrics = TelemetryMetricOverrides {
+            queue_depth: parse_metric_name_env(&[
+                "AXS_NODE_METRIC_QUEUE_DEPTH",
+                "AXS_THOR_METRIC_QUEUE_DEPTH",
+            ])?,
+            active_sequences: parse_metric_name_env(&[
+                "AXS_NODE_METRIC_ACTIVE_SEQUENCES",
+                "AXS_THOR_METRIC_ACTIVE_SEQUENCES",
+            ])?,
+        };
         let model_identity = ModelIdentityConfig {
             revision: load_optional_string_env("AXS_MODEL_REVISION"),
             artifact_digest: load_digest_env("AXS_MODEL_ARTIFACT_DIGEST")?,
@@ -520,9 +551,51 @@ impl ThorConfig {
             max_context,
             embedding,
             vision,
+            runtime_health_path,
+            telemetry_metrics,
             model_identity,
         })
     }
+}
+
+/// Validate an operator-supplied upstream health path. Must be an absolute
+/// path without query, fragment, or whitespace; any 2xx response counts as
+/// ready, so lightweight endpoints such as `/v1/models` are acceptable.
+fn parse_runtime_health_path(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        bail!("runtime health path must start with '/': {raw}");
+    }
+    if trimmed.contains('?') || trimmed.contains('#') {
+        bail!("runtime health path must not include query params or fragments: {raw}");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        bail!("runtime health path must not contain whitespace: {raw}");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn is_valid_prometheus_metric_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == ':')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+fn parse_metric_name_env(keys: &[&str]) -> Result<Option<String>> {
+    load_first_optional_string_env_with_key(keys)
+        .map(|(key, value)| {
+            if is_valid_prometheus_metric_name(&value) {
+                Ok(value)
+            } else {
+                bail!(
+                    "invalid {key}: {value}; expected a Prometheus metric name ([a-zA-Z_:][a-zA-Z0-9_:]*)"
+                )
+            }
+        })
+        .transpose()
 }
 
 fn parse_domain_qualification(value: Option<&str>) -> Result<QualificationState> {
@@ -832,6 +905,98 @@ mod tests {
 
         let err = ThorConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("AXS_NODE_MAX_INFLIGHT"));
+    }
+
+    #[test]
+    fn from_env_defaults_runtime_health_path_and_metric_overrides() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _health = EnvGuard::remove("AXS_NODE_RUNTIME_HEALTH_PATH");
+        let _health_legacy = EnvGuard::remove("AXS_THOR_RUNTIME_HEALTH_PATH");
+        let _queue = EnvGuard::remove("AXS_NODE_METRIC_QUEUE_DEPTH");
+        let _queue_legacy = EnvGuard::remove("AXS_THOR_METRIC_QUEUE_DEPTH");
+        let _active = EnvGuard::remove("AXS_NODE_METRIC_ACTIVE_SEQUENCES");
+        let _active_legacy = EnvGuard::remove("AXS_THOR_METRIC_ACTIVE_SEQUENCES");
+
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.runtime_health_path, "/health");
+        assert_eq!(config.telemetry_metrics.queue_depth, None);
+        assert_eq!(config.telemetry_metrics.active_sequences, None);
+    }
+
+    #[test]
+    fn from_env_accepts_runtime_health_path_and_metric_overrides() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _health = EnvGuard::set("AXS_NODE_RUNTIME_HEALTH_PATH", "/v1/models");
+        let _queue = EnvGuard::set("AXS_NODE_METRIC_QUEUE_DEPTH", "myruntime_requests_queued");
+        let _active = EnvGuard::set(
+            "AXS_NODE_METRIC_ACTIVE_SEQUENCES",
+            "myruntime:requests_active",
+        );
+
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.runtime_health_path, "/v1/models");
+        assert_eq!(
+            config.telemetry_metrics.queue_depth.as_deref(),
+            Some("myruntime_requests_queued")
+        );
+        assert_eq!(
+            config.telemetry_metrics.active_sequences.as_deref(),
+            Some("myruntime:requests_active")
+        );
+    }
+
+    #[test]
+    fn from_env_accepts_legacy_health_path_and_metric_aliases() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _health = EnvGuard::remove("AXS_NODE_RUNTIME_HEALTH_PATH");
+        let _health_legacy = EnvGuard::set("AXS_THOR_RUNTIME_HEALTH_PATH", "/status");
+        let _queue = EnvGuard::remove("AXS_NODE_METRIC_QUEUE_DEPTH");
+        let _queue_legacy = EnvGuard::set("AXS_THOR_METRIC_QUEUE_DEPTH", "legacy_queue_gauge");
+
+        let config = ThorConfig::from_env().unwrap();
+        assert_eq!(config.runtime_health_path, "/status");
+        assert_eq!(
+            config.telemetry_metrics.queue_depth.as_deref(),
+            Some("legacy_queue_gauge")
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_runtime_health_path() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+
+        for bad in ["health", "/health?ready=1", "/health#frag", "/has space"] {
+            let _health = EnvGuard::set("AXS_NODE_RUNTIME_HEALTH_PATH", bad);
+            let err = ThorConfig::from_env().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("AXS_NODE_RUNTIME_HEALTH_PATH"),
+                "input {bad:?}: got: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_metric_name_overrides() {
+        let _lock = crate::test_env::lock();
+        let _control = EnvGuard::set("AXS_CONTROL_PLANE_URL", "http://127.0.0.1:8080");
+        let _listen = EnvGuard::set("AXS_NODE_LISTEN_ADDR", "127.0.0.1:18081");
+        let _advertised = EnvGuard::set("AXS_NODE_ADVERTISED_ADDR", "127.0.0.1:18081");
+        let _queue = EnvGuard::set("AXS_NODE_METRIC_QUEUE_DEPTH", "9bad-name");
+
+        let err = ThorConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("AXS_NODE_METRIC_QUEUE_DEPTH"));
     }
 
     #[test]
