@@ -287,15 +287,23 @@ impl FleetStateStore for MemoryFleetStateStore {
     ) -> StoreFuture<'a, FleetMutationResult> {
         Box::pin(async move {
             self.prune_expired();
-            let Some(current) = self.records.get(worker_id) else {
-                return Ok(FleetMutationResult::Missing);
-            };
-            if current.record.registration_id != registration_id {
-                return Ok(FleetMutationResult::Fenced);
+            // Atomic conditional remove: a check-then-remove race could delete
+            // a fresh lease written by a concurrent re-registration with a new
+            // registration_id, which this call is explicitly fenced off from.
+            if self
+                .records
+                .remove_if(worker_id, |_, value| {
+                    value.record.registration_id == registration_id
+                })
+                .is_some()
+            {
+                return Ok(FleetMutationResult::Applied);
             }
-            drop(current);
-            self.records.remove(worker_id);
-            Ok(FleetMutationResult::Applied)
+            if self.records.contains_key(worker_id) {
+                Ok(FleetMutationResult::Fenced)
+            } else {
+                Ok(FleetMutationResult::Missing)
+            }
         })
     }
 
@@ -336,7 +344,12 @@ impl FleetStateStore for MemoryFleetStateStore {
                 remove_bucket = reservations.is_empty();
             }
             if remove_bucket {
-                self.reservations.remove(worker_id);
+                // Conditional remove: a concurrent `try_reserve` may have
+                // inserted a fresh attempt into the bucket after we dropped
+                // the shard guard above — an unconditional `remove` would
+                // delete that live reservation and bypass admission control.
+                self.reservations
+                    .remove_if(worker_id, |_, reservations| reservations.is_empty());
             }
             Ok(())
         })
@@ -1393,6 +1406,90 @@ mod tests {
                 .await
                 .unwrap(),
             super::ReservationResult::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_release_reservation_only_removes_empty_bucket() {
+        // Regression guard: bucket cleanup after releasing an attempt must
+        // keep sibling reservations intact — the bucket may only be removed
+        // when it is actually empty at removal time.
+        let store = MemoryFleetStateStore::default();
+        let worker_id = ax_serving_protocol::WorkerId::new("worker-bucket").unwrap();
+        let attempts: Vec<_> = (0..4)
+            .map(|_| ax_serving_protocol::AttemptId::new())
+            .collect();
+
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[0], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Reserved
+        );
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[1], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Reserved
+        );
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[2], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Saturated
+        );
+
+        // Releasing one attempt frees exactly one slot; the sibling stays.
+        store
+            .release_reservation(&worker_id, attempts[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[2], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Reserved
+        );
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[3], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Saturated
+        );
+
+        // Releasing the rest empties the bucket; admission opens again.
+        store
+            .release_reservation(&worker_id, attempts[1])
+            .await
+            .unwrap();
+        store
+            .release_reservation(&worker_id, attempts[2])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .try_reserve(&worker_id, attempts[3], 2, 60_000)
+                .await
+                .unwrap(),
+            super::ReservationResult::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_remove_if_registration_reports_missing_for_unknown_worker() {
+        let store = MemoryFleetStateStore::default();
+        let worker_id = ax_serving_protocol::WorkerId::new("ghost").unwrap();
+        assert_eq!(
+            store
+                .remove_if_registration(&worker_id, ax_serving_protocol::RegistrationId::new())
+                .await
+                .unwrap(),
+            super::FleetMutationResult::Missing
         );
     }
 

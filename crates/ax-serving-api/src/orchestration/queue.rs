@@ -96,6 +96,48 @@ pub struct GlobalQueueMetrics {
     pub timeout_total: AtomicU64,
 }
 
+// ── Slot handoff ──────────────────────────────────────────────────────────────
+
+/// Message delivered to a queued waiter through its oneshot channel.
+#[derive(Debug)]
+enum WaiterMsg {
+    /// A concurrency slot was handed off from a completing request. The
+    /// `active` counter was NOT decremented — ownership of the slot travels
+    /// with this message.
+    Handoff(SlotHandoff),
+    /// This request was shed by a newer one (overload policy `ShedOldest`).
+    Shed,
+}
+
+/// A concurrency slot in transit from a dropping permit to a woken waiter.
+///
+/// If the waiter never claims the slot (e.g. its future was dropped between
+/// the wakeup and the next poll — client disconnect or abort), `Drop` returns
+/// the slot to the pool so it is not permanently lost.
+#[derive(Debug)]
+struct SlotHandoff {
+    active: Arc<AtomicUsize>,
+    claimed: bool,
+}
+
+impl SlotHandoff {
+    /// Take ownership of the slot, disarming the Drop-based return to the
+    /// pool. Used by the woken waiter (which materializes the slot into a
+    /// `QueuePermit`) and by the dropping permit when a handoff send fails
+    /// (it keeps the slot and retries with the next waiter).
+    fn claim(mut self) {
+        self.claimed = true;
+    }
+}
+
+impl Drop for SlotHandoff {
+    fn drop(&mut self) {
+        if !self.claimed {
+            self.active.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
 // ── QueuePermit ───────────────────────────────────────────────────────────────
 
 /// RAII permit.  Dropping it releases one concurrency slot and wakes the
@@ -150,15 +192,28 @@ impl Drop for QueuePermit {
             let next = select_next_waiter(&mut waiters, hint);
             match next {
                 Some(entry) => {
-                    if entry.tx.send(true).is_ok() {
-                        if let Some(ref mut client) = last_served {
-                            **client = Some(entry.client_key);
+                    let handoff = SlotHandoff {
+                        active: Arc::clone(&self.active),
+                        claimed: false,
+                    };
+                    match entry.tx.send(WaiterMsg::Handoff(handoff)) {
+                        Ok(()) => {
+                            if let Some(ref mut client) = last_served {
+                                **client = Some(entry.client_key);
+                            }
+                            // Slot transferred — active count is unchanged
+                            // (permit passes from this request to the woken
+                            // waiter). If the waiter is dropped before claiming
+                            // it, SlotHandoff's Drop returns the slot.
+                            return;
                         }
-                        // Slot transferred — active count is unchanged (permit
-                        // passes from this request to the woken waiter).
-                        return;
+                        // Dead waiter — the failed send hands the message back.
+                        // We still own the slot and will try the next waiter,
+                        // so reclaim it to stop SlotHandoff's Drop from
+                        // decrementing `active`.
+                        Err(WaiterMsg::Handoff(handoff)) => handoff.claim(),
+                        Err(WaiterMsg::Shed) => unreachable!("handoff built above"),
                     }
-                    // Dead waiter — try the next one.
                 }
                 None => {
                     // No live waiter; return the slot to the pool.
@@ -343,7 +398,7 @@ impl GlobalQueue {
                                 .position(|entry| effective_priority(entry, now) == lowest)
                         });
                         if let Some(oldest) = shed_index.and_then(|index| waiters.remove(index)) {
-                            let _ = oldest.tx.send(false); // false = "you are shed"
+                            let _ = oldest.tx.send(WaiterMsg::Shed);
                             self.metrics.shed_total.fetch_add(1, Ordering::Relaxed);
                             // Fall through: enqueue current request.
                         } else {
@@ -356,7 +411,7 @@ impl GlobalQueue {
                 }
             }
 
-            let (tx, rx) = oneshot::channel::<bool>();
+            let (tx, rx) = oneshot::channel::<WaiterMsg>();
             // Clone key into the waiter entry (for fairness tracking during
             // handoff); the original moves into the permit when we wake up.
             waiters.push_back(WaiterEntry {
@@ -371,17 +426,22 @@ impl GlobalQueue {
         // Wait for a permit, with timeout.
         let wait_dur = std::time::Duration::from_millis(self.config.wait_ms);
         match timeout(wait_dur, rx).await {
-            Ok(Ok(true)) => {
-                // Slot handed off from a completing request.
+            Ok(Ok(WaiterMsg::Handoff(handoff))) => {
+                // Slot handed off from a completing request. Claim it before
+                // building the permit so SlotHandoff's Drop does not fire.
+                handoff.claim();
                 self.metrics.permit_total.fetch_add(1, Ordering::Relaxed);
                 AcquireResult::Permit(self.make_permit(client_key))
             }
-            Ok(Ok(false)) => {
+            Ok(Ok(WaiterMsg::Shed)) => {
                 // Shed by a newer incoming request.
                 AcquireResult::Shed
             }
             Ok(Err(_)) | Err(_) => {
-                // Sender dropped (shouldn't happen) or wait_ms elapsed.
+                // Sender dropped without sending (shouldn't happen) or wait_ms
+                // elapsed. If a handoff was delivered into the channel but
+                // never polled (timeout/cancellation race), dropping `rx` runs
+                // SlotHandoff's Drop and returns the slot to the pool.
                 self.metrics.timeout_total.fetch_add(1, Ordering::Relaxed);
                 AcquireResult::Timeout
             }
@@ -408,7 +468,7 @@ struct WaiterEntry {
     client_key: String,
     priority: QueuePriority,
     enqueued_at: std::time::Instant,
-    tx: oneshot::Sender<bool>,
+    tx: oneshot::Sender<WaiterMsg>,
 }
 
 fn effective_priority(entry: &WaiterEntry, now: std::time::Instant) -> u8 {
@@ -564,6 +624,41 @@ mod tests {
         let result = handle.await.unwrap();
         assert!(matches!(result, AcquireResult::Permit(_)));
         assert_eq!(q.metrics.permit_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn handed_off_slot_is_returned_when_waiter_is_cancelled() {
+        // Regression for: a permit dropped while a waiter was queued sent the
+        // slot through the oneshot without decrementing `active`. If the
+        // waiter task was aborted (client disconnect) after the send but
+        // before its next poll, the delivered value was discarded with the
+        // receiver and the slot leaked permanently.
+        //
+        // `#[tokio::test]` uses the current-thread runtime, so between
+        // `drop(permit)` and `handle.abort()` the waiter cannot be polled —
+        // the abort deterministically lands in the loss window.
+        let q = Arc::new(GlobalQueue::new(cfg(1, 4, 5_000, OverloadPolicy::Reject)));
+        let permit = q.acquire(key("a")).await;
+        assert!(matches!(permit, AcquireResult::Permit(_)));
+
+        let q2 = Arc::clone(&q);
+        let handle = tokio::spawn(async move { q2.acquire(key("b")).await });
+
+        // Give the waiter time to enqueue.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(q.queued(), 1);
+
+        // Hand the slot to the waiter, then cancel it before it can poll the
+        // delivered handoff.
+        drop(permit);
+        handle.abort();
+        let _ = handle.await;
+
+        // The slot must have returned to the pool.
+        assert_eq!(q.active(), 0);
+        let r = q.acquire(key("c")).await;
+        assert!(matches!(r, AcquireResult::Permit(_)));
+        assert_eq!(q.active(), 1);
     }
 
     #[tokio::test]

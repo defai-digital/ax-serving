@@ -362,6 +362,17 @@ impl DeploymentCatalog {
                 &deployment.required_capabilities,
                 None,
             ) {
+                // Match `route_candidates`: only endpoints with a fenced
+                // protocol-v1 lease can actually receive production traffic.
+                // Without this gate the rollout readiness check (and "Ready"
+                // reporting) counts legacy/compat endpoints that routing will
+                // never select, allowing a cutover to an unroutable target.
+                if endpoint.protocol_worker_id.is_none()
+                    || endpoint.worker_instance_id.is_none()
+                    || endpoint.registration_id.is_none()
+                {
+                    continue;
+                }
                 if !endpoint_matches_pool(&endpoint, pool) {
                     continue;
                 }

@@ -31,7 +31,8 @@ use crate::ServingLayer;
 /// The TCP listener enforces `Authorization: Bearer <key>` when `keys` is non-empty,
 /// consistent with the REST API's auth policy.
 ///
-/// Removes any stale socket file before binding.
+/// Removes any stale socket file before binding, then restricts the socket to
+/// owner-only access (0o600) since UDS connections carry no token check.
 pub async fn serve(
     layer: Arc<ServingLayer>,
     socket_path: String,
@@ -43,6 +44,15 @@ pub async fn serve(
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     let uds = tokio::net::UnixListener::bind(&socket_path)?;
+
+    // The UDS listener skips token auth (see below), so the socket file itself
+    // is the access gate. Restrict it to the owner — the default umask would
+    // otherwise leave it accessible to any local user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let uds_stream = UnixListenerStream::new(uds);
 
     // UDS: no auth — protected by filesystem permissions.

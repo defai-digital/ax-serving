@@ -996,6 +996,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_summary_counts_only_protocol_leased_endpoints() {
+        // Regression: `observed_endpoint_summary` counted endpoints that
+        // `route_candidates` would never select because they lack a fenced
+        // protocol-v1 lease. The rollout readiness gate and "Ready" reporting
+        // must only count explicitly routable endpoints.
+        use super::super::registry::{RegisterCapabilities, RegisterRequest};
+
+        let layer = layer().await;
+
+        // Legacy (non-protocol) worker serving the deployment's runtime model.
+        let _ = layer.registry.register(
+            RegisterRequest {
+                worker_id: None,
+                addr: "127.0.0.1:18082".into(),
+                capabilities: RegisterCapabilities::Legacy(vec!["runtime/baseline".into()]),
+                backend: "vllm".into(),
+                runtime: Some("vllm".into()),
+                hardware_class: Some("cuda".into()),
+                worker_pool: Some("cuda".into()),
+                max_inflight: 4,
+                ..Default::default()
+            },
+            5_000,
+        );
+
+        // Protocol-v1 worker with a fenced lease serving the same model.
+        layer
+            .registry
+            .register_protocol(
+                RegisterWorkerRequest {
+                    protocol: ProtocolDescriptor::current(BTreeSet::new()),
+                    agent: AgentDescriptor {
+                        name: "test-agent".into(),
+                        version: "1".into(),
+                        build_sha: None,
+                    },
+                    worker: WorkerDescriptor {
+                        id: WorkerId::new("summary-worker").unwrap(),
+                        instance_id: WorkerInstanceId::new(),
+                        advertise_url: "http://127.0.0.1:18083".into(),
+                        pool_id: PoolId::new("cuda").unwrap(),
+                        trust_domain: TrustDomainId::new("private").unwrap(),
+                        labels: BTreeMap::new(),
+                    },
+                    runtime: RuntimeDescriptor {
+                        kind: "vllm".into(),
+                        version: "1.0.0".into(),
+                        api: "openai-v1".into(),
+                    },
+                    hardware: HardwareDescriptor {
+                        platform: "linux".into(),
+                        accelerator: "nvidia-gpu".into(),
+                        device_count: 1,
+                        memory_bytes: None,
+                        hardware_class: Some("cuda".into()),
+                    },
+                    domain: None,
+                    domain_observation: None,
+                    observation: RuntimeObservation {
+                        observed_at: OffsetDateTime::now_utc(),
+                        runtime: RuntimeStatus::ready(),
+                        inventory_generation: 1,
+                        models: vec![RuntimeModelDescriptor {
+                            runtime_model_id: RuntimeModelId::new("runtime/baseline").unwrap(),
+                            identity: identity(),
+                            operations: BTreeSet::from([Operation::chat_completions()]),
+                            capabilities: BTreeSet::new(),
+                            max_context_tokens: Some(32_768),
+                            max_output_tokens: Some(4_096),
+                        }],
+                        capacity: Some(CapacityObservation {
+                            active_requests: Some(0),
+                            max_concurrent_requests: Some(4),
+                            ..Default::default()
+                        }),
+                    },
+                },
+                "127.0.0.1:18083".parse().unwrap(),
+                NegotiatedProtocol {
+                    version: CURRENT_PROTOCOL,
+                    capabilities: BTreeSet::new(),
+                },
+                5_000,
+                15_000,
+            )
+            .unwrap();
+
+        let catalog = layer.deployment_catalog.snapshot();
+        let spec = catalog
+            .deployment(&DeploymentId::new("baseline").unwrap())
+            .unwrap();
+        let (ready, _inflight) = catalog.observed_endpoint_summary(&layer.registry, spec);
+        assert_eq!(
+            ready, 1,
+            "only the protocol-leased endpoint may count toward rollout readiness"
+        );
+    }
+
+    #[tokio::test]
     async fn rollout_enables_ready_replacement_before_disabling_source() {
         let source_id = DeploymentId::new("source").unwrap();
         let target_id = DeploymentId::new("target").unwrap();

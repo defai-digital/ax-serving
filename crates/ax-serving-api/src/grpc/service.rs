@@ -308,10 +308,19 @@ impl AxServingServiceTrait for AxServingService {
         &self,
         _request: Request<proto::HealthRequest>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
-        let thermal = engine_thermal_to_proto(self.layer.backend.thermal_state());
+        let thermal_state = self.layer.backend.thermal_state();
+        let thermal = engine_thermal_to_proto(thermal_state);
+        // Mirror the REST /health readiness condition: a thermally-critical
+        // node must report NOT_SERVING so health-checking callers stop
+        // routing traffic to it.
+        let status = if matches!(thermal_state, ThermalState::Critical) {
+            proto::ServingStatus::NotServing
+        } else {
+            proto::ServingStatus::Serving
+        };
 
         Ok(Response::new(proto::HealthResponse {
-            status: proto::ServingStatus::Serving as i32,
+            status: status as i32,
             model_ids: self.layer.registry.list_ids(),
             uptime_secs: self.layer.metrics.uptime_secs(),
             thermal_state: thermal as i32,
@@ -561,12 +570,18 @@ mod tests {
 
     struct HoldingBackend {
         sender: Mutex<Option<mpsc::Sender<GenerateEvent>>>,
+        thermal: ThermalState,
     }
 
     impl HoldingBackend {
         fn new() -> Self {
+            Self::with_thermal(ThermalState::Nominal)
+        }
+
+        fn with_thermal(thermal: ThermalState) -> Self {
             Self {
                 sender: Mutex::new(None),
+                thermal,
             }
         }
 
@@ -631,7 +646,7 @@ mod tests {
         }
 
         fn thermal_state(&self) -> ThermalState {
-            ThermalState::Nominal
+            self.thermal
         }
 
         fn recommended_concurrency(&self) -> usize {
@@ -948,6 +963,36 @@ mod tests {
 
         drop(first);
         backend.release_generation();
+    }
+
+    #[tokio::test]
+    async fn grpc_health_reports_not_serving_on_critical_thermal() {
+        let mut config = ServeConfig::default();
+        config.cache.enabled = false;
+
+        let critical_layer = Arc::new(ServingLayer::new(
+            Arc::new(HoldingBackend::with_thermal(ThermalState::Critical))
+                as Arc<dyn InferenceBackend>,
+            config.clone(),
+        ));
+        let critical = AxServingService::new(critical_layer)
+            .health(Request::new(proto::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(critical.status, proto::ServingStatus::NotServing as i32);
+        assert_eq!(critical.thermal_state, proto::ThermalState::Critical as i32);
+
+        let nominal_layer = Arc::new(ServingLayer::new(
+            Arc::new(HoldingBackend::new()) as Arc<dyn InferenceBackend>,
+            config,
+        ));
+        let nominal = AxServingService::new(nominal_layer)
+            .health(Request::new(proto::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(nominal.status, proto::ServingStatus::Serving as i32);
     }
 
     #[test]

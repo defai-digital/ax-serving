@@ -239,7 +239,7 @@ pub async fn start_servers(layer: Arc<ServingLayer>, config: &ServeConfig) -> Re
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(check_interval_secs));
-            let idle_ms = idle_secs * 1_000;
+            let idle_ms = idle_secs.saturating_mul(1_000);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}

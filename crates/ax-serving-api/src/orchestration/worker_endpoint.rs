@@ -44,6 +44,17 @@ impl WorkerEndpoint {
         if host.is_empty() || host == "*" {
             return Err("advertise endpoint host is invalid".into());
         }
+        // `Url::host_str()` keeps the brackets on IPv6 literals ("[::1]").
+        // Strip them so the literal validates as an IP address below instead
+        // of falling into the DNS-name check and being rejected; the brackets
+        // are re-added when the base URL is built.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
+        if host.is_empty() {
+            return Err("advertise endpoint host is invalid".into());
+        }
         // Reject wildcard IPs when the host is an IP literal.
         if let Ok(ip) = host.parse::<IpAddr>() {
             if ip.is_unspecified() || ip.is_multicast() || is_link_local(ip) {
@@ -67,10 +78,8 @@ impl WorkerEndpoint {
             .port_or_known_default()
             .ok_or_else(|| "advertise endpoint is missing a port".to_string())?;
         // Url may omit default ports; always store an explicit port for stable dispatch.
-        let host_for_url = if host.contains(':') && !host.starts_with('[') {
-            // Should not happen for non-bracket IPv6; keep as-is.
-            host.to_string()
-        } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        // IPv6 literals must be bracketed to keep the stored `base_url` a valid URL.
+        let host_for_url = if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
             format!("[{ip}]")
         } else {
             host.to_string()
@@ -95,6 +104,11 @@ impl WorkerEndpoint {
     pub fn tcp_probe_addr(&self) -> Option<SocketAddr> {
         let url = reqwest::Url::parse(&self.base_url).ok()?;
         let host = url.host_str()?;
+        // `Url::host_str()` keeps brackets on IPv6 literals — strip before parsing.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
         let ip = host.parse::<IpAddr>().ok()?;
         let port = url.port_or_known_default()?;
         Some(SocketAddr::new(ip, port))
@@ -107,6 +121,11 @@ impl WorkerEndpoint {
         let Some(host) = url.host_str() else {
             return false;
         };
+        // `Url::host_str()` keeps brackets on IPv6 literals — strip before parsing.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
         match host.parse::<IpAddr>() {
             Ok(ip) => ip.is_loopback(),
             Err(_) => host.eq_ignore_ascii_case("localhost"),
@@ -190,6 +209,37 @@ mod tests {
             ep.tcp_probe_addr(),
             Some("10.20.30.40:18081".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn ipv6_host_is_rebracketed_in_base_url() {
+        // Regression: `Url::host_str()` strips brackets from IPv6 literals, so
+        // the stored base_url became `http://::1:18081` — an invalid URL that
+        // broke dispatch, TCP probing, and serde roundtrips for IPv6 workers.
+        let ep = WorkerEndpoint::parse("http://[2001:db8::5]:18081").unwrap();
+        assert_eq!(ep.base_url(), "http://[2001:db8::5]:18081");
+        assert_eq!(
+            ep.tcp_probe_addr(),
+            Some("[2001:db8::5]:18081".parse().unwrap())
+        );
+        assert_eq!(
+            ep.join_path("/v1/chat/completions"),
+            "http://[2001:db8::5]:18081/v1/chat/completions"
+        );
+
+        // Legacy bracketed host:port form.
+        let ep = WorkerEndpoint::parse("[::1]:18081").unwrap();
+        assert_eq!(ep.base_url(), "http://[::1]:18081");
+        assert_eq!(ep.tcp_probe_addr(), Some("[::1]:18081".parse().unwrap()));
+        assert_eq!(ep.host_port_display(), "[::1]:18081");
+
+        // Serde roundtrip re-parses the stored base_url — must succeed.
+        let json = serde_json::to_string(&ep).unwrap();
+        let back: WorkerEndpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ep);
+
+        // Wildcard IPv6 is still rejected after bracket stripping.
+        assert!(WorkerEndpoint::parse("http://[::]:18081").is_err());
     }
 
     #[test]

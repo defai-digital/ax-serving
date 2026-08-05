@@ -1895,24 +1895,33 @@ impl WorkerRegistry {
 
         // Second pass: remove only entries that are still stale. This closes the
         // race where a heartbeat or re-registration refreshes the worker after
-        // the first pass but before removal.
+        // the first pass but before removal. Only ids actually removed are
+        // reported and have their protocol sessions purged — a worker that
+        // heartbeated between the passes must keep its session.
+        let mut removed = Vec::new();
         for id in &evicted {
-            self.inner.remove_if(id, |_, entry| {
-                let age_ms = entry.last_heartbeat.elapsed().as_millis() as u64;
-                if entry.drain {
-                    age_ms > ttl_ms
-                } else {
-                    age_ms > ttl_ms && matches!(entry.health, WorkerHealth::Dead)
-                }
-            });
+            let was_removed = self
+                .inner
+                .remove_if(id, |_, entry| {
+                    let age_ms = entry.last_heartbeat.elapsed().as_millis() as u64;
+                    if entry.drain {
+                        age_ms > ttl_ms
+                    } else {
+                        age_ms > ttl_ms && matches!(entry.health, WorkerHealth::Dead)
+                    }
+                })
+                .is_some();
+            if was_removed {
+                removed.push(*id);
+            }
         }
 
-        if !evicted.is_empty() {
+        if !removed.is_empty() {
             self.protocol_sessions
-                .retain(|_, session| !evicted.contains(&session.internal_id));
+                .retain(|_, session| !removed.contains(&session.internal_id));
         }
 
-        evicted
+        removed
     }
 
     /// Count workers that are healthy AND not draining.
@@ -3933,6 +3942,66 @@ mod tests {
         let evicted = r.tick(1);
         assert!(!evicted.is_empty());
         assert!(r.eligible_workers("m1").is_empty());
+    }
+
+    #[test]
+    fn tick_reports_only_workers_it_actually_removed() {
+        // Regression: tick() returned every id collected in its first pass —
+        // and unconditionally purged those ids' protocol sessions — even when
+        // the second-pass recheck kept the worker because a heartbeat landed
+        // between the two passes. The returned ids must be exactly the
+        // workers this call removed from the registry.
+        let r = Arc::new(WorkerRegistry::new());
+        let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+        let current_id = Arc::new(std::sync::Mutex::new(
+            WorkerId::parse(&resp.worker_id).unwrap(),
+        ));
+
+        // Hammer heartbeats to land them between tick's first and second pass.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = {
+            let r = Arc::clone(&r);
+            let current_id = Arc::clone(&current_id);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let id = *current_id.lock().unwrap();
+                    r.heartbeat(
+                        id,
+                        HeartbeatRequest {
+                            model_ids: vec!["m1".to_string()],
+                            ..Default::default()
+                        },
+                    );
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        for _ in 0..1_000 {
+            let id = *current_id.lock().unwrap();
+            // Backdate so the first pass selects the worker for eviction.
+            let Some(mut entry) = r.inner.get_mut(&id) else {
+                // Actually evicted in a previous round — re-register.
+                let resp = r.register(reg_req("127.0.0.1:8081", &["m1"], 4), 5000);
+                *current_id.lock().unwrap() = WorkerId::parse(&resp.worker_id).unwrap();
+                continue;
+            };
+            entry.last_heartbeat = Instant::now()
+                .checked_sub(std::time::Duration::from_millis(10))
+                .unwrap();
+            drop(entry);
+
+            for evicted in r.tick(1) {
+                assert!(
+                    r.inner.get(&evicted).is_none(),
+                    "tick reported {evicted} as evicted but it is still registered"
+                );
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
     }
 
     #[test]

@@ -311,7 +311,19 @@ impl ModelRegistry {
         if !failed_evictions.is_empty() {
             let mut guard = self.inner_write();
             for entry in failed_evictions {
-                guard.insert(entry.id.clone(), entry);
+                // Re-insert only if the id is still vacant: a concurrent
+                // `load()` of the same id may have completed while the backend
+                // unload was in flight, and blindly overwriting its entry would
+                // leak the newly loaded handle.
+                if guard.contains_key(&entry.id) {
+                    warn!(
+                        "warm pool: not re-inserting '{}' — a newer load claimed the id; \
+                         the failed-unload handle may leak until process exit",
+                        entry.id
+                    );
+                } else {
+                    guard.insert(entry.id.clone(), entry);
+                }
             }
             anyhow::bail!("warm-pool eviction failed; cannot load '{model_id}'");
         }
@@ -428,10 +440,21 @@ impl ModelRegistry {
 
         // Backend unload outside the lock — slow operation.
         if let Err(e) = backend.unload_model(entry.handle) {
-            // Re-insert to prevent a handle leak.
+            // Re-insert only if the id is still vacant: a concurrent `load()`
+            // of the same id may have completed while the unload was in
+            // flight, and blindly overwriting its entry would leak the newly
+            // loaded handle and resurrect the old mapping.
             {
                 let mut guard = self.inner_write();
-                guard.insert(model_id.to_string(), entry);
+                if guard.contains_key(model_id) {
+                    warn!(
+                        "unload of '{model_id}' failed, but a newer load claimed the id; \
+                         leaving the new entry in place (the failed-unload handle may leak \
+                         until process exit)"
+                    );
+                } else {
+                    guard.insert(model_id.to_string(), entry);
+                }
             }
             return Err(e).with_context(|| format!("backend failed to unload model '{model_id}'"));
         }
@@ -579,8 +602,19 @@ impl ModelRegistry {
             if let Some(entry) = entry_to_evict {
                 if let Err(e) = backend.unload_model(entry.handle) {
                     warn!("idle eviction: failed to unload '{id}': {e}");
+                    // Re-insert only if the id is still vacant: a concurrent
+                    // `load()` of the same id may have completed while the
+                    // unload was in flight, and blindly overwriting its entry
+                    // would leak the newly loaded handle.
                     let mut guard = self.inner_write();
-                    guard.insert(id, entry); // re-insert: avoid handle leak
+                    if guard.contains_key(&id) {
+                        warn!(
+                            "idle eviction: not re-inserting '{id}' — a newer load claimed \
+                             the id; the failed-unload handle may leak until process exit"
+                        );
+                    } else {
+                        guard.insert(id, entry); // re-insert: avoid handle leak
+                    }
                 } else {
                     evicted.push(id);
                 }
@@ -996,6 +1030,77 @@ mod tests {
 
         fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: ModelHandle,
+            _: GenerateInput,
+            _: GenerationParams,
+            _: tokio::sync::mpsc::Sender<GenerateEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn tokenize(&self, _: ModelHandle, _: &str, _: bool) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn decode_tokens(&self, _: ModelHandle, _: &[u32]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn eos_tokens(&self, _: ModelHandle) -> anyhow::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn thermal_state(&self) -> ThermalState {
+            ThermalState::Nominal
+        }
+
+        fn recommended_concurrency(&self) -> usize {
+            4
+        }
+    }
+
+    /// Backend whose `unload_model` simulates a concurrent same-id `load()`
+    /// landing in the unload window (entry removed, backend unload in flight):
+    /// it loads a fresh entry into the registry, then reports failure.
+    struct ReentrantLoadFailingUnloadBackend {
+        registry: ModelRegistry,
+        path: PathBuf,
+    }
+
+    impl InferenceBackend for ReentrantLoadFailingUnloadBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _config: LoadConfig,
+        ) -> anyhow::Result<(ModelHandle, ModelMetadata)> {
+            Ok((
+                ModelHandle(100),
+                ModelMetadata {
+                    architecture: "reentrant".into(),
+                    n_layers: 0,
+                    n_heads: 0,
+                    n_kv_heads: 0,
+                    embedding_dim: 0,
+                    vocab_size: 0,
+                    context_length: 2048,
+                    load_time_ms: 1,
+                    peak_rss_bytes: 0,
+                    resolved_backend: ax_serving_engine::BackendType::Auto,
+                },
+            ))
+        }
+
+        fn unload_model(&self, _handle: ModelHandle) -> anyhow::Result<()> {
+            // A concurrent load of the same id completes while this unload is
+            // in flight (the registry holds no lock across this call).
+            self.registry
+                .load("m", &self.path, LoadConfig::default(), &NullBackend)
+                .expect("reentrant load must succeed");
+            Err(anyhow::anyhow!("simulated backend unload failure"))
         }
 
         fn generate(
@@ -2022,6 +2127,42 @@ mod tests {
             reg.get("m").is_some(),
             "entry must be re-inserted after failed unload to prevent handle leak"
         );
+    }
+
+    #[test]
+    fn unload_backend_failure_does_not_clobber_concurrent_reload() {
+        // Regression: a failed unload re-inserted its entry unconditionally.
+        // If a concurrent load of the same id completed while the backend
+        // unload was in flight, the blind re-insert overwrote the new entry —
+        // leaking the newly loaded handle and resurrecting the old mapping.
+        // The mock backend performs that concurrent load reentrantly inside
+        // `unload_model`, which is exactly the lock-free window in `unload()`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_gguf(&dir);
+        let reg = ModelRegistry::new(16);
+        let backend = ReentrantLoadFailingUnloadBackend {
+            registry: reg.clone(),
+            path: path.clone(),
+        };
+
+        let original = reg
+            .load("m", &path, LoadConfig::default(), &backend)
+            .unwrap();
+        let original_handle = original.handle;
+        drop(original);
+
+        let result = reg.unload("m", &backend);
+        assert!(result.is_err(), "backend failure must propagate as error");
+
+        let current = reg
+            .get("m")
+            .expect("the concurrent reload must remain registered");
+        assert_eq!(
+            current.handle,
+            ModelHandle(1),
+            "the entry inserted by the concurrent load (NullBackend handle) must win"
+        );
+        assert_ne!(current.handle, original_handle);
     }
 
     #[test]
