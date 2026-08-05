@@ -144,6 +144,43 @@ def test_rest_chat_does_not_send_default_top_k_zero(monkeypatch) -> None:
     assert "top_k" not in captured["json"]
 
 
+def test_rest_chat_does_not_send_seed_unless_explicit(monkeypatch) -> None:
+    """Default seed must be omitted so the server samples randomly.
+
+    Sending seed=0 would pin the RNG (REST seed is Option; None = random).
+    """
+    captured: dict[str, Any] = {}
+
+    def post(url: str, **kwargs: Any) -> FakeResponse:
+        captured.update(kwargs)
+        return FakeResponse(
+            {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                },
+            }
+        )
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=post))
+
+    client = Client(base_url="http://127.0.0.1:18080")
+    client.chat.completions.create(
+        model="default",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    assert "seed" not in captured["json"]
+
+    client.chat.completions.create(
+        model="default",
+        messages=[{"role": "user", "content": "hello"}],
+        seed=0,
+    )
+    assert captured["json"]["seed"] == 0
+
+
 def test_rest_stream_uses_api_key(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -269,3 +306,43 @@ def test_grpc_chat_ignores_rest_only_options() -> None:
     assert captured["model_id"] == "default"
     assert "cache" not in captured["kwargs"]
     assert "cache_ttl" not in captured["kwargs"]
+    assert "seed" not in captured["kwargs"]
+
+
+def test_grpc_chat_maps_embedded_finish_reasons_to_openai() -> None:
+    class FakeGrpc:
+        def __init__(self, finish_reason: str) -> None:
+            self._finish_reason = finish_reason
+            self.last_finish_reason: str | None = None
+
+        def infer_full(self, model_id: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                text="ok",
+                finish_reason=self._finish_reason,
+                metrics=None,
+            )
+
+        def infer(self, model_id: str, messages: list[dict[str, str]] | None = None, **kwargs: Any):
+            self.last_finish_reason = self._finish_reason
+            if False:  # pragma: no cover - make this a generator
+                yield ""
+
+    for embedded, openai in (("eos", "stop"), ("max_tokens", "length"), ("stop_sequence", "stop")):
+        client = Client(grpc_port=50051)
+        client._grpc = FakeGrpc(embedded)
+        response = client.chat.completions.create(
+            model="default",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert response.choices[0].finish_reason == openai
+
+        client._grpc = FakeGrpc(embedded)
+        chunks = list(
+            client.chat.completions.create(
+                model="default",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+            )
+        )
+        assert chunks[-1].choices[0].finish_reason == openai
+        assert chunks[-1].choices[0].delta.content is None

@@ -22,14 +22,15 @@ def _make_channel(socket: str | None, host: str | None, port: int) -> grpc.Chann
     Priority:
     1. TCP ``host:port`` when *host* is explicitly set (caller prefers TCP).
     2. UDS socket when the socket file exists and no host is specified.
-    3. Fallback to ``localhost:port`` TCP.
+    3. Fallback to ``127.0.0.1:port`` TCP (IPv4 loopback; avoids dual-stack
+       ``localhost`` resolving to ``::1`` when the server is IPv4-only).
     """
     if host is not None:
         target = f"{host}:{port}"
     elif socket and os.path.exists(socket):
         target = f"unix://{socket}"
     else:
-        target = f"localhost:{port}"
+        target = f"127.0.0.1:{port}"
     return grpc.insecure_channel(target)
 
 
@@ -68,6 +69,8 @@ class GrpcClient:
         self._timeout = timeout
         self._channel: grpc.Channel | None = None
         self._stub: pb_grpc.AxServingServiceStub | None = None
+        # Populated after a streaming ``infer()`` completes.
+        self.last_finish_reason: str | None = None
 
     def _ensure_connected(self) -> pb_grpc.AxServingServiceStub:
         if self._stub is None:
@@ -176,10 +179,13 @@ class GrpcClient:
             max_tokens=max_tokens,
         )
 
+        self.last_finish_reason = None
         for resp in stub.Infer(req, timeout=self._timeout):
             if not resp.finished:
                 yield resp.text
-            # On finish the caller can inspect metrics via infer_full()
+            else:
+                self.last_finish_reason = _FINISH_MAP.get(resp.finish_reason, "eos")
+                # On finish the caller can inspect metrics via infer_full()
 
     def infer_full(
         self,

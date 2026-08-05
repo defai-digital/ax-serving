@@ -17,6 +17,24 @@ _GRPC_GENERATION_KEYS = {
     "seed",
 }
 
+# Map embedded gRPC finish reasons onto the OpenAI-compatible vocabulary.
+_OPENAI_FINISH_REASON = {
+    "eos": "stop",
+    "stop_sequence": "stop",
+    "unspecified": "stop",
+    "max_tokens": "length",
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "content_filter": "content_filter",
+}
+
+
+def _openai_finish_reason(reason: str | None) -> str:
+    if not reason:
+        return "stop"
+    return _OPENAI_FINISH_REASON.get(reason, reason)
+
 
 class _CompletionChunk:
     """Minimal OpenAI ChatCompletionChunk-compatible object."""
@@ -110,7 +128,7 @@ class _Completions:
         top_p: float = 0.9,
         top_k: int = 0,
         repeat_penalty: float = 1.1,
-        seed: int = 0,
+        seed: int | None = None,
         **extra: Any,
     ) -> _ChatCompletionResponse | Iterator[_CompletionChunk]:
         """Create a chat completion.
@@ -124,16 +142,21 @@ class _Completions:
             top_p: Nucleus sampling probability.
             top_k: Top-k sampling (0 = disabled).
             repeat_penalty: Repetition penalty.
-            seed: Random seed.
+            seed: Random seed. ``None`` (default) leaves sampling unseeded so
+                the server chooses a random seed; only send an explicit value
+                when reproducibility is required.
         """
-        kwargs = dict(
+        kwargs: dict[str, Any] = dict(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repeat_penalty=repeat_penalty,
             max_tokens=max_tokens,
-            seed=seed,
         )
+        # Omit seed unless the caller set it: REST treats missing seed as
+        # random, while seed=0 would pin the RNG to a fixed stream.
+        if seed is not None:
+            kwargs["seed"] = seed
         for key, value in extra.items():
             if value is not None:
                 kwargs[key] = value
@@ -160,13 +183,18 @@ class _Completions:
             def _stream() -> Generator[_CompletionChunk, None, None]:
                 for tok in grpc_client.infer(model, messages=messages, **grpc_kwargs):
                     yield _CompletionChunk(tok, model)
-                yield _CompletionChunk("", model, finish_reason="stop")
+                reason = _openai_finish_reason(
+                    getattr(grpc_client, "last_finish_reason", None)
+                )
+                yield _CompletionChunk(None, model, finish_reason=reason)
             return _stream()
 
         result = grpc_client.infer_full(model, messages=messages, **grpc_kwargs)
         pt = result.metrics.prefill_tokens if result.metrics else 0
         ct = result.metrics.decode_tokens if result.metrics else 0
-        finish_reason = getattr(result, "finish_reason", "stop")
+        finish_reason = _openai_finish_reason(
+            getattr(result, "finish_reason", None)
+        )
         return _ChatCompletionResponse(result.text, model, pt, ct, finish_reason)
 
     def _create_rest(
@@ -269,30 +297,30 @@ class Client:
 
     Examples::
 
-        # REST (default, matches OpenAI SDK interface)
-        c = Client(base_url="http://localhost:18080")
+        # REST against the portable public gateway (default port 18080)
+        c = Client()  # http://127.0.0.1:18080 , AXS_API_KEY if set
         resp = c.chat.completions.create(
-            model="llama3",
+            model="default",  # must match an id from GET /v1/models
             messages=[{"role": "user", "content": "Hello!"}],
         )
         print(resp.choices[0].message.content)
 
-        # gRPC via UDS
+        # gRPC via UDS (embedded macOS compatibility only)
         c = Client(grpc_socket="/tmp/ax-serving.sock")
         for chunk in c.chat.completions.create(
-            model="llama3",
+            model="default",
             messages=[{"role": "user", "content": "Hello!"}],
             stream=True,
         ):
             print(chunk.choices[0].delta.content, end="", flush=True)
 
-        # gRPC via TCP
+        # gRPC via TCP (embedded compatibility only)
         c = Client(grpc_port=50051)
     """
 
     def __init__(
         self,
-        base_url: str = "http://localhost:18080",
+        base_url: str = "http://127.0.0.1:18080",
         grpc_socket: str | None = None,
         grpc_port: int | None = None,
         api_key: str | None = None,
@@ -310,7 +338,7 @@ class Client:
                 ) from error
             self._grpc = GrpcClient(
                 socket=grpc_socket or "/tmp/ax-serving.sock",
-                host=None if grpc_socket else "localhost",
+                host=None if grpc_socket else "127.0.0.1",
                 port=grpc_port or 50051,
             )
 
