@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 #[cfg(feature = "embedded-compat")]
 use ax_serving_engine::{LlamaCppConfig, MlxConfig};
-use ax_serving_protocol::{DeploymentSpec, DomainSpec, EquivalencePolicy, PoolSpec};
+use ax_serving_protocol::{DeploymentSpec, DomainId, DomainSpec, EquivalencePolicy, PoolSpec};
 use serde::Deserialize;
 
 #[cfg(not(feature = "embedded-compat"))]
@@ -332,6 +332,8 @@ pub struct OrchestratorConfig {
     pub deployments: Vec<DeploymentSpec>,
     /// Operator-certified equivalence policies for cross-pool routing.
     pub equivalence_classes: Vec<EquivalencePolicy>,
+    /// Conservative replay/shadow/canary/active/rollback domain policy.
+    pub adaptive_federation: AdaptiveFederationConfig,
 
     /// `/readyz` mode: `control_plane` (default) or `eligible_workers` (legacy).
     /// env: `AXS_READYZ_MODE`
@@ -382,6 +384,7 @@ impl Default for OrchestratorConfig {
             domains: Vec::new(),
             deployments: Vec::new(),
             equivalence_classes: Vec::new(),
+            adaptive_federation: AdaptiveFederationConfig::default(),
             readyz_mode: "control_plane".into(),
             fleet_store_ready_max_stale_ms: 15_000,
             shutdown_propagation_ms: 5_000,
@@ -389,6 +392,51 @@ impl Default for OrchestratorConfig {
             shutdown_hard_secs: 330,
         }
     }
+}
+
+/// Operator-pinned adaptive domain-policy configuration.
+///
+/// Predictions are bounded, prompt-free certification inputs. Runtime rank
+/// details never enter this policy surface.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AdaptiveFederationConfig {
+    pub enabled: bool,
+    /// `shadow`, `canary`, `active`, or `rollback`.
+    pub mode: String,
+    pub target_domain: Option<DomainId>,
+    pub baseline_domain: Option<DomainId>,
+    /// Deterministic target share in parts per million.
+    pub canary_share_ppm: u32,
+    pub max_cost_microusd: Option<u64>,
+    pub latency_slo_ms: Option<u64>,
+    pub domains: Vec<AdaptiveDomainPredictionConfig>,
+}
+
+impl Default for AdaptiveFederationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "shadow".into(),
+            target_domain: None,
+            baseline_domain: None,
+            canary_share_ppm: 0,
+            max_cost_microusd: None,
+            latency_slo_ms: None,
+            domains: Vec::new(),
+        }
+    }
+}
+
+/// Retained aggregate prediction for one complete execution domain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveDomainPredictionConfig {
+    pub domain: DomainId,
+    pub predicted_cost_microusd: u64,
+    pub predicted_latency_ms: u64,
+    #[serde(default)]
+    pub stability_rank: u32,
 }
 
 // ── ProjectPolicyConfig ───────────────────────────────────────────────────────
@@ -625,6 +673,63 @@ impl ServeConfig {
                 "unknown deployment_mode '{}'; valid: legacy_compat, explicit",
                 self.orchestrator.deployment_mode
             );
+        }
+        if self.orchestrator.adaptive_federation.enabled {
+            let adaptive = &self.orchestrator.adaptive_federation;
+            if !matches!(
+                normalize_config_token(&adaptive.mode).as_str(),
+                "shadow" | "canary" | "active" | "rollback"
+            ) {
+                anyhow::bail!(
+                    "adaptive_federation.mode must be shadow, canary, active, or rollback"
+                );
+            }
+            if adaptive.canary_share_ppm > 1_000_000 {
+                anyhow::bail!("adaptive_federation.canary_share_ppm must be <= 1000000");
+            }
+            if adaptive.latency_slo_ms == Some(0) {
+                anyhow::bail!("adaptive_federation.latency_slo_ms must be > 0");
+            }
+            let target = adaptive.target_domain.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("adaptive_federation.target_domain is required when enabled")
+            })?;
+            let baseline = adaptive.baseline_domain.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("adaptive_federation.baseline_domain is required when enabled")
+            })?;
+            if target == baseline {
+                anyhow::bail!("adaptive target_domain and baseline_domain must differ");
+            }
+            let declared_domains = self
+                .orchestrator
+                .domains
+                .iter()
+                .map(|domain| &domain.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            if !declared_domains.contains(target) || !declared_domains.contains(baseline) {
+                anyhow::bail!(
+                    "adaptive target and baseline domains must exist in orchestrator.domains"
+                );
+            }
+            let mut predictions = std::collections::BTreeSet::new();
+            for prediction in &adaptive.domains {
+                if !predictions.insert(&prediction.domain) {
+                    anyhow::bail!(
+                        "adaptive_federation.domains contains duplicate domain '{}'",
+                        prediction.domain
+                    );
+                }
+                if prediction.predicted_latency_ms == 0 {
+                    anyhow::bail!(
+                        "adaptive prediction latency must be > 0 for domain '{}'",
+                        prediction.domain
+                    );
+                }
+            }
+            if !predictions.contains(target) || !predictions.contains(baseline) {
+                anyhow::bail!(
+                    "adaptive_federation.domains must include target and baseline predictions"
+                );
+            }
         }
         if self.orchestrator.telemetry_stale_ms == 0 {
             anyhow::bail!("orchestrator.telemetry_stale_ms must be > 0");
@@ -1081,6 +1186,7 @@ mod tests {
             "serving.yaml",
             "serving.example.yaml",
             "serving.offline-enterprise.yaml",
+            "serving.mac-cluster.example.yaml",
         ] {
             let path = config_dir.join(filename);
             let config = ServeConfig::from_file(&path)
@@ -1123,6 +1229,69 @@ mod tests {
     #[test]
     fn default_config_passes_validation() {
         assert!(valid_cfg().validate().is_ok());
+    }
+
+    fn adaptive_domain(name: &str) -> DomainSpec {
+        DomainSpec {
+            id: DomainId::new(name).unwrap(),
+            kind: ax_serving_protocol::ExecutionDomainKind::MacAxEngine,
+            pool: ax_serving_protocol::PoolId::new(format!("{name}-pool")).unwrap(),
+            trust_domain: ax_serving_protocol::TrustDomainId::new("private").unwrap(),
+            hardware_class: "apple-silicon".into(),
+            required_qualification: ax_serving_protocol::QualificationState::Experimental,
+            selector: std::collections::BTreeMap::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn adaptive_config_requires_distinct_declared_domains_and_predictions() {
+        let baseline = DomainId::new("mac-single").unwrap();
+        let target = DomainId::new("mac-cluster").unwrap();
+        let mut cfg = valid_cfg();
+        cfg.orchestrator.domains =
+            vec![adaptive_domain(baseline.as_str()), adaptive_domain(target.as_str())];
+        cfg.orchestrator.adaptive_federation = AdaptiveFederationConfig {
+            enabled: true,
+            mode: "shadow".into(),
+            target_domain: Some(target.clone()),
+            baseline_domain: Some(baseline.clone()),
+            canary_share_ppm: 100_000,
+            max_cost_microusd: Some(1_000),
+            latency_slo_ms: Some(1_000),
+            domains: vec![
+                AdaptiveDomainPredictionConfig {
+                    domain: baseline.clone(),
+                    predicted_cost_microusd: 100,
+                    predicted_latency_ms: 100,
+                    stability_rank: 1,
+                },
+                AdaptiveDomainPredictionConfig {
+                    domain: target.clone(),
+                    predicted_cost_microusd: 200,
+                    predicted_latency_ms: 80,
+                    stability_rank: 1,
+                },
+            ],
+        };
+        cfg.validate().expect("complete adaptive policy should validate");
+
+        cfg.orchestrator.adaptive_federation.target_domain = Some(baseline);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must differ")
+        );
+
+        cfg.orchestrator.adaptive_federation.target_domain = Some(target);
+        cfg.orchestrator.adaptive_federation.domains.pop();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must include target and baseline")
+        );
     }
 
     #[test]

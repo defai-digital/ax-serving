@@ -10,10 +10,10 @@ independently operated execution domains. It does not run models or schedule acc
 The target architecture federates:
 
 - Apple Silicon Macs running AX Engine through `ax-runtime-agent`;
+- model-parallel Mac clusters coordinated by `ax-mac-cluster-adapter`
+  (in-repo control plane complete; physical multi-Mac certification external);
 - NVIDIA GPU PCs managed inside an upstream NVIDIA Dynamo domain;
-- NVIDIA Thor devices managed inside a separate Dynamo domain with independent qualification;
-- future model-parallel Mac clusters represented by the experimental
-  `ax-mac-cluster-adapter`.
+- NVIDIA Thor devices managed inside a separate Dynamo domain with independent qualification.
 
 The defining rule is:
 
@@ -53,16 +53,16 @@ measurable policy, availability, utilization, privacy/locality, cost/SLO, or wor
 
 ## Project status
 
-The v3 target architecture is accepted. Its implementation and qualification are incremental.
+The v2.3 target architecture is accepted. Its implementation and qualification are incremental.
 “Source implemented” below means that code and automated tests exist; it does not mean live
 hardware, performance, fault, security, or production certification.
 
 | Area | Current state |
 | --- | --- |
 | Portable REST/SSE gateway and protocol v1.2 | Source implemented and CI-tested on Linux AMD64/ARM64 and Apple Silicon; protocol v1.0/v1.1 migration fixtures remain supported |
-| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; complete policy and live mixed-domain evidence remain |
+| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; full domain-selection policy and live mixed-domain evidence remain |
 | Mac -> `ax-runtime-agent` -> AX Engine | Source implemented with mock tests; pinned live AX Engine qualification pending |
-| Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phase 1 coordinator, gang manifest, registration, proxy, and HA admission implemented with source/mock tests; distributed AX Engine PP is not implemented |
+| Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phases 0–5 in-repo surfaces complete (manifest, gang lifecycle, domain reservation, placement, multi-replica, micro-batch contracts, TP/hybrid validation, adaptive federation hooks); physical multi-Mac production certification and Engine-native TP kernels remain external |
 | Direct vLLM/SGLang -> `ax-runtime-agent` | Source implemented for migration/testing as `compatibility_runtime_endpoint`; not the target NVIDIA production path |
 | NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy source implemented with mock conformance; live qualification pending |
 | NVIDIA Thor -> separate `ax-dynamo-adapter` -> Dynamo domain | Source path exists but is experimental; no Thor production-support claim |
@@ -87,7 +87,7 @@ domains. Heterogeneous hardware is an important use case, not a requirement. If 
 to one NVIDIA deployment with one policy, call Dynamo directly; AX Serving would add an unnecessary
 hop.
 
-AX Serving v3 is the Apache-2.0 infrastructure layer described in this repository. All
+AX Serving v2.3 is the Apache-2.0 infrastructure layer described in this repository. All
 functionality shipped here remains available under that license.
 Separately distributed products such as AX Fabric and AX Trust may add orchestration, governance,
 attestation, managed operations, or enterprise services through public contracts. They are not
@@ -137,7 +137,7 @@ boundary.
 | Domain kind | AX-visible endpoint | Local execution owner | Qualification rule |
 | --- | --- | --- | --- |
 | `mac_ax_engine` | Each eligible Mac node in a Mac pool | `ax-runtime-agent` and AX Engine | Exact AX Engine/model identity must be certified |
-| `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | Coordinator/control-plane source exists; AX Engine distributed execution does not |
+| `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | In-repo control plane complete; physical multi-Mac + Engine PP/TP production pin required for support claims |
 | `nvidia_dynamo_pc` | One adapter for one PC Dynamo deployment | Dynamo and its selected backend | Exact Dynamo/backend/image/config manifest must be certified |
 | `nvidia_dynamo_thor` | One adapter for one separate Thor deployment | Dynamo and a Thor-qualified backend | Always separate from PC; experimental until its own gates pass |
 | `compatibility_runtime_endpoint` | One direct vLLM/SGLang or other compatible runtime node | Configured runtime | Migration and testing only; never a Dynamo-domain claim |
@@ -372,7 +372,7 @@ Dynamo remains a separately pinned and operated execution domain.
 - `crates/ax-serving-api` — gateway, catalog, routing, HA state, lifecycle, REST/SSE;
 - `crates/ax-serving-adapter-core` — byte-preserving OpenAI/SSE adapter transport;
 - `crates/ax-dynamo-adapter` — one runtime-SDK-free endpoint per NVIDIA Dynamo domain;
-- `crates/ax-mac-cluster-adapter` — experimental coordinator/adapter for one future Mac AX Engine cluster;
+- `crates/ax-mac-cluster-adapter` — Mac cluster coordinator/adapter (gang lifecycle, rank bootstrap, advisory placement, multi-replica aggregation);
 - `crates/ax-thor-agent` — current package for the generic `ax-runtime-agent` binary;
 - `crates/ax-serving-cli` — portable gateway and embedded compatibility CLI;
 - `crates/ax-serving-engine` — embedded compatibility backends, not federation architecture;

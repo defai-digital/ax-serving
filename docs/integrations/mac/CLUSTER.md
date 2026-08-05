@@ -174,13 +174,32 @@ deadline, and closes request KV on every rank at termination, timeout, error, or
 stream stops accepting deltas. Rank services can post generation-bound ready heartbeats directly
 to the adapter once weights are loaded.
 
+## In-repo phase status
+
+| Phase | In-repo surface | Physical / Engine pin |
+| --- | --- | --- |
+| 0–1 | Protocol 1.2 cluster domain, registration, heartbeat, drain, generation fence, domain reservation | Live Redis HA exercised when `AXS_TEST_REDIS_URL` is set |
+| 2 | Static PP manifest, gang lifecycle, rank-0 proxy, typed pre-admission / non-retry ambiguous failure, generation restart policy | Real-weight two-Mac correctness still external |
+| 3 | Shard-aware artifact prepare/verify, advisory placement, async reconcile, micro-batch contracts, multi-replica aggregation, operator status, metrics, evidence hooks | Load/fault/soak evidence retained via hooks; 60-minute hardware soak external |
+| 4 | TP/hybrid plan validation, model-parallel topology projection, chunking profile contracts | Model-native Engine TP/hybrid kernels external |
+| 5 | Adaptive federation config + live dispatch selection with shadow/canary/active/rollback and decision retention | Production policy rollout external |
+
 ## Remaining qualification gates
 
-1. add richer OpenAI sampling/tool/structured-output contracts;
-2. automate bootstrap artifact download and generation replacement;
+1. add richer OpenAI sampling/tool/structured-output contracts on the Engine rank-0 gateway;
+2. automate bootstrap artifact download and live generation replacement;
 3. add temperature/top-k/top-p sampling with deterministic generation ownership;
 4. run retained real-weight, two-Mac memory/throughput/latency, link-loss, memory-pressure, restart,
-   and long-soak evidence;
-5. expand the certified matrix beyond dense Llama 3 static pipeline parallelism.
+   and long-soak evidence on pinned hardware;
+5. expand the certified matrix beyond dense Llama 3 static pipeline parallelism once Engine TP/hybrid
+   kernels land.
 
-Until those gates pass, do not advertise the Mac cluster path as production supported.
+Until those physical and Engine gates pass, do not advertise the Mac cluster path as production
+supported.
+
+## Multi-process rehearsal
+
+A compose template for gateway + Redis + adapter (+ optional Engine rank profile) lives at
+[`deploy/compose/mac-cluster.compose.example.yaml`](../../../deploy/compose/mac-cluster.compose.example.yaml).
+Operator install, upgrade, rank-loss, credential rotation, and rollback steps are documented in
+[`docs/runbooks/mac-cluster-operations.md`](../../runbooks/mac-cluster-operations.md).

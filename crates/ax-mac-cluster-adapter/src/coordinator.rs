@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use ax_serving_protocol::{
     ArtifactFileKind, ArtifactFilePlan, CapacityObservation, ClusterLifecycleState,
     ClusterModelSpec, ClusterRankObservation, ClusterRuntimeSpec, CompatibilityManifestDigest,
-    DeploymentIdentity, DomainId, DomainObservation, Operation, ParallelismPlan,
+    DeploymentIdentity, DomainId, DomainObservation, Operation, ParallelismKind, ParallelismPlan,
     ProtocolCapability, RankPlan, RuntimeModelDescriptor, RuntimeObservation, RuntimeState,
     RuntimeStatus, TransportPlan,
 };
@@ -27,6 +27,7 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::manifest::ValidatedManifest;
+use crate::planner::{AdvisoryPipelinePlan, PlacementProfileV1, build_advisory_plan};
 
 #[derive(Clone, Debug)]
 pub struct ObservationSnapshot {
@@ -81,6 +82,7 @@ pub struct EnginePipelineTopology {
     pub manifest_digest: String,
     pub model_artifact_digest: String,
     pub total_layers: u32,
+    pub micro_batch_limit: u16,
     pub ranks: Vec<EnginePipelineRank>,
 }
 
@@ -97,6 +99,39 @@ pub struct EnginePipelineRank {
 pub struct EngineLayerRange {
     pub start: u32,
     pub end: u32,
+}
+
+/// General AX Engine-owned PP/TP/hybrid topology projection.
+///
+/// Unlike the compatibility `EnginePipelineTopology`, this preserves logical
+/// stage and tensor-rank coordinates and is consumable by the model-parallel
+/// runtime without exposing rank details to AX Serving fleet state.
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineModelParallelTopology {
+    pub schema_version: u16,
+    pub cluster_id: String,
+    pub generation: u64,
+    pub manifest_digest: String,
+    pub model_artifact_digest: String,
+    pub total_layers: u32,
+    pub kind: ParallelismKind,
+    pub pp_size: u16,
+    pub tp_size: u16,
+    pub micro_batch_limit: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_profile_digest: Option<String>,
+    pub ranks: Vec<EngineModelParallelRank>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineModelParallelRank {
+    pub rank: u16,
+    pub node_identity_digest: String,
+    pub stage: u16,
+    pub tensor_rank: u16,
+    pub layers: EngineLayerRange,
+    pub owns_embeddings: bool,
+    pub owns_output_head: bool,
 }
 
 impl ClusterCoordinator {
@@ -119,6 +154,21 @@ impl ClusterCoordinator {
     pub fn begin_drain(&self) {
         self.draining.store(true, Ordering::Release);
         self.ready.store(false, Ordering::Release);
+    }
+
+    /// Fence the active generation after rank loss or operator restart.
+    ///
+    /// Recovery requires loading a higher-generation immutable manifest into a
+    /// new coordinator instance. This only stops admission and marks observed
+    /// ranks failed so stale heartbeats cannot restore readiness.
+    pub async fn fence_generation(&self) {
+        self.ready.store(false, Ordering::Release);
+        self.draining.store(false, Ordering::Release);
+        let mut observations = self.observations.write().await;
+        for observation in observations.values_mut() {
+            observation.state = ClusterLifecycleState::Failed;
+            observation.reason_code = Some("generation_fenced".into());
+        }
     }
 
     pub async fn update_rank(&self, observation: ClusterRankObservation) -> Result<()> {
@@ -233,10 +283,16 @@ impl ClusterCoordinator {
             .any(|observation| observation.state == ClusterLifecycleState::Failed)
         {
             ClusterLifecycleState::Failed
-        } else if ready_ranks == required_ranks {
+        } else if ready_ranks == required_ranks && ranks.len() == required_ranks {
+            // Ready only when every required rank is present, fresh, and ready.
             ClusterLifecycleState::Ready
         } else {
-            least_progress(&ranks, now, self.stale_after)
+            // Partial observation sets may include Ready ranks; never promote the
+            // incomplete gang to Ready (partial-rank admission is forbidden).
+            match least_progress(&ranks, now, self.stale_after) {
+                ClusterLifecycleState::Ready => ClusterLifecycleState::Warming,
+                other => other,
+            }
         };
         ClusterStatus {
             cluster_id: self.manifest.manifest.cluster_id.to_string(),
@@ -286,6 +342,7 @@ impl ClusterCoordinator {
             manifest_digest: self.manifest.digest.to_string(),
             model_artifact_digest: manifest.model.artifact_digest.to_string(),
             total_layers: manifest.model.total_layers,
+            micro_batch_limit: manifest.parallelism.micro_batch_limit,
             ranks: manifest
                 .ranks
                 .iter()
@@ -303,10 +360,103 @@ impl ClusterCoordinator {
         }
     }
 
+    /// Project the complete immutable topology for an AX Engine PP/TP/hybrid
+    /// runtime. The active manifest remains the single source of truth.
+    pub fn engine_model_parallel_topology(&self) -> EngineModelParallelTopology {
+        let manifest = &self.manifest.manifest;
+        EngineModelParallelTopology {
+            schema_version: 1,
+            cluster_id: manifest.cluster_id.to_string(),
+            generation: manifest.generation,
+            manifest_digest: self.manifest.digest.to_string(),
+            model_artifact_digest: manifest.model.artifact_digest.to_string(),
+            total_layers: manifest.model.total_layers,
+            kind: manifest.parallelism.kind,
+            pp_size: manifest.parallelism.pp_size,
+            tp_size: manifest.parallelism.tp_size,
+            micro_batch_limit: manifest.parallelism.micro_batch_limit,
+            chunking_profile_digest: manifest
+                .parallelism
+                .chunking_profile_digest
+                .as_ref()
+                .map(ToString::to_string),
+            ranks: manifest
+                .ranks
+                .iter()
+                .map(|rank| EngineModelParallelRank {
+                    rank: rank.rank,
+                    node_identity_digest: rank.node_identity_digest.to_string(),
+                    stage: rank.stage,
+                    tensor_rank: rank.tensor_rank,
+                    layers: EngineLayerRange {
+                        start: rank.layers.start,
+                        end: rank.layers.end,
+                    },
+                    owns_embeddings: rank.owns_embeddings,
+                    owns_output_head: rank.owns_output_head,
+                })
+                .collect(),
+        }
+    }
+
+    /// Produce an advisory candidate for a higher generation from fresh,
+    /// measured rank topology. This never mutates the active manifest.
+    pub async fn advisory_plan(
+        &self,
+        profile: &PlacementProfileV1,
+    ) -> Result<AdvisoryPipelinePlan> {
+        let now = time::OffsetDateTime::now_utc();
+        let observations = self.observations.read().await;
+        if observations.len() != self.manifest.manifest.ranks.len() {
+            bail!("advisory placement requires a complete measured gang");
+        }
+        let mut ordered = observations.values().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|observation| observation.rank);
+        if ordered.iter().any(|observation| {
+            observation.state != ClusterLifecycleState::Ready
+                || now - observation.observed_at
+                    > time::Duration::try_from(self.stale_after).unwrap_or(time::Duration::MAX)
+        }) {
+            bail!("advisory placement requires fresh ready observations from every rank");
+        }
+        build_advisory_plan(
+            &self.manifest.manifest,
+            &self.manifest.digest,
+            &ordered,
+            profile,
+        )
+    }
+
     async fn refresh_ready(&self) {
         let ready = self.status().await.state == ClusterLifecycleState::Ready;
         self.ready.store(ready, Ordering::Release);
     }
+}
+
+/// Validate that `next` may replace `current` as a higher-generation restart.
+///
+/// Process managers construct a new `ClusterCoordinator` with `next` only when
+/// this check succeeds. Live resharding of the admitted generation is forbidden.
+pub fn validate_generation_restart(
+    current: &ValidatedManifest,
+    next: &ValidatedManifest,
+) -> Result<()> {
+    if next.manifest.cluster_id != current.manifest.cluster_id {
+        bail!("restart manifest cluster_id must match the active cluster");
+    }
+    if next.manifest.generation <= current.manifest.generation {
+        bail!("restart requires a strictly higher cluster generation");
+    }
+    if next.digest == current.digest {
+        bail!("restart requires a distinct manifest digest");
+    }
+    if next.manifest.model.artifact_digest != current.manifest.model.artifact_digest
+        && next.manifest.runtime.build_digest == current.manifest.runtime.build_digest
+    {
+        // Model replacement is allowed only with explicit generation bump, which
+        // is already required above. Keep the check focused on identity safety.
+    }
+    Ok(())
 }
 
 fn model_descriptor(manifest: &ValidatedManifest) -> RuntimeModelDescriptor {
@@ -403,6 +553,11 @@ pub fn router(coordinator: ClusterCoordinator, token: String) -> Router {
             "/internal/cluster/engine-topology",
             get(engine_pipeline_topology),
         )
+        .route(
+            "/internal/cluster/engine-model-parallel-topology",
+            get(engine_model_parallel_topology),
+        )
+        .route("/internal/cluster/advisory-plan", post(advisory_placement))
         .route("/internal/cluster/status", get(cluster_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), rank_auth))
         .with_state(state)
@@ -430,6 +585,22 @@ async fn engine_pipeline_topology(
     State(state): State<RankApiState>,
 ) -> Json<EnginePipelineTopology> {
     Json(state.coordinator.engine_topology())
+}
+
+async fn engine_model_parallel_topology(
+    State(state): State<RankApiState>,
+) -> Json<EngineModelParallelTopology> {
+    Json(state.coordinator.engine_model_parallel_topology())
+}
+
+async fn advisory_placement(
+    State(state): State<RankApiState>,
+    Json(profile): Json<PlacementProfileV1>,
+) -> Response {
+    match state.coordinator.advisory_plan(&profile).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
 }
 
 async fn rank_bootstrap_plan(State(state): State<RankApiState>, Path(rank): Path<u16>) -> Response {
@@ -652,6 +823,7 @@ mod tests {
         let topology = coordinator.engine_topology();
         assert_eq!(topology.generation, 1);
         assert_eq!(topology.total_layers, 126);
+        assert_eq!(topology.micro_batch_limit, 1);
         assert_eq!(topology.ranks.len(), 2);
         assert_eq!(topology.ranks[0].layers.start, 0);
         assert_eq!(topology.ranks[0].layers.end, 63);
@@ -660,5 +832,121 @@ mod tests {
         assert_eq!(topology.ranks[1].layers.start, 63);
         assert_eq!(topology.ranks[1].layers.end, 126);
         assert!(topology.ranks[1].owns_output_head);
+
+        let model_parallel = coordinator.engine_model_parallel_topology();
+        assert_eq!(model_parallel.schema_version, 1);
+        assert_eq!(model_parallel.kind, ParallelismKind::Pipeline);
+        assert_eq!(model_parallel.pp_size, 2);
+        assert_eq!(model_parallel.tp_size, 1);
+        assert_eq!(model_parallel.ranks[0].stage, 0);
+        assert_eq!(model_parallel.ranks[1].stage, 1);
+        assert_eq!(model_parallel.ranks[0].tensor_rank, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_stops_admission_before_ranks_shut_down() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        for rank in 0..2 {
+            for state in [
+                ClusterLifecycleState::Planned,
+                ClusterLifecycleState::Downloading,
+                ClusterLifecycleState::Connecting,
+                ClusterLifecycleState::Loading,
+                ClusterLifecycleState::Warming,
+                ClusterLifecycleState::Ready,
+            ] {
+                coordinator
+                    .update_rank(observation(&coordinator, rank, state))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(coordinator.snapshot().await.domain.ready);
+        coordinator.begin_drain();
+        let snapshot = coordinator.snapshot().await;
+        assert!(!snapshot.domain.ready);
+        assert_eq!(
+            coordinator.status().await.state,
+            ClusterLifecycleState::Draining
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_gang_never_reports_ready() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        coordinator
+            .update_rank(observation(&coordinator, 0, ClusterLifecycleState::Ready))
+            .await
+            .unwrap();
+        let status = coordinator.status().await;
+        assert_ne!(status.state, ClusterLifecycleState::Ready);
+        assert!(!coordinator.snapshot().await.domain.ready);
+        assert_eq!(status.ready_ranks, 1);
+        assert_eq!(status.required_ranks, 2);
+    }
+
+    #[tokio::test]
+    async fn fence_generation_stops_admission_and_fails_observed_ranks() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_secs(30));
+        for rank in 0..2 {
+            for state in [
+                ClusterLifecycleState::Planned,
+                ClusterLifecycleState::Downloading,
+                ClusterLifecycleState::Connecting,
+                ClusterLifecycleState::Loading,
+                ClusterLifecycleState::Warming,
+                ClusterLifecycleState::Ready,
+            ] {
+                coordinator
+                    .update_rank(observation(&coordinator, rank, state))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(coordinator.snapshot().await.domain.ready);
+        coordinator.fence_generation().await;
+        assert!(!coordinator.snapshot().await.domain.ready);
+        assert_eq!(
+            coordinator.status().await.state,
+            ClusterLifecycleState::Failed
+        );
+    }
+
+    #[test]
+    fn generation_restart_requires_higher_generation_and_new_digest() {
+        let current = fixture_manifest();
+        let mut next = current.clone();
+        next.manifest.generation = current.manifest.generation;
+        assert!(validate_generation_restart(&current, &next).is_err());
+
+        next.manifest.generation = current.manifest.generation + 1;
+        // Same bytes => same digest; still rejected.
+        let next_same_digest = ValidatedManifest {
+            digest: current.digest.clone(),
+            manifest: next.manifest.clone(),
+        };
+        assert!(validate_generation_restart(&current, &next_same_digest).is_err());
+
+        // Re-load and bump generation in JSON-equivalent structure via mutate + rehash:
+        // construct by changing generation then re-serializing through load path is heavy;
+        // instead compare validate against a recomputed digest using the manifest helper.
+        let mut bumped = current.manifest.clone();
+        bumped.generation = current.manifest.generation + 1;
+        let bytes = serde_json::to_vec(&bumped).unwrap();
+        let digest = {
+            use sha2::{Digest as _, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            ax_serving_protocol::CompatibilityManifestDigest::new(format!(
+                "sha256:{:x}",
+                hasher.finalize()
+            ))
+            .unwrap()
+        };
+        let next = ValidatedManifest {
+            digest,
+            manifest: bumped,
+        };
+        validate_generation_restart(&current, &next).unwrap();
     }
 }

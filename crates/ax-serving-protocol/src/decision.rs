@@ -70,6 +70,8 @@ pub enum PolicyMode {
     Shadow,
     Canary,
     Active,
+    /// Explicit operator rollback to the previous active baseline.
+    Rollback,
 }
 
 /// Bounded reason for accepting or preferring a selected candidate.
@@ -83,6 +85,11 @@ pub enum DecisionReasonCode {
     LowestNormalizedScore,
     StableTieBreak,
     ExplicitDeployment,
+    AdaptivePolicy,
+    ShadowBaseline,
+    CanaryAssignment,
+    ActiveAssignment,
+    PolicyRollback,
 }
 
 /// Bounded hard-filter reason attached to an ineligible candidate.
@@ -142,6 +149,12 @@ pub struct DecisionRecordV1 {
     pub predicted_cost_microusd: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_latency_ms: Option<u64>,
+    /// Counterfactual domain retained for shadow/canary comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterfactual_domain: Option<DomainId>,
+    /// True only for an explicit policy rollback decision.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rolled_back: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub decided_at: OffsetDateTime,
 }
@@ -179,8 +192,15 @@ impl DecisionRecordV1 {
         {
             return Err(DecisionValidationError::SelectedGenerationMissing);
         }
+        if self.rolled_back != (self.policy_mode == PolicyMode::Rollback) {
+            return Err(DecisionValidationError::RollbackModeMismatch);
+        }
         Ok(())
     }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn validate_bounded_token(field: &'static str, value: &str) -> Result<(), DecisionValidationError> {
@@ -215,6 +235,8 @@ pub enum DecisionValidationError {
     SelectedCandidateMissing,
     #[error("selected domain observation generation is missing")]
     SelectedGenerationMissing,
+    #[error("rolled_back must be true exactly when policy_mode is rollback")]
+    RollbackModeMismatch,
 }
 
 #[cfg(test)]
@@ -255,6 +277,8 @@ mod tests {
             observation_generations: BTreeMap::from([(domain, 7)]),
             predicted_cost_microusd: None,
             predicted_latency_ms: None,
+            counterfactual_domain: None,
+            rolled_back: false,
             decided_at: OffsetDateTime::UNIX_EPOCH,
         };
         record.validate().unwrap();
