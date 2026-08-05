@@ -133,7 +133,7 @@ jobs:
           python -m zipfile --test dist/ax_serving_vllm_runtime-0.1.0-py3-none-any.whl
 
   build-macos:
-    name: Build and sign Apple Silicon release
+    name: Build and attest Apple Silicon release
     needs: [release-gate, release-security, nvidia-runtime-package]
     runs-on: macos-15
     env:
@@ -203,17 +203,23 @@ jobs:
           shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "sha256=$(awk '{print $1}' "${TARBALL}.sha256")" >> "$GITHUB_OUTPUT"
-      - name: Sign archive
+      - name: Sign archive with Minisign when configured
+        id: minisign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
           TARBALL: ${{ steps.package.outputs.tarball }}
         run: |
-          test -n "$MINISIGN_SECRET_KEY"
+          if [[ -z "$MINISIGN_SECRET_KEY" ]]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::MINISIGN_SECRET_KEY is not configured; publishing with GitHub provenance attestation only."
+            exit 0
+          fi
           umask 077
           printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
           minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$TARBALL" -x "${TARBALL}.minisig"
-          rm -f "$RUNNER_TEMP/minisign.key"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -224,14 +230,25 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.package.outputs.tarball }}
+      - name: Collect release files
+        id: release-files
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          {
+            echo 'files<<EOF'
+            printf '%s\n' "$TARBALL"
+            printf '%s\n' "${TARBALL}.sha256"
+            printf '%s\n' "${TARBALL}.spdx.json"
+            if [[ -f "${TARBALL}.minisig" ]]; then
+              printf '%s\n' "${TARBALL}.minisig"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ steps.package.outputs.tarball }}
-            ${{ steps.package.outputs.tarball }}.sha256
-            ${{ steps.package.outputs.tarball }}.minisig
-            ${{ steps.package.outputs.tarball }}.spdx.json
+          files: ${{ steps.release-files.outputs.files }}
           generate_release_notes: true
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
       - uses: actions/upload-artifact@v7
@@ -246,10 +263,23 @@ jobs:
     needs: build-macos
     runs-on: ubuntu-latest
     steps:
+      - name: Check Homebrew publishing configuration
+        id: config
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [[ -n "$TAP_GITHUB_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::TAP_GITHUB_TOKEN is not configured; skipping Homebrew tap update."
+          fi
       - uses: actions/download-artifact@v8
+        if: steps.config.outputs.enabled == 'true'
         with:
           name: release-metadata
       - name: Update formula
+        if: steps.config.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ needs.build-macos.outputs.version }}
@@ -273,12 +303,26 @@ jobs:
     needs: build-macos
     runs-on: ubuntu-latest
     steps:
+      - name: Check npm publishing configuration
+        id: config
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "$NPM_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NPM_TOKEN is not configured; skipping npm publish."
+          fi
       - uses: actions/checkout@v7
+        if: steps.config.outputs.enabled == 'true'
       - uses: actions/setup-node@v6
+        if: steps.config.outputs.enabled == 'true'
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
       - name: Publish
+        if: steps.config.outputs.enabled == 'true'
         working-directory: sdk/javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
