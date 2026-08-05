@@ -130,8 +130,11 @@ process being alive is insufficient.
 
 ### Current compatibility path
 
-The current `ax-runtime-agent` can point directly at vLLM/SGLang for migration and testing. This is
-not the final production NVIDIA architecture and must not be used as Dynamo federation evidence.
+The current `ax-runtime-agent` can point directly at vLLM, SGLang, or TensorRT-LLM for migration
+and testing. This is not the final production NVIDIA architecture and must not be used as Dynamo
+federation evidence. The single-PC TensorRT-LLM Compose overlay and generic no-retry qualification
+runner live under [`deploy/compose`](../../deploy/compose/README.md#tensorrt-llm-on-one-nvidia-pc)
+and [`scripts/qualification/runtime`](../../scripts/qualification/runtime/README.md).
 
 ### Generic OpenAI-compatible runtime (llama.cpp example)
 

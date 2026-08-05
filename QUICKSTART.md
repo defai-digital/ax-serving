@@ -9,8 +9,8 @@ Requirements:
 
 - Rust 1.88 or newer;
 - macOS arm64 or Linux x86_64/arm64 for the portable gateway and agent;
-- an independently running OpenAI-compatible AX Engine, vLLM, or SGLang
-  endpoint.
+- an independently running OpenAI-compatible AX Engine, vLLM, SGLang, or
+  TensorRT-LLM endpoint.
 
 ```bash
 cargo build --release \
@@ -77,6 +77,13 @@ This direct path registers `compatibility_runtime_endpoint`, whether it runs on 
 Thor device. It is not a `nvidia_dynamo_pc` or `nvidia_dynamo_thor` domain. The target NVIDIA
 production topology uses one [`ax-dynamo-adapter`](docs/integrations/nvidia/DYNAMO.md) for each
 separately operated Dynamo domain.
+
+For a pinned single-PC TensorRT-LLM evaluation, use the
+[`deploy/compose` overlay](deploy/compose/README.md#tensorrt-llm-on-one-nvidia-pc).
+It registers the canonical runtime identity `tensorrt_llm`, uses `/v1/models`
+as its readiness path, and includes a `uv`-runnable stream/concurrency/stability
+probe. This remains the same direct compatibility path, not Dynamo-domain
+certification.
 
 For AX Engine on Apple Silicon, point the same agent at the AX Engine server:
 

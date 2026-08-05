@@ -54,10 +54,10 @@ Mac and NVIDIA use different adapter boundaries:
   calibration, rollout state, and qualification evidence.
 - AX Serving selects a domain. Dynamo selects the NVIDIA worker inside that domain.
 
-The direct vLLM/SGLang mode in `ax-runtime-agent` remains available for migration and testing. It is
-`compatibility_runtime_endpoint`, not the target NVIDIA production path. This remains true on both
-AMD64 PCs and Thor: the legacy `ax-thor-agent` executable is an alias for `ax-runtime-agent` and
-cannot register a Dynamo domain.
+The direct vLLM/SGLang/TensorRT-LLM mode in `ax-runtime-agent` remains available for migration and
+testing. It is `compatibility_runtime_endpoint`, not the target NVIDIA production path. This
+remains true on both AMD64 PCs and Thor: the legacy `ax-thor-agent` executable is an alias for
+`ax-runtime-agent` and cannot register a Dynamo domain.
 
 ## Local-office topology
 

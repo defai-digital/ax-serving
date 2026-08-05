@@ -110,7 +110,7 @@ telemetry.prefix-cache
 | `protocol` | Version and optional capabilities |
 | `agent` | Agent name, version, optional build SHA |
 | `worker` | Stable worker ID, process instance ID, advertised URL, pool, trust domain, bounded labels |
-| `runtime` | Runtime kind, version, and API family |
+| `runtime` | Runtime kind, version, API family, and optional operator-visible upstream endpoint |
 | `hardware` | Platform, accelerator, device count, optional memory and hardware class |
 | `domain` | Optional stable execution-domain descriptor; requires `control.execution-domain.v1` |
 | `domain_observation` | Optional aggregate domain state, inventory, manifest, and capacity |
@@ -354,8 +354,8 @@ valid v1.1 descriptor, and a ready aggregate observation.
 
 ### Generic OpenAI-compatible runtime onboarding
 
-Any OpenAI-compatible runtime (for example `llama-server`, `mlxcel-server`,
-or Ollama) can sit behind `ax-runtime-agent` as a
+Any OpenAI-compatible runtime (for example TensorRT-LLM, `llama-server`,
+`mlxcel-server`, or Ollama) can sit behind `ax-runtime-agent` as a
 `compatibility_runtime_endpoint` node without code changes. The minimal
 runtime surface is:
 
@@ -380,9 +380,17 @@ runtime surface is:
 Signals a runtime does not measure are reported as absent, never fabricated:
 the gateway's default dispatch policy penalizes missing signals, so a node
 with no queue metric is treated as *unknown*, not as permanently un-queued.
-Onboarding a generic runtime must not add runtime-name conditionals to the
-gateway, adapter, or protocol crates; operator configuration and the
-tolerant decoding rules above are the entire extension surface.
+Onboarding a generic runtime must not require runtime-name conditionals in the
+gateway, adapter, or protocol crates; operator configuration and the tolerant
+decoding rules above are the extension surface. Centrally normalized aliases
+and operator guidance for well-known runtimes must not become routing gates.
+
+Runtime identifiers are normalized to lower-case underscore form and preserved
+in fleet state, routing hints, and diagnostics when they use bounded
+ASCII-alphanumeric, underscore, dot, or hyphen syntax. Known aliases such as
+`TensorRT-LLM`, `trt_llm`, and `trtllm` canonicalize to `tensorrt_llm`.
+Malformed identifiers are rejected instead of silently selecting another
+runtime.
 
 The protocol types, fixtures, and validation rules in `crates/ax-serving-protocol` are normative.
 The public [Mac cluster integration guide](../integrations/mac/CLUSTER.md) documents the current

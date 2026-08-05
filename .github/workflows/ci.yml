@@ -199,8 +199,10 @@ jobs:
           ruff check .
           ruff format --check .
           pytest -q
-      - name: Test Dynamo qualification tooling
-        run: python scripts/qualification/nvidia/test_soak_dynamo_domain.py
+      - name: Test runtime qualification tooling
+        run: |
+          python scripts/qualification/nvidia/test_soak_dynamo_domain.py
+          python scripts/qualification/runtime/test_smoke_openai_runtime.py
       - name: Build and inspect runtime wheel
         working-directory: integrations/nvidia/vllm-runtime
         run: |

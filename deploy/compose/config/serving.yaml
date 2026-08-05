@@ -3,7 +3,8 @@ orchestrator:
   port: 18080
   internal_bind_addr: "0.0.0.0"
   internal_port: 19090
-  deployment_mode: "explicit"
+  # This evaluation config has no explicit deployment catalog.
+  deployment_mode: "legacy_compat"
   tls_profile: "trusted_mesh"
   fleet_store: "redis"
   gateway_id: "gateway-compose-1"

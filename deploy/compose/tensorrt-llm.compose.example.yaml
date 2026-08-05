@@ -1,0 +1,59 @@
+# Direct TensorRT-LLM compatibility evaluation for one NVIDIA PC.
+#
+# This is deliberately not an NVIDIA Dynamo production topology or a support
+# certificate. Pair it with compose.yaml and an operator-owned copy of
+# tensorrt-llm.env.example.
+services:
+  tensorrt-llm:
+    profiles: ["tensorrt-llm"]
+    image: "${TRTLLM_IMAGE:?set TRTLLM_IMAGE to an immutable linux/amd64 digest}"
+    command:
+      - trtllm-serve
+      - serve
+      - "${TRTLLM_MODEL:?set TRTLLM_MODEL}"
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --backend
+      - pytorch
+      - --hf_revision
+      - "${TRTLLM_MODEL_REVISION:?set TRTLLM_MODEL_REVISION}"
+      - --served_model_name
+      - "${TRTLLM_SERVED_MODEL:?set TRTLLM_SERVED_MODEL}"
+      - --max_batch_size
+      - "${TRTLLM_MAX_BATCH_SIZE:-8}"
+      - --max_num_tokens
+      - "${TRTLLM_MAX_NUM_TOKENS:-2048}"
+      - --max_seq_len
+      - "${TRTLLM_MAX_SEQ_LEN:-2048}"
+      - --no-telemetry
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - trtllm-hf-cache:/root/.cache/huggingface
+    ports:
+      - "${TRTLLM_HOST_PORT:-8000}:8000"
+    gpus: all
+    shm_size: "4gb"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c 'import urllib.request;
+          urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=3).read()'
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 120s
+
+  runtime-agent:
+    depends_on:
+      tensorrt-llm:
+        condition: service_healthy
+
+volumes:
+  trtllm-hf-cache:
+    name: "${TRTLLM_HF_CACHE_VOLUME:-trtllm-hf-cache}"
