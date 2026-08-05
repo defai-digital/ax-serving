@@ -111,8 +111,10 @@ async fn bench(cfg: &MultiWorkerConfig) -> Result<MultiWorkerResults> {
     let sem = Arc::new(Semaphore::new(cfg.concurrency));
     let success_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
+    // Cap the pre-allocation: in duration mode total_requests is usize::MAX,
+    // which would make with_capacity panic on capacity overflow.
     let latencies: Arc<tokio::sync::Mutex<Vec<f64>>> = Arc::new(tokio::sync::Mutex::new(
-        Vec::with_capacity(cfg.total_requests.max(1024)),
+        Vec::with_capacity(cfg.total_requests.clamp(1024, 1_000_000)),
     ));
 
     let start = Instant::now();

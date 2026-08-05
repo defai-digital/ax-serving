@@ -72,8 +72,10 @@ pub async fn run(cfg: CacheBenchConfig) -> Result<()> {
     let warm_avg_ms = warm_avg_ms_f.round() as u128;
     let warm_min_ms = warm_slice.iter().copied().min().unwrap_or(0);
 
-    let speedup = if warm_avg_ms > 0 {
-        cold_ms as f64 / warm_avg_ms as f64
+    // Use the unrounded average: sub-millisecond warm latencies round to 0,
+    // which would report an infinite speedup.
+    let speedup = if warm_avg_ms_f > 0.0 {
+        cold_ms as f64 / warm_avg_ms_f
     } else {
         f64::INFINITY
     };
