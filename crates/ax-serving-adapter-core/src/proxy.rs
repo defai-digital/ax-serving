@@ -480,6 +480,18 @@ async fn health(State(state): State<ProxyState>) -> axum::response::Response {
             )
                 .into_response()
         }
+        Ok(response) if response.status().is_success() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "adapter_live": true,
+                "agent_live": true,
+                "runtime_ready": false,
+                "runtime_state": "unavailable",
+                "reason_code": "domain_not_ready",
+                "observed_at": observed_at,
+            })),
+        )
+            .into_response(),
         Ok(response) => (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -756,14 +768,15 @@ async fn proxy_to(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
         FORWARDED_HEADERS, InflightGuard, ProxyState, add_limited_body_len,
-        append_limited_body_chunk, is_successful_event_stream, pre_admission_response, proxy_to,
-        response_builder_with_runtime_headers, response_declares_oversize,
+        append_limited_body_chunk, health, is_successful_event_stream, pre_admission_response,
+        proxy_to, response_builder_with_runtime_headers, response_declares_oversize,
         sanitize_runtime_error_body, should_forward_runtime_header,
     };
 
@@ -886,6 +899,43 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["x-ax-admission-state"], "not-admitted");
+    }
+
+    #[tokio::test]
+    async fn health_distinguishes_domain_readiness_from_runtime_rejection() {
+        use axum::{Router, routing::get};
+
+        let upstream = Router::new().route("/health", get(|| async { StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = ProxyState {
+            client: reqwest::Client::new(),
+            upstream_url: format!("http://{addr}"),
+            upstream_health_path: "/health".into(),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_inflight: 1,
+            draining: Arc::new(AtomicBool::new(false)),
+            ready: Some(Arc::new(AtomicBool::new(false))),
+        };
+
+        // Runtime answers 200 but the domain is not ready: this must not be
+        // reported as a runtime health rejection.
+        let response = health(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("domain_not_ready"));
+        assert!(!text.contains("runtime_health_rejected"));
+
+        state.ready.as_ref().unwrap().store(true, Ordering::Release);
+        let response = health(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

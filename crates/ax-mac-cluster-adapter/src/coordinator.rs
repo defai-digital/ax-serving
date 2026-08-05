@@ -160,6 +160,10 @@ impl ClusterCoordinator {
         let status = self.status().await;
         let observed_at = time::OffsetDateTime::now_utc();
         let ready = status.state.admits_requests() && !self.draining.load(Ordering::Acquire);
+        // Keep the proxy pre-admission flag in sync with freshly computed
+        // readiness: rank staleness only becomes visible here, since
+        // `refresh_ready` runs solely on `update_rank`.
+        self.ready.store(ready, Ordering::Release);
         let runtime_state = if self.draining.load(Ordering::Acquire) {
             RuntimeState::Draining
         } else {
@@ -554,6 +558,27 @@ mod tests {
         assert_eq!(status.state, ClusterLifecycleState::Planned);
         assert_eq!(status.ready_ranks, 0);
         assert!(!coordinator.snapshot().await.domain.ready);
+    }
+
+    #[tokio::test]
+    async fn snapshot_clears_proxy_ready_flag_once_ranks_go_stale() {
+        let coordinator = ClusterCoordinator::new(fixture_manifest(), 2, Duration::from_millis(10));
+        for rank in 0..2 {
+            coordinator
+                .update_rank(observation(
+                    &coordinator,
+                    rank,
+                    ClusterLifecycleState::Ready,
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(coordinator.ready.load(Ordering::Acquire));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let snapshot = coordinator.snapshot().await;
+        assert!(!snapshot.domain.ready);
+        assert!(!coordinator.ready.load(Ordering::Acquire));
     }
 
     #[tokio::test]

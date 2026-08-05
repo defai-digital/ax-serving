@@ -406,7 +406,7 @@ pub fn parse_prometheus_telemetry(metrics: &str) -> RuntimeTelemetry {
                 "sglang_num_running_reqs",
             ],
         ),
-        decode_tok_per_sec: sum_f64(
+        decode_tok_per_sec: sum_per_alias_max_across(
             &samples,
             &[
                 "ax_runtime_decode_tok_per_sec",
@@ -652,15 +652,6 @@ fn values_for<'a>(samples: &'a BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> 
         .collect()
 }
 
-fn sum_f64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
-    let values = values_for(samples, aliases);
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.into_iter().sum())
-    }
-}
-
 fn max_f64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<f64> {
     values_for(samples, aliases)
         .into_iter()
@@ -756,8 +747,11 @@ fn prometheus_histogram_quantile_seconds(
     Some(previous_bound)
 }
 
+/// Like [`sum_per_alias_max_across`], but converts to `u64`: per-label samples
+/// are summed within each alias, and aliases for the same concept take the max
+/// rather than being summed together (which would double-count).
 fn sum_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
-    sum_f64(samples, aliases).and_then(f64_to_u64)
+    sum_per_alias_max_across(samples, aliases).and_then(f64_to_u64)
 }
 
 fn max_u64(samples: &BTreeMap<String, Vec<f64>>, aliases: &[&str]) -> Option<u64> {
@@ -992,6 +986,27 @@ vllm:batch_utilization 0.5
         assert_eq!(telemetry.decode_tok_per_sec, Some(91.5));
         assert_eq!(telemetry.kv_utilization, Some(0.87));
         assert_eq!(telemetry.batch_utilization, Some(0.5));
+    }
+
+    #[test]
+    fn aliases_for_the_same_concept_do_not_double_count() {
+        let telemetry = parse_prometheus_telemetry(
+            r#"
+ax_runtime_decode_tok_per_sec{model="a"} 10
+ax_runtime_decode_tok_per_sec{model="b"} 15
+vllm:avg_generation_throughput_toks_per_s 25
+ax_runtime_kv_pages_used 12
+ax_engine_step_kv_usage_blocks 12
+ax_runtime_prefix_reusable_tokens 256
+vllm:prefix_cache_hits 256
+"#,
+        );
+
+        // Per-label series sum within one alias, but a runtime exposing both an
+        // AX alias and its native metric must not be summed across aliases.
+        assert_eq!(telemetry.decode_tok_per_sec, Some(25.0));
+        assert_eq!(telemetry.kv_pages_used, Some(12));
+        assert_eq!(telemetry.prefix_reusable_tokens, Some(256));
     }
 
     #[test]
