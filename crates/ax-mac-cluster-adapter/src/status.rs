@@ -136,8 +136,8 @@ const fn phase_reason(phase: OperatorClusterPhase) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ax_serving_protocol::{ClusterLifecycleState, DomainId};
     use crate::replicas::{ClusterReplicaObservation, aggregate_replicas};
+    use ax_serving_protocol::{ClusterLifecycleState, DomainId};
 
     #[test]
     fn experimental_flag_is_derived_from_qualification() {
@@ -150,8 +150,7 @@ mod tests {
             required_ranks: 2,
             ranks: vec![],
         };
-        let view =
-            operator_view_from_gang(&status, QualificationState::Experimental, true);
+        let view = operator_view_from_gang(&status, QualificationState::Experimental, true);
         assert!(view.experimental);
         assert!(!view.certified);
         assert_eq!(view.phase, OperatorClusterPhase::Ready);

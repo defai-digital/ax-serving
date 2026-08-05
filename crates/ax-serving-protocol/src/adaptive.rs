@@ -278,7 +278,10 @@ mod tests {
     fn target_and_baseline_must_be_distinct() {
         let mut invalid = policy(PolicyMode::Active);
         invalid.target_domain = invalid.baseline_domain.clone();
-        assert_eq!(invalid.validate(), Err(AdaptivePolicyError::SamePolicyDomain));
+        assert_eq!(
+            invalid.validate(),
+            Err(AdaptivePolicyError::SamePolicyDomain)
+        );
     }
 
     #[test]

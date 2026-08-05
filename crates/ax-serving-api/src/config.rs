@@ -1249,8 +1249,10 @@ mod tests {
         let baseline = DomainId::new("mac-single").unwrap();
         let target = DomainId::new("mac-cluster").unwrap();
         let mut cfg = valid_cfg();
-        cfg.orchestrator.domains =
-            vec![adaptive_domain(baseline.as_str()), adaptive_domain(target.as_str())];
+        cfg.orchestrator.domains = vec![
+            adaptive_domain(baseline.as_str()),
+            adaptive_domain(target.as_str()),
+        ];
         cfg.orchestrator.adaptive_federation = AdaptiveFederationConfig {
             enabled: true,
             mode: "shadow".into(),
@@ -1274,7 +1276,8 @@ mod tests {
                 },
             ],
         };
-        cfg.validate().expect("complete adaptive policy should validate");
+        cfg.validate()
+            .expect("complete adaptive policy should validate");
 
         cfg.orchestrator.adaptive_federation.target_domain = Some(baseline);
         assert!(

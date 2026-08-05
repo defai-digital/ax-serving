@@ -21,14 +21,12 @@ pub mod worker;
 pub use adaptive::{
     AdaptiveFederationPolicyV1, AdaptivePolicyError, AdaptiveSelection, DomainCostSignal,
 };
-pub use chunking::{
-    ChunkingProfileError, ChunkingProfileV1, StageChunkProfile,
-};
 pub use admission::{
     ADMISSION_STATE_HEADER, ATTEMPT_ID_HEADER, AdmissionError, AdmissionPhase, AdmissionState,
     AxErrorEnvelope, AxErrorMetadata, CommitmentState, DISPATCH_TOKEN_HEADER, ErrorBody,
     REQUEST_ID_HEADER, RetryDecision,
 };
+pub use chunking::{ChunkingProfileError, ChunkingProfileV1, StageChunkProfile};
 pub use cluster::{
     ArtifactFileKind, ArtifactFilePlan, ClusterLifecycleState, ClusterManifestError,
     ClusterModelSpec, ClusterRankObservation, ClusterRuntimeSpec, LayerRange, ParallelismKind,

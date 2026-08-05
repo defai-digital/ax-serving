@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use ax_serving_api::config::{AdaptiveDomainPredictionConfig, AdaptiveFederationConfig};
 use ax_serving_api::orchestration::{
     OrchestratorConfig, OrchestratorLayer, ProjectPolicyConfig,
     direct::DirectDispatcher,
@@ -25,7 +26,6 @@ use ax_serving_api::orchestration::{
     },
     start_orchestrator,
 };
-use ax_serving_api::config::{AdaptiveDomainPredictionConfig, AdaptiveFederationConfig};
 use ax_serving_api::rest::schema::MAX_CONTENT_BYTES;
 use ax_serving_protocol::{
     AgentDescriptor, CURRENT_PROTOCOL, CapacityObservation, CompatibilityManifestDigest,
@@ -254,9 +254,8 @@ fn register_adaptive_domain_worker(
     .map(|value| ProtocolCapability::new(value).unwrap())
     .collect();
     if kind == ExecutionDomainKind::MacAxEngineCluster {
-        capabilities.insert(
-            ProtocolCapability::new(ProtocolCapability::CONTROL_MAC_CLUSTER).unwrap(),
-        );
+        capabilities
+            .insert(ProtocolCapability::new(ProtocolCapability::CONTROL_MAC_CLUSTER).unwrap());
     }
     layer
         .registry
@@ -1037,7 +1036,11 @@ async fn test_adaptive_federation_modes_route_complete_domains_and_retain_eviden
         assert_eq!(decision.policy_mode, mode);
         assert_eq!(decision.counterfactual_domain, counterfactual);
         assert_eq!(decision.rolled_back, mode == PolicyMode::Rollback);
-        assert!(decision.reason_codes.contains(&DecisionReasonCode::AdaptivePolicy));
+        assert!(
+            decision
+                .reason_codes
+                .contains(&DecisionReasonCode::AdaptivePolicy)
+        );
         assert!(decision.reason_codes.contains(&reason_code));
         assert_eq!(
             fleet_store.list_decisions(10).await.unwrap(),

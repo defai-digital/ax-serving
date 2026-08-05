@@ -2,8 +2,8 @@
 //!
 //! Labels never include prompts, outputs, user IDs, or rank-local cache indexes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -144,7 +144,8 @@ impl StageTimer {
     }
 
     pub fn finish(mut self) {
-        self.metrics.record_stage(self.stage, self.started.elapsed());
+        self.metrics
+            .record_stage(self.stage, self.started.elapsed());
         self.finished = true;
     }
 }
