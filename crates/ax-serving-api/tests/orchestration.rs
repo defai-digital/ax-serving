@@ -225,16 +225,28 @@ fn adaptive_identity() -> DeploymentIdentity {
     }
 }
 
-fn register_adaptive_domain_worker(
-    layer: &OrchestratorLayer,
-    worker_addr: SocketAddr,
-    worker_id: &str,
+struct AdaptiveDomainWorker<'a> {
+    worker_id: &'a str,
     pool_id: PoolId,
     domain_id: DomainId,
     kind: ExecutionDomainKind,
-    hardware_class: &str,
+    hardware_class: &'a str,
     runtime_model_id: RuntimeModelId,
+}
+
+fn register_adaptive_domain_worker(
+    layer: &OrchestratorLayer,
+    worker_addr: SocketAddr,
+    worker: AdaptiveDomainWorker<'_>,
 ) {
+    let AdaptiveDomainWorker {
+        worker_id,
+        pool_id,
+        domain_id,
+        kind,
+        hardware_class,
+        runtime_model_id,
+    } = worker;
     let trust_domain = TrustDomainId::new("private").unwrap();
     let model = RuntimeModelDescriptor {
         runtime_model_id,
@@ -978,22 +990,26 @@ async fn test_adaptive_federation_modes_route_complete_domains_and_retain_eviden
         register_adaptive_domain_worker(
             &layer,
             single_addr,
-            "adaptive-single-worker",
-            PoolId::new("mac-single").unwrap(),
-            single_domain.clone(),
-            ExecutionDomainKind::MacAxEngine,
-            "apple-silicon",
-            RuntimeModelId::new("fixture/adaptive-single").unwrap(),
+            AdaptiveDomainWorker {
+                worker_id: "adaptive-single-worker",
+                pool_id: PoolId::new("mac-single").unwrap(),
+                domain_id: single_domain.clone(),
+                kind: ExecutionDomainKind::MacAxEngine,
+                hardware_class: "apple-silicon",
+                runtime_model_id: RuntimeModelId::new("fixture/adaptive-single").unwrap(),
+            },
         );
         register_adaptive_domain_worker(
             &layer,
             cluster_addr,
-            "adaptive-cluster-worker",
-            PoolId::new("mac-cluster").unwrap(),
-            cluster_domain.clone(),
-            ExecutionDomainKind::MacAxEngineCluster,
-            "apple-silicon-cluster",
-            RuntimeModelId::new("fixture/adaptive-cluster").unwrap(),
+            AdaptiveDomainWorker {
+                worker_id: "adaptive-cluster-worker",
+                pool_id: PoolId::new("mac-cluster").unwrap(),
+                domain_id: cluster_domain.clone(),
+                kind: ExecutionDomainKind::MacAxEngineCluster,
+                hardware_class: "apple-silicon-cluster",
+                runtime_model_id: RuntimeModelId::new("fixture/adaptive-cluster").unwrap(),
+            },
         );
         layer.reconcile_deployment_state().await.unwrap();
 

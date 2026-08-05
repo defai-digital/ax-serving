@@ -960,7 +960,7 @@ impl DirectDispatcher {
             PolicyId::new("explicit-catalog").expect("static decision policy id is valid")
         };
         let policy_version = adaptive
-            .and_then(|_| self.adaptive_policy.as_ref())
+            .and(self.adaptive_policy.as_ref())
             .map(|policy| policy.policy().policy_version.clone())
             .unwrap_or_else(|| {
                 PolicyVersion::new(env!("CARGO_PKG_VERSION"))
