@@ -10,8 +10,8 @@ checks:
 - optional continuous inventory stability;
 - a bounded concurrent no-retry request burst.
 
-The runner has no third-party Python dependencies. `uv` still gives each
-operator a predictable interpreter boundary:
+The runner has no third-party Python dependencies. The managed profiles pin
+`uv` 0.12.2 and Python 3.12 to keep a predictable interpreter boundary:
 
 ```bash
 uv run scripts/qualification/runtime/smoke_openai_runtime.py \
@@ -25,11 +25,24 @@ uv run scripts/qualification/runtime/smoke_openai_runtime.py \
   --output target/trtllm-runtime-smoke.json
 ```
 
-`python3` can run the same script when `uv` is unavailable. Credentials are
-read only from the environment selected by `--api-key-env`; never put them in
-the URL or command line.
+Credentials are read only from the environment selected by `--api-key-env`;
+never put them in the URL or command line.
 
-Run the direct TensorRT-LLM endpoint once without `--runtime`, then run the AX
-Serving endpoint with `--runtime tensorrt_llm`. A successful direct or
-runtime-agent compatibility result does not certify the separately operated
+For one NVIDIA PC, `run_compose_profile.sh` manages the pinned `vllm`,
+`sglang`, and `tensorrt_llm` profiles. It rejects unknown runtimes and mutable
+image/model pins, renders Compose before startup, prevents accidental
+cross-profile GPU contention, qualifies both direct and gateway paths, and
+cleans up by default:
+
+```bash
+scripts/qualification/runtime/run_compose_profile.sh test \
+  --runtime sglang \
+  --env-file .env.sglang \
+  --output-dir target/runtime-qualification
+```
+
+For Jetson Thor, `install_tensorrt_edge_llm_thor.sh` pins NVIDIA TensorRT
+Edge-LLM, `uv`, and the model revision. See
+[`deploy/thor/README.md`](../../../deploy/thor/README.md). A successful direct
+or runtime-agent compatibility result does not certify a separately operated
 NVIDIA Dynamo topology.

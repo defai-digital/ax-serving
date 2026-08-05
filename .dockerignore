@@ -3,3 +3,11 @@ target
 .internal
 sdk
 **/node_modules
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+
+# Operator-owned credentials and host-local runtime configuration.
+/.env
+/.env.*

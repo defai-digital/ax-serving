@@ -36,6 +36,8 @@ services:
       - "${TRTLLM_HOST_PORT:-8000}:8000"
     gpus: all
     shm_size: "4gb"
+    labels:
+      com.automatosx.ax-serving.runtime-profile: tensorrt_llm
     healthcheck:
       test:
         - CMD-SHELL
@@ -53,6 +55,8 @@ services:
     depends_on:
       tensorrt-llm:
         condition: service_healthy
+    labels:
+      com.automatosx.ax-serving.runtime-profile: tensorrt_llm
 
 volumes:
   trtllm-hf-cache:

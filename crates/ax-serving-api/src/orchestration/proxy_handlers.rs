@@ -2091,7 +2091,9 @@ fn worker_replacement_commands(worker_ids: &[String]) -> Vec<String> {
 fn expected_hardware_classes(runtime: &str) -> Option<&'static [&'static str]> {
     match runtime {
         "ax_engine" => Some(&["mac"]),
-        "vllm" | "sglang" | "tensorrt_llm" => Some(&["pc-cuda", "thor"]),
+        "vllm" | "sglang" => Some(&["pc-cuda", "thor"]),
+        "tensorrt_llm" => Some(&["pc-cuda"]),
+        "tensorrt_edge_llm" => Some(&["thor"]),
         _ => None,
     }
 }
@@ -2137,19 +2139,51 @@ fn runtime_guidance(runtime: &str) -> serde_json::Value {
                 "PC CUDA and Thor placement should be represented by hardware_class and worker_pool"
             ]
         }),
-        "tensorrt_llm" => serde_json::json!({
-            "runtime_owner": "NVIDIA TensorRT-LLM",
+        "sglang" => serde_json::json!({
+            "runtime_owner": "SGLang",
             "expected_hardware_classes": ["pc-cuda", "thor"],
             "adapter": "ax-runtime-agent",
             "required_registration": {
-                "runtime": "tensorrt_llm",
+                "runtime": "sglang",
                 "hardware_class": "pc-cuda or thor"
+            },
+            "operator_checks": [
+                "SGLang OpenAI-compatible endpoint exposes /health",
+                "SGLang OpenAI-compatible endpoint exposes /v1/models",
+                "adapter reports runtime version, model inventory, and supported operations",
+                "PC CUDA and Thor placement should be represented by hardware_class and worker_pool"
+            ]
+        }),
+        "tensorrt_llm" => serde_json::json!({
+            "runtime_owner": "NVIDIA TensorRT-LLM",
+            "expected_hardware_classes": ["pc-cuda"],
+            "adapter": "ax-runtime-agent",
+            "required_registration": {
+                "runtime": "tensorrt_llm",
+                "hardware_class": "pc-cuda"
             },
             "operator_checks": [
                 "TensorRT-LLM OpenAI-compatible endpoint exposes /v1/models",
                 "AXS_NODE_RUNTIME_HEALTH_PATH targets a stable 2xx readiness endpoint",
                 "adapter reports runtime version, model inventory, and supported operations",
+                "Jetson Thor uses the distinct tensorrt_edge_llm runtime identity",
                 "production NVIDIA domains use ax-dynamo-adapter; this direct endpoint remains a compatibility path"
+            ]
+        }),
+        "tensorrt_edge_llm" => serde_json::json!({
+            "runtime_owner": "NVIDIA TensorRT Edge-LLM",
+            "expected_hardware_classes": ["thor"],
+            "adapter": "ax-runtime-agent",
+            "support_level": "experimental_compatibility",
+            "required_registration": {
+                "runtime": "tensorrt_edge_llm",
+                "hardware_class": "thor"
+            },
+            "operator_checks": [
+                "TensorRT Edge-LLM experimental server exposes /health and /v1/models",
+                "AXS_NODE_RUNTIME_HEALTH_PATH is /health and the exact model revision is retained",
+                "adapter reports Edge-LLM, JetPack, CUDA, TensorRT, model, and engine identities",
+                "TensorRT Edge-LLM is distinct from TensorRT-LLM and remains an experimental compatibility path"
             ]
         }),
         "unknown" => serde_json::json!({
@@ -2496,10 +2530,29 @@ mod tests {
     }
 
     #[test]
-    fn tensorrt_and_generic_runtime_guidance_is_actionable() {
+    fn nvidia_and_generic_runtime_guidance_is_actionable() {
+        let sglang = runtime_guidance("sglang");
+        assert_eq!(sglang["runtime_owner"], "SGLang");
+        assert_eq!(
+            sglang["expected_hardware_classes"],
+            serde_json::json!(["pc-cuda", "thor"])
+        );
+
         let tensorrt = runtime_guidance("tensorrt_llm");
         assert_eq!(tensorrt["runtime_owner"], "NVIDIA TensorRT-LLM");
         assert_eq!(tensorrt["adapter"], "ax-runtime-agent");
+        assert_eq!(
+            tensorrt["expected_hardware_classes"],
+            serde_json::json!(["pc-cuda"])
+        );
+
+        let edge = runtime_guidance("tensorrt_edge_llm");
+        assert_eq!(edge["runtime_owner"], "NVIDIA TensorRT Edge-LLM");
+        assert_eq!(
+            edge["expected_hardware_classes"],
+            serde_json::json!(["thor"])
+        );
+        assert_eq!(edge["support_level"], "experimental_compatibility");
 
         let generic = runtime_guidance("ollama");
         assert_eq!(generic["runtime_owner"], "ollama");

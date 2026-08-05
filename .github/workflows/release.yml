@@ -125,6 +125,8 @@ jobs:
           ruff format --check integrations/nvidia/vllm-runtime
           pytest -q integrations/nvidia/vllm-runtime
           python scripts/qualification/nvidia/test_soak_dynamo_domain.py
+          python scripts/qualification/runtime/test_install_tensorrt_edge_llm_thor.py
+          python scripts/qualification/runtime/test_run_compose_profile.py
           python scripts/qualification/runtime/test_smoke_openai_runtime.py
       - name: Build and inspect runtime wheel
         working-directory: integrations/nvidia/vllm-runtime

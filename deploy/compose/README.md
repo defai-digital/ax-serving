@@ -33,42 +33,54 @@ runnable. An operator-owned `.env` overrides both ends together. `AXS_NODE_HARDW
 `AXS_NODE_WORKER_POOL`, runtime version, health path, capacity, and shutdown timeout are also
 overridable; the Compose file no longer labels every external runtime as `cpu`.
 
-## TensorRT-LLM on one NVIDIA PC
+## NVIDIA runtime profiles on one PC
 
-The TensorRT-LLM overlay pins the exact linux/amd64 image and TinyLlama revision used for the
-compatibility test. It keeps the Hugging Face cache in a named volume and waits for `/v1/models`
-before starting `ax-runtime-agent`:
+The vLLM, SGLang, and TensorRT-LLM overlays pin the exact linux/amd64 images
+and TinyLlama revision used for compatibility testing. They use retained
+Hugging Face caches (shared by the vLLM and SGLang examples), wait for
+`/v1/models`, and register distinct runtime identities through
+`ax-runtime-agent`.
 
 ```bash
-cp deploy/compose/tensorrt-llm.env.example .env.trtllm
-# Replace credentials and review every image/model/runtime pin.
-docker compose \
-  --env-file .env.trtllm \
-  -f deploy/compose/compose.yaml \
-  -f deploy/compose/tensorrt-llm.compose.example.yaml \
-  --profile agent --profile tensorrt-llm \
-  up --build
+cp deploy/compose/vllm.env.example .env.vllm
+# Replace the two evaluation credentials, then validate without starting:
+scripts/qualification/runtime/run_compose_profile.sh validate \
+  --runtime vllm \
+  --env-file .env.vllm
 ```
 
-Run bounded stream, non-stream, inventory-stability, and concurrency checks with
-an isolated Python environment:
+Use one profile at a time on a single GPU:
+
+| Runtime | Overlay | Example environment | Host port |
+|---|---|---|---:|
+| vLLM | `vllm.compose.example.yaml` | `vllm.env.example` | 8001 |
+| SGLang | `sglang.compose.example.yaml` | `sglang.env.example` | 8002 |
+| TensorRT-LLM | `tensorrt-llm.compose.example.yaml` | `tensorrt-llm.env.example` | 8000 |
+
+`test` starts the selected profile, waits for its exact model identity, runs
+bounded stream, non-stream, inventory-stability, and concurrency checks
+directly and through AX Serving, writes JSON evidence, and cleans up:
 
 ```bash
-uv run scripts/qualification/runtime/smoke_openai_runtime.py \
-  --base-url http://127.0.0.1:18080 \
-  --model tinyllama-trtllm \
-  --runtime tensorrt_llm \
+scripts/qualification/runtime/run_compose_profile.sh test \
+  --runtime vllm \
+  --env-file .env.vllm \
   --stability-seconds 45 \
-  --requests 8 \
-  --concurrency 4 \
-  --allow-insecure-http \
-  --output target/trtllm-compat-smoke.json
+  --output-dir target/runtime-qualification
 ```
 
-The runner detects inventory, transport, concurrency, response-shape, and SSE termination failures
-without labeling the result as Dynamo evidence. A successful direct compatibility run is **not**
-Dynamo-domain certification. Production NVIDIA deployments remain the separately pinned
+The wrapper allow-lists runtime names, rejects mutable image tags and model
+revisions, never sources the environment file, and does not print
+credentials. It requires `uv` 0.12.2 and Python 3.12 for the qualification
+interpreter boundary.
+Pass `--keep` only when you intentionally want to inspect a test stack after
+qualification. A successful direct compatibility run is **not** Dynamo-domain
+certification. Production NVIDIA deployments remain the separately pinned
 `ax-dynamo-adapter` topology.
+
+Jetson Thor uses the distinct native TensorRT Edge-LLM path documented in
+[`deploy/thor`](../thor/README.md); do not use the PC TensorRT-LLM profile as a
+Thor substitute.
 
 On macOS, AX Engine remains a native host process. Use
 `AXS_NODE_RUNTIME_URL=http://host.docker.internal:<port>` from the agent container,

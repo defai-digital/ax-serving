@@ -1,0 +1,47 @@
+# AX runtime-agent for a native TensorRT Edge-LLM server on Jetson Thor.
+# Linux host networking is intentional: the native server binds host port 8000
+# and the agent must advertise the Thor's routable LAN address.
+services:
+  runtime-agent:
+    build:
+      context: ../..
+      dockerfile: packaging/container/Dockerfile
+      target: agent
+    network_mode: host
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      AXS_CONTROL_PLANE_URL: "${AXS_CONTROL_PLANE_URL:?set the gateway internal URL}"
+      AXS_NODE_LISTEN_ADDR: "0.0.0.0:18081"
+      AXS_NODE_ADVERTISED_URL: "${AXS_NODE_ADVERTISED_URL:?set the Thor LAN agent URL}"
+      AXS_NODE_RUNTIME_URL: "http://127.0.0.1:${EDGE_LLM_PORT:-8000}"
+      AXS_NODE_RUNTIME_HEALTH_PATH: "/health"
+      AXS_DISPATCH_TOKEN: "${AXS_DISPATCH_TOKEN:?set AXS_DISPATCH_TOKEN}"
+      AXS_WORKER_TOKEN: "${AXS_WORKER_TOKEN:?set AXS_WORKER_TOKEN}"
+      AXS_TLS_PROFILE: "${AXS_TLS_PROFILE:-trusted_mesh}"
+      AXS_NODE_RUNTIME: "tensorrt_edge_llm"
+      AXS_RUNTIME_VERSION: "0.9.1"
+      AXS_NODE_ID: "${AXS_NODE_ID:?set AXS_NODE_ID}"
+      AXS_NODE_FRIENDLY_NAME: "${AXS_NODE_FRIENDLY_NAME:?set AXS_NODE_FRIENDLY_NAME}"
+      AXS_NODE_WORKER_POOL: "${AXS_NODE_WORKER_POOL:-tensorrt-edge-llm-thor}"
+      AXS_NODE_CLASS: "jetson-thor"
+      AXS_NODE_CHIP_MODEL: "NVIDIA Thor"
+      AXS_NODE_HARDWARE_CLASS: "thor-jetpack-7.2"
+      AXS_NODE_MAX_INFLIGHT: "1"
+      AXS_NODE_MAX_CONTEXT: "2048"
+      AXS_NODE_EMBEDDING: "false"
+      AXS_NODE_VISION: "false"
+      AXS_NODE_SHUTDOWN_TIMEOUT_SECS: "30"
+      AXS_MODEL_REVISION: "c1899de289a04d12100db370d81485cdf75e47ca"
+      AXS_MODEL_QUANTIZATION: "fp16"
+      AXS_MODEL_MAX_OUTPUT_TOKENS: "2048"
+      AXS_NODE_DOMAIN_ID: "${AXS_NODE_DOMAIN_ID:?set AXS_NODE_DOMAIN_ID}"
+      AXS_NODE_DOMAIN_QUALIFICATION: "experimental"
+    labels:
+      com.automatosx.ax-serving.runtime-profile: tensorrt_edge_llm
+    restart: unless-stopped
+    stop_grace_period: 45s

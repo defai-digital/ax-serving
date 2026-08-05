@@ -202,6 +202,8 @@ jobs:
       - name: Test runtime qualification tooling
         run: |
           python scripts/qualification/nvidia/test_soak_dynamo_domain.py
+          python scripts/qualification/runtime/test_install_tensorrt_edge_llm_thor.py
+          python scripts/qualification/runtime/test_run_compose_profile.py
           python scripts/qualification/runtime/test_smoke_openai_runtime.py
       - name: Build and inspect runtime wheel
         working-directory: integrations/nvidia/vllm-runtime
@@ -239,6 +241,17 @@ jobs:
             next if path.include?("/templates/");
             YAML.load_stream(File.read(path));
           end'
+      - name: Render NVIDIA compatibility profiles
+        run: |
+          bash scripts/qualification/runtime/run_compose_profile.sh validate \
+            --runtime vllm \
+            --env-file deploy/compose/vllm.env.example
+          bash scripts/qualification/runtime/run_compose_profile.sh validate \
+            --runtime sglang \
+            --env-file deploy/compose/sglang.env.example
+          bash scripts/qualification/runtime/run_compose_profile.sh validate \
+            --runtime tensorrt_llm \
+            --env-file deploy/compose/tensorrt-llm.env.example
       - name: Validate dashboard JSON
         run: jq empty deploy/monitoring/grafana-dashboard.json
       - name: Build portable container targets

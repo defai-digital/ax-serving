@@ -39,7 +39,7 @@ execution-domain qualification are independent claims.
 | Redis/Valkey | Reachable trusted infrastructure for the HA profile | Shared AX-owned gateway/fleet state |
 
 The gateway and adapters do not require a GPU and do not link AX Engine, MLX, Metal, CUDA, Dynamo,
-vLLM, SGLang, or TensorRT-LLM runtime SDKs.
+vLLM, SGLang, TensorRT-LLM, or TensorRT Edge-LLM runtime SDKs.
 
 ## Adapter rules
 
@@ -54,7 +54,8 @@ Mac and NVIDIA use different adapter boundaries:
   calibration, rollout state, and qualification evidence.
 - AX Serving selects a domain. Dynamo selects the NVIDIA worker inside that domain.
 
-The direct vLLM/SGLang/TensorRT-LLM mode in `ax-runtime-agent` remains available for migration and
+The direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM mode in
+`ax-runtime-agent` remains available for migration and
 testing. It is `compatibility_runtime_endpoint`, not the target NVIDIA production path. This
 remains true on both AMD64 PCs and Thor: the legacy `ax-thor-agent` executable is an alias for
 `ax-runtime-agent` and cannot register a Dynamo domain.

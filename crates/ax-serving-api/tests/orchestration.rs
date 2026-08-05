@@ -2640,6 +2640,94 @@ async fn test_admin_diagnostics_preserves_tensorrt_runtime_and_hardware_subclass
 }
 
 #[tokio::test]
+async fn test_admin_diagnostics_distinguishes_sglang_and_tensorrt_edge_llm() {
+    let layer = Arc::new(
+        OrchestratorLayer::new(
+            OrchestratorConfig::default(),
+            ProjectPolicyConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut sglang = reg_req("127.0.0.1:28086".parse().unwrap(), &["sglang-model"]);
+    sglang.backend = "sglang".into();
+    sglang.runtime = Some("sglang".into());
+    sglang.runtime_endpoint = Some("http://127.0.0.1:30000".into());
+    sglang.hardware_class = Some("pc-cuda-sm120".into());
+    sglang.supported_operations = vec!["llm".into()];
+    layer.registry.register(sglang, 5_000);
+
+    let mut edge = protocol_reg_req(
+        "127.0.0.1:28087".parse().unwrap(),
+        "df-thor-01",
+        "TensorRT-Edge-LLM",
+        "qwen3-edge",
+    );
+    edge.hardware.hardware_class = Some("thor-jetpack-7.2".into());
+    layer
+        .registry
+        .register_protocol(
+            edge,
+            ax_serving_api::orchestration::worker_endpoint::WorkerEndpoint::parse(
+                "http://127.0.0.1:28087",
+            )
+            .unwrap(),
+            NegotiatedProtocol {
+                version: CURRENT_PROTOCOL,
+                capabilities: BTreeSet::new(),
+            },
+            5_000,
+            15_000,
+        )
+        .unwrap();
+
+    let app = proxy_router_with_key(Arc::clone(&layer), "secret");
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/v1/admin/diagnostics")
+                .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let runtimes = &json["runtime_diagnostics"]["runtimes"];
+    assert_eq!(
+        runtimes["sglang"]["runtime_guidance"]["runtime_owner"],
+        "SGLang"
+    );
+    assert_eq!(
+        runtimes["tensorrt_edge_llm"]["runtime_guidance"]["runtime_owner"],
+        "NVIDIA TensorRT Edge-LLM"
+    );
+    assert_eq!(
+        runtimes["tensorrt_edge_llm"]["hardware_classes"]["thor-jetpack-7.2"],
+        1
+    );
+    assert_eq!(
+        runtimes["tensorrt_edge_llm"]["runtime_guidance"]["support_level"],
+        "experimental_compatibility"
+    );
+    assert!(
+        !runtimes["tensorrt_edge_llm"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "unexpected_hardware_class")
+    );
+}
+
+#[tokio::test]
 async fn test_admin_diagnostics_reports_runtime_telemetry_recovery_actions() {
     let layer = Arc::new(
         OrchestratorLayer::new(

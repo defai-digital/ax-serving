@@ -170,6 +170,8 @@ impl RuntimeKind {
             "sglang" | "sg_lang" => Self::SgLang,
             "vllm" | "v_llm" => Self::Vllm,
             "tensorrt_llm" | "trt_llm" | "trtllm" => Self::Other("tensorrt_llm".into()),
+            "tensorrt_edge_llm" | "tensorrt_edgellm" | "trt_edge_llm" | "trt_edgellm"
+            | "edgellm" => Self::Other("tensorrt_edge_llm".into()),
             _ => Self::Other(normalized),
         }
     }
@@ -4637,6 +4639,19 @@ mod tests {
             RuntimeKind::parse("trtllm"),
             RuntimeKind::Other("tensorrt_llm".into())
         );
+        for alias in [
+            "TensorRT-Edge-LLM",
+            "TensorRT-EdgeLLM",
+            "trt-edge-llm",
+            "trt_edgellm",
+            "edgellm",
+        ] {
+            assert_eq!(
+                RuntimeKind::parse(alias),
+                RuntimeKind::Other("tensorrt_edge_llm".into()),
+                "runtime alias {alias} must preserve the Edge-LLM identity"
+            );
+        }
         assert_eq!(
             RuntimeKind::parse("ollama"),
             RuntimeKind::Other("ollama".into())

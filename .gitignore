@@ -15,6 +15,10 @@
 *.swo
 .venv/
 
+# Operator-owned credentials and host-local runtime configuration.
+/.env
+/.env.*
+
 # Local model artifacts
 /models/
 /models-local/

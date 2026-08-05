@@ -389,6 +389,10 @@ Runtime identifiers are normalized to lower-case underscore form and preserved
 in fleet state, routing hints, and diagnostics when they use bounded
 ASCII-alphanumeric, underscore, dot, or hyphen syntax. Known aliases such as
 `TensorRT-LLM`, `trt_llm`, and `trtllm` canonicalize to `tensorrt_llm`.
+`TensorRT-Edge-LLM`, `trt_edge_llm`, `trt_edgellm`, and `edgellm`
+canonicalize separately to `tensorrt_edge_llm`; this identity is restricted
+to Thor-class compatibility inventory and must not inherit TensorRT-LLM
+artifacts or qualification.
 Malformed identifiers are rejected instead of silently selecting another
 runtime.
 

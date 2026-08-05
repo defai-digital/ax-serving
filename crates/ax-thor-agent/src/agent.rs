@@ -367,6 +367,9 @@ fn normalize_runtime_kind(raw: &str) -> String {
         "v_llm" | "vllm" => "vllm".into(),
         "sg_lang" | "sglang" => "sglang".into(),
         "tensorrt_llm" | "trt_llm" | "trtllm" => "tensorrt_llm".into(),
+        "tensorrt_edge_llm" | "tensorrt_edgellm" | "trt_edge_llm" | "trt_edgellm" | "edgellm" => {
+            "tensorrt_edge_llm".into()
+        }
         other => other.to_string(),
     }
 }
@@ -397,7 +400,7 @@ fn accelerator_name(config: &ThorConfig) -> String {
     // resolve to the same accelerator as their canonical spellings.
     match normalize_runtime_kind(&config.runtime).as_str() {
         "ax_engine" => "apple-gpu".into(),
-        "vllm" | "sglang" | "tensorrt_llm" => "nvidia-gpu".into(),
+        "vllm" | "sglang" | "tensorrt_llm" | "tensorrt_edge_llm" => "nvidia-gpu".into(),
         _ if config.hardware_class.to_ascii_lowercase().contains("cuda") => "nvidia-gpu".into(),
         _ => "unknown".into(),
     }
@@ -998,6 +1001,9 @@ mod tests {
             "sg-lang",
             "TensorRT-LLM",
             "trtllm",
+            "TensorRT-Edge-LLM",
+            "trt-edgellm",
+            "edgellm",
         ] {
             config.runtime = alias.into();
             assert_eq!(

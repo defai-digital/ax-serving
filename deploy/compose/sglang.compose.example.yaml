@@ -1,0 +1,60 @@
+# Direct SGLang compatibility evaluation for one NVIDIA PC.
+#
+# Pair this overlay with compose.yaml and an operator-owned copy of
+# sglang.env.example. This profile is not NVIDIA Dynamo certification.
+services:
+  sglang:
+    profiles: ["sglang"]
+    image: "${SGLANG_IMAGE:?set SGLANG_IMAGE to an immutable linux/amd64 digest}"
+    command:
+      - sglang
+      - serve
+      - --model-path
+      - "${SGLANG_MODEL:?set SGLANG_MODEL}"
+      - --revision
+      - "${SGLANG_MODEL_REVISION:?set SGLANG_MODEL_REVISION}"
+      - --served-model-name
+      - "${SGLANG_SERVED_MODEL:?set SGLANG_SERVED_MODEL}"
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "30000"
+      - --context-length
+      - "${SGLANG_CONTEXT_LENGTH:-2048}"
+      - --max-running-requests
+      - "${SGLANG_MAX_RUNNING_REQUESTS:-8}"
+      - --mem-fraction-static
+      - "${SGLANG_MEM_FRACTION_STATIC:-0.50}"
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - runtime-hf-cache:/root/.cache/huggingface
+    ports:
+      - "${SGLANG_HOST_PORT:-8002}:30000"
+    gpus: all
+    shm_size: "4gb"
+    labels:
+      com.automatosx.ax-serving.runtime-profile: sglang
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c 'import urllib.request;
+          urllib.request.urlopen("http://127.0.0.1:30000/v1/models", timeout=3).read()'
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 120s
+
+  runtime-agent:
+    depends_on:
+      sglang:
+        condition: service_healthy
+    labels:
+      com.automatosx.ax-serving.runtime-profile: sglang
+
+volumes:
+  runtime-hf-cache:
+    name: "${RUNTIME_HF_CACHE_VOLUME:-ax-serving-runtime-hf-cache}"

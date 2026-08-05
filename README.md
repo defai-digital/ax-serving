@@ -63,7 +63,7 @@ hardware, performance, fault, security, or production certification.
 | Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; full domain-selection policy and live mixed-domain evidence remain |
 | Mac -> `ax-runtime-agent` -> AX Engine | Source implemented with mock tests; pinned live AX Engine qualification pending |
 | Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phases 0–5 in-repo surfaces complete (manifest, gang lifecycle, domain reservation, placement, multi-replica, micro-batch contracts, TP/hybrid validation, adaptive federation hooks); physical multi-Mac production certification and Engine-native TP kernels remain external |
-| Direct vLLM/SGLang/TensorRT-LLM -> `ax-runtime-agent` | Source implemented for migration/testing as `compatibility_runtime_endpoint`; not the target NVIDIA production path |
+| Direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM -> `ax-runtime-agent` | Source implemented for migration/testing as `compatibility_runtime_endpoint`; Edge-LLM is Thor-only and experimental, and none is the target NVIDIA production path |
 | NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy source implemented with mock conformance; live qualification pending |
 | NVIDIA Thor -> separate `ax-dynamo-adapter` -> Dynamo domain | Source path exists but is experimental; no Thor production-support claim |
 | Streaming, cancellation, deadlines, and safe pre-commit retry | Implemented with mock/fault tests; live mixed-domain evidence pending |
@@ -140,11 +140,12 @@ boundary.
 | `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | In-repo control plane complete; physical multi-Mac + Engine PP/TP production pin required for support claims |
 | `nvidia_dynamo_pc` | One adapter for one PC Dynamo deployment | Dynamo and its selected backend | Exact Dynamo/backend/image/config manifest must be certified |
 | `nvidia_dynamo_thor` | One adapter for one separate Thor deployment | Dynamo and a Thor-qualified backend | Always separate from PC; experimental until its own gates pass |
-| `compatibility_runtime_endpoint` | One direct vLLM/SGLang/TensorRT-LLM or other compatible runtime node | Configured runtime | Migration and testing only; never a Dynamo-domain claim |
+| `compatibility_runtime_endpoint` | One direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM or other compatible runtime node | Configured runtime | Migration and testing only; never a Dynamo-domain claim |
 
 PC and Thor never share a tensor-parallel group, artifacts, capacity calibration, or certification
 by default. The legacy `ax-thor-agent` binary is only an alias for the generic
-`ax-runtime-agent`; when pointed directly at vLLM/SGLang/TensorRT-LLM it registers a compatibility endpoint, not
+`ax-runtime-agent`; when pointed directly at vLLM, SGLang, TensorRT-LLM, or
+TensorRT Edge-LLM it registers a compatibility endpoint, not
 a `nvidia_dynamo_thor` domain. One request attempt remains in one domain.
 
 ### Core model
@@ -237,7 +238,8 @@ target/release/ax-runtime-agent
 ```
 
 `AXS_NODE_DOMAIN_ID` is opt-in. AX Engine agents advertise `mac_ax_engine`; direct
-vLLM/SGLang/TensorRT-LLM agents can advertise only `compatibility_runtime_endpoint` and can never
+vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM agents can advertise only
+`compatibility_runtime_endpoint` and can never
 claim a Dynamo domain.
 Use `certified` only when the exact runtime/model deployment has retained qualification evidence.
 
@@ -254,7 +256,8 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-The current agent can also proxy direct vLLM/SGLang/TensorRT-LLM endpoints—including on Thor—for
+The current agent can also proxy direct vLLM/SGLang endpoints on PC or Thor,
+TensorRT-LLM endpoints on PC, and TensorRT Edge-LLM endpoints on Thor for
 migration and testing. That path always registers as `compatibility_runtime_endpoint`; it is not a
 Dynamo domain and is not the target NVIDIA production architecture.
 The same compatibility path covers generic OpenAI-compatible runtimes (llama.cpp `llama-server`,
@@ -366,6 +369,7 @@ environments. A skipped hardware test is not support evidence.
   `mac-cluster-adapter` in
   [packaging/container/Dockerfile](packaging/container/Dockerfile).
 - Compose: [deploy/compose](deploy/compose/README.md).
+- Jetson Thor TensorRT Edge-LLM compatibility path: [deploy/thor](deploy/thor/README.md).
 - Kubernetes baseline: [deploy/kubernetes](deploy/kubernetes/README.md).
 - First-party CPU-only chart: [deploy/helm/ax-serving](deploy/helm/ax-serving/README.md).
 
