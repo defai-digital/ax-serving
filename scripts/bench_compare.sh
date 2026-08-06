@@ -49,9 +49,9 @@ echo ""
 # ── llama-bench (reference, -p N exact tokens, greedy by default) ─────────
 echo "── llama-bench (ngl=99, exact token sequences, greedy) ─────────"
 IFS=',' read -ra PP_ARR <<< "$PP_SIZES"
-PP_FLAGS=""
-for pp in "${PP_ARR[@]}"; do PP_FLAGS="$PP_FLAGS -p $pp"; done
-$LLAMA_BENCH -m "$MODEL" $PP_FLAGS -n "$TG_TOKENS" -ngl 99 -r "$ITERS" 2>&1 \
+PP_FLAGS=()
+for pp in "${PP_ARR[@]}"; do PP_FLAGS+=(-p "$pp"); done
+"$LLAMA_BENCH" -m "$MODEL" "${PP_FLAGS[@]}" -n "$TG_TOKENS" -ngl 99 -r "$ITERS" 2>&1 \
     | grep -E "^\|" | grep -v "model\|─"
 echo ""
 

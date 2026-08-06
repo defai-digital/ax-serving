@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -15,14 +16,21 @@ EXAMPLE = REPO_ROOT / "deploy" / "compose" / "vllm.env.example"
 
 class ComposeProfileRunnerTests(unittest.TestCase):
     def run_profile(
-        self, *arguments: str, env_text: str | None = None
+        self,
+        *arguments: str,
+        env_text: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             env_file = Path(directory) / "runtime.env"
             env_file.write_text(
-                env_text if env_text is not None else EXAMPLE.read_text(encoding="utf-8"),
+                env_text
+                if env_text is not None
+                else EXAMPLE.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+            environment = os.environ.copy()
+            environment.update(extra_env or {})
             return subprocess.run(
                 [
                     "bash",
@@ -34,6 +42,7 @@ class ComposeProfileRunnerTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
+                env=environment,
             )
 
     def test_plan_is_static_and_does_not_expose_credentials(self):
@@ -52,6 +61,16 @@ class ComposeProfileRunnerTests(unittest.TestCase):
         self.assertIn("qualification=direct-and-gateway", result.stdout)
         self.assertNotIn(secret, result.stdout + result.stderr)
 
+    def test_top_level_help_succeeds_without_a_runtime(self):
+        result = subprocess.run(
+            ["bash", str(SCRIPT), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Usage:", result.stdout)
+
     def test_static_validation_accepts_the_checked_in_pin(self):
         result = self.run_profile(
             "validate",
@@ -60,6 +79,69 @@ class ComposeProfileRunnerTests(unittest.TestCase):
             "--static-only",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_validate_falls_back_to_standalone_compose_v2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_bin = Path(directory)
+            docker = fake_bin / "docker"
+            docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            docker.chmod(0o755)
+
+            docker_compose = fake_bin / "docker-compose"
+            docker_compose.write_text(
+                """#!/bin/sh
+if [ "$1" = "version" ] && [ "$2" = "--short" ]; then
+  printf '%s\n' '2.40.0'
+  exit 0
+fi
+for argument in "$@"; do
+  [ "$argument" = "config" ] && exit 0
+done
+exit 1
+""",
+                encoding="utf-8",
+            )
+            docker_compose.chmod(0o755)
+
+            result = self.run_profile(
+                "validate",
+                "--runtime",
+                "vllm",
+                extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runtime=vllm", result.stdout)
+
+    def test_validate_rejects_standalone_compose_v1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_bin = Path(directory)
+            docker = fake_bin / "docker"
+            docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            docker.chmod(0o755)
+
+            docker_compose = fake_bin / "docker-compose"
+            docker_compose.write_text(
+                """#!/bin/sh
+if [ "$1" = "version" ] && [ "$2" = "--short" ]; then
+  printf '%s\n' '1.29.2'
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            docker_compose.chmod(0o755)
+
+            result = self.run_profile(
+                "validate",
+                "--runtime",
+                "vllm",
+                extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Compose v2 or newer is required", result.stderr)
 
     def test_unknown_runtime_is_rejected(self):
         result = self.run_profile("plan", "--runtime", "arbitrary-command")
@@ -86,9 +168,9 @@ class ComposeProfileRunnerTests(unittest.TestCase):
             patterns = ignore_file.read_text(encoding="utf-8").splitlines()
             self.assertIn("/.env", patterns)
             self.assertIn("/.env.*", patterns)
-        docker_patterns = (REPO_ROOT / ".dockerignore").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        docker_patterns = (
+            (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        )
         self.assertIn(".venv", docker_patterns)
         self.assertIn("**/__pycache__", docker_patterns)
 

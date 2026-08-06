@@ -44,6 +44,19 @@ advertised runtime capacity and target tail latency:
 5. Reduce admission when runtime queue/KV pressure rises; do not blindly add
    gateway concurrency.
 
+Admission capacity and endpoint capacity are different measurements. The global queue can admit a
+request while every eligible worker is already at `max_inflight`; that request receives `503`
+before runtime dispatch. Report these responses separately from:
+
+- gateway admission `429` responses, which include `Retry-After`;
+- queue deadline `504` responses;
+- runtime/backend failures after dispatch;
+- successful logical requests that required a client-side capacity retry.
+
+Use bounded, jittered backoff for an overload experiment. Retain both HTTP attempt count and logical
+request count; otherwise a tight retry loop can produce an apparently high request rate dominated
+by immediate `503` responses.
+
 ## 3. Endpoint policy
 
 `inference_aware` is the production-candidate default. It hard-filters
@@ -79,7 +92,7 @@ Useful commands:
 cargo run -p ax-serving-bench --release -- bench \
   -m ./models/replace-with-supported-model
 
-python3 scripts/load_test_chat.py \
+uv run --python 3.12 python scripts/load_test_chat.py \
   --url http://127.0.0.1:18080/v1/chat/completions \
   --model replace-with-logical-model \
   --requests 200 \

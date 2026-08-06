@@ -1,7 +1,54 @@
 # AX Serving quick start
 
-This guide starts the portable runtime-neutral gateway. The embedded
-Apple-Silicon server is a separate compatibility path described at the end.
+This guide connects one existing model runtime to the portable AX Serving gateway and sends an
+OpenAI-compatible request through it. AX Serving does not install a model or replace the runtime;
+start AX Engine, vLLM, SGLang, TensorRT-LLM, TensorRT Edge-LLM, llama.cpp, Ollama, or another
+supported OpenAI-compatible server separately.
+
+At the end of steps 1–4, the request path is:
+
+```text
+curl / SDK
+    |
+    v
+AX gateway :18080  <---- registration + heartbeat on :19090
+    |
+    v
+runtime agent :18081
+    |
+    v
+existing model runtime :8000
+```
+
+The ports are defaults, not requirements:
+
+| Port | Owner | Purpose | Exposure |
+| ---: | --- | --- | --- |
+| `18080` | Gateway | Public OpenAI-compatible API, health, and admin routes | Client/operator network |
+| `19090` | Gateway | Worker and domain registration/control | Private control network only |
+| `18081` | Runtime agent | Authenticated dispatch proxy | Gateway-reachable network only |
+| `8000` | Example runtime | Runtime-native API | Prefer loopback or agent-only access |
+
+## Choose an evaluation path
+
+| You have | Recommended path |
+| --- | --- |
+| A runtime already listening on the same host | Follow the source steps below |
+| Docker and only want to verify the control plane | [Compose gateway smoke test](deploy/compose/README.md#quick-start) |
+| One NVIDIA PC for vLLM, SGLang, or TensorRT-LLM | [Pinned Compose runtime profiles](deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc) |
+| A Jetson Thor for TensorRT Edge-LLM | [Thor compatibility guide](deploy/thor/README.md) |
+| A separately operated NVIDIA Dynamo deployment | [Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) |
+
+Steps 1–4 use `legacy_compat`, which routes by the runtime model ID and is appropriate for
+evaluation and migration. Production cross-domain routing uses an explicit deployment catalog,
+immutable identity, and retained equivalence evidence as described in step 5.
+
+Success means all of the following:
+
+- `/readyz` reports a healthy control plane;
+- `/routablez` changes from `503` to `200` after the agent registers;
+- `/v1/models` lists the runtime model through the gateway;
+- a completion sent to port `18080` returns from the attached runtime.
 
 ## 1. Build
 
@@ -9,8 +56,7 @@ Requirements:
 
 - Rust 1.88 or newer;
 - macOS arm64 or Linux x86_64/arm64 for the portable gateway and agent;
-- an independently running OpenAI-compatible AX Engine, vLLM, SGLang, or
-  TensorRT-LLM endpoint.
+- an independently running supported OpenAI-compatible runtime endpoint.
 
 ```bash
 cargo build --release \
@@ -66,7 +112,7 @@ AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
 AXS_NODE_RUNTIME=vllm \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
-AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_ADVERTISED_URL=http://127.0.0.1:18081 \
 AXS_NODE_HARDWARE_CLASS=pc-cuda \
 AXS_NODE_WORKER_POOL=cuda \
 AXS_NODE_MAX_INFLIGHT=16 \
@@ -79,11 +125,15 @@ production topology uses one [`ax-dynamo-adapter`](docs/integrations/nvidia/DYNA
 separately operated Dynamo domain.
 
 For a pinned single-PC TensorRT-LLM evaluation, use the
-[`deploy/compose` overlay](deploy/compose/README.md#tensorrt-llm-on-one-nvidia-pc).
+[`deploy/compose` overlay](deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc).
 It registers the canonical runtime identity `tensorrt_llm`, uses `/v1/models`
 as its readiness path, and includes a `uv`-runnable stream/concurrency/stability
 probe. This remains the same direct compatibility path, not Dynamo-domain
 certification.
+
+The same Compose guide has pinned vLLM and SGLang profiles. Jetson Thor uses
+[TensorRT Edge-LLM](deploy/thor/README.md), which is a different runtime from
+TensorRT-LLM and remains an experimental Thor-only compatibility path.
 
 For AX Engine on Apple Silicon, point the same agent at the AX Engine server:
 
@@ -92,7 +142,7 @@ AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
 AXS_NODE_RUNTIME=ax_engine \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
-AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
+AXS_NODE_ADVERTISED_URL=http://127.0.0.1:18081 \
 AXS_NODE_HARDWARE_CLASS=mac \
 AXS_NODE_WORKER_POOL=mac-mlx \
 AXS_NODE_MAX_INFLIGHT=8 \
@@ -127,7 +177,7 @@ AXS_DISCOVER_LAN_CLUSTER=home-lab \
 AXS_NODE_RUNTIME=ax_engine \
 AXS_RUNTIME_API_KEY=$AX_ENGINE_API_KEY \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=<routable-host>:18081 \
+AXS_NODE_ADVERTISED_URL=http://replace-with-routable-host:18081 \
 AXS_DISPATCH_TOKEN=$DISPATCH \
 AXS_TLS_PROFILE=trusted_mesh \
 target/release/ax-runtime-agent
@@ -139,6 +189,12 @@ Leave `AXS_NODE_RUNTIME_URL` / `AXS_CONTROL_PLANE_URL` unset when using
 `AXS_DISCOVER_LAN_INSTANCE_ID`. See
 `docs/designs/ax-engine-integration-and-lan-discovery-2026-07-14.md` and
 `ax-engine` `docs/LAN-DISCOVERY.md`.
+
+On macOS, validate the agent after its launching SSH/Terminal session has ended. A process that can
+register while attached to an interactive session can still lose LAN access when relaunched as a
+background service if Local Network policy is not granted to that execution context. Use a
+supervised service, verify several heartbeat intervals, and confirm the gateway can reach
+`AXS_NODE_ADVERTISED_URL`. `nohup` alone is not a production service manager.
 
 The agent does not link the runtime SDK. It discovers readiness, inventory,
 capabilities, and common metrics over HTTP, then proxies request and stream
@@ -289,6 +345,22 @@ Useful controls:
 | `AXS_TENANT_MAX_CONCURRENT` | `0` | Per-tenant active quota; zero disables |
 | `AXS_DISPATCH_POLICY` | `inference_aware` | Endpoint scoring after hard filters |
 | `AXS_MAX_DISPATCH_ATTEMPTS` | `2` | Hard maximum; safe conditions only |
+
+Gateway admission and runtime capacity are separate:
+
+- `429` means the gateway admission limit rejected the request; respect `Retry-After`.
+- `503` with an `all_at_capacity` routing reason means the request passed gateway admission but
+  every eligible worker reached its reported `max_inflight`.
+- `504` can mean the request expired while waiting for gateway admission or a downstream deadline.
+
+For non-streaming requests rejected before runtime admission, use jittered, bounded exponential
+backoff and one end-to-end deadline. Never retry in a tight loop. Do not automatically retry an
+ambiguous timeout or any request after response bytes have been committed.
+
+For a controlled evaluation, `AXS_ROUTING_TRACE=true` adds an
+`x-ax-routing-trace` response header with bounded candidate, selected-worker, and reason fields.
+It contains no prompt or generated text. Treat worker IDs as operator diagnostics and avoid
+exposing the header through an untrusted public ingress.
 
 Clients may send `x-ax-priority: low|normal|high`. Priority aging and
 cross-client fairness prevent indefinite starvation, but runtime token

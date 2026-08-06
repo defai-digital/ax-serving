@@ -46,6 +46,10 @@ action="${1:-}"
   usage >&2
   exit 2
 }
+if [[ "$action" == "-h" || "$action" == "--help" ]]; then
+  usage
+  exit 0
+fi
 shift
 
 runtime=""
@@ -199,18 +203,45 @@ validate_static() {
   require_safe_integer "--wait-seconds" "$wait_seconds"
 }
 
-compose=(
-  docker compose
-  --env-file "$env_file"
-  -f "$base_compose"
-  -f "$overlay"
-  --profile agent
-  --profile "$compose_profile"
-)
+compose=()
+
+compose_version_is_supported() {
+  local version="$1"
+  local major
+  version="${version##*$'\n'}"
+  version="${version##* }"
+  version="${version#v}"
+  major="${version%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] && ((10#$major >= 2))
+}
+
+select_compose_command() {
+  ((${#compose[@]} == 0)) || return
+
+  local version=""
+  if command -v docker >/dev/null 2>&1 &&
+    version="$(docker compose version --short 2>/dev/null)" &&
+    compose_version_is_supported "$version"; then
+    compose=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1 &&
+    version="$(docker-compose version --short 2>/dev/null)" &&
+    compose_version_is_supported "$version"; then
+    compose=(docker-compose)
+  else
+    die "Docker Compose v2 or newer is required (docker compose or docker-compose)"
+  fi
+
+  compose+=(
+    --env-file "$env_file"
+    -f "$base_compose"
+    -f "$overlay"
+    --profile agent
+    --profile "$compose_profile"
+  )
+}
 
 validate_compose() {
-  command -v docker >/dev/null 2>&1 || die "docker is required"
-  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  select_compose_command
   "${compose[@]}" config --quiet
 }
 
@@ -384,7 +415,7 @@ case "$action" in
     cleanup=true
     cleanup_stack() {
       local status=$?
-      if $cleanup; then
+      if $cleanup && ((${#compose[@]} > 0)); then
         "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true
       fi
       exit "$status"

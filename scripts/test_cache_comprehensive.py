@@ -22,25 +22,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 
-def wait_http(url: str, timeout_s: int = 240) -> None:
+def wait_http(
+    url: str,
+    timeout_s: int = 240,
+    process: subprocess.Popen[str] | None = None,
+) -> None:
     end = time.time() + timeout_s
+    last_error = "endpoint not ready"
     while time.time() < end:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"process exited with status {process.returncode} while waiting for {url}"
+            )
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
                     return
-        except Exception:
-            pass
+        except (OSError, urllib.error.URLError) as error:
+            last_error = str(error)
         time.sleep(1)
-    raise RuntimeError(f"timeout waiting for {url}")
+    raise RuntimeError(f"timeout waiting for {url}: {last_error}")
 
 
 def http_json(url: str, payload: dict, timeout_s: int = 180) -> tuple[int, str]:
@@ -62,39 +73,53 @@ def assert_true(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def pick_free_tcp_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
 class Valkey:
-    def __init__(self, server_bin: Path, cli_bin: Path):
+    def __init__(self, server_bin: Path, cli_bin: Path, port: int, log_path: Path):
         self.server_bin = server_bin
         self.cli_bin = cli_bin
+        self.port = port
+        self.log_path = log_path
         self.proc: subprocess.Popen[str] | None = None
 
     def start(self) -> None:
-        log_fd = open("/tmp/valkey-cache-tests.log", "w")  # noqa: SIM115
-        self.proc = subprocess.Popen(
-            [
-                str(self.server_bin),
-                "--bind",
-                "127.0.0.1",
-                "--port",
-                "6379",
-                "--save",
-                "",
-                "--appendonly",
-                "no",
-            ],
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        log_fd.close()
+        with self.log_path.open("w", encoding="utf-8") as log_file:
+            self.proc = subprocess.Popen(
+                [
+                    str(self.server_bin),
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    str(self.port),
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        last_error = "server not ready"
         for _ in range(120):
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"valkey exited with status {self.proc.returncode}; see {self.log_path}"
+                )
             try:
                 if "PONG" in self.cli("PING"):
                     return
-            except Exception:
-                pass
+            except (OSError, subprocess.CalledProcessError) as error:
+                last_error = str(error)
             time.sleep(0.5)
-        raise RuntimeError("valkey failed to start")
+        raise RuntimeError(
+            f"valkey failed to start ({last_error}); see {self.log_path}"
+        )
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -108,8 +133,9 @@ class Valkey:
 
     def cli(self, *args: str) -> str:
         return subprocess.check_output(
-            [str(self.cli_bin), "-h", "127.0.0.1", "-p", "6379", *args],
+            [str(self.cli_bin), "-h", "127.0.0.1", "-p", str(self.port), *args],
             text=True,
+            stderr=subprocess.PIPE,
         ).strip()
 
     def flushall(self) -> None:
@@ -130,6 +156,7 @@ class AxServer:
         grpc_socket: str,
         extra_env: dict[str, str] | None = None,
         log_tag: str = "ax-cache-test",
+        log_dir: Path = Path("/tmp"),
     ):
         self.ax_bin = ax_bin
         self.config = config
@@ -138,36 +165,42 @@ class AxServer:
         self.grpc_socket = grpc_socket
         self.extra_env = extra_env or {}
         self.log_tag = log_tag
+        self.log_path = log_dir / f"{log_tag}.log"
         self.proc: subprocess.Popen[str] | None = None
 
     def start(self, cwd: Path) -> None:
         env = os.environ.copy()
         env["AXS_GRPC_SOCKET"] = self.grpc_socket
         env.update(self.extra_env)
-        log_fd = open(f"/tmp/{self.log_tag}.log", "w")  # noqa: SIM115
-        self.proc = subprocess.Popen(
-            [
-                str(self.ax_bin),
-                "serve",
-                "-m",
-                str(self.model),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.port),
-                "--config",
-                str(self.config),
-            ],
-            cwd=str(cwd),
-            env=env,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        log_fd.close()
-        wait_http(f"http://127.0.0.1:{self.port}/health", timeout_s=360)
-        if self.proc.poll() is not None:
-            raise RuntimeError(f"ax server exited early: {self.log_tag}")
+        with self.log_path.open("w", encoding="utf-8") as log_file:
+            self.proc = subprocess.Popen(
+                [
+                    str(self.ax_bin),
+                    "serve",
+                    "-m",
+                    str(self.model),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(self.port),
+                    "--config",
+                    str(self.config),
+                ],
+                cwd=str(cwd),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        try:
+            wait_http(
+                f"http://127.0.0.1:{self.port}/health",
+                timeout_s=360,
+                process=self.proc,
+            )
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -180,7 +213,9 @@ class AxServer:
         self.proc = None
 
     def post(self, body: dict, timeout_s: int = 180) -> tuple[int, str]:
-        return http_json(f"http://127.0.0.1:{self.port}/v1/chat/completions", body, timeout_s)
+        return http_json(
+            f"http://127.0.0.1:{self.port}/v1/chat/completions", body, timeout_s
+        )
 
     def cache_metrics(self) -> dict:
         with urllib.request.urlopen(
@@ -194,7 +229,9 @@ def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--ax-bin", default=str(root / "target/release/ax-serving"), help="ax-serving binary"
+        "--ax-bin",
+        default=str(root / "target/release/ax-serving"),
+        help="ax-serving binary",
     )
     parser.add_argument(
         "--config",
@@ -224,21 +261,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valkey: Valkey) -> None:
+def run_qwen_matrix(
+    root: Path,
+    ax_bin: Path,
+    cfg: Path,
+    qwen_model: Path,
+    valkey: Valkey,
+    cache_url: str,
+    run_dir: Path,
+) -> None:
     print("[QWEN] full matrix")
     valkey.flushall()
     srv = AxServer(
         ax_bin,
         cfg,
         qwen_model,
-        port=19100,
-        grpc_socket="/tmp/ax-serving-cache-qwen.sock",
+        port=pick_free_tcp_port(),
+        grpc_socket=str(run_dir / "qwen.sock"),
+        extra_env={"AXS_CACHE_URL": cache_url},
         log_tag="ax-cache-qwen",
+        log_dir=run_dir,
     )
     srv.start(root)
     try:
         m0 = srv.cache_metrics()
-        assert_true(m0 == {"enabled": True, "hits": 0, "misses": 0, "writes": 0, "errors": 0}, "baseline cache metrics mismatch")
+        assert_true(
+            m0 == {"enabled": True, "hits": 0, "misses": 0, "writes": 0, "errors": 0},
+            "baseline cache metrics mismatch",
+        )
 
         base = {
             "model": "default",
@@ -256,7 +306,10 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         m1 = srv.cache_metrics()
         assert_true(s1 == 200 and s2 == 200, "enable requests failed")
         assert_true(j1["id"] == j2["id"], "second enable request should be cache hit")
-        assert_true(m1["misses"] == 1 and m1["hits"] == 1 and m1["writes"] == 1, "miss/hit/write metrics mismatch")
+        assert_true(
+            m1["misses"] == 1 and m1["hits"] == 1 and m1["writes"] == 1,
+            "miss/hit/write metrics mismatch",
+        )
 
         # disable bypass
         bypass = dict(base)
@@ -273,7 +326,9 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         stream["stream"] = True
         s4, b4 = srv.post(stream, timeout_s=120)
         m3 = srv.cache_metrics()
-        assert_true(s4 == 200 and "chat.completion.chunk" in b4, "stream response mismatch")
+        assert_true(
+            s4 == 200 and "chat.completion.chunk" in b4, "stream response mismatch"
+        )
         assert_true(m3 == m2, "stream should bypass cache")
 
         # invalid ttl
@@ -281,7 +336,10 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         bad["messages"] = [{"role": "user", "content": "bad ttl"}]
         bad["cache_ttl"] = "invalid-ttl"
         s5, b5 = srv.post(bad)
-        assert_true(s5 == 400 and "invalid cache_ttl" in b5, "invalid cache_ttl should return 400")
+        assert_true(
+            s5 == 400 and "invalid cache_ttl" in b5,
+            "invalid cache_ttl should return 400",
+        )
 
         # ttl cap
         keys_before = valkey.keys("axs:chat:v1:*")
@@ -291,7 +349,9 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         s6, _ = srv.post(cap)
         keys_after = valkey.keys("axs:chat:v1:*")
         new_keys = keys_after - keys_before
-        assert_true(s6 == 200 and len(new_keys) == 1, "ttl cap request did not write one key")
+        assert_true(
+            s6 == 200 and len(new_keys) == 1, "ttl cap request did not write one key"
+        )
         ttl = int(valkey.cli("TTL", next(iter(new_keys))))
         assert_true(2_500_000 <= ttl <= 2_592_000, f"ttl cap mismatch: {ttl}")
 
@@ -302,9 +362,14 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         sens2 = dict(sens1)
         sens2["max_tokens"] = 12
         pre = srv.cache_metrics()
-        assert_true(srv.post(sens1)[0] == 200 and srv.post(sens2)[0] == 200, "param sensitivity requests failed")
+        assert_true(
+            srv.post(sens1)[0] == 200 and srv.post(sens2)[0] == 200,
+            "param sensitivity requests failed",
+        )
         post = srv.cache_metrics()
-        assert_true(post["misses"] >= pre["misses"] + 2, "params should create separate misses")
+        assert_true(
+            post["misses"] >= pre["misses"] + 2, "params should create separate misses"
+        )
 
         # restart persistence
         persist = dict(base)
@@ -315,9 +380,11 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
             ax_bin,
             cfg,
             qwen_model,
-            port=19100,
-            grpc_socket="/tmp/ax-serving-cache-qwen-r.sock",
+            port=pick_free_tcp_port(),
+            grpc_socket=str(run_dir / "qwen-restart.sock"),
+            extra_env={"AXS_CACHE_URL": cache_url},
             log_tag="ax-cache-qwen-r",
+            log_dir=run_dir,
         )
         srv.start(root)
         pid2 = json.loads(srv.post(persist)[1])["id"]
@@ -327,19 +394,30 @@ def run_qwen_matrix(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, valke
         srv.stop()
 
 
-def run_outage_case(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path) -> None:
+def run_outage_case(
+    root: Path,
+    ax_bin: Path,
+    cfg: Path,
+    qwen_model: Path,
+    run_dir: Path,
+) -> None:
     print("[QWEN] outage fallback")
+    server_port = pick_free_tcp_port()
+    unavailable_cache = socket.socket()
+    unavailable_cache.bind(("127.0.0.1", 0))
+    unavailable_cache_port = int(unavailable_cache.getsockname()[1])
     srv = AxServer(
         ax_bin,
         cfg,
         qwen_model,
-        port=19101,
-        grpc_socket="/tmp/ax-serving-cache-outage.sock",
-        extra_env={"AXS_CACHE_URL": "redis://127.0.0.1:6399"},
+        port=server_port,
+        grpc_socket=str(run_dir / "outage.sock"),
+        extra_env={"AXS_CACHE_URL": f"redis://127.0.0.1:{unavailable_cache_port}"},
         log_tag="ax-cache-outage",
+        log_dir=run_dir,
     )
-    srv.start(root)
     try:
+        srv.start(root)
         pre = srv.cache_metrics()
         body = {
             "model": "default",
@@ -351,14 +429,27 @@ def run_outage_case(root: Path, ax_bin: Path, cfg: Path, qwen_model: Path) -> No
         }
         status, _ = srv.post(body)
         post = srv.cache_metrics()
-        assert_true(status == 200, "request should succeed even if cache backend is unavailable")
-        assert_true(post["errors"] >= pre["errors"] + 1, "cache errors should increment in outage")
+        assert_true(
+            status == 200, "request should succeed even if cache backend is unavailable"
+        )
+        assert_true(
+            post["errors"] >= pre["errors"] + 1,
+            "cache errors should increment in outage",
+        )
     finally:
         srv.stop()
+        unavailable_cache.close()
 
 
 def run_cross_model_isolation(
-    root: Path, ax_bin: Path, cfg: Path, qwen_model: Path, llama_model: Path, valkey: Valkey
+    root: Path,
+    ax_bin: Path,
+    cfg: Path,
+    qwen_model: Path,
+    llama_model: Path,
+    valkey: Valkey,
+    cache_url: str,
+    run_dir: Path,
 ) -> None:
     print("[QWEN/LLAMA] cross-model isolation")
     valkey.flushall()
@@ -375,9 +466,11 @@ def run_cross_model_isolation(
         ax_bin,
         cfg,
         qwen_model,
-        port=19102,
-        grpc_socket="/tmp/ax-serving-cache-qwen-iso.sock",
+        port=pick_free_tcp_port(),
+        grpc_socket=str(run_dir / "qwen-isolation.sock"),
+        extra_env={"AXS_CACHE_URL": cache_url},
         log_tag="ax-cache-qwen-iso",
+        log_dir=run_dir,
     )
     q.start(root)
     try:
@@ -385,7 +478,10 @@ def run_cross_model_isolation(
         qid2 = json.loads(q.post(body)[1])["id"]
         qm = q.cache_metrics()
         assert_true(qid1 == qid2, "qwen second request should hit cache")
-        assert_true(qm["misses"] == 1 and qm["hits"] == 1 and qm["writes"] == 1, "qwen isolation metrics mismatch")
+        assert_true(
+            qm["misses"] == 1 and qm["hits"] == 1 and qm["writes"] == 1,
+            "qwen isolation metrics mismatch",
+        )
     finally:
         q.stop()
 
@@ -393,9 +489,11 @@ def run_cross_model_isolation(
         ax_bin,
         cfg,
         llama_model,
-        port=19103,
-        grpc_socket="/tmp/ax-serving-cache-llama-iso.sock",
+        port=pick_free_tcp_port(),
+        grpc_socket=str(run_dir / "llama-isolation.sock"),
+        extra_env={"AXS_CACHE_URL": cache_url},
         log_tag="ax-cache-llama-iso",
+        log_dir=run_dir,
     )
     l.start(root)
     try:
@@ -404,7 +502,10 @@ def run_cross_model_isolation(
         lm = l.cache_metrics()
         assert_true(lid1 == lid2, "llama second request should hit cache")
         assert_true(lid1 != qid1, "llama should not reuse qwen cached response")
-        assert_true(lm["misses"] == 1 and lm["hits"] == 1 and lm["writes"] == 1, "llama isolation metrics mismatch")
+        assert_true(
+            lm["misses"] == 1 and lm["hits"] == 1 and lm["writes"] == 1,
+            "llama isolation metrics mismatch",
+        )
     finally:
         l.stop()
 
@@ -424,20 +525,29 @@ def main() -> int:
             print(f"missing required path: {p}", file=sys.stderr)
             return 2
 
-    subprocess.run(["killall", "ax-serving"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["killall", "valkey-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    valkey = Valkey(vks, vkc)
-    try:
-        valkey.start()
-        run_qwen_matrix(root, ax_bin, cfg, qwen, valkey)
-        run_outage_case(root, ax_bin, cfg, qwen)
-        valkey.stop()
-        valkey.start()
-        run_cross_model_isolation(root, ax_bin, cfg, qwen, llama, valkey)
-    finally:
-        valkey.stop()
-        subprocess.run(["killall", "ax-serving"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with tempfile.TemporaryDirectory(prefix="ax-serving-cache-") as directory:
+        run_dir = Path(directory)
+        valkey_port = pick_free_tcp_port()
+        cache_url = f"redis://127.0.0.1:{valkey_port}"
+        valkey = Valkey(vks, vkc, valkey_port, run_dir / "valkey.log")
+        try:
+            valkey.start()
+            run_qwen_matrix(root, ax_bin, cfg, qwen, valkey, cache_url, run_dir)
+            run_outage_case(root, ax_bin, cfg, qwen, run_dir)
+            valkey.stop()
+            valkey.start()
+            run_cross_model_isolation(
+                root,
+                ax_bin,
+                cfg,
+                qwen,
+                llama,
+                valkey,
+                cache_url,
+                run_dir,
+            )
+        finally:
+            valkey.stop()
 
     print("ALL CACHE TESTS PASSED")
     return 0

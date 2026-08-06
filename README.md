@@ -3,36 +3,79 @@
 [![CI](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/defai-digital/ax-serving/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-AX Serving is an Apache-2.0 **federation gateway and multi-domain inference control plane** for
-private AI fleets. It presents one authenticated OpenAI-compatible API and selects among
-independently operated execution domains. It does not run models or schedule accelerator workers.
+AX Serving gives applications **one authenticated OpenAI-compatible API for several private
+inference systems**. The CPU-only gateway discovers capacity, enforces policy, and routes each
+whole request to an eligible execution domain.
 
-The target architecture federates:
+AX Serving is not a model server. AX Engine still executes models on Apple Silicon, and NVIDIA
+Dynamo plus its backend still owns NVIDIA worker scheduling and token execution. AX Serving adds
+the cross-domain layer: model identity, admission, tenant and trust policy, conservative failover,
+audit, drain, and one stable client endpoint.
 
-- Apple Silicon Macs running AX Engine through `ax-runtime-agent`;
-- model-parallel Mac clusters coordinated by `ax-mac-cluster-adapter`
-  (in-repo control plane complete; physical multi-Mac certification external);
-- NVIDIA GPU PCs managed inside an upstream NVIDIA Dynamo domain;
-- NVIDIA Thor devices managed inside a separate Dynamo domain with independent qualification.
+```text
+OpenAI-compatible client
+          |
+          v
+  AX Serving gateway        public API :18080
+  auth · policy · routing   control API :19090
+       /          \
+      v            v
+Mac runtime     NVIDIA domain
+agent +         Dynamo adapter +
+AX Engine       Dynamo/backend
+```
 
-The defining rule is:
+The ownership rule is:
 
-> **AX Serving selects an execution domain. Dynamo selects NVIDIA workers. AX Engine executes on
-> Mac. No layer makes the same placement decision twice.**
+> **AX Serving selects an execution domain. The selected runtime system chooses how to execute
+> inside that domain. No layer makes the same placement decision twice.**
 
-AX Serving does not generate tokens or replace the systems inside a domain. It owns the
-cross-domain API boundary: public authentication, tenant and trust policy, logical models,
-deployment identity and equivalence, admission, conservative failover, audit, and operator
-workflows.
+## Start here
 
-The CPU-only control plane is independent of inference hardware: it is designed to run on Apple
-Silicon, Linux AMD64, or Linux ARM64—including a Thor host when co-location is appropriate—and can
-govern local-office or remote Mac, NVIDIA PC, and Thor domains over a trusted network. Control-plane
-portability does not imply that every host, runtime, or execution domain is production-qualified.
-Running the gateway on a Thor host is a control-plane placement choice; it does not make Thor a
-qualified inference domain. See
-[Control-plane placement and mixed-fleet topologies](docs/deployment-topologies.md) for the
-deployment matrix, adapter placement, LAN/WAN examples, and current claim boundary.
+| Goal | Start with |
+| --- | --- |
+| Understand the product boundary | [Is AX Serving the right layer?](#is-ax-serving-the-right-layer) |
+| Run a local gateway and attach one runtime | [Quick start](QUICKSTART.md) |
+| Evaluate vLLM, SGLang, or TensorRT-LLM on one NVIDIA PC | [Compose runtime profiles](deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc) |
+| Evaluate TensorRT Edge-LLM on Jetson Thor | [Thor compatibility guide](deploy/thor/README.md) |
+| Design a Mac plus NVIDIA fleet | [Deployment topologies](docs/deployment-topologies.md) |
+| Operate multiple workers or gateway replicas | [Federated fleet runbook](docs/runbooks/multi-worker.md) |
+| Integrate a production NVIDIA domain | [Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) |
+| Find contracts, operations, SDKs, and design references | [Documentation index](docs/README.md) |
+
+### Two-minute control-plane smoke test
+
+This starts a gateway and Redis without installing a model runtime:
+
+```bash
+docker compose -f deploy/compose/compose.yaml up --build gateway redis
+```
+
+In another terminal:
+
+```bash
+curl -i http://127.0.0.1:18080/livez
+curl -i http://127.0.0.1:18080/readyz
+curl -i http://127.0.0.1:18080/routablez
+```
+
+`/livez` and `/readyz` should return `200`. `/routablez` returns `503` until an eligible runtime
+agent registers; that distinction prevents a healthy control plane from pretending inference
+capacity exists. Continue with the [quick start](QUICKSTART.md) for an end-to-end completion.
+
+## What AX Serving owns
+
+| AX Serving owns | The execution system still owns |
+| --- | --- |
+| Public REST/SSE API and authentication | Model loading and token generation |
+| Logical models and immutable deployment identity | Runtime-specific scheduling and batching |
+| Cross-domain eligibility, policy, admission, and selection | Dynamo worker/KV routing inside NVIDIA domains |
+| Safe pre-commit failover, drain, audit, and diagnostics | AX Engine execution inside a Mac endpoint |
+| Gateway HA state through Redis/Valkey | GPU allocation, scaling, and backend lifecycle |
+
+The gateway and adapters do not link AX Engine, MLX, Metal, CUDA, Dynamo, vLLM, SGLang, or
+TensorRT SDKs. They integrate through versioned HTTP contracts, so the control plane can run on
+Apple Silicon, Linux AMD64, or Linux ARM64 independently of the inference hardware.
 
 ## Is AX Serving the right layer?
 
@@ -73,19 +116,7 @@ hardware, performance, fault, security, or production certification.
 Source and mock conformance are development evidence only. Production claims require retained
 live-runtime qualification, performance, fault, and soak artifacts.
 
-## Why AX Serving exists
-
-| Layer | Owner |
-| --- | --- |
-| Cross-domain API, identity, tenant/privacy/locality policy, admission, audit | AX Serving |
-| NVIDIA PC/Thor worker routing, KV, prefill/decode, planner, scaling | NVIDIA Dynamo |
-| NVIDIA token execution | A Dynamo-certified vLLM, SGLang, or TensorRT-LLM backend |
-| Apple Silicon token execution | AX Engine |
-
-This product is useful when a fleet has multiple execution, trust, region, rollout, or failure
-domains. Heterogeneous hardware is an important use case, not a requirement. If every request goes
-to one NVIDIA deployment with one policy, call Dynamo directly; AX Serving would add an unnecessary
-hop.
+## Ecosystem boundary
 
 AX Serving v2.3 is the Apache-2.0 infrastructure layer described in this repository. All
 functionality shipped here remains available under that license.
@@ -201,49 +232,33 @@ or backend lifecycle. It does not tokenize prompts, render chat templates, parse
 or move KV state across Mac, PC, and Thor. It is not an agent planner, tool runner, MCP host,
 sandbox, workflow engine, or durable agent-memory system.
 
-## Development quick start: portable gateway and Mac agent
+## Build from source
 
-For a full walkthrough, including direct-runtime migration mode, explicit hybrid routing,
-authentication, HA, lifecycle, and observability, see [QUICKSTART.md](QUICKSTART.md).
-
-Build the implemented portable binaries:
+The full [quick start](QUICKSTART.md) covers prerequisites, one-runtime setup, requests,
+authentication, explicit hybrid routing, HA, and observability. The shortest source path is:
 
 ```bash
-cargo build --release \
+cargo build --locked --release \
   -p ax-serving-cli --bin ax-serving-api \
-  -p ax-thor-agent --bin ax-runtime-agent \
-  -p ax-dynamo-adapter --bin ax-dynamo-adapter \
-  -p ax-mac-cluster-adapter --bin ax-mac-cluster-adapter
-```
+  -p ax-thor-agent --bin ax-runtime-agent
 
-Start a development gateway on loopback:
-
-```bash
 AXS_ALLOW_NO_AUTH=true target/release/ax-serving-api
 ```
 
-Start `ax-engine-server` separately, then attach the current agent:
+Start an OpenAI-compatible runtime separately, then run the agent in another terminal:
 
 ```bash
 AXS_CONTROL_PLANE_URL=http://127.0.0.1:19090 \
-AXS_NODE_RUNTIME=ax_engine \
+AXS_NODE_RUNTIME=vllm \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=127.0.0.1:18081 \
-AXS_NODE_ADVERTISED_ADDR=127.0.0.1:18081 \
-AXS_NODE_HARDWARE_CLASS=apple-silicon \
-AXS_NODE_WORKER_POOL=mac-mlx \
-AXS_NODE_DOMAIN_ID=mac-local \
-AXS_NODE_DOMAIN_QUALIFICATION=experimental \
+AXS_NODE_ADVERTISED_URL=http://127.0.0.1:18081 \
+AXS_NODE_HARDWARE_CLASS=local-evaluation \
+AXS_NODE_WORKER_POOL=local \
 target/release/ax-runtime-agent
 ```
 
-`AXS_NODE_DOMAIN_ID` is opt-in. AX Engine agents advertise `mac_ax_engine`; direct
-vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM agents can advertise only
-`compatibility_runtime_endpoint` and can never
-claim a Dynamo domain.
-Use `certified` only when the exact runtime/model deployment has retained qualification evidence.
-
-In `legacy_compat` mode, call the runtime model ID:
+Use a model ID returned by the runtime:
 
 ```bash
 curl -sS http://127.0.0.1:18080/v1/chat/completions \
@@ -256,29 +271,16 @@ curl -sS http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-The current agent can also proxy direct vLLM/SGLang endpoints on PC or Thor,
-TensorRT-LLM endpoints on PC, and TensorRT Edge-LLM endpoints on Thor for
-migration and testing. That path always registers as `compatibility_runtime_endpoint`; it is not a
-Dynamo domain and is not the target NVIDIA production architecture.
-The same compatibility path covers generic OpenAI-compatible runtimes (llama.cpp `llama-server`,
-`mlxcel-server`, Ollama): set `AXS_NODE_RUNTIME_HEALTH_PATH` when the runtime has no `/health`
-endpoint (e.g. `/v1/models`, any 2xx is ready) and `AXS_NODE_METRIC_QUEUE_DEPTH` /
-`AXS_NODE_METRIC_ACTIVE_SEQUENCES` when its Prometheus `/metrics` names are outside the built-in
-alias tables. Signals a runtime does not measure are reported as unknown, never fabricated.
-For the NVIDIA path, follow the
-[Dynamo domain guide](docs/integrations/nvidia/DYNAMO.md) and validate an immutable manifest before
-starting `ax-dynamo-adapter`. Source/mock conformance is not live hardware certification.
+This direct-runtime path is intentionally named `compatibility_runtime_endpoint`: it is useful for
+evaluation and migration, but it is not a Dynamo production-domain claim. Direct vLLM, SGLang,
+TensorRT-LLM, TensorRT Edge-LLM, llama.cpp, Ollama, and similar runtimes all use this boundary.
+Production NVIDIA integration uses a separately operated Dynamo domain and
+[`ax-dynamo-adapter`](docs/integrations/nvidia/DYNAMO.md).
 
-The Mac cluster coordinator has a separate
-[source-level setup guide](docs/integrations/mac/CLUSTER.md). It is useful for protocol and
-coordinator integration today, but it cannot make a model span Macs until AX Engine implements the
-manifest-bound pipeline executor and activation data plane.
-
-For explicit deployment identity, start from
-[`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). It demonstrates explicit
-Mac and compatibility-domain declarations; the CUDA entry remains a migration example, not the
-target Dynamo production path. Replace every placeholder identity and never enable
-cross-deployment equivalence without a retained certification artifact.
+For an explicit multi-domain catalog, start from
+[`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). Never declare two
+deployments equivalent based only on a shared model name; pin and qualify the model, tokenizer,
+template, quantization, runtime, operations, and retained certification artifact.
 
 ## Public and operator APIs
 
@@ -298,6 +300,12 @@ Health and observability:
 - `GET /v1/metrics` — admin-authenticated JSON metrics;
 - `GET /metrics` — admin-authenticated Prometheus metrics;
 - `GET /v1/admin/status`, `/diagnostics`, `/audit`, `/decisions`, `/fleet`, `/deployments`.
+
+Readiness and capacity are deliberately different. `/readyz` answers whether the control plane can
+operate; `/routablez` answers whether at least one worker is eligible. Even while `/routablez` is
+`200`, an inference request can receive `503` if all matching workers reach `max_inflight`.
+Clients should use bounded backoff rather than a zero-delay retry loop. See
+[service tuning](docs/perf/service-tuning.md) for the response and measurement model.
 
 Asynchronous lifecycle APIs:
 
@@ -393,6 +401,8 @@ Dynamo remains a separately pinned and operated execution domain.
 
 ## Public contracts and guides
 
+- [Documentation index](docs/README.md)
+- [Quick start](QUICKSTART.md)
 - [Runtime responsibility inventory](docs/contracts/ax-serving-runtime-responsibility-inventory.md)
 - [Node protocol contract](docs/contracts/ax-serving-node-contract.md)
 - [Product positioning and claim boundary](docs/market-positioning.md)

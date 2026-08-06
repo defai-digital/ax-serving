@@ -63,8 +63,6 @@ spec:
               value: 0.0.0.0:18081
             - name: AXS_NODE_ADVERTISED_URL
               value: "http://$(POD_IP):18081"
-            - name: AXS_NODE_ADVERTISED_ADDR
-              value: "$(POD_IP):18081"
             - name: AXS_NODE_ID
               value: "vllm-$(POD_UID)"
             - name: AXS_NODE_WORKER_POOL

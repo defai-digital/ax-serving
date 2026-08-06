@@ -120,13 +120,14 @@ run_single_model() {
   echo "    output: $model_dir"
 
   echo "    [1/5] raw llama.cpp"
-  local pp_flags=""
+  local -a pp_flags=()
+  local -a pp_arr
   local pp
-  IFS=',' read -r -a PP_ARR <<< "$PROMPT_LENGTHS"
-  for pp in "${PP_ARR[@]}"; do
-    pp_flags="$pp_flags -p $pp"
+  IFS=',' read -r -a pp_arr <<< "$PROMPT_LENGTHS"
+  for pp in "${pp_arr[@]}"; do
+    pp_flags+=(-p "$pp")
   done
-  "$LLAMA_BENCH_BIN" -m "$model_path" $pp_flags -n "$DECODE_TOKENS" -ngl 99 -r "$ITERS" > "$raw_txt" 2>&1
+  "$LLAMA_BENCH_BIN" -m "$model_path" "${pp_flags[@]}" -n "$DECODE_TOKENS" -ngl 99 -r "$ITERS" > "$raw_txt" 2>&1
 
   echo "    [2/5] parse raw llama.cpp JSON"
   python3 - "$raw_txt" "$raw_json" "$DECODE_TOKENS" <<'PY'

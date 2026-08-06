@@ -44,10 +44,12 @@ runtime, Redis, or affinity secrets.
   this so agents can register during bootstrap. Legacy
   `AXS_READYZ_MODE=eligible_workers` restores the old worker-gated behavior.
 - `/routablez` `200` means at least one endpoint/domain is currently eligible for
-  inference; `503` means capacity is unavailable (structured inference 503 with
-  `Retry-After` applies). AX Fabric should use `/routablez` (or
-  `workers.eligible > 0` from `/health`) as serving capacity readiness, not
-  merely process readiness.
+  inference; its own `503` response includes `Retry-After`. An individual
+  inference request can still receive `503` if all matching workers become
+  saturated after the probe; that capacity response is distinct from gateway
+  admission `429` and does not currently guarantee `Retry-After`. AX Fabric
+  should use `/routablez` (or `workers.eligible > 0` from `/health`) as serving
+  capacity readiness, not merely process readiness.
 - `/health` always returns a JSON fleet summary while the process is live.
 
 Relevant `/health` fields:

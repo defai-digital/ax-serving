@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Source contract; release stability follows tagged release notes |
-| Last updated | 2026-07-28 |
+| Last updated | 2026-08-05 |
 | Related | [Runtime-agent protocol](ax-serving-node-contract.md) |
 
 This inventory identifies supported integration boundaries. Internal Rust
@@ -33,13 +33,25 @@ and `POST /v1/license` are not public contracts.
 
 ## Errors and tracing
 
-Gateway-generated inference errors use the AX envelope with:
+Gateway admission and policy errors use the AX envelope with:
 
 - stable machine code;
 - safe message/detail;
 - request ID;
 - retryable flag;
 - admission/dispatch phase.
+
+The direct dispatcher currently returns a plain-text `503` for `all_at_capacity` and
+`reroute_no_candidate`; when `AXS_ROUTING_TRACE=true`, the bounded route reason is also present in
+`x-ax-routing-trace`. Clients must not assume every capacity `503` has an AX JSON envelope.
+
+Important overload classes are distinct:
+
+- admission `429` includes `Retry-After`;
+- queue deadline `504` means the gateway admission deadline expired;
+- pre-dispatch capacity `503` means no eligible worker currently has reported capacity and does not
+  currently guarantee `Retry-After`;
+- a runtime/backend error after dispatch is not interchangeable with pre-dispatch capacity.
 
 Responses preserve an opaque request ID. Attempt IDs are internal dispatch
 evidence and must not be used as authentication or user identifiers.

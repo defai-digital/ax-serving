@@ -4,8 +4,13 @@
 | --- | --- |
 | Current scope | Portable `ax-serving-api`, protocol v1.2 foundation, and `ax-runtime-agent` |
 | Target scope | Mac AX Engine pools plus separate NVIDIA PC/Thor Dynamo domains |
-| Last updated | 2026-07-28 |
+| Last updated | 2026-08-05 |
 | Status | Current Mac/compatibility procedures are runnable; Dynamo/Thor procedures are qualification targets |
+
+This is an operator runbook, not the first installation guide. Start with the
+[quick start](../../QUICKSTART.md) if you have not yet routed one successful request through a
+single runtime. Use this runbook when adding workers, enabling explicit deployment identity,
+operating multiple gateways, or rehearsing drain and failure behavior.
 
 This runbook separates current source behavior from the final architecture. Execution-domain
 types/config/diagnostics ship in source, but the Dynamo Domain Adapter and live federation
@@ -93,7 +98,7 @@ AXS_NODE_RUNTIME=ax_engine \
 AXS_RUNTIME_VERSION='replace-with-pinned-version' \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8000 \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=10.20.1.10:18081 \
+AXS_NODE_ADVERTISED_URL=http://10.20.1.10:18081 \
 AXS_NODE_ID=mac-mlx-01 \
 AXS_NODE_WORKER_POOL=mac-mlx \
 AXS_NODE_HARDWARE_CLASS=apple-silicon \
@@ -151,7 +156,7 @@ AXS_NODE_RUNTIME=llamacpp \
 AXS_RUNTIME_VERSION='replace-with-pinned-version' \
 AXS_NODE_RUNTIME_URL=http://127.0.0.1:8080 \
 AXS_NODE_LISTEN_ADDR=0.0.0.0:18081 \
-AXS_NODE_ADVERTISED_ADDR=10.20.1.11:18081 \
+AXS_NODE_ADVERTISED_URL=http://10.20.1.11:18081 \
 AXS_NODE_ID=generic-llamacpp-01 \
 AXS_NODE_WORKER_POOL=generic-compat \
 AXS_NODE_HARDWARE_CLASS=x86-cpu \
@@ -287,6 +292,17 @@ Client disconnect and deadlines propagate to the adapter and runtime/domain owne
 | `AXS_GLOBAL_QUEUE_WAIT_MS` | `10000` | Maximum queue wait |
 | `AXS_GLOBAL_QUEUE_POLICY` | `queue` | `queue`, `reject`, or `shed_oldest` |
 | `AXS_TENANT_MAX_CONCURRENT` | `0` | Per-tenant active cap; zero disables |
+
+The global queue limits work entering the gateway; it does not reserve capacity inside every
+eligible runtime. A request can pass gateway admission and still receive `503` when all matching
+workers are at their reported `max_inflight`. Clients should use a bounded, jittered backoff for
+that pre-dispatch capacity response and keep one absolute request deadline. A zero-delay retry loop
+amplifies overload. `429` admission responses include `Retry-After`; do not assume every capacity
+`503` does.
+
+In a trusted evaluation environment, set `AXS_ROUTING_TRACE=true` and retain the bounded
+`x-ax-routing-trace` response header to verify candidate count, selected worker, and route reason.
+Do not expose internal worker identifiers through an untrusted ingress.
 
 Priority is `low`, `normal`, or `high`. AX does not perform token-level scheduling.
 

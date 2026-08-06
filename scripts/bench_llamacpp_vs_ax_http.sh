@@ -172,6 +172,8 @@ run_single_model() {
     local llama_pid=""
     local ax_pid=""
 
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2329
     cleanup() {
       if [[ -n "${ax_pid:-}" ]]; then
         kill "$ax_pid" >/dev/null 2>&1 || true
@@ -654,7 +656,7 @@ if [[ -n "$MODEL" ]]; then
   MODELS+=("$MODEL")
 else
   while IFS= read -r line; do
-    line="$(echo "$line" | sed 's/[[:space:]]*$//')"
+    line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
     [[ "${line:0:1}" == "#" ]] && continue
     MODELS+=("$line")
