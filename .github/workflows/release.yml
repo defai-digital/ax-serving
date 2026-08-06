@@ -51,6 +51,9 @@ jobs:
         run: |
           uv sync --locked --extra dev
           uv run --locked --extra dev python -m pytest -q
+          uv build --clear
+          uv run --locked --extra dev python \
+            scripts/check_distribution_metadata.py dist/*.whl
       - name: Require populated benchmark evidence
         run: |
           python3 - <<'PY'
@@ -387,6 +390,8 @@ jobs:
           uv sync --locked --extra dev
           uv run --locked --extra dev python -m pytest -q
           uv build --clear
+          uv run --locked --extra dev python \
+            scripts/check_distribution_metadata.py dist/*.whl
           uv venv --clear "$RUNNER_TEMP/ax-serving-wheel" --python 3.13
           uv pip install \
             --python "$RUNNER_TEMP/ax-serving-wheel/bin/python" \

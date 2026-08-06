@@ -173,6 +173,9 @@ jobs:
         run: |
           uv sync --locked --extra dev
           uv run --locked --extra dev python -m pytest -q
+          uv build --clear
+          uv run --locked --extra dev python \
+            scripts/check_distribution_metadata.py dist/*.whl
 
   nvidia-runtime-package:
     name: NVIDIA runtime package (${{ matrix.arch }})

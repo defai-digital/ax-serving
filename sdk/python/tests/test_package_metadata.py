@@ -53,3 +53,14 @@ def test_portable_rest_install_does_not_require_grpc_runtime() -> None:
     assert any(dependency.startswith("grpcio>=") for dependency in grpc_extra)
     assert any(dependency.startswith("protobuf>=") for dependency in grpc_extra)
     assert not any(dependency.startswith("grpcio-tools") for dependency in grpc_extra)
+
+
+def test_pypi_long_description_is_declared_and_substantive() -> None:
+    project = tomllib.loads((SDK_ROOT / "pyproject.toml").read_text())["project"]
+    assert project["readme"] == "README.md"
+
+    readme = (SDK_ROOT / project["readme"]).read_text()
+    assert readme.startswith("# AX Serving Python SDK")
+    assert len(readme.strip()) >= 1_000
+    assert "uv add ax-serving" in readme
+    assert "AXS_API_KEY" in readme

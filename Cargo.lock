@@ -165,7 +165,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "ax-dynamo-adapter"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-adapter-core",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "ax-mac-cluster-adapter"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-adapter-core",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-adapter-core"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-protocol",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-api"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-bench"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-cli"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-api",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-discovery"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "mdns-sd",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-engine"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-engine-sdk",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-grpc-compat"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "prost",
  "tonic",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-observability"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-protocol"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-py"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "ax-serving-shim"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-engine",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "ax-thor-agent"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "ax-serving-adapter-core",

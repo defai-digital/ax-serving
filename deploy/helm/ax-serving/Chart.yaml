@@ -2,8 +2,8 @@ apiVersion: v2
 name: ax-serving
 description: CPU-only AX Serving gateway (no inference runtimes or accelerators)
 type: application
-version: 0.1.1
-appVersion: "2.3.1"
+version: 0.1.2
+appVersion: "2.3.2"
 keywords:
   - inference
   - gateway
