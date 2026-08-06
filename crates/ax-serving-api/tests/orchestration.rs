@@ -461,7 +461,8 @@ fn adaptive_orchestrator_config(mode: PolicyMode) -> OrchestratorConfig {
             id: equivalence_id,
             identity_policy,
             certified_deployments: BTreeSet::from([single_deployment, cluster_deployment]),
-            certification_artifact: "cert/adaptive-fixture-v1.json".into(),
+            certification_artifact_digest: Digest::new(format!("sha256:{}", "d".repeat(64)))
+                .unwrap(),
         }],
         adaptive_federation: AdaptiveFederationConfig {
             enabled: true,
@@ -1068,6 +1069,11 @@ async fn test_explicit_deployment_routes_logical_alias_and_preserves_public_cred
         .await
         .unwrap();
     let decision_response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        decision_response["record_type"],
+        "gateway_routing_decision_v1"
+    );
+    assert_eq!(decision_response["execution_observed"], false);
     assert_eq!(
         decision_response["records"][0]["selected_domain"],
         "cuda-compat"

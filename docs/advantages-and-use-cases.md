@@ -46,6 +46,8 @@ inference hardware it governs. See
 - Explicit identity/equivalence and upstream compatibility manifests require operational discipline.
 - Cross-domain quality labels and value evidence are workload-specific.
 - Thor requires separate live qualification despite generic ARM64/Blackwell prerequisites.
+  Compatibility Edge-LLM lab evidence is not a Dynamo-on-Thor or production Thor claim; see
+  [heterogeneous compatibility fleet evidence](qualification/2026-08-05-heterogeneous-compatibility-fleet.md).
 - If one execution domain already satisfies all traffic and policy, the added complexity has little
   value.
 

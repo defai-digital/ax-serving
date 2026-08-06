@@ -942,12 +942,6 @@ fn validate_equivalence_policy(
     policy: &EquivalencePolicy,
     deployments: &BTreeMap<DeploymentId, DeploymentSpec>,
 ) -> anyhow::Result<()> {
-    if policy.certification_artifact.trim().is_empty() {
-        anyhow::bail!(
-            "equivalence class '{}' requires a certification_artifact",
-            policy.id
-        );
-    }
     if policy.certified_deployments.is_empty() {
         anyhow::bail!(
             "equivalence class '{}' must certify at least one deployment",
@@ -1198,7 +1192,7 @@ mod tests {
             id: EquivalenceClassId::new("qwen-certified").unwrap(),
             identity_policy: deployments[0].required_identity.clone(),
             certified_deployments: deployments.iter().map(|item| item.id.clone()).collect(),
-            certification_artifact: "cert/qwen-v1.json".into(),
+            certification_artifact_digest: digest('d'),
         }
     }
 

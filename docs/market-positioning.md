@@ -24,7 +24,7 @@ The CPU-only gateway can run independently on Apple Silicon, Linux AMD64, or Lin
 local or remote domains over an operator-provided trusted network. See
 [Control-plane placement and mixed-fleet topologies](deployment-topologies.md).
 
-AX Serving v3 is the Apache-2.0 open infrastructure layer. AX Fabric and AX Trust may provide
+The AX Serving v2.3 release line is the Apache-2.0 open infrastructure layer. AX Fabric and AX Trust may provide
 separate orchestration, governance, trust, managed-service, and enterprise value through the public
 contracts. They are not required to operate AX Serving and do not unlock or relicense it.
 
@@ -42,13 +42,17 @@ that user should call Dynamo directly.
 - explicit, fail-closed deployment identity and cross-domain equivalence;
 - tenant, privacy, residency, locality, budget, and SLO policy above runtimes;
 - conservative pre-commit retry with clear AX-versus-Dynamo retry ownership;
-- bounded, versioned, replayable decision records;
+- bounded, versioned, replayable pre-dispatch decision records;
 - active-active AX state, capacity fencing, drain, rollout, diagnostics, and audit;
 - a measurable value gate: cost/load, policy-correct availability, privacy/locality, or simpler
   operations.
 
 These are product hypotheses until pinned Mac/Dynamo conformance, performance, HA, fault, soak, and
 value evidence passes.
+
+The current decision records prove what the gateway selected from the policy inputs it observed.
+They do not prove runtime admission, hardware placement, response completion, or execution-stack
+attestation.
 
 ## Anti-scope
 
@@ -77,7 +81,13 @@ AX Serving is not:
 The repository implements the portable gateway, protocol v1.2 execution-domain
 foundation, Mac-capable runtime agent, runtime-SDK-free Dynamo Domain Adapter,
 and runtime-neutral Mac cluster coordinator with source/mock conformance. The
-Mac cluster control plane is not a distributed AX Engine runtime claim. Live
-Mac/NVIDIA federation and published multi-architecture Linux artifacts are not production qualified.
-Thor remains experimental until independent live qualification. See the
-[deployment topology guide](deployment-topologies.md) for the public claim boundary.
+Mac cluster control plane is not a distributed AX Engine runtime claim.
+
+**Live laboratory evidence** exists for heterogeneous **compatibility multi-worker** federation
+(vLLM + Thor TensorRT Edge-LLM + Mac llama.cpp under one logical model, including soak). That is
+not production certification, not Dynamo-domain qualification, not multi-Mac cluster certification,
+and not live mixed-domain failover evidence. Published multi-architecture Linux production artifacts
+and Dynamo PC/Thor domain gates remain open. Thor Edge-LLM remains an experimental compatibility
+path. See the
+[retained evidence summary](qualification/2026-08-05-heterogeneous-compatibility-fleet.md) and
+[deployment topology guide](deployment-topologies.md).

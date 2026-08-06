@@ -261,11 +261,13 @@ before scoring.
 Cross-pool/domain retry additionally requires:
 
 - source and target in the same operator-certified equivalence class;
-- both deployment IDs listed in the certification artifact;
+- both deployment IDs listed in the operator policy;
 - every required identity field present and matching.
 
 The protocol does not promise bit-identical output. Equivalence is an explicit
-operator policy backed by a retained workload artifact.
+operator policy bound to the content digest of a retained workload artifact.
+Digest validation pins bytes; it does not inspect the artifact or establish that
+its test method is sufficient.
 
 ## 10. Lifecycle jobs
 

@@ -40,5 +40,7 @@ AX must not claim superiority from a feature checklist. It must report:
 - routing regret and quality-floor violations for adaptive policies;
 - exact AX, Dynamo, backend, image, model, tokenizer/template/quantization, and hardware identities.
 
-The Dynamo adapter and Thor domain are not currently certified; public comparisons must preserve
-that status.
+The Dynamo adapter and Dynamo-on-Thor domain are not currently certified; public comparisons must
+preserve that status. Live laboratory multi-worker results for **compatibility** endpoints (vLLM,
+Thor Edge-LLM, Mac llama.cpp) may be cited only at that claim level—see
+[heterogeneous compatibility fleet evidence](qualification/2026-08-05-heterogeneous-compatibility-fleet.md).

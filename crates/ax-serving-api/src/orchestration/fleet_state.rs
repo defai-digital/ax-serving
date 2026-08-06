@@ -156,7 +156,7 @@ pub trait FleetStateStore: Send + Sync {
         job_id: JobId,
     ) -> StoreFuture<'a, Option<DeploymentJobRecord>>;
     fn list_deployment_jobs(&self) -> StoreFuture<'_, Vec<DeploymentJobRecord>>;
-    /// Retain a bounded, prompt-free domain decision for replay and audit.
+    /// Retain a bounded, prompt-free pre-dispatch decision for replay and diagnostics.
     fn put_decision<'a>(&'a self, record: &'a DecisionRecordV1, ttl_ms: u64)
     -> StoreFuture<'a, ()>;
     fn list_decisions(&self, limit: usize) -> StoreFuture<'_, Vec<DecisionRecordV1>>;

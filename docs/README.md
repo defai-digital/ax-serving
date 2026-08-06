@@ -36,10 +36,11 @@ prove that two deployments are semantically equivalent.
 | vLLM on one NVIDIA PC | [Compose profiles](../deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc) | Compatibility endpoint |
 | SGLang on one NVIDIA PC | [Compose profiles](../deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc) | Compatibility endpoint |
 | TensorRT-LLM on one NVIDIA PC | [Compose profiles](../deploy/compose/README.md#nvidia-runtime-profiles-on-one-pc) | Compatibility endpoint |
-| TensorRT Edge-LLM on Jetson Thor | [Thor guide](../deploy/thor/README.md) | Experimental Thor compatibility endpoint |
-| AX Engine on one Mac | [Quick start](../QUICKSTART.md#3-attach-a-runtime) | Mac endpoint; exact deployment still needs evidence |
+| TensorRT Edge-LLM on Jetson Thor | [Thor guide](../deploy/thor/README.md) | Experimental Thor compatibility endpoint; live smoke + hetero soak lab evidence exists |
+| AX Engine on one Mac | [Quick start](../QUICKSTART.md#3-attach-a-runtime) | Mac endpoint; pinned live AX Engine evidence still open (hetero lab used llama.cpp) |
 | Mac model-parallel coordinator | [Mac cluster integration](integrations/mac/CLUSTER.md) | Source-level coordinator; physical certification pending |
 | NVIDIA Dynamo | [Dynamo integration](integrations/nvidia/DYNAMO.md) | Production target; exact stack must be qualified |
+| Mixed compatibility workers (vLLM + Thor Edge-LLM + Mac llama.cpp) | [Live evidence summary](qualification/2026-08-05-heterogeneous-compatibility-fleet.md) | Lab multi-worker routing/soak; not Dynamo/failover/cluster certification |
 
 Runtime qualification tools are documented in
 [`scripts/qualification/runtime`](../scripts/qualification/runtime/README.md) and
@@ -79,12 +80,15 @@ Documentation uses the following terms deliberately:
 | --- | --- |
 | Source implemented | Code and automated tests exist in this repository |
 | Mock/conformance tested | Contract behavior passed without proving a live hardware stack |
-| Live qualified | The exact runtime, model, artifact, hardware, and configuration produced retained evidence |
+| Live laboratory evidence | A retained run on real hardware under an explicit, narrow claim boundary |
+| Live qualified | The exact runtime, model, artifact, hardware, and configuration produced retained evidence for a named path |
 | Certified | The applicable correctness, fault, security, performance, and soak gates passed |
 | Experimental | Useful for evaluation, but not a production support claim |
 
 Portable compilation does not qualify every runtime on that architecture. Likewise, a successful
-smoke test is not a performance, failover, or production certification result.
+smoke test or healthy-worker soak is not a failover, multi-Mac cluster, Dynamo-domain, or production
+certification result. Current retained multi-worker lab evidence:
+[2026-08-05 heterogeneous compatibility fleet](qualification/2026-08-05-heterogeneous-compatibility-fleet.md).
 
 ## Product and strategy context
 

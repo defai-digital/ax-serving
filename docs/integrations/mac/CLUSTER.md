@@ -21,7 +21,7 @@ therefore an internal runtime bring-up surface, not a production-supported 405B 
 
 | Concern | Owner |
 | --- | --- |
-| Public API, logical model, domain choice, reservation, decision evidence | AX Serving gateway |
+| Public API, logical model, domain choice, reservation, pre-dispatch decision evidence | AX Serving gateway |
 | Manifest validation, gang state, aggregate observation, rank bootstrap | Mac cluster adapter |
 | Layer loading, embeddings/head, KV, activation transfer, greedy final-rank sampling, cancellation | AX Engine |
 | Rank discovery and transport trust | Operator plus AX Engine pipeline rank runtime |

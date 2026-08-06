@@ -1556,6 +1556,8 @@ pub(super) async fn proxy_admin_decisions(
         }
     };
     Json(serde_json::json!({
+        "record_type": "gateway_routing_decision_v1",
+        "execution_observed": false,
         "records": records,
     }))
 }

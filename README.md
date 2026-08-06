@@ -97,24 +97,28 @@ measurable policy, availability, utilization, privacy/locality, cost/SLO, or wor
 ## Project status
 
 The v2.3 target architecture is accepted. Its implementation and qualification are incremental.
-“Source implemented” below means that code and automated tests exist; it does not mean live
-hardware, performance, fault, security, or production certification.
+“Source implemented” below means that code and automated tests exist; it does not mean production
+certification. “Live laboratory evidence” means a retained multi-worker run on real hardware under a
+stated claim boundary—not a production support promise.
 
 | Area | Current state |
 | --- | --- |
 | Portable REST/SSE gateway and protocol v1.2 | Source implemented and CI-tested on Linux AMD64/ARM64 and Apple Silicon; protocol v1.0/v1.1 migration fixtures remain supported |
-| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; full domain-selection policy and live mixed-domain evidence remain |
-| Mac -> `ax-runtime-agent` -> AX Engine | Source implemented with mock tests; pinned live AX Engine qualification pending |
+| Domain catalog, deployment identity, equivalence, and hard eligibility | Foundation source implemented; full domain-selection policy and live **mixed-domain failover** evidence remain open |
+| Compatibility multi-worker federation (vLLM + Thor Edge-LLM + Mac llama.cpp) | **Live laboratory evidence** (2026-08-05/06): one logical model, serial fair round-robin, 300 s concurrency-4 soak, 29,741/29,741 logical successes, routing traces on every request; see [retained summary](docs/qualification/2026-08-05-heterogeneous-compatibility-fleet.md) |
+| Mac -> `ax-runtime-agent` -> AX Engine | Source implemented with mock tests; pinned live **AX Engine** qualification still pending (hetero Mac path used llama.cpp, not AX Engine) |
 | Mac cluster -> `ax-mac-cluster-adapter` -> AX Engine ranks | Phases 0–5 in-repo surfaces complete (manifest, gang lifecycle, domain reservation, placement, multi-replica, micro-batch contracts, TP/hybrid validation, adaptive federation hooks); physical multi-Mac production certification and Engine-native TP kernels remain external |
-| Direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM -> `ax-runtime-agent` | Source implemented for migration/testing as `compatibility_runtime_endpoint`; Edge-LLM is Thor-only and experimental, and none is the target NVIDIA production path |
-| NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy source implemented with mock conformance; live qualification pending |
-| NVIDIA Thor -> separate `ax-dynamo-adapter` -> Dynamo domain | Source path exists but is experimental; no Thor production-support claim |
-| Streaming, cancellation, deadlines, and safe pre-commit retry | Implemented with mock/fault tests; live mixed-domain evidence pending |
+| Direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM -> `ax-runtime-agent` | Source implemented as `compatibility_runtime_endpoint` for migration/evaluation; **live hetero soak** covers vLLM + TensorRT Edge-LLM + llama.cpp. Edge-LLM remains Thor-only and experimental; none of these is the target NVIDIA production path |
+| NVIDIA PC -> `ax-dynamo-adapter` -> Dynamo | Adapter, manifest validation, registration, observation, and proxy source implemented with mock conformance; live **Dynamo domain** qualification pending (hetero RTX path used direct vLLM, not Dynamo) |
+| NVIDIA Thor compatibility (Edge-LLM via runtime agent) | **Live laboratory smoke + hetero soak** on two Thor Edge-LLM workers; experimental evaluation path only |
+| NVIDIA Thor -> separate `ax-dynamo-adapter` -> Dynamo domain | Source path exists but is experimental; **no** Dynamo-on-Thor production-support claim |
+| Streaming, cancellation, deadlines, and safe pre-commit retry | Implemented with mock/fault tests; live **mixed-domain failover / drain / worker-death** evidence still pending (hetero soak was healthy-worker capacity, not failure injection) |
 | Fleet state and decisions | Generation-fenced domain reservations and bounded decision persistence implemented for memory and Redis/Valkey; two-gateway partition/soak and offline replay evidence pending |
-| Packaging | CPU-only gateway/adapter container, Compose, Kubernetes, and Helm sources implemented; signed release artifacts and runtime qualification have separate gates |
+| Packaging | CPU-only gateway/adapter container, Compose, Kubernetes, and Helm sources implemented; signed release artifacts and production runtime qualification have separate gates |
 
-Source and mock conformance are development evidence only. Production claims require retained
-live-runtime qualification, performance, fault, and soak artifacts.
+Source and mock conformance are development evidence only. Compatibility multi-worker live results
+are laboratory evidence under an explicit claim boundary. Production claims still require retained
+identity pins, fault/failover, performance, security, and soak gates for the exact deployment path.
 
 ## Ecosystem boundary
 
@@ -171,7 +175,7 @@ boundary.
 | `mac_ax_engine_cluster` | One complete model-parallel Mac cluster | `ax-mac-cluster-adapter` and AX Engine | In-repo control plane complete; physical multi-Mac + Engine PP/TP production pin required for support claims |
 | `nvidia_dynamo_pc` | One adapter for one PC Dynamo deployment | Dynamo and its selected backend | Exact Dynamo/backend/image/config manifest must be certified |
 | `nvidia_dynamo_thor` | One adapter for one separate Thor deployment | Dynamo and a Thor-qualified backend | Always separate from PC; experimental until its own gates pass |
-| `compatibility_runtime_endpoint` | One direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM or other compatible runtime node | Configured runtime | Migration and testing only; never a Dynamo-domain claim |
+| `compatibility_runtime_endpoint` | One direct vLLM/SGLang/TensorRT-LLM/TensorRT Edge-LLM or other compatible runtime node | Configured runtime | Migration and evaluation; live multi-worker lab evidence exists for some stacks; never a Dynamo-domain claim |
 
 PC and Thor never share a tensor-parallel group, artifacts, capacity calibration, or certification
 by default. The legacy `ax-thor-agent` binary is only an alias for the generic
@@ -280,7 +284,7 @@ Production NVIDIA integration uses a separately operated Dynamo domain and
 For an explicit multi-domain catalog, start from
 [`config/serving.hybrid.example.yaml`](config/serving.hybrid.example.yaml). Never declare two
 deployments equivalent based only on a shared model name; pin and qualify the model, tokenizer,
-template, quantization, runtime, operations, and retained certification artifact.
+template, quantization, runtime, operations, and digest-pinned retained certification artifact.
 
 ## Public and operator APIs
 
@@ -408,6 +412,7 @@ Dynamo remains a separately pinned and operated execution domain.
 - [Product positioning and claim boundary](docs/market-positioning.md)
 - [Use cases and trade-offs](docs/advantages-and-use-cases.md)
 - [Deployment topologies and qualification boundary](docs/deployment-topologies.md)
+- [Live evidence: heterogeneous compatibility fleet (2026-08-05)](docs/qualification/2026-08-05-heterogeneous-compatibility-fleet.md)
 - [NVIDIA Dynamo domain integration](docs/integrations/nvidia/DYNAMO.md)
 - [Multi-worker operations runbook](docs/runbooks/multi-worker.md)
 

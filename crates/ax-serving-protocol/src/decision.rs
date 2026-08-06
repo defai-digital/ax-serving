@@ -1,8 +1,9 @@
 //! Bounded domain-decision contracts.
 //!
 //! These records intentionally exclude prompts, tenant identifiers, URLs, and
-//! free-form diagnostics. They are safe control-plane evidence, not request
-//! transcripts. Durable storage and deterministic replay remain responsibilities
+//! free-form diagnostics. They describe a gateway routing decision made before
+//! dispatch. They do not prove that a runtime admitted, executed, or completed
+//! the request. Durable storage and deterministic replay remain responsibilities
 //! of the control-plane layer.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,7 +129,7 @@ pub struct CandidateDecision {
     pub normalized_score_microunits: Option<i64>,
 }
 
-/// Versioned evidence for one active or counterfactual domain decision.
+/// Versioned evidence for one active or counterfactual pre-dispatch decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRecordV1 {
     pub request_id: RequestId,

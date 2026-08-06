@@ -248,7 +248,9 @@ curl -sS http://gateway:19090/internal/workers \
 ```
 
 Domain descriptors/observations appear when a v1.1 adapter reports them. The decision endpoint is a
-bounded in-process diagnostic journal; it is not durable replay evidence across gateway restarts.
+bounded pre-dispatch diagnostic journal. The memory store is process-local; Redis/Valkey retains
+the same records for the current fixed 24-hour TTL. Neither mode is an execution receipt, signature,
+or hardware attestation.
 
 ## 7. Identity and equivalence
 
@@ -260,10 +262,13 @@ Cross-domain retry/failover requires:
 
 1. both deployment IDs in one operator-certified equivalence class;
 2. every required identity field present and matching;
-3. a non-empty immutable workload certification artifact;
+3. `certification_artifact_digest` set to the SHA-256 or BLAKE3 digest of an immutable retained
+   workload qualification artifact;
 4. operation/capability/quality and trust/residency compatibility.
 
-A shared model string is not equivalence. Different formats/quantizers must be disclosed and tested.
+A syntactically valid digest only pins bytes; it does not validate test quality or fetch the
+artifact. A shared model string is not equivalence. Different formats/quantizers must be disclosed
+and tested.
 
 ## 8. Retry and cancellation
 
@@ -391,7 +396,7 @@ Incident order:
 1. stop unsafe admission or disable the affected domain/deployment;
 2. preserve existing streams when safe;
 3. confirm retry/commitment state before manually replaying work;
-4. inspect bounded decision/audit evidence and pinned manifests;
+4. inspect bounded pre-dispatch decisions, audit events, and pinned manifests;
 5. restore an immutable prior policy/domain version;
 6. retain timeline, config, traces, and raw evidence without prompts/secrets.
 

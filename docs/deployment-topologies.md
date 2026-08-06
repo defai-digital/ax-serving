@@ -144,8 +144,14 @@ hardware mixing by itself.
 
 The repository currently checks portable gateway source on Linux AMD64 and Linux ARM64 and packages
 Apple Silicon macOS release binaries. CPU-only container, Compose, Kubernetes, and Helm sources are
-present. Published, production-qualified multi-architecture Linux artifacts and live mixed-domain
-certification remain release gates.
+present.
+
+Live laboratory evidence for a heterogeneous **compatibility** multi-worker fleet (vLLM PC + Thor
+Edge-LLM + Mac llama.cpp) is retained in
+[docs/qualification/2026-08-05-heterogeneous-compatibility-fleet.md](qualification/2026-08-05-heterogeneous-compatibility-fleet.md).
+That run does not certify Dynamo domains, multi-Mac clusters, pinned AX Engine, or mixed-domain
+failover. Published, production-qualified multi-architecture Linux artifacts and those remaining
+live gates stay open.
 
 The Dynamo Domain Adapter and compatibility-manifest validation have source/mock conformance.
 NVIDIA PC live qualification is pending, and Thor remains experimental until its independent

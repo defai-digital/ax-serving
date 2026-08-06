@@ -38,7 +38,16 @@ latency cost, deploy AX Engine or Dynamo directly and do not expand AX policy sc
 ## Current availability
 
 The current source contains the portable gateway, execution-domain foundation, Mac-capable agent,
-and Dynamo Domain Adapter with source/mock conformance. Live mixed-domain certification,
-production-qualified multi-architecture Linux artifacts, and Thor qualification remain release
-work. See the [deployment topology guide](deployment-topologies.md) and
+and Dynamo Domain Adapter with source/mock conformance.
+
+**Live laboratory evidence (2026-08-05/06)** shows one logical model routed across heterogeneous
+**compatibility** workers—vLLM on NVIDIA PC, TensorRT Edge-LLM on two Thor devices, and llama.cpp
+on a Mac Studio—including serial fair selection and a 300 s concurrency-4 soak with zero final
+logical failures. See
+[heterogeneous compatibility fleet evidence](qualification/2026-08-05-heterogeneous-compatibility-fleet.md).
+
+The following remain release work and are **not** established by that run: production mixed-domain
+**failover**, physical multi-Mac cluster certification, pinned live AX Engine, Dynamo PC/Thor domain
+qualification, and production-qualified multi-architecture Linux artifacts. See the
+[deployment topology guide](deployment-topologies.md) and
 [multi-worker runbook](runbooks/multi-worker.md) before planning a deployment.

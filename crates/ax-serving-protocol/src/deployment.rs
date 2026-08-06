@@ -186,7 +186,14 @@ pub struct EquivalencePolicy {
     pub identity_policy: IdentityPolicy,
     #[serde(default)]
     pub certified_deployments: BTreeSet<DeploymentId>,
-    pub certification_artifact: String,
+    /// Content digest of the immutable workload qualification artifact.
+    ///
+    /// A path or URI is not evidence: the operator may store the artifact
+    /// elsewhere, but the routing contract binds failover to these exact
+    /// bytes. The legacy field name is accepted only when its value is a
+    /// valid digest.
+    #[serde(alias = "certification_artifact")]
+    pub certification_artifact_digest: Digest,
 }
 
 impl EquivalencePolicy {
@@ -199,7 +206,6 @@ impl EquivalencePolicy {
     ) -> bool {
         self.certified_deployments.contains(source_id)
             && self.certified_deployments.contains(target_id)
-            && !self.certification_artifact.trim().is_empty()
             && self.identity_policy.identities_match(source, target)
     }
 }
@@ -312,14 +318,14 @@ mod tests {
     }
 
     #[test]
-    fn failover_requires_both_certification_membership_and_artifact() {
+    fn failover_requires_both_certification_membership_and_artifact_digest() {
         let source = DeploymentId::new("mac-qwen").unwrap();
         let target = DeploymentId::new("cuda-qwen").unwrap();
         let policy = EquivalencePolicy {
             id: EquivalenceClassId::new("qwen-certified").unwrap(),
             identity_policy: IdentityPolicy::strict_cross_runtime(),
             certified_deployments: BTreeSet::from([source.clone(), target.clone()]),
-            certification_artifact: "benchmarks/qwen-equivalence.json".into(),
+            certification_artifact_digest: digest('d'),
         };
         assert!(policy.permits_failover(
             &source,
@@ -327,6 +333,17 @@ mod tests {
             &target,
             &identity("vllm")
         ));
+    }
+
+    #[test]
+    fn legacy_artifact_path_is_not_accepted_as_evidence() {
+        let value = serde_json::json!({
+            "id": "qwen-certified",
+            "identity_policy": {"required_matching_fields": []},
+            "certified_deployments": ["mac-qwen", "cuda-qwen"],
+            "certification_artifact": "benchmarks/qwen-equivalence.json"
+        });
+        assert!(serde_json::from_value::<EquivalencePolicy>(value).is_err());
     }
 
     #[test]

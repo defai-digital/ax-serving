@@ -1148,7 +1148,8 @@ mod tests {
                 id: class_id,
                 identity_policy: IdentityPolicy::strict_cross_runtime(),
                 certified_deployments: BTreeSet::from([source_id.clone(), target_id.clone()]),
-                certification_artifact: "tests/rollout-certification.json".into(),
+                certification_artifact_digest: Digest::new(format!("sha256:{}", "d".repeat(64)))
+                    .unwrap(),
             }],
             ..OrchestratorConfig::default()
         };

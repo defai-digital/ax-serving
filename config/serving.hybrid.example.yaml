@@ -128,7 +128,9 @@ orchestrator:
       certified_deployments:
         - "qwen-mlx"
         - "qwen-cuda"
-      certification_artifact: "certifications/qwen-code-v1.json"
+      # Illustrative pin only. Replace it with the digest of the retained
+      # workload qualification artifact before enabling cross-domain failover.
+      certification_artifact_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 
 # Required secret environment variables for a remote fleet:
 #   AXS_API_KEY=<public-client-secret>

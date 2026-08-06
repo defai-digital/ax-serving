@@ -234,7 +234,8 @@ enum ReservationAcquireError {
 ///
 /// Holds a shared `reqwest::Client` (connection-pool enabled).
 /// Per-request routing state comes from `WorkerRegistry` and the policy. Only a
-/// bounded, prompt-free decision journal is retained for operator diagnostics.
+/// bounded, prompt-free pre-dispatch decision journal is retained for operator
+/// diagnostics. It is not an execution receipt or attestation.
 #[derive(Clone)]
 pub struct DirectDispatcher {
     client: Client,
@@ -915,7 +916,7 @@ impl DirectDispatcher {
         }
     }
 
-    /// Return the most recent prompt-free domain decisions in chronological order.
+    /// Return the most recent prompt-free pre-dispatch decisions in chronological order.
     pub fn decision_records(&self, limit: usize) -> Vec<DecisionRecordV1> {
         self.decision_journal.tail(limit.clamp(1, 200))
     }

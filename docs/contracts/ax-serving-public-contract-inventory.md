@@ -28,7 +28,7 @@ OpenAI compatibility means documented request/response behavior for supported
 fields; it does not imply every extension of every upstream runtime.
 
 `GET /v1/license` is an unauthenticated, read-only build-metadata endpoint. In
-v3 it reports the immutable `Apache-2.0` license identity. License activation
+the v2.3 release line it reports the immutable `Apache-2.0` license identity. License activation
 and `POST /v1/license` are not public contracts.
 
 ## Errors and tracing
@@ -90,6 +90,10 @@ Read/diagnostic family:
 - `/v1/admin/deployments`;
 - `/v1/workers` and worker detail.
 
+`/v1/admin/decisions` returns `record_type=gateway_routing_decision_v1` and
+`execution_observed=false`. Its records are made before runtime dispatch; they explain a routing
+choice but are not execution receipts, runtime logs, signatures, or hardware attestations.
+
 Asynchronous lifecycle family:
 
 - `GET|POST /admin/v1/deployments`;
@@ -115,7 +119,7 @@ The cross-platform `ax-serving-protocol` crate and JSON fixtures define:
 - drain and deployment-job control;
 - deployment/model/equivalence identity;
 - execution-domain identity, qualification, desired state, and aggregate observations;
-- bounded decision profiles and records;
+- bounded pre-dispatch decision profiles and records;
 - request/attempt/admission/error fields.
 
 New runtime integrations depend on this wire contract, not `InferenceBackend`
@@ -124,10 +128,11 @@ cannot certify cross-runtime failover.
 
 The current source contract is protocol v1.2 with tolerant v1.0/v1.1 fixtures. Domain descriptors,
 observations, configuration/catalog resolution, worker diagnostics, generation-fenced domain
-reservations, rejected-candidate evidence, and bounded decision persistence are implemented for
-memory and Redis/Valkey stores. Live support certification, two-gateway partition/soak evidence, and
-offline replay tooling remain unreleased. One Dynamo deployment registers as one domain endpoint;
-its internal workers are never AX public/control-plane resources.
+reservations, rejected-candidate evidence, and bounded pre-dispatch decision persistence are
+implemented for memory and Redis/Valkey stores. Gateway-observed execution receipts, signatures,
+live support certification, two-gateway partition/soak evidence, and offline replay tooling remain
+unreleased. One Dynamo deployment registers as one domain endpoint; its internal workers are never
+AX public/control-plane resources.
 
 ## Configuration
 

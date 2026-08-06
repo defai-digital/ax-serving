@@ -62,7 +62,7 @@ Do not reuse credentials across planes.
 
 - Adapter/gateway: redeploy previous binary + previous generation manifest.
 - Adaptive federation: set `adaptive_federation.mode: rollback` to force the
-  baseline domain while retaining decision evidence.
+  baseline domain while retaining pre-dispatch decision evidence.
 - Never roll back to a partial-rank plan.
 
 ## Evidence retention
@@ -72,6 +72,6 @@ Retain for every certification run:
 - topology label, OS, AX Engine build, model/quantization digests
 - transport class and measured bandwidth/latency
 - load / fault / restart / soak outcomes via evidence journal hooks
-- adaptive decision records (prompt-free) from the fleet store
+- adaptive pre-dispatch decision records (prompt-free) from the fleet store
 
 Physical 60-minute soak and usefulness thresholds remain external release gates.
