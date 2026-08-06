@@ -50,6 +50,58 @@ async fn runtime_agent_handles_sigint_and_drains() -> Result<()> {
     exercise_runtime_agent_signal(libc::SIGINT, None).await
 }
 
+/// Wait until the control plane has recorded at least one heartbeat.
+///
+/// The wait must re-check the heartbeat buffer on a short poll interval.
+/// `Notify::notify_waiters` does not store a permit, so a heartbeat that
+/// lands between an empty check and `notified().await` would otherwise hang
+/// until the outer timeout (the flake that failed the workspace suite).
+async fn wait_for_recorded_heartbeat(control_state: &ControlPlaneState) {
+    loop {
+        if !control_state.heartbeats.lock().await.is_empty() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = control_state.heartbeat_notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn heartbeat_wait_observes_signal_that_races_empty_check() -> Result<()> {
+    let control_state = Arc::new(ControlPlaneState::default());
+    let producer_state = Arc::clone(&control_state);
+
+    // Arm the waiter first so it observes an empty buffer, then race a
+    // producer that records a heartbeat and notifies before the next poll.
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_recorded_heartbeat(&control_state),
+        )
+        .await
+        .context("wait_for_recorded_heartbeat timed out under synthetic race")
+    });
+
+    // Yield so the waiter can perform its first empty check.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    producer_state
+        .heartbeats
+        .lock()
+        .await
+        .push(("race-worker".into(), json!({"sequence": 1})));
+    // notify_waiters intentionally (no stored permit): the poll fallback in
+    // wait_for_recorded_heartbeat must still observe the buffer.
+    producer_state.heartbeat_notify.notify_waiters();
+
+    waiter.await.context("waiter task failed")??;
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn exercise_runtime_agent_signal(
     signal: i32,
@@ -62,7 +114,7 @@ async fn exercise_runtime_agent_signal(
     let worker_id = format!("signal-test-{}", uuid::Uuid::new_v4().simple());
     let mut child = spawn_runtime_agent(&control_base, &runtime_base, &worker_id)?;
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if !control_state.heartbeats.lock().await.is_empty() {
                 return Ok(());
@@ -70,7 +122,11 @@ async fn exercise_runtime_agent_signal(
             if let Some(status) = child.try_wait()? {
                 bail!("runtime agent exited before its first heartbeat: {status}");
             }
-            control_state.heartbeat_notify.notified().await;
+            tokio::select! {
+                biased;
+                _ = control_state.heartbeat_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
         }
     })
     .await
@@ -227,14 +283,10 @@ async fn thor_agent_registers_heartbeats_and_proxies_chat() -> Result<()> {
         runtime.clone(),
     ));
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !control_state.heartbeats.lock().await.is_empty() {
-                break;
-            }
-            control_state.heartbeat_notify.notified().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_recorded_heartbeat(&control_state),
+    )
     .await
     .context("timed out waiting for thor heartbeat")?;
 
@@ -534,14 +586,10 @@ async fn thor_agent_fronts_generic_runtime_without_health_endpoint() -> Result<(
         runtime.clone(),
     ));
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !control_state.heartbeats.lock().await.is_empty() {
-                break;
-            }
-            control_state.heartbeat_notify.notified().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_recorded_heartbeat(&control_state),
+    )
     .await
     .context("timed out waiting for thor heartbeat")?;
 
@@ -667,7 +715,9 @@ async fn handle_heartbeat(
     Json(body): Json<Value>,
 ) -> StatusCode {
     state.heartbeats.lock().await.push((worker_id, body));
-    state.heartbeat_notify.notify_waiters();
+    // Prefer notify_one: unlike notify_waiters, it stores a permit when no
+    // task is currently waiting, so a late waiter still wakes immediately.
+    state.heartbeat_notify.notify_one();
     StatusCode::OK
 }
 
