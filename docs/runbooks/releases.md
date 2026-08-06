@@ -24,8 +24,10 @@ In this repo that means:
 Before tagging any release:
 
 1. Update the Rust workspace version in [Cargo.toml](../../Cargo.toml).
-2. Update the JS SDK version in [package.json](../../sdk/javascript/package.json) if the SDK is being published.
-3. Ensure the tag exactly matches those versions, without the leading `v`.
+2. Update the JS SDK version in [package.json](../../sdk/javascript/package.json).
+3. Update the Python SDK version in [pyproject.toml](../../sdk/python/pyproject.toml).
+4. Regenerate and commit [uv.lock](../../sdk/python/uv.lock) with `uv lock`.
+5. Ensure the tag exactly matches all three package versions, without the leading `v`.
 
 Examples:
 
@@ -51,6 +53,7 @@ Effects:
 - GitHub Release is published as a normal release.
 - Homebrew tap is updated.
 - npm publish uses the default `latest` dist-tag.
+- The Python SDK is built, tested, and published to PyPI with uv trusted publishing.
 
 ## Beta Release Process
 
@@ -69,6 +72,23 @@ Effects:
 - GitHub Release is published as a prerelease.
 - Homebrew tap is not updated.
 - npm publish uses the `beta` dist-tag.
+- The Python SDK prerelease is published to PyPI with its SemVer prerelease version.
+
+## PyPI Trusted Publisher
+
+The release job uses GitHub OIDC rather than a long-lived PyPI token. Before the
+first publish, configure a pending trusted publisher for the `ax-serving`
+project in PyPI with:
+
+- Owner: `defai-digital`
+- Repository: `ax-serving`
+- Workflow: `release.yml`
+- Environment: `pypi`
+
+The repository environment and the PyPI publisher must use the same
+case-sensitive environment name. The publish job is a required release job;
+an SDK test, package validation, OIDC, or upload failure leaves the deployment
+failed instead of reporting a successful release workflow.
 
 ## Notes
 

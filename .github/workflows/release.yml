@@ -29,6 +29,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: '0.12.2'
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
       - uses: Swatinem/rust-cache@v2
       - name: Install native dependencies
         run: bash scripts/ci-install-native-deps.sh
@@ -44,9 +49,8 @@ jobs:
       - name: Validate Python SDK
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-          python -m pytest -q
+          uv sync --locked --extra dev
+          uv run --locked --extra dev python -m pytest -q
       - name: Require populated benchmark evidence
         run: |
           python3 - <<'PY'
@@ -342,10 +346,17 @@ jobs:
           test -n "$NODE_AUTH_TOKEN"
           npm ci
           npm test
+          set +e
           if [[ "${{ needs.build-macos.outputs.prerelease }}" == "true" ]]; then
             npm publish --access public --provenance --tag beta
           else
             npm publish --access public --provenance
+          fi
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            echo "::warning::npm publish failed (exit $status). The @defai-digital scope may be missing or the token may lack publish rights. GitHub release artifacts remain valid."
+            exit "$status"
           fi
 
   publish-pypi:
@@ -366,15 +377,31 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: '0.12.2'
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
       - name: Build and test distribution
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade pip build
-          python -m pip install -e '.[dev]'
-          python -m pytest -q
-          python -m build
-          python -m pip install --force-reinstall --no-deps dist/*.whl
-          python -m pip check
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: sdk/python/dist/
+          # Install with the `dev` extra so grpcio/protobuf are present for
+          # gRPC client tests. The portable REST wheel remains grpc-free.
+          uv sync --locked --extra dev
+          uv run --locked --extra dev python -m pytest -q
+          uv build --clear
+          uv venv --clear "$RUNNER_TEMP/ax-serving-wheel" --python 3.13
+          uv pip install \
+            --python "$RUNNER_TEMP/ax-serving-wheel/bin/python" \
+            dist/*.whl
+          uv pip check --python "$RUNNER_TEMP/ax-serving-wheel/bin/python"
+          EXPECTED_VERSION="${GITHUB_REF_NAME#v}" \
+            "$RUNNER_TEMP/ax-serving-wheel/bin/python" -c \
+            'import os, ax_serving; assert ax_serving.__version__ == os.environ["EXPECTED_VERSION"]'
+      - name: Publish Python SDK
+        working-directory: sdk/python
+        run: >-
+          uv publish
+          --trusted-publishing always
+          --check-url https://pypi.org/simple/ax-serving/
+          dist/*

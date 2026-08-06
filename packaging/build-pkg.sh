@@ -2,7 +2,7 @@
 # packaging/build-pkg.sh — build a signed + notarized macOS .pkg installer
 #
 # Usage (local signing + notarization):
-#   VERSION=2.3.0 \
+#   VERSION=2.3.1 \
 #   DEVELOPER_ID_INSTALLER="Developer ID Installer: ACME Corp (TEAM1234567)" \
 #   APPLE_ID="you@example.com" \
 #   APPLE_TEAM_ID="TEAM1234567" \
@@ -10,7 +10,7 @@
 #   ./packaging/build-pkg.sh
 #
 # Unsigned local build (skip signing + notarization):
-#   VERSION=2.3.0 ./packaging/build-pkg.sh
+#   VERSION=2.3.1 ./packaging/build-pkg.sh
 #
 # Prerequisites: Xcode Command Line Tools, cargo, Developer ID Installer cert
 # in Keychain (for signed builds).

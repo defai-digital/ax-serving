@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ax-serving"
-version = "2.3.0"
+version = "2.3.1"
 requires-python = ">=3.10"
 description = "AX Serving portable REST/SSE client with embedded gRPC compatibility"
 license = "Apache-2.0"
@@ -29,3 +29,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["ax_serving"]
+
+[tool.uv]
+required-version = "==0.12.2"

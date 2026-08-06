@@ -160,15 +160,19 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: '0.12.2'
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
       - name: JavaScript SDK
         working-directory: sdk/javascript
         run: npm ci && npm test && npm run typecheck
       - name: Python SDK
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-          python -m pytest -q
+          uv sync --locked --extra dev
+          uv run --locked --extra dev python -m pytest -q
 
   nvidia-runtime-package:
     name: NVIDIA runtime package (${{ matrix.arch }})
