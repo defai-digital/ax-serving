@@ -363,9 +363,6 @@ jobs:
     name: Publish Python SDK
     needs: build-macos
     runs-on: ubuntu-latest
-    # PyPI trusted publishing must be configured outside this repository. A
-    # missing publisher must not turn a successful GitHub release red.
-    continue-on-error: true
     environment:
       name: pypi
       url: https://pypi.org/project/ax-serving/
